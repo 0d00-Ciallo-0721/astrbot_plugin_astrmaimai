@@ -106,6 +106,7 @@ class AstrMaiBaseSubAgent(FunctionTool[AstrAgentContext]):
                     models=models,
                     max_steps=self.get_max_steps(),
                     timeout=self.get_timeout(),
+                    propagate_queue_timeout_status=False,
                 )
                 result_text = result.text if hasattr(result, "text") else str(result)
                 logger.info(f"[Sys3/{self.name}] 任务完成 (via Gateway)，结果长度: {len(result_text)} 字")

@@ -7,7 +7,7 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
 from ...infrastructure.compat.legacy_compat import emit_legacy_prompt_envelope_extras, read_legacy_focus_thread_context
-from ...infrastructure.runtime.lane_manager import LaneKey
+from ...infrastructure.runtime.dialog_lane_identity import resolve_dialog_lane_identity
 from ...infrastructure.runtime.trace_runtime import preview_text
 from ...infrastructure.runtime.turn_call_ledger import record_context_block_stats
 from ..attention.group_context_snapshot import GroupContextSnapshotBuilder
@@ -344,19 +344,18 @@ class PlannerPromptContextMixin:
         chat_id: str,
         max_age_seconds: float = 900.0,
         *,
+        event: AstrMessageEvent | None = None,
         history_policy: DialogHistoryPolicy | None = None,
     ) -> str:
         lane_manager = getattr(self.gateway, "lane_manager", None)
         if not lane_manager:
             return ""
-        lane_key = LaneKey(subsystem="sys2", task_family="dialog", scope_id=chat_id)
-        base_origin = chat_id
         if history_policy is not None and history_policy.group_id:
             if not history_policy.uses_lane_history:
                 return ""
-            topic_scope = f"{chat_id}#topic:{max(1, history_policy.topic_epoch)}"
-            lane_key = LaneKey(subsystem="sys2", task_family="dialog", scope_id=topic_scope)
-            base_origin = f"{chat_id}@@topic:{max(1, history_policy.topic_epoch)}"
+            if event is not None:
+                history_policy.bind(event)
+        lane_key, base_origin = resolve_dialog_lane_identity(event, chat_id)
         try:
             return await lane_manager.get_recent_transcript(
                 lane_key=lane_key,
@@ -712,6 +711,7 @@ class PlannerPromptContextMixin:
                     if history_policy.group_id
                     else 900.0
                 ),
+                event=focus_event,
                 history_policy=history_policy if history_policy.group_id else None,
             )
         )

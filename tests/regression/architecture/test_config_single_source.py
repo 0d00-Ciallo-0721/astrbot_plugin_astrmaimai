@@ -30,7 +30,7 @@ class DegradedConfigLoadTests(unittest.TestCase):
         cfg = config_mod.load_astrmai_config(
             {"infra": {"api_timeout": -5}, "reply": {"meme_probability": "abc"}}
         )
-        self.assertEqual(cfg.infra.api_timeout, 15.0)
+        self.assertEqual(cfg.infra.api_timeout, 45.0)
         self.assertEqual(cfg.reply.meme_probability, 60)
 
     def test_valid_values_untouched(self):

@@ -1728,7 +1728,7 @@
       "model_request_timeout_sec": {
         "description": "单次模型请求超时（秒）",
         "type": "float",
-        "default": 15.0,
+        "default": 45.0,
         "minimum": 1,
         "maximum": 3600,
         "hint": "普通模型请求允许等待的最长时间。响应通常超过 90 秒的模型建议设置为 180 至 300。"
@@ -1764,6 +1764,22 @@
         "minimum": 0.1,
         "maximum": 600,
         "hint": "同一群聊已有回复生成时，新的回复最多等待这段时间；超时后结束本轮并释放排队计数。"
+      },
+      "attention_background_slot_wait_timeout_sec": {
+        "description": "回复后台槽位最长等待（秒）",
+        "type": "float",
+        "default": 15.0,
+        "minimum": 0.1,
+        "maximum": 600,
+        "hint": "群聊回复等待后台执行槽位超过该时间后放弃本轮；该时间不计入后台任务获得槽位后的执行时间。"
+      },
+      "energy_prepare_timeout_sec": {
+        "description": "状态能量准备最长等待（秒）",
+        "type": "float",
+        "default": 5.0,
+        "minimum": 0.1,
+        "maximum": 600,
+        "hint": "准备本轮状态能量超过该时间后结束本轮，并将具体阶段记录为超时。"
       },
       "lane_prepare_timeout_sec": {
         "description": "会话通道准备最长等待（秒）",
@@ -1808,7 +1824,7 @@
       "fast_mode_execution_timeout_sec": {
         "description": "快速聊天执行超时（秒）",
         "type": "int",
-        "default": 15,
+        "default": 45,
         "minimum": 1,
         "maximum": 7200,
         "hint": "快速模式生成回复的时间预算。慢模型仍用于快速模式时，请同步提高此值。"
@@ -1824,7 +1840,7 @@
       "attention_judge_timeout_sec": {
         "description": "注意力判断超时（秒）",
         "type": "float",
-        "default": 3.0,
+        "default": 20.0,
         "minimum": 0.1,
         "maximum": 600,
         "hint": "超过后会放行消息并继续聊天。使用慢模型时可提高，但群聊每条消息也会等待更久。"
@@ -1832,7 +1848,7 @@
       "cognitive_loop_timeout_sec": {
         "description": "认知决策超时（秒）",
         "type": "float",
-        "default": 2.5,
+        "default": 20.0,
         "minimum": 0.1,
         "maximum": 600,
         "hint": "超过后会降级到默认规划流程。慢模型需要提高，否则认知决策不会真正完成。"
@@ -1848,7 +1864,7 @@
       "memory_react_timeout_sec": {
         "description": "深度记忆判断超时（秒）",
         "type": "float",
-        "default": 15.0,
+        "default": 45.0,
         "minimum": 1,
         "maximum": 600,
         "hint": "深度记忆检索生成检索问题的等待时间，超时后退回普通召回。"
@@ -1856,7 +1872,7 @@
       "query_rewrite_timeout_sec": {
         "description": "记忆查询改写快速等待时间（秒）",
         "type": "float",
-        "default": 3.0,
+        "default": 20.0,
         "minimum": 0.5,
         "maximum": 60,
         "hint": "仅限制可选的查询改写步骤。超时后立即使用用户原话检索，不会阻塞正常记忆召回。"
@@ -1864,7 +1880,7 @@
       "deep_memory_total_budget_sec": {
         "description": "深度记忆整条链路总预算（秒）",
         "type": "float",
-        "default": 12.0,
+        "default": 60.0,
         "minimum": 1,
         "maximum": 120,
         "hint": "查询改写、记忆重排和记忆压缩共同使用这段时间。预算耗尽后立即使用已有文字检索结果继续回复，避免多阶段串行等待。"
@@ -1872,17 +1888,17 @@
       "memory_rerank_timeout_sec": {
         "description": "记忆智能重排单步上限（秒）",
         "type": "float",
-        "default": 5.0,
+        "default": 20.0,
         "minimum": 0.5,
-        "maximum": 30,
+        "maximum": 60,
         "hint": "只限制候选记忆的模型重排步骤，并且不会超过深度记忆总预算。超时后保留本地排序结果。"
       },
       "memory_compress_timeout_sec": {
         "description": "记忆压缩整理单步上限（秒）",
         "type": "float",
-        "default": 4.0,
+        "default": 20.0,
         "minimum": 0.5,
-        "maximum": 30,
+        "maximum": 60,
         "hint": "只限制记忆压缩步骤，并且不会超过深度记忆总预算。超时后直接使用已选记忆，不影响最终回复。"
       },
       "compaction_timeout_sec": {
@@ -2224,6 +2240,14 @@
         "type": "int",
         "default": 3,
         "hint": "同一时间最多允许多少个模型请求同时进行。数值过大可能更容易触发限流。"
+      },
+      "semaphore_wait_timeout_sec": {
+        "description": "模型并发槽位最长排队时间（秒）",
+        "type": "float",
+        "default": 30.0,
+        "minimum": 0.1,
+        "maximum": 3600.0,
+        "hint": "等待模型并发槽位超过该时间后放弃本次调用；不包含模型请求本身的响应时间。"
       },
       "background_task_concurrency": {
         "description": "受预算后台任务并发数",

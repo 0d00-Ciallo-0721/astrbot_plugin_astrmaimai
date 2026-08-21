@@ -30,6 +30,7 @@ except ImportError:  # pragma: no cover
 
 
 from ...infrastructure.runtime.lane_manager import LaneKey
+from ...infrastructure.runtime.dialog_lane_identity import resolve_dialog_lane_identity
 from ...infrastructure.runtime.trace_runtime import debug_trace, preview_text
 from ...infrastructure.gateway.output_guard import validate_visible_output_text
 from ...infrastructure.gateway.gateway_exceptions import LLMCascadeFailureException
@@ -906,14 +907,7 @@ class ConcurrentExecutor:
         return cleaned[:96]
 
     def _resolve_dialog_lane_identity(self, event: AstrMessageEvent, chat_id: str) -> tuple[LaneKey, str]:
-        if not self._is_group_chat_event(event, chat_id):
-            return LaneKey(subsystem="sys2", task_family="dialog", scope_id=chat_id), chat_id
-
-        history_policy = DialogHistoryPolicy.from_event(event)
-        topic_epoch = max(1, int(history_policy.topic_epoch or 1))
-        scoped_origin = f"{chat_id}@@topic:{topic_epoch}"
-        scoped_id = f"{chat_id}#topic:{topic_epoch}"
-        return LaneKey(subsystem="sys2", task_family="dialog", scope_id=scoped_id), scoped_origin
+        return resolve_dialog_lane_identity(event, chat_id)
 
     def _execution_runtime_values(self, event: AstrMessageEvent, chat_id: str) -> dict[str, Any]:
         bot_id = str(event.get_self_id()) if hasattr(event, "get_self_id") else "SELF_BOT"

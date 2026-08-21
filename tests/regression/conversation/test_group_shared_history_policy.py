@@ -7,8 +7,10 @@ from types import SimpleNamespace
 from astrmai.conversation.attention.group_dialogue_store import GroupDialogueStore
 from astrmai.conversation.contracts.dialog_history_policy import DialogHistoryPolicy
 from astrmai.conversation.execution.executor import ConcurrentExecutor
+from astrmai.conversation.execution.reply_post_send import ReplyPostSendMixin
 from astrmai.conversation.planning.conversation_continuity import ConversationContinuityStore
 from astrmai.conversation.planning.planner import Planner
+from astrmai.conversation.planning.planner_prompt_context import PlannerPromptContextMixin
 
 
 class _GroupEvent:
@@ -324,3 +326,62 @@ def test_group_dialog_lane_is_shared_by_topic_epoch_not_sender():
     )
     assert next_lane.scope_id != lane_a.scope_id
     assert next_origin != origin_a
+
+
+def test_topic_lane_identity_is_shared_by_executor_planner_and_reply_history():
+    event = _GroupEvent(sender_id="10001")
+    policy = DialogHistoryPolicy(
+        history_mode="current_topic",
+        group_id="552752264",
+        thread_key="group:552752264",
+        topic_epoch=7,
+        current_sender_id="10001",
+        allow_provider_session=True,
+    )
+    policy.bind(event)
+    calls = []
+
+    class _LaneManager:
+        async def get_recent_transcript(self, *, lane_key, base_origin, **kwargs):
+            calls.append(("planner", lane_key, base_origin))
+            return "recent transcript"
+
+        async def get_lane_history(self, *, lane_key, base_origin):
+            calls.append(("reply", lane_key, base_origin))
+            return [{"role": "user", "content": "hello"}]
+
+    lane_manager = _LaneManager()
+    executor = object.__new__(ConcurrentExecutor)
+    planner_prompt = object.__new__(PlannerPromptContextMixin)
+    planner_prompt.gateway = SimpleNamespace(lane_manager=lane_manager)
+    reply_post_send = object.__new__(ReplyPostSendMixin)
+    reply_post_send.config = SimpleNamespace(
+        attention=SimpleNamespace(bg_pool_size=20)
+    )
+    reply_post_send.state_engine = SimpleNamespace(
+        gateway=SimpleNamespace(lane_manager=lane_manager)
+    )
+
+    async def _run():
+        executor_identity = executor._resolve_dialog_lane_identity(
+            event,
+            event.unified_msg_origin,
+        )
+        transcript = await planner_prompt._get_recent_dialogue_transcript(
+            event.unified_msg_origin,
+            event=event,
+            history_policy=policy,
+        )
+        history = await reply_post_send._fetch_history(
+            event.unified_msg_origin,
+            "hello",
+            event,
+        )
+        return executor_identity, transcript, history
+
+    executor_identity, transcript, history = asyncio.run(_run())
+
+    assert transcript == "recent transcript"
+    assert history == [{"role": "user", "content": "hello"}]
+    assert calls[0][1:] == executor_identity
+    assert calls[1][1:] == executor_identity

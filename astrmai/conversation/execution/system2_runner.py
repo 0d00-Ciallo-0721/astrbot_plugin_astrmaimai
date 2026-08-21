@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 
 from astrbot.api import logger
 
+from ...infrastructure.runtime.dialog_lane_identity import resolve_dialog_lane_identity
 from ...infrastructure.runtime.lane_manager import LaneKey
 from ...infrastructure.runtime.trace_runtime import debug_trace
 from ...infrastructure.runtime.turn_call_ledger import (
@@ -12,6 +14,12 @@ from ...infrastructure.runtime.turn_call_ledger import (
     finish_stage,
 )
 from .followup_manager import FollowupManager
+
+
+class System2QueueTimeout(asyncio.TimeoutError):
+    def __init__(self, stage: str) -> None:
+        self.stage = str(stage or "system2.chat_lock_wait")
+        super().__init__(self.stage)
 
 
 class System2Runner:
@@ -54,8 +62,45 @@ class System2Runner:
             configured = 20.0
         return clamp_timeout_to_turn_budget(event, max(0.1, configured), reserve_for_reply=True)
 
+    def _resolve_dialog_lane_identity(self, event, chat_id: str) -> tuple[LaneKey, str]:
+        return resolve_dialog_lane_identity(event, chat_id)
+
     async def _prepare_system2_runtime(self, main_event, chat_id: str) -> None:
-        await self.runtime.state_engine.consume_energy(chat_id)
+        energy_stage = begin_stage(
+            main_event,
+            "system2.energy_prepare",
+            critical_path=True,
+            metadata={"chat_id": str(chat_id or "")},
+        )
+        timing = getattr(getattr(self.runtime, "config", None), "timing", None)
+        try:
+            configured_energy_timeout = float(
+                getattr(timing, "energy_prepare_timeout_sec", 5.0) or 5.0
+            )
+        except (TypeError, ValueError):
+            configured_energy_timeout = 5.0
+        energy_timeout = clamp_timeout_to_turn_budget(
+            main_event,
+            max(0.1, configured_energy_timeout),
+            reserve_for_reply=True,
+        )
+        try:
+            await asyncio.wait_for(
+                self.runtime.state_engine.consume_energy(chat_id),
+                timeout=max(0.1, energy_timeout),
+            )
+        except asyncio.TimeoutError:
+            finish_stage(main_event, energy_stage, status="timeout", reason="queue_timeout")
+            main_event.set_extra("astrmai_execution_status", "queue_timeout")
+            main_event.set_extra("astrmai_queue_timeout_stage", "system2.energy_prepare")
+            raise System2QueueTimeout("system2.energy_prepare")
+        except asyncio.CancelledError:
+            finish_stage(main_event, energy_stage, status="cancelled", reason="acquire_cancelled")
+            raise
+        except Exception as exc:
+            finish_stage(main_event, energy_stage, status="error", reason=type(exc).__name__)
+            raise
+        finish_stage(main_event, energy_stage, metadata={"timeout_sec": energy_timeout})
         lane_stage = begin_stage(
             main_event,
             "system2.lane_prepare",
@@ -64,24 +109,13 @@ class System2Runner:
         )
         timeout_sec = self._lane_prepare_timeout(main_event)
         try:
+            lane_key, base_origin = self._resolve_dialog_lane_identity(main_event, chat_id)
             if timeout_sec <= 0.0:
                 raise asyncio.TimeoutError
             await asyncio.wait_for(
                 self.runtime.lane_manager.ensure_lane(
-                    lane_key=LaneKey(
-                        subsystem="sys2",
-                        task_family="dialog",
-                        scope_id=(
-                            f"{chat_id}#thread:{self._turn_thread_id(main_event)}"
-                            if getattr(main_event.get_extra("astrmai_turn_identity", None), "thread_id", "")
-                            else chat_id
-                        ),
-                    ),
-                    base_origin=(
-                        f"{chat_id}@@thread:{self._turn_thread_id(main_event)}"
-                        if getattr(main_event.get_extra("astrmai_turn_identity", None), "thread_id", "")
-                        else chat_id
-                    ),
+                    lane_key=lane_key,
+                    base_origin=base_origin,
                 ),
                 timeout=max(0.1, timeout_sec),
             )
@@ -89,7 +123,7 @@ class System2Runner:
             finish_stage(main_event, lane_stage, status="timeout", reason="queue_timeout")
             main_event.set_extra("astrmai_execution_status", "queue_timeout")
             main_event.set_extra("astrmai_queue_timeout_stage", "system2.lane_prepare")
-            raise
+            raise System2QueueTimeout("system2.lane_prepare")
         except asyncio.CancelledError:
             finish_stage(main_event, lane_stage, status="cancelled", reason="acquire_cancelled")
             raise
@@ -125,6 +159,40 @@ class System2Runner:
     async def _execute_planner(self, main_event, queue_events: list) -> bool:
         await self.runtime.system2_planner.plan_and_execute(main_event, queue_events)
         return bool(main_event.get_extra("astrmai_reply_sent", False))
+
+    async def _record_pre_planner_timeout(self, event, stage: str) -> None:
+        trace_state = str(event.get_extra("astrmai_pre_planner_trace_state", "") or "")
+        if trace_state in {"pending", "persisted"} or event.get_extra(
+            "astrmai_pre_planner_trace_finalized", False
+        ):
+            return
+        event.set_extra("astrmai_pre_planner_trace_state", "pending")
+        recorder = getattr(getattr(self.runtime, "system2_planner", None), "record_turn_trace", None)
+        if not callable(recorder):
+            event.set_extra("astrmai_pre_planner_trace_state", "retryable")
+            return
+        try:
+            result = recorder(
+                str(getattr(event, "unified_msg_origin", "") or ""),
+                event,
+                status="queue_timeout",
+                reply_text=None,
+            )
+            if inspect.isawaitable(result):
+                await result
+        except asyncio.CancelledError:
+            event.set_extra("astrmai_pre_planner_trace_state", "retryable")
+            raise
+        except Exception as exc:
+            event.set_extra("astrmai_pre_planner_trace_state", "retryable")
+            logger.warning(
+                "[AstrMai] pre-planner queue timeout trace failed "
+                f"stage={stage} error_type={type(exc).__name__}"
+            )
+            return
+        event.set_extra("astrmai_pre_planner_timeout_recorded", True)
+        event.set_extra("astrmai_pre_planner_trace_finalized", True)
+        event.set_extra("astrmai_pre_planner_trace_state", "persisted")
 
     def _lock_wait_timeout(self, event) -> float:
         timing = getattr(getattr(self.runtime, "config", None), "timing", None)
@@ -162,8 +230,11 @@ class System2Runner:
         try:
             timeout_sec = self._lock_wait_timeout(main_event)
             if timeout_sec <= 0.0:
-                raise asyncio.TimeoutError
-            acquired_mode = await self._acquire_lock_bounded(lock, timeout_sec)
+                raise System2QueueTimeout("system2.chat_lock_wait")
+            try:
+                acquired_mode = await self._acquire_lock_bounded(lock, timeout_sec)
+            except asyncio.TimeoutError as exc:
+                raise System2QueueTimeout("system2.chat_lock_wait") from exc
             finish_stage(main_event, lock_stage, metadata={"timeout_sec": timeout_sec})
             lock_stage = ""
             self._reset_runtime_reply_extras(main_event)
@@ -171,15 +242,16 @@ class System2Runner:
             reply_sent = await self._execute_planner(main_event, queue_events)
             await self._finalize_followups(chat_id, main_event, reply_sent)
             return reply_sent
-        except asyncio.TimeoutError:
+        except System2QueueTimeout as exc:
             if lock_stage:
                 finish_stage(main_event, lock_stage, status="timeout", reason="queue_timeout")
-            timeout_stage = str(main_event.get_extra("astrmai_queue_timeout_stage", "") or "")
+            timeout_stage = str(main_event.get_extra("astrmai_queue_timeout_stage", "") or exc.stage)
             if not timeout_stage:
                 timeout_stage = "system2.chat_lock_wait"
-                main_event.set_extra("astrmai_execution_status", "queue_timeout")
-                main_event.set_extra("astrmai_queue_timeout_stage", timeout_stage)
+            main_event.set_extra("astrmai_execution_status", "queue_timeout")
+            main_event.set_extra("astrmai_queue_timeout_stage", timeout_stage)
             debug_trace(main_event, "system2.queue_timeout", wait_stage=timeout_stage)
+            await self._record_pre_planner_timeout(main_event, timeout_stage)
             return False
         except asyncio.CancelledError:
             finish_stage(main_event, lock_stage, status="cancelled", reason="acquire_cancelled")

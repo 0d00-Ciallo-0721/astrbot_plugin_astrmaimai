@@ -195,6 +195,12 @@ class PlanningInputLoader:
             tasks.extend(
                 [
                     self._run_timed(event, "slang_context", lambda: self._load_slang_context(chat_id), ""),
+                    self._run_timed(
+                        event,
+                        "goal_update",
+                        lambda: self._load_goal_update(chat_id, prompt_envelope, window_lines),
+                        "",
+                    ),
                 ]
             )
         loaded_items = await asyncio.gather(*tasks, return_exceptions=True)
@@ -210,24 +216,17 @@ class PlanningInputLoader:
         result["stable_jargon_explanation"] = str(result.get("jargon_explanation", "") or "")
 
         if level >= 2:
-            goal_item = await self._run_timed(
-                event,
-                "goal_update",
-                lambda: self._load_goal_update(chat_id, prompt_envelope, window_lines),
-                "",
-            )
-            self._record_timing(event, goal_item)
-            goal_text = str(goal_item.value or "")
-            result["goal_text"] = goal_text
-            result["planner_reasoning"] = goal_text
-            goals_context_item = await self._run_timed(
+            goals_context = await self._run_timed(
                 event,
                 "goals_context",
                 lambda: self._load_goals_context(chat_id),
                 "",
             )
-            self._record_timing(event, goals_context_item)
-            result["goals_context"] = str(goals_context_item.value or "")
+            self._record_timing(event, goals_context)
+            goal_text = str(result.get("goal_update", "") or "")
+            result["goal_text"] = goal_text
+            result["planner_reasoning"] = goal_text
+            result["goals_context"] = str(goals_context.value or "")
         else:
             self._record_skip(event, "goal_update", f"think_level_{level}")
             self._record_skip(event, "slang_context", f"think_level_{level}")

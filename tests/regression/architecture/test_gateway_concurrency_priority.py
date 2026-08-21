@@ -17,6 +17,7 @@ import unittest
 from types import SimpleNamespace
 
 from astrmai.infrastructure.gateway.gateway_call import GatewayCallMixin
+from astrmai.infrastructure.gateway.gateway_exceptions import GatewayQueueTimeout
 from astrmai.infrastructure.gateway.model_gateway import GlobalModelGateway
 
 
@@ -26,6 +27,7 @@ class _Limiter(GatewayCallMixin):
     def __init__(self, total: int, background: int | None):
         self._global_semaphore = asyncio.Semaphore(total)
         self._background_semaphore = asyncio.Semaphore(background) if background is not None else None
+        self.settings = SimpleNamespace(semaphore_wait_timeout_sec=0.02)
 
 
 class SlotArithmeticTests(unittest.TestCase):
@@ -180,6 +182,68 @@ class ConcurrencyPriorityTests(unittest.TestCase):
                 return True
 
         self.assertTrue(asyncio.run(_run()))
+
+    def test_global_slot_wait_is_bounded_and_does_not_leak(self):
+        limiter = _Limiter(total=1, background=None)
+
+        async def _run():
+            await limiter._global_semaphore.acquire()
+            try:
+                with self.assertRaises(GatewayQueueTimeout) as raised:
+                    async with limiter._concurrency_slot(True):
+                        self.fail("timed out caller must not enter the slot")
+                self.assertEqual(raised.exception.stage, "gateway.semaphore_wait")
+                self.assertEqual(limiter._global_semaphore._value, 0)
+            finally:
+                limiter._global_semaphore.release()
+            async with limiter._concurrency_slot(True):
+                self.assertEqual(limiter._global_semaphore._value, 0)
+            return limiter._global_semaphore._value
+
+        self.assertEqual(asyncio.run(_run()), 1)
+
+    def test_background_timeout_releases_background_subslot(self):
+        limiter = _Limiter(total=1, background=1)
+
+        async def _run():
+            await limiter._global_semaphore.acquire()
+            try:
+                with self.assertRaises(GatewayQueueTimeout):
+                    async with limiter._concurrency_slot(False):
+                        self.fail("timed out caller must not enter the slot")
+                return limiter._background_semaphore._value
+            finally:
+                limiter._global_semaphore.release()
+
+        self.assertEqual(asyncio.run(_run()), 1)
+
+    def test_same_task_nested_slot_reuses_parent_lease(self):
+        limiter = _Limiter(total=1, background=None)
+
+        async def _run():
+            async with limiter._concurrency_slot(True):
+                self.assertEqual(limiter._global_semaphore._value, 0)
+                async with limiter._concurrency_slot(True):
+                    self.assertEqual(limiter._global_semaphore._value, 0)
+            return limiter._global_semaphore._value
+
+        self.assertEqual(asyncio.run(_run()), 1)
+
+    def test_child_task_does_not_inherit_parent_slot_ownership(self):
+        limiter = _Limiter(total=1, background=None)
+
+        async def _run():
+            async with limiter._concurrency_slot(True):
+                async def _child():
+                    async with limiter._concurrency_slot(True):
+                        return True
+
+                task = asyncio.create_task(_child())
+                with self.assertRaises(GatewayQueueTimeout):
+                    await task
+            return limiter._global_semaphore._value
+
+        self.assertEqual(asyncio.run(_run()), 1)
 
 
 if __name__ == "__main__":

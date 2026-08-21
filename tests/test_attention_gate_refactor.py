@@ -2299,6 +2299,114 @@ class RefactoredAttentionGateTests(unittest.TestCase):
         )
         self.assertEqual(traced, [(event.unified_msg_origin, "skipped_sensor_filter", None)])
 
+    def test_pre_planner_trace_finalization_is_idempotent(self):
+        traced = []
+
+        async def trace_callback(chat_id, event, *, status, reply_text=None):
+            traced.append((chat_id, status, reply_text))
+
+        self.gate.turn_trace_callback = trace_callback
+        event = _FakeEvent("user-1", "Alice", "already settled")
+
+        async def _run():
+            await self.gate._finalize_pre_planner_turn(
+                event,
+                event.unified_msg_origin,
+                status="skipped_sensor_filter",
+            )
+            await self.gate._finalize_pre_planner_turn(
+                event,
+                event.unified_msg_origin,
+                status="completion_timeout",
+            )
+
+        asyncio.run(_run())
+        self.assertEqual(
+            traced,
+            [(event.unified_msg_origin, "skipped_sensor_filter", None)],
+        )
+        self.assertTrue(event.get_extra("astrmai_pre_planner_trace_finalized"))
+        self.assertEqual(event.get_extra("astrmai_pre_planner_trace_state"), "persisted")
+
+    def test_pre_planner_trace_without_callback_remains_retryable(self):
+        event = _FakeEvent("user-1", "Alice", "retry trace")
+        traced = []
+
+        async def trace_callback(chat_id, event, *, status, reply_text=None):
+            traced.append((chat_id, status, reply_text))
+
+        async def _run():
+            self.gate.turn_trace_callback = None
+            await self.gate._finalize_pre_planner_turn(
+                event,
+                event.unified_msg_origin,
+                status="skipped_sensor_filter",
+            )
+            state_without_callback = event.get_extra("astrmai_pre_planner_trace_state")
+            finalized_without_callback = event.get_extra(
+                "astrmai_pre_planner_trace_finalized",
+                False,
+            )
+            self.gate.turn_trace_callback = trace_callback
+            await self.gate._finalize_pre_planner_turn(
+                event,
+                event.unified_msg_origin,
+                status="skipped_sensor_filter",
+            )
+            return state_without_callback, finalized_without_callback
+
+        state, finalized = asyncio.run(_run())
+        self.assertEqual(state, "retryable")
+        self.assertFalse(finalized)
+        self.assertEqual(
+            traced,
+            [(event.unified_msg_origin, "skipped_sensor_filter", None)],
+        )
+        self.assertTrue(event.get_extra("astrmai_pre_planner_trace_finalized"))
+        self.assertEqual(event.get_extra("astrmai_pre_planner_trace_state"), "persisted")
+
+    def test_pre_planner_trace_cancelled_persist_is_retryable(self):
+        event = _FakeEvent("user-1", "Alice", "cancel trace")
+        started = asyncio.Event()
+        release = asyncio.Event()
+        traced = []
+
+        async def blocking_callback(*args, **kwargs):
+            started.set()
+            await release.wait()
+
+        async def _run():
+            self.gate.turn_trace_callback = blocking_callback
+            task = asyncio.create_task(
+                self.gate._finalize_pre_planner_turn(
+                    event,
+                    event.unified_msg_origin,
+                    status="skipped_sensor_filter",
+                )
+            )
+            await started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            state_after_cancel = event.get_extra("astrmai_pre_planner_trace_state")
+
+            async def callback(chat_id, event, *, status, reply_text=None):
+                traced.append((chat_id, status, reply_text))
+
+            self.gate.turn_trace_callback = callback
+            await self.gate._finalize_pre_planner_turn(
+                event,
+                event.unified_msg_origin,
+                status="skipped_sensor_filter",
+            )
+            return state_after_cancel
+
+        state = asyncio.run(_run())
+
+        self.assertEqual(state, "retryable")
+        self.assertEqual(traced, [(event.unified_msg_origin, "skipped_sensor_filter", None)])
+        self.assertEqual(event.get_extra("astrmai_pre_planner_trace_state"), "persisted")
+
     def test_debounce_worker_drain_loop_keeps_late_arrivals(self):
         captured = []
         first_batch_entered = asyncio.Event()
@@ -2391,6 +2499,95 @@ class RefactoredAttentionGateTests(unittest.TestCase):
         asyncio.run(_run())
 
         self.assertLessEqual(max_running, self.gate.BACKGROUND_TASK_MAX_CONCURRENCY)
+
+    def test_background_budget_execution_starts_after_attention_slot_acquire(self):
+        observed_available = []
+
+        class _Budget:
+            async def run(_self, factory, *, task_name):
+                observed_available.append(
+                    self.gate._background_task_semaphore._value
+                )
+                self.assertEqual(task_name, "attention.system2")
+                return await factory()
+
+        self.gate.background_task_budget = _Budget()
+
+        async def background_job():
+            await asyncio.sleep(0)
+            return "done"
+
+        result = asyncio.run(
+            self.gate._run_background_task(
+                background_job(),
+                task_name="attention.system2",
+            )
+        )
+
+        self.assertEqual(result, "done")
+        self.assertEqual(
+            observed_available,
+            [self.gate.BACKGROUND_TASK_MAX_CONCURRENCY - 1],
+        )
+
+    def test_background_budget_queue_timeout_settles_pre_planner_turn(self):
+        budget_mod = importlib.import_module(
+            "astrmai.infrastructure.runtime.background_task_budget"
+        )
+        budget = budget_mod.BackgroundTaskBudget(
+            1,
+            max_queue=1,
+            wait_timeout_sec=0.01,
+        )
+        self.gate.background_task_budget = budget
+        event = _FakeEvent("user-1", "Alice", "queued background task")
+        release = asyncio.Event()
+        blocker_started = asyncio.Event()
+        traced = []
+
+        async def blocker():
+            blocker_started.set()
+            await release.wait()
+
+        async def trace_callback(chat_id, event, *, status, reply_text=None):
+            traced.append((chat_id, status, reply_text))
+
+        self.gate.turn_trace_callback = trace_callback
+
+        async def _run():
+            blocker_task = asyncio.create_task(
+                budget.run(blocker, task_name="test.blocker", scope_id="global")
+            )
+            await blocker_started.wait()
+            result = await self.gate._run_background_task(
+                asyncio.sleep(0),
+                event,
+                task_name="attention.system2",
+            )
+            release.set()
+            await blocker_task
+            return result
+
+        result = asyncio.run(_run())
+
+        self.assertIsNone(result)
+        self.assertEqual(
+            event.get_extra("astrmai_execution_status"),
+            "background_queue_timeout",
+        )
+        self.assertEqual(
+            event.get_extra("astrmai_queue_timeout_stage"),
+            "attention.background_budget_wait",
+        )
+        stages = event.get_extra("astrmai_stage_ledger", [])
+        budget_stages = [
+            item for item in stages if item["stage"] == "attention.background_budget_wait"
+        ]
+        self.assertEqual(budget_stages[-1]["status"], "timeout")
+        self.assertEqual(
+            traced,
+            [(event.unified_msg_origin, "background_queue_timeout", None)],
+        )
 
     def test_generation_cancels_turn_while_waiting_for_background_slot(self):
         coordinator_mod = importlib.import_module(

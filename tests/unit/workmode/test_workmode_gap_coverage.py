@@ -189,6 +189,7 @@ class WorkmodeGapCoverageTests(unittest.TestCase):
         self.assertEqual(result, "handled by configured pool")
         self.assertEqual(observed["models"], ["agent-primary", "agent-fallback"])
         self.assertEqual(observed["prompt"], "create reminder")
+        self.assertFalse(observed["propagate_queue_timeout_status"])
 
     def test_handoff_registry_removes_agents_no_longer_active(self):
         alpha = SimpleNamespace(name="dynamic_alpha", active=True)

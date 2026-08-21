@@ -133,7 +133,7 @@ class AttentionConfig(BaseModel):
     # OPT-10/PL-05: debounce_window/throttle_*/repeater_threshold/max_message_length
     # 为功能重构后的死配置（防抖硬编码分档、限流改能量驱动、复读阈值硬编码 3），
     # 已随 schema 一并删除——UI 不再展示无效承诺
-    judge_timeout: float = Field(default=3.0, ge=0.1, description="System1 Judge attention gate timeout in seconds")
+    judge_timeout: float = Field(default=20.0, ge=0.1, description="System1 Judge attention gate timeout in seconds")
     bg_pool_size: int = Field(default=20, ge=1)
     focus_thread_enabled: bool = Field(default=True, description="启用 Focus Thread 算法，在窗口内选择主线程作为本轮回复目标")
     focus_thread_core_max_messages: int = Field(default=4, description="Focus Thread 核心消息的最大条数")
@@ -545,7 +545,13 @@ class MemoryConfig(BaseModel):
 class InfraConfig(BaseModel):
     llm_retries: int = Field(default=2, ge=0)
     backoff_factor: float = Field(default=1.5, ge=0.0)
-    api_timeout: float = Field(default=15.0, ge=1.0, description="网关级绝对超时时间(秒)，超时后强制中断 API 请求")
+    api_timeout: float = Field(default=45.0, ge=1.0, description="网关级绝对超时时间(秒)，超时后强制中断 API 请求")
+    semaphore_wait_timeout_sec: float = Field(
+        default=30.0,
+        ge=0.1,
+        le=3600.0,
+        description="等待模型并发槽位的最长时间；不包含模型请求本身",
+    )
     max_concurrent_llm_calls: int = Field(default=3, ge=1, description="全局 LLM 并发请求上限，防止后台任务雪崩导致 429")
     background_task_concurrency: int = Field(default=2, ge=1, le=8, description="受预算后台任务并发上限")
     background_task_queue_limit: int = Field(default=64, ge=0, le=2048, description="受预算后台任务排队上限")
@@ -698,12 +704,24 @@ class TimingConfig(BaseModel):
     shutdown_component_timeout_sec: float = Field(default=1.5, ge=0.1, le=10.0)
     shutdown_cancel_grace_sec: float = Field(default=1.0, ge=0.0, le=10.0)
     shutdown_snapshot_timeout_sec: float = Field(default=0.5, ge=0.1, le=5.0)
-    model_request_timeout_sec: float = Field(default=15.0, ge=1.0, le=3600.0)
+    model_request_timeout_sec: float = Field(default=45.0, ge=1.0, le=3600.0)
     turn_total_budget_sec: float = Field(default=360.0, ge=30.0, le=7200.0)
     main_reply_reserve_sec: float = Field(default=90.0, ge=0.0, le=1800.0)
     sys2_lock_wait_timeout_sec: float = Field(default=20.0, ge=0.1, le=600.0)
     executor_lock_wait_timeout_sec: float = Field(default=15.0, ge=0.1, le=600.0)
+    attention_background_slot_wait_timeout_sec: float = Field(
+        default=15.0,
+        ge=0.1,
+        le=600.0,
+        description="群聊回复后台执行槽位的最长等待时间（秒）",
+    )
     lane_prepare_timeout_sec: float = Field(default=20.0, ge=0.1, le=600.0)
+    energy_prepare_timeout_sec: float = Field(
+        default=5.0,
+        ge=0.1,
+        le=600.0,
+        description="状态能量准备阶段的最长等待时间（秒）",
+    )
     lane_persist_timeout_sec: float = Field(default=5.0, ge=0.1, le=600.0)
     proactive_completion_timeout_sec: float = Field(
         default=180.0,
@@ -713,16 +731,16 @@ class TimingConfig(BaseModel):
     )
     reply_max_age_sec: float = Field(default=0.0, ge=0.0, le=7200.0)
     agent_execution_timeout_sec: int = Field(default=60, ge=1, le=7200)
-    fast_mode_execution_timeout_sec: int = Field(default=15, ge=1, le=7200)
+    fast_mode_execution_timeout_sec: int = Field(default=45, ge=1, le=7200)
     workmode_execution_timeout_sec: int = Field(default=120, ge=1, le=86400)
-    attention_judge_timeout_sec: float = Field(default=3.0, ge=0.1, le=600.0)
-    cognitive_loop_timeout_sec: float = Field(default=2.5, ge=0.1, le=600.0)
+    attention_judge_timeout_sec: float = Field(default=20.0, ge=0.1, le=600.0)
+    cognitive_loop_timeout_sec: float = Field(default=20.0, ge=0.1, le=600.0)
     mood_analysis_timeout_sec: float = Field(default=30.0, ge=1.0, le=600.0)
-    memory_react_timeout_sec: float = Field(default=15.0, ge=1.0, le=600.0)
-    query_rewrite_timeout_sec: float = Field(default=3.0, ge=0.5, le=60.0)
-    deep_memory_total_budget_sec: float = Field(default=12.0, ge=1.0, le=120.0)
-    memory_rerank_timeout_sec: float = Field(default=5.0, ge=0.5, le=30.0)
-    memory_compress_timeout_sec: float = Field(default=4.0, ge=0.5, le=30.0)
+    memory_react_timeout_sec: float = Field(default=45.0, ge=1.0, le=600.0)
+    query_rewrite_timeout_sec: float = Field(default=20.0, ge=0.5, le=60.0)
+    deep_memory_total_budget_sec: float = Field(default=60.0, ge=1.0, le=120.0)
+    memory_rerank_timeout_sec: float = Field(default=20.0, ge=0.5, le=60.0)
+    memory_compress_timeout_sec: float = Field(default=20.0, ge=0.5, le=60.0)
     compaction_timeout_sec: float = Field(default=60.0, ge=1.0, le=1200.0)
     embedding_timeout_sec: float = Field(default=15.0, ge=1.0, le=600.0)
     faiss_timeout_sec: float = Field(default=20.0, ge=0.5, le=60.0)

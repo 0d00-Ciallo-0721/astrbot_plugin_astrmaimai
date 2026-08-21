@@ -49,7 +49,7 @@ class CognitiveLoopGateDecision:
 class CognitiveLoop:
     """Planner-side cognitive decision layer with one optional readonly tool step."""
 
-    SOFT_TIMEOUT_SECONDS = 2.5
+    SOFT_TIMEOUT_SECONDS = 20.0
     FULL_RETRIEVE_KEYS = [
         "logic_style",
         "speech_style",

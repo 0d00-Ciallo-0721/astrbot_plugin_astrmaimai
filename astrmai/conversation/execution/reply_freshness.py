@@ -32,11 +32,11 @@ def resolve_reply_max_age_seconds(config) -> float:
     agent = getattr(config, "agent", None)
     try:
         api_timeout = float(
-            getattr(timing, "model_request_timeout_sec", getattr(infra, "api_timeout", 15.0))
+            getattr(timing, "model_request_timeout_sec", getattr(infra, "api_timeout", 45.0))
             or 15.0
         )
     except (TypeError, ValueError):
-        api_timeout = 15.0
+            api_timeout = 45.0
     try:
         agent_timeout = float(
             getattr(timing, "agent_execution_timeout_sec", getattr(agent, "timeout", 60.0))

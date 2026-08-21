@@ -19,7 +19,8 @@ class GatewaySettings:
     critical_path_reserved_slots: int = 1
     llm_retries: int = 2
     backoff_factor: float = 1.5
-    api_timeout: float = 15.0
+    api_timeout: float = 45.0
+    semaphore_wait_timeout_sec: float = 30.0
     rate_limit_model_cooldown_sec: int = 120
     quota_model_cooldown_sec: int = 1800
     debug_mode: bool = False
@@ -94,7 +95,10 @@ def build_infrastructure_settings(config: Any) -> InfrastructureSettings:
             critical_path_reserved_slots=_min_int(getattr(infra, "critical_path_reserved_slots", None), 1, 0),
             llm_retries=int(_num(getattr(infra, "llm_retries", None), 2)),
             backoff_factor=float(_num(getattr(infra, "backoff_factor", None), 1.5)),
-            api_timeout=_min_float(getattr(infra, "api_timeout", None), 15.0, 1.0),
+            api_timeout=_min_float(getattr(infra, "api_timeout", None), 45.0, 1.0),
+            semaphore_wait_timeout_sec=_min_float(
+                getattr(infra, "semaphore_wait_timeout_sec", None), 30.0, 0.1
+            ),
             rate_limit_model_cooldown_sec=int(_num(getattr(infra, "rate_limit_model_cooldown_sec", None), 120)),
             quota_model_cooldown_sec=int(_num(getattr(infra, "quota_model_cooldown_sec", None), 1800)),
             debug_mode=bool(getattr(global_settings, "debug_mode", False)),

@@ -72,7 +72,7 @@ class MemoryRetrievalService:
 
     def _begin_deep_memory_budget(self, query: MemoryQuery) -> float:
         timing = self._timing_config()
-        configured = max(1.0, float(getattr(timing, "deep_memory_total_budget_sec", 12.0) or 12.0))
+        configured = max(1.0, float(getattr(timing, "deep_memory_total_budget_sec", 60.0) or 60.0))
         effective = clamp_timeout_to_turn_budget(None, configured, reserve_for_reply=True)
         metadata = dict(query.metadata or {})
         metadata["_deep_memory_deadline_mono"] = time.monotonic() + max(0.0, effective)
@@ -999,7 +999,7 @@ class MemoryRetrievalService:
             self._record_query_rewrite_trace(query, status="gateway_unavailable", elapsed_ms=0.0, rewrite_count=0)
             return [base_query]
         timing = getattr(getattr(self.engine, "config", None), "timing", None)
-        configured_timeout_sec = max(0.01, float(getattr(timing, "query_rewrite_timeout_sec", 3.0) or 3.0))
+        configured_timeout_sec = max(0.01, float(getattr(timing, "query_rewrite_timeout_sec", 20.0) or 20.0))
         timeout_sec = clamp_timeout_to_turn_budget(
             None,
             configured_timeout_sec,
@@ -1134,9 +1134,9 @@ class MemoryRetrievalService:
         timing = self._timing_config()
         configured_timeout = 12.0
         if query is not None and stage == "rerank":
-            configured_timeout = float(getattr(timing, "memory_rerank_timeout_sec", 5.0) or 5.0)
+            configured_timeout = float(getattr(timing, "memory_rerank_timeout_sec", 20.0) or 20.0)
         elif query is not None and stage == "compress":
-            configured_timeout = float(getattr(timing, "memory_compress_timeout_sec", 4.0) or 4.0)
+            configured_timeout = float(getattr(timing, "memory_compress_timeout_sec", 20.0) or 20.0)
         timeout_override = clamp_timeout_to_turn_budget(None, configured_timeout, reserve_for_reply=True)
         remaining_budget = self._remaining_deep_memory_budget(query)
         if remaining_budget is not None:

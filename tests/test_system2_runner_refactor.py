@@ -205,7 +205,14 @@ class RefactoredSystem2RunnerTests(unittest.TestCase):
         self.assertEqual(runtime.state_engine.calls, [event.unified_msg_origin])
         self.assertEqual(
             runtime.lane_manager.calls,
-            [("sys2", "dialog", event.unified_msg_origin, event.unified_msg_origin)],
+            [
+                (
+                    "sys2",
+                    "dialog",
+                    f"{event.unified_msg_origin}#topic:1",
+                    f"{event.unified_msg_origin}@@topic:1",
+                )
+            ],
         )
         self.assertEqual(
             runtime.runtime_coordinator.wait_updates,
@@ -218,12 +225,75 @@ class RefactoredSystem2RunnerTests(unittest.TestCase):
         self.assertEqual(runtime.chat_loop_kernel.cooldowns[0][1:], ("followup", "followup_dispatch"))
         self.assertEqual(runtime.group_reply_wait_manager.events, [event])
         stages = event.get_extra("astrmai_stage_ledger", [])
-        self.assertEqual(stages[-2]["stage"], "system2.chat_lock_wait")
+        self.assertEqual(stages[-3]["stage"], "system2.chat_lock_wait")
+        self.assertEqual(stages[-3]["status"], "success")
+        self.assertEqual(stages[-3]["metadata"]["thread_id"], "thread-a")
+        self.assertEqual(stages[-3]["metadata"]["lock_scope"], "chat")
+        self.assertEqual(stages[-2]["stage"], "system2.energy_prepare")
         self.assertEqual(stages[-2]["status"], "success")
-        self.assertEqual(stages[-2]["metadata"]["thread_id"], "thread-a")
-        self.assertEqual(stages[-2]["metadata"]["lock_scope"], "chat")
         self.assertEqual(stages[-1]["stage"], "system2.lane_prepare")
         self.assertEqual(stages[-1]["status"], "success")
+
+    def test_runner_prewarms_same_topic_lane_as_executor(self):
+        runner_mod = importlib.import_module("astrmai.conversation.execution.system2_runner")
+        executor_mod = importlib.import_module("astrmai.conversation.execution.executor")
+        runtime = type(
+            "Runtime",
+            (),
+            {
+                "runtime_coordinator": _FakeCoordinator(),
+                "state_engine": _FakeStateEngine(),
+                "lane_manager": _FakeLaneManager(),
+                "system2_planner": _FakePlanner(),
+                "private_chat_manager": _FakePrivateChatManager(),
+                "group_reply_wait_manager": _FakeGroupReplyWaitManager(),
+                "chat_loop_kernel": _FakeKernel(),
+                "config": SimpleNamespace(attention=SimpleNamespace(thread_same_speaker_followup_sec=8)),
+            },
+        )()
+        event = _FakeEvent()
+        event.set_extra(
+            "astrmai_dialog_history_policy",
+            {"history_mode": "current_topic", "group_id": "group-1", "topic_epoch": 7},
+        )
+        runner = runner_mod.System2Runner(runtime)
+        expected_key, expected_origin = executor_mod.ConcurrentExecutor._resolve_dialog_lane_identity(
+            SimpleNamespace(), event, event.unified_msg_origin
+        )
+
+        asyncio.run(runner.run(event))
+
+        self.assertEqual(
+            runtime.lane_manager.calls,
+            [("sys2", "dialog", expected_key.scope_id, expected_origin)],
+        )
+
+    def test_runner_times_out_while_preparing_energy(self):
+        runner_mod = importlib.import_module("astrmai.conversation.execution.system2_runner")
+
+        class _BlockingStateEngine:
+            async def consume_energy(self, chat_id):
+                await asyncio.Event().wait()
+
+        runtime = type(
+            "Runtime",
+            (),
+            {
+                "runtime_coordinator": _FakeCoordinator(),
+                "state_engine": _BlockingStateEngine(),
+                "lane_manager": _FakeLaneManager(),
+                "system2_planner": _FakePlanner(),
+                "config": SimpleNamespace(timing=SimpleNamespace(energy_prepare_timeout_sec=0.01)),
+            },
+        )()
+        event = _FakeEvent()
+
+        self.assertFalse(asyncio.run(runner_mod.System2Runner(runtime).run(event)))
+        self.assertEqual(event.get_extra("astrmai_execution_status"), "queue_timeout")
+        self.assertEqual(event.get_extra("astrmai_queue_timeout_stage"), "system2.energy_prepare")
+        stages = event.get_extra("astrmai_stage_ledger", [])
+        self.assertEqual(stages[-1]["stage"], "system2.energy_prepare")
+        self.assertEqual(stages[-1]["status"], "timeout")
 
     def test_runner_times_out_while_preparing_system2_lane(self):
         runner_mod = importlib.import_module("astrmai.conversation.execution.system2_runner")
@@ -254,6 +324,71 @@ class RefactoredSystem2RunnerTests(unittest.TestCase):
         stages = event.get_extra("astrmai_stage_ledger", [])
         self.assertEqual(stages[-1]["stage"], "system2.lane_prepare")
         self.assertEqual(stages[-1]["status"], "timeout")
+
+    def test_pre_planner_timeout_trace_retries_when_recorder_becomes_available(self):
+        runner_mod = importlib.import_module("astrmai.conversation.execution.system2_runner")
+        planner = SimpleNamespace()
+        runtime = SimpleNamespace(system2_planner=planner)
+        runner = runner_mod.System2Runner(runtime)
+        event = _FakeEvent()
+        traced = []
+
+        async def recorder(chat_id, event, *, status, reply_text=None):
+            traced.append((chat_id, status, reply_text))
+
+        async def _run():
+            await runner._record_pre_planner_timeout(event, "system2.lane_prepare")
+            state_without_recorder = event.get_extra("astrmai_pre_planner_trace_state")
+            planner.record_turn_trace = recorder
+            await runner._record_pre_planner_timeout(event, "system2.lane_prepare")
+            return state_without_recorder
+
+        state = asyncio.run(_run())
+
+        self.assertEqual(state, "retryable")
+        self.assertEqual(
+            traced,
+            [(event.unified_msg_origin, "queue_timeout", None)],
+        )
+        self.assertTrue(event.get_extra("astrmai_pre_planner_trace_finalized"))
+        self.assertEqual(event.get_extra("astrmai_pre_planner_trace_state"), "persisted")
+
+    def test_pre_planner_timeout_trace_cancelled_persist_is_retryable(self):
+        runner_mod = importlib.import_module("astrmai.conversation.execution.system2_runner")
+        started = asyncio.Event()
+        release = asyncio.Event()
+        traced = []
+
+        async def blocking_recorder(*args, **kwargs):
+            started.set()
+            await release.wait()
+
+        planner = SimpleNamespace(record_turn_trace=blocking_recorder)
+        runner = runner_mod.System2Runner(SimpleNamespace(system2_planner=planner))
+        event = _FakeEvent()
+
+        async def _run():
+            task = asyncio.create_task(
+                runner._record_pre_planner_timeout(event, "system2.lane_prepare")
+            )
+            await started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            state_after_cancel = event.get_extra("astrmai_pre_planner_trace_state")
+
+            async def recorder(chat_id, event, *, status, reply_text=None):
+                traced.append((chat_id, status, reply_text))
+
+            planner.record_turn_trace = recorder
+            await runner._record_pre_planner_timeout(event, "system2.lane_prepare")
+            return state_after_cancel
+
+        state = asyncio.run(_run())
+
+        self.assertEqual(state, "retryable")
+        self.assertEqual(traced, [(event.unified_msg_origin, "queue_timeout", None)])
+        self.assertEqual(event.get_extra("astrmai_pre_planner_trace_state"), "persisted")
 
     def test_runner_private_followup_does_not_block_and_expires_wait_in_background(self):
         runner_mod = importlib.import_module("astrmai.conversation.execution.system2_runner")

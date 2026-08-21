@@ -719,11 +719,12 @@ class AttentionDecisionRouter:
                 except Exception as exc:
                     logger.debug(f"[AttentionGate] primary mood update degraded: {exc}")
         message = self.build_judge_window_message(events) or str(getattr(focus_event, "message_str", "") or "")
-        # ponytail: judgment timeout configurable; default 3.0s (was 2.0s) for cold-start LLM resilience
+        # Keep the standalone fallback aligned with TimingConfig; a partial host
+        # config must not silently restore the old 3-second budget.
         attention_config = getattr(getattr(self.gate, "config", None), "attention", None)
         judge_timeout = float(
-            getattr(attention_config, "judge_timeout", getattr(getattr(self.gate, "config", None), "judge_timeout", 3.0))
-            or 3.0
+            getattr(attention_config, "judge_timeout", getattr(getattr(self.gate, "config", None), "judge_timeout", 20.0))
+            or 20.0
         )
         judge_timeout = clamp_timeout_to_turn_budget(
             focus_event,

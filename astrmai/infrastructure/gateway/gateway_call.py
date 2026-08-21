@@ -1,6 +1,7 @@
 import asyncio
 import time
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from typing import Any, Callable, Dict, List, Optional, Union
 
 from astrbot.api import logger
@@ -9,15 +10,94 @@ from ..context_economy import WorkloadPolicy
 from ..runtime.runtime_contracts import FailureKind, LLMCallResult
 from ..runtime.turn_call_ledger import (
     begin_llm_call,
+    begin_stage,
     clamp_timeout_to_turn_budget,
     finish_llm_call,
+    finish_stage,
     record_llm_attempt,
 )
-from .gateway_exceptions import LLMCascadeFailureException
+from .gateway_exceptions import GatewayQueueTimeout, LLMCascadeFailureException
 from .output_guard import validate_visible_output_text
 
 
+_GATEWAY_SLOT_OWNERS: ContextVar[frozenset[tuple[int, int]]] = ContextVar(
+    "astrmai_gateway_slot_owners",
+    default=frozenset(),
+)
+
+
 class GatewayCallMixin:
+    @asynccontextmanager
+    async def _model_cascade_scope(self):
+        """Keep cascade structure without retaining a provider concurrency slot."""
+        yield
+
+    @asynccontextmanager
+    async def _provider_request_stage(
+        self,
+        event: Any,
+        *,
+        critical_path: bool,
+        model_id: str,
+        attempt: int = 0,
+        tool_mode: bool = False,
+    ):
+        stage_id = begin_stage(
+            event,
+            "gateway.provider_request",
+            critical_path=bool(critical_path),
+            metadata={
+                "model_id": str(model_id or ""),
+                "attempt": int(attempt),
+                "tool_mode": bool(tool_mode),
+            },
+        )
+        try:
+            yield
+        except asyncio.CancelledError:
+            finish_stage(event, stage_id, status="cancelled", reason="request_cancelled")
+            raise
+        except asyncio.TimeoutError:
+            finish_stage(event, stage_id, status="timeout", reason="provider_timeout")
+            raise
+        except Exception as exc:
+            finish_stage(event, stage_id, status="error", reason=type(exc).__name__)
+            raise
+        else:
+            finish_stage(event, stage_id)
+
+    async def _wait_retry_backoff(
+        self,
+        delay_sec: float,
+        *,
+        event: Any,
+        critical_path: bool,
+        model_id: str,
+        attempt: int,
+        tool_mode: bool = False,
+    ) -> None:
+        delay_sec = max(0.0, float(delay_sec or 0.0))
+        if delay_sec <= 0.0:
+            return
+        stage_id = begin_stage(
+            event,
+            "gateway.retry_backoff",
+            critical_path=bool(critical_path),
+            metadata={
+                "delay_sec": delay_sec,
+                "model_id": str(model_id or ""),
+                "attempt": int(attempt),
+                "tool_mode": bool(tool_mode),
+            },
+        )
+        try:
+            await asyncio.sleep(delay_sec)
+        except asyncio.CancelledError:
+            finish_stage(event, stage_id, status="cancelled", reason="backoff_cancelled")
+            raise
+        else:
+            finish_stage(event, stage_id)
+
     def _raise_cascade_failure(
         self,
         *,
@@ -165,8 +245,29 @@ class GatewayCallMixin:
             logger.warning(f"[Gateway] benchmark recording degraded after successful call: {exc}")
         return economy_payload
 
+    def _semaphore_wait_timeout(self, event: Any = None, *, critical_path: bool = True) -> float:
+        try:
+            configured = float(
+                getattr(getattr(self, "settings", None), "semaphore_wait_timeout_sec", 30.0)
+                or 30.0
+            )
+        except (TypeError, ValueError):
+            configured = 30.0
+        return clamp_timeout_to_turn_budget(
+            event,
+            max(0.1, configured),
+            reserve_for_reply=bool(critical_path),
+        )
+
     @asynccontextmanager
-    async def _concurrency_slot(self, critical_path: bool):
+    async def _concurrency_slot(
+        self,
+        critical_path: bool,
+        *,
+        event: Any = None,
+        stage: str = "gateway.semaphore_wait",
+        propagate_queue_timeout_status: bool = True,
+    ):
         """G7/RT-11: 关键路径直取全局槽；后台调用须先过子限流器。
 
         总并发仍受 `_global_semaphore` 约束（429 保护不变），但后台最多占用
@@ -174,14 +275,77 @@ class GatewayCallMixin:
         获取顺序关键：先 background 后 global——反之后台会攥着全局槽等子槽，
         反而把关键路径堵死。
         """
-        background_semaphore = None if critical_path else getattr(self, "_background_semaphore", None)
-        if background_semaphore is None:
-            async with self._global_semaphore:
-                yield
+        current_task = asyncio.current_task()
+        owner_key = (id(self), id(current_task))
+        current_owners = _GATEWAY_SLOT_OWNERS.get()
+        if owner_key in current_owners:
+            stage_id = begin_stage(
+                event,
+                stage,
+                critical_path=bool(critical_path),
+                metadata={"reentrant": True},
+            )
+            finish_stage(event, stage_id, metadata={"reentrant": True})
+            yield
             return
-        async with background_semaphore:
-            async with self._global_semaphore:
-                yield
+
+        background_semaphore = None if critical_path else getattr(self, "_background_semaphore", None)
+        timeout_sec = self._semaphore_wait_timeout(event, critical_path=critical_path)
+
+        async def _acquire(semaphore, wait_stage: str) -> None:
+            stage_id = begin_stage(
+                event,
+                wait_stage,
+                critical_path=bool(critical_path),
+                metadata={"timeout_sec": timeout_sec},
+            )
+            try:
+                if timeout_sec <= 0.0:
+                    raise asyncio.TimeoutError
+                await asyncio.wait_for(semaphore.acquire(), timeout=timeout_sec)
+            except asyncio.TimeoutError:
+                finish_stage(event, stage_id, status="timeout", reason="queue_timeout")
+                if event is not None and hasattr(event, "set_extra"):
+                    timeout_record = {
+                        "stage": wait_stage,
+                        "critical_path": bool(critical_path),
+                        "terminal": bool(propagate_queue_timeout_status),
+                    }
+                    timeouts = list(event.get_extra("astrmai_gateway_queue_timeouts", []) or [])
+                    timeouts.append(timeout_record)
+                    event.set_extra("astrmai_gateway_queue_timeouts", timeouts[-32:])
+                    event.set_extra("astrmai_last_gateway_queue_timeout", timeout_record)
+                    if propagate_queue_timeout_status:
+                        event.set_extra("astrmai_execution_status", "queue_timeout")
+                        event.set_extra("astrmai_queue_timeout_stage", wait_stage)
+                raise GatewayQueueTimeout(wait_stage, timeout_sec)
+            except asyncio.CancelledError:
+                finish_stage(event, stage_id, status="cancelled", reason="acquire_cancelled")
+                raise
+            except Exception as exc:
+                finish_stage(event, stage_id, status="error", reason=type(exc).__name__)
+                raise
+            else:
+                finish_stage(event, stage_id, metadata={"timeout_sec": timeout_sec})
+
+        acquired_background = False
+        acquired_global = False
+        owner_token = None
+        try:
+            if background_semaphore is not None:
+                await _acquire(background_semaphore, "gateway.background_semaphore_wait")
+                acquired_background = True
+            await _acquire(self._global_semaphore, stage)
+            acquired_global = True
+            owner_token = _GATEWAY_SLOT_OWNERS.set(current_owners | {owner_key})
+            yield
+        finally:
+            if owner_token is not None:
+                _GATEWAY_SLOT_OWNERS.reset(owner_token)
+            if acquired_global:
+                self._global_semaphore.release()
+            if acquired_background:
+                background_semaphore.release()
 
     async def _elastic_call_result(
         self,
@@ -209,12 +373,12 @@ class GatewayCallMixin:
         max_models_override: Optional[int] = None,
         allow_cooldown_override: bool = True,
         reserve_for_reply: bool = False,
+        event: Any = None,
+        propagate_queue_timeout_status: bool = True,
     ) -> LLMCallResult:
         # OPT-08/RT-11: 记录信号量排队时长（skipped 轮 judge elapsed 51.7s vs
         # attempt 数秒的差值即排队）；G7 起按 critical_path 分流配额
-        semaphore_wait_started = time.perf_counter()
-        async with self._concurrency_slot(ledger_critical_path):
-            semaphore_wait_ms = round((time.perf_counter() - semaphore_wait_started) * 1000, 1)
+        async with self._model_cascade_scope():
             primary_models, attempt_queue = self._build_attempt_queue(
                 pool_name,
                 models,
@@ -255,7 +419,7 @@ class GatewayCallMixin:
                     metadata={
                         "lane_enabled": bool(contexts),
                         "model_count": len(models or []),
-                        "semaphore_wait_ms": semaphore_wait_ms,
+                        "slot_scope": "provider_attempt",
                     },
                 )
             if not attempt_queue:
@@ -319,16 +483,55 @@ class GatewayCallMixin:
                             request_kwargs_factory=request_kwargs_factory,
                         )
                         t0 = time.perf_counter()
-                        response = await asyncio.wait_for(
-                            self.context.llm_generate(
-                                chat_provider_id=model_id,
-                                prompt=prompt if prompt else None,
-                                contexts=list(contexts or []),
-                                **llm_kwargs,
-                            ),
-                            timeout=effective_timeout,
-                        )
+                        async with self._concurrency_slot(
+                            ledger_critical_path,
+                            event=event,
+                            stage="gateway.semaphore_wait",
+                            propagate_queue_timeout_status=propagate_queue_timeout_status,
+                        ):
+                            async with self._provider_request_stage(
+                                event,
+                                critical_path=ledger_critical_path,
+                                model_id=model_id,
+                                attempt=attempt,
+                            ):
+                                response = await asyncio.wait_for(
+                                    self.context.llm_generate(
+                                        chat_provider_id=model_id,
+                                        prompt=prompt if prompt else None,
+                                        contexts=list(contexts or []),
+                                        **llm_kwargs,
+                                    ),
+                                    timeout=effective_timeout,
+                                )
+                    except GatewayQueueTimeout:
+                        if owns_ledger_call:
+                            finish_llm_call(
+                                event,
+                                ledger_call_id,
+                                status="error",
+                                model=model_id,
+                                error_kind="queue_timeout",
+                                error="gateway.semaphore_wait",
+                            )
+                        raise
                     except asyncio.TimeoutError as exc:
+                        # Preserve queue timeouts across hot-reloaded exception
+                        # modules; they must not be treated as provider retries.
+                        if (
+                            type(exc).__name__ == "GatewayQueueTimeout"
+                            or str(getattr(exc, "stage", "") or "").startswith("gateway.")
+                        ):
+                            if owns_ledger_call:
+                                finish_llm_call(
+                                    event,
+                                    ledger_call_id,
+                                    status="error",
+                                    model=model_id,
+                                    error_kind="queue_timeout",
+                                    error=str(getattr(exc, "stage", "") or "gateway.semaphore_wait"),
+                                )
+                            raise
                         # ponytail: timeout is not fatal — should retry, not raise into outer except (R8)
                         last_error = str(exc)
                         last_result = self._build_failure_result(
@@ -359,7 +562,13 @@ class GatewayCallMixin:
                             )
                             if remaining <= 0.0:
                                 break
-                            await asyncio.sleep(remaining)
+                            await self._wait_retry_backoff(
+                                remaining,
+                                event=event,
+                                critical_path=ledger_critical_path,
+                                model_id=model_id,
+                                attempt=attempt,
+                            )
                         continue
                     except Exception as exc:
                         last_error = str(exc)
@@ -397,7 +606,13 @@ class GatewayCallMixin:
                             )
                             if remaining <= 0.0:
                                 break
-                            await asyncio.sleep(remaining)
+                            await self._wait_retry_backoff(
+                                remaining,
+                                event=event,
+                                critical_path=ledger_critical_path,
+                                model_id=model_id,
+                                attempt=attempt,
+                            )
                         continue
 
                     raw_completion_text = ""  # ponytail: init before try to avoid NameError in nested except
@@ -540,7 +755,13 @@ class GatewayCallMixin:
                             f"[Gateway] model {model_id} failed ({attempt + 1}/{max_retries + 1}): {last_error}"
                         )
                         if attempt < max_retries:
-                            await asyncio.sleep((backoff_factor + retry_penalty) ** attempt)
+                            await self._wait_retry_backoff(
+                                (backoff_factor + retry_penalty) ** attempt,
+                                event=event,
+                                critical_path=ledger_critical_path,
+                                model_id=model_id,
+                                attempt=attempt,
+                            )
 
             if owns_ledger_call:
                 finish_llm_call(

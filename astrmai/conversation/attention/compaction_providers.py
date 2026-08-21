@@ -23,9 +23,22 @@ class CompactionProviderMixin:
 
     async def _run_compaction_model(self, awaitable_factory):
         budget = getattr(self, "background_task_budget", None)
-        if budget is None:
+        gateway = getattr(self, "gateway", None)
+        slot_factory = getattr(gateway, "_concurrency_slot", None)
+
+        async def _run_with_gateway_slot():
+            if callable(slot_factory):
+                async with slot_factory(
+                    False,
+                    event=None,
+                    stage="gateway.compaction_semaphore_wait",
+                ):
+                    return await awaitable_factory()
             return await awaitable_factory()
-        return await budget.run(awaitable_factory, task_name="compaction")
+
+        if budget is None:
+            return await _run_with_gateway_slot()
+        return await budget.run(_run_with_gateway_slot, task_name="compaction")
 
     def _compaction_provider_validated(self, context, configured: str) -> bool:
         cache = getattr(self, "_compaction_provider_validation", None)

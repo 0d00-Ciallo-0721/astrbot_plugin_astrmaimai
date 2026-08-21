@@ -124,7 +124,7 @@ class RefactoredReplyServiceTests(unittest.TestCase):
         stages = event.get_extra("astrmai_stage_ledger", [])
         self.assertEqual(
             [stage["stage"] for stage in stages],
-            ["reply.prepare", "reply.send"],
+            ["reply.prepare", "reply.send", "reply.commit"],
         )
         self.assertTrue(all(stage["status"] == "success" for stage in stages))
 

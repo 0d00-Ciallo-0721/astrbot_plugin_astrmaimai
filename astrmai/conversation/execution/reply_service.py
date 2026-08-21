@@ -284,11 +284,18 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
         artifact.metadata["reply_commit_id"] = committed_turn.commit_id
         artifact.metadata["reply_commit_status"] = committed_turn.send_status.value
         artifact.metadata["partial_send"] = committed_turn.partial_send
-        commit_result = await self._commit_visible_reply(
+        with observe_stage(
             event,
-            committed_turn,
-            user_text=formatted_user_text,
-        )
+            "reply.commit",
+            metadata={"commit_id": committed_turn.commit_id},
+        ) as commit_stage:
+            commit_result = await self._commit_visible_reply(
+                event,
+                committed_turn,
+                user_text=formatted_user_text,
+            )
+            commit_stage["consumer_count"] = len(commit_result.consumer_status)
+            commit_stage["repair_scheduled"] = bool(commit_result.repair_scheduled)
         event.set_extra("astrmai_reply_commit_id", committed_turn.commit_id)
         record_committed_reply = getattr(
             self.state_engine,

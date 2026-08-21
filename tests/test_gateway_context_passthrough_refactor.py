@@ -290,6 +290,303 @@ class GatewayContextPassthroughRefactorTests(unittest.TestCase):
         self.assertEqual(event.get_extra("astrmai_execution_status"), "queue_timeout")
         self.assertEqual(event.get_extra("astrmai_queue_timeout_stage"), "gateway.lane_prepare")
 
+    def test_tool_semaphore_wait_is_bounded_and_recorded(self):
+        fake_context = _FakeContext()
+        config = SimpleNamespace(
+            infra=SimpleNamespace(
+                max_concurrent_llm_calls=1,
+                llm_retries=0,
+                backoff_factor=1.5,
+                api_timeout=10,
+                semaphore_wait_timeout_sec=0.01,
+            ),
+            provider=SimpleNamespace(fallback_models=[]),
+        )
+        gateway = self.gateway_mod.GlobalModelGateway(fake_context, config)
+        gateway.set_lane_manager(self.lane_mod.LaneManager(_FakeConversationManager()))
+        lane_key = self.lane_mod.LaneKey(
+            subsystem="sys2", task_family="dialog", scope_id="group-1"
+        )
+        event = _TraceEvent()
+
+        async def _run():
+            await gateway._global_semaphore.acquire()
+            try:
+                with self.assertRaises(asyncio.TimeoutError):
+                    await gateway.tool_chat_in_lane_result(
+                        lane_key=lane_key,
+                        base_origin="default:GroupMessage:group-1",
+                        event=event,
+                        prompt="hello",
+                        system_prompt="stable prompt",
+                        tools=object(),
+                        models=["model-a"],
+                        max_steps=2,
+                        timeout=10,
+                    )
+            finally:
+                gateway._global_semaphore.release()
+
+        asyncio.run(_run())
+        self.assertEqual(event.get_extra("astrmai_execution_status"), "queue_timeout")
+        self.assertEqual(
+            event.get_extra("astrmai_queue_timeout_stage"),
+            "gateway.tool_semaphore_wait",
+        )
+        stages = event.get_extra("astrmai_stage_ledger", [])
+        self.assertEqual(stages[-1]["stage"], "gateway.tool_semaphore_wait")
+        self.assertEqual(stages[-1]["status"], "timeout")
+
+    def test_auxiliary_queue_timeout_does_not_set_turn_terminal_status(self):
+        fake_context = _FakeContext()
+        config = SimpleNamespace(
+            infra=SimpleNamespace(
+                max_concurrent_llm_calls=1,
+                llm_retries=0,
+                backoff_factor=1.5,
+                api_timeout=10,
+                semaphore_wait_timeout_sec=0.01,
+            ),
+            provider=SimpleNamespace(fallback_models=[]),
+        )
+        gateway = self.gateway_mod.GlobalModelGateway(fake_context, config)
+        gateway.set_lane_manager(self.lane_mod.LaneManager(_FakeConversationManager()))
+        event = _TraceEvent()
+
+        async def _run():
+            await gateway._global_semaphore.acquire()
+            try:
+                with self.assertRaises(asyncio.TimeoutError):
+                    await gateway.chat_in_lane_result(
+                        lane_key=self.lane_mod.LaneKey(
+                            subsystem="sys1",
+                            task_family="judge",
+                            scope_id="group-1",
+                        ),
+                        base_origin="default:GroupMessage:group-1",
+                        prompt="judge",
+                        system_prompt="judge",
+                        models=["model-a"],
+                        use_fallback=False,
+                        event=event,
+                        propagate_queue_timeout_status=False,
+                    )
+            finally:
+                gateway._global_semaphore.release()
+
+        asyncio.run(_run())
+        self.assertIsNone(event.get_extra("astrmai_execution_status"))
+        self.assertIsNone(event.get_extra("astrmai_queue_timeout_stage"))
+        local_timeout = event.get_extra("astrmai_last_gateway_queue_timeout")
+        self.assertEqual(local_timeout["stage"], "gateway.semaphore_wait")
+        self.assertFalse(local_timeout["terminal"])
+
+    def test_subagent_tool_queue_timeout_does_not_set_parent_turn_terminal_status(self):
+        fake_context = _FakeContext()
+        config = SimpleNamespace(
+            infra=SimpleNamespace(
+                max_concurrent_llm_calls=1,
+                llm_retries=0,
+                backoff_factor=1.5,
+                api_timeout=10,
+                semaphore_wait_timeout_sec=0.01,
+            ),
+            provider=SimpleNamespace(fallback_models=[]),
+        )
+        gateway = self.gateway_mod.GlobalModelGateway(fake_context, config)
+        gateway.set_lane_manager(self.lane_mod.LaneManager(_FakeConversationManager()))
+        event = _TraceEvent()
+
+        async def _run():
+            await gateway._global_semaphore.acquire()
+            try:
+                with self.assertRaises(asyncio.TimeoutError):
+                    await gateway.tool_chat_in_lane_result(
+                        lane_key=self.lane_mod.LaneKey(
+                            subsystem="sys3",
+                            task_family="agent",
+                            scope_id="group-1",
+                        ),
+                        base_origin="default:GroupMessage:group-1",
+                        event=event,
+                        prompt="delegate",
+                        system_prompt="subagent",
+                        tools=object(),
+                        models=["model-a"],
+                        max_steps=2,
+                        timeout=10,
+                        propagate_queue_timeout_status=False,
+                    )
+            finally:
+                gateway._global_semaphore.release()
+
+        asyncio.run(_run())
+        self.assertIsNone(event.get_extra("astrmai_execution_status"))
+        self.assertIsNone(event.get_extra("astrmai_queue_timeout_stage"))
+        local_timeout = event.get_extra("astrmai_last_gateway_queue_timeout")
+        self.assertEqual(local_timeout["stage"], "gateway.tool_semaphore_wait")
+        self.assertFalse(local_timeout["terminal"])
+
+    def test_provider_request_and_retry_backoff_have_separate_stages(self):
+        class _RetryContext(_FakeContext):
+            async def llm_generate(self, **kwargs):
+                self.calls.append(kwargs)
+                if len(self.calls) == 1:
+                    raise asyncio.TimeoutError("first attempt timed out")
+                return _FakeResponse("ok")
+
+        fake_context = _RetryContext()
+        config = SimpleNamespace(
+            infra=SimpleNamespace(
+                max_concurrent_llm_calls=1,
+                llm_retries=1,
+                backoff_factor=0.01,
+                api_timeout=10,
+            ),
+            provider=SimpleNamespace(fallback_models=[]),
+        )
+        gateway = self.gateway_mod.GlobalModelGateway(fake_context, config)
+        gateway.set_lane_manager(self.lane_mod.LaneManager(_FakeConversationManager()))
+        event = _TraceEvent()
+
+        result = asyncio.run(
+            gateway.chat_in_lane_result(
+                lane_key=self.lane_mod.LaneKey(
+                    subsystem="sys2",
+                    task_family="dialog",
+                    scope_id="group-1",
+                ),
+                base_origin="default:GroupMessage:group-1",
+                prompt="hello",
+                system_prompt="stable prompt",
+                models=["model-a"],
+                use_fallback=False,
+                event=event,
+            )
+        )
+
+        self.assertEqual(result.text, "ok")
+        stages = event.get_extra("astrmai_stage_ledger", [])
+        provider_stages = [
+            item for item in stages if item["stage"] == "gateway.provider_request"
+        ]
+        backoff_stages = [
+            item for item in stages if item["stage"] == "gateway.retry_backoff"
+        ]
+        self.assertEqual(
+            [item["status"] for item in provider_stages],
+            ["timeout", "success"],
+        )
+        self.assertEqual(len(backoff_stages), 1)
+        self.assertEqual(backoff_stages[0]["status"], "success")
+
+    def test_tool_runner_is_not_wrapped_by_a_lifecycle_wide_slot(self):
+        fake_context = _FakeContext()
+        config = SimpleNamespace(
+            infra=SimpleNamespace(
+                max_concurrent_llm_calls=1,
+                llm_retries=0,
+                backoff_factor=1.5,
+                api_timeout=10,
+            ),
+            provider=SimpleNamespace(fallback_models=[]),
+        )
+        gateway = self.gateway_mod.GlobalModelGateway(fake_context, config)
+        gateway.set_lane_manager(self.lane_mod.LaneManager(_FakeConversationManager()))
+        observed_available = []
+
+        async def fake_provider_scoped_runner(**kwargs):
+            observed_available.append(gateway._global_semaphore._value)
+            async with gateway._concurrency_slot(True, event=kwargs.get("event")):
+                await asyncio.sleep(0)
+            return _FakeResponse("tool-ok")
+
+        gateway._run_tool_loop_agent_with_provider_slots = fake_provider_scoped_runner
+
+        result = asyncio.run(
+            gateway.tool_chat_in_lane_result(
+                lane_key=self.lane_mod.LaneKey(
+                    subsystem="sys2",
+                    task_family="dialog",
+                    scope_id="group-1",
+                ),
+                base_origin="default:GroupMessage:group-1",
+                event=_TraceEvent(),
+                prompt="hello",
+                system_prompt="stable prompt",
+                tools=object(),
+                models=["model-a"],
+                max_steps=2,
+                timeout=10,
+            )
+        )
+
+        self.assertEqual(result.text, "tool-ok")
+        self.assertEqual(observed_available, [1])
+
+    def test_three_outer_agents_leave_capacity_for_nested_agent_tasks(self):
+        fake_context = _FakeContext()
+        config = SimpleNamespace(
+            infra=SimpleNamespace(
+                max_concurrent_llm_calls=3,
+                llm_retries=0,
+                backoff_factor=1.5,
+                api_timeout=10,
+                semaphore_wait_timeout_sec=0.05,
+            ),
+            provider=SimpleNamespace(fallback_models=[]),
+        )
+        gateway = self.gateway_mod.GlobalModelGateway(fake_context, config)
+        gateway.set_lane_manager(self.lane_mod.LaneManager(_FakeConversationManager()))
+        outer_ready = 0
+        all_outer_ready = asyncio.Event()
+
+        async def fake_provider_scoped_runner(**kwargs):
+            nonlocal outer_ready
+            outer_ready += 1
+            if outer_ready == 3:
+                all_outer_ready.set()
+            await asyncio.wait_for(all_outer_ready.wait(), timeout=1.0)
+
+            async def nested_agent():
+                async with gateway._concurrency_slot(
+                    True,
+                    event=kwargs.get("event"),
+                    stage="gateway.tool_semaphore_wait",
+                ):
+                    await asyncio.sleep(0)
+                    return "nested-ok"
+
+            self.assertEqual(await asyncio.create_task(nested_agent()), "nested-ok")
+            return _FakeResponse("tool-ok")
+
+        gateway._run_tool_loop_agent_with_provider_slots = fake_provider_scoped_runner
+
+        async def _run():
+            calls = [
+                gateway.tool_chat_in_lane_result(
+                    lane_key=self.lane_mod.LaneKey(
+                        subsystem="sys3",
+                        task_family="agent",
+                        scope_id=f"chat-{index}",
+                    ),
+                    base_origin=f"chat-{index}",
+                    event=_TraceEvent(),
+                    prompt="hello",
+                    system_prompt="stable prompt",
+                    tools=object(),
+                    models=["model-a"],
+                    max_steps=2,
+                    timeout=10,
+                )
+                for index in range(3)
+            ]
+            return await asyncio.wait_for(asyncio.gather(*calls), timeout=2.0)
+
+        results = asyncio.run(_run())
+        self.assertEqual([result.text for result in results], ["tool-ok"] * 3)
+        self.assertEqual(gateway._global_semaphore._value, 3)
+
     def test_tool_chat_in_lane_passes_image_urls_to_tool_loop_agent(self):
         fake_context = _FakeContext()
         config = SimpleNamespace(

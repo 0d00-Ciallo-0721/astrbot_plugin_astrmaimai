@@ -19,10 +19,15 @@ from ..contracts.turn_identity import TurnIdentity, build_p0_thread_id
 from ..threading.group_thread_resolver import resolve_group_thread
 from ...infrastructure.compat.legacy_compat import emit_legacy_focus_thread_extras
 from ...infrastructure.gateway.output_guard import validate_visible_output_text
+from ...infrastructure.runtime.background_task_budget import (
+    BackgroundTaskQueueFull,
+    BackgroundTaskQueueTimeout,
+)
 from ...infrastructure.runtime.trace_runtime import debug_trace, new_trace_id, preview_text
 from ...infrastructure.runtime.turn_call_ledger import (
     attach_background_task_trace,
     begin_stage,
+    clamp_timeout_to_turn_budget,
     finish_stage,
     rebind_turn_telemetry,
 )
@@ -444,52 +449,200 @@ class AttentionGate:
             if coordinator is not None and hasattr(coordinator, "unregister_turn_task"):
                 await coordinator.unregister_turn_task(turn, task)
 
-    async def _run_background_slot(self, coro, event=None):
+    async def _run_background_slot(self, awaitable_factory, event=None):
         acquired = False
+        timing = getattr(getattr(self, "config", None), "timing", None)
+        try:
+            configured_timeout = float(
+                getattr(timing, "attention_background_slot_wait_timeout_sec", 15.0)
+                or 15.0
+            )
+        except (TypeError, ValueError):
+            configured_timeout = 15.0
+        timeout_sec = clamp_timeout_to_turn_budget(
+            event,
+            max(0.1, configured_timeout),
+            reserve_for_reply=True,
+        )
         wait_stage = begin_stage(
             event,
             "attention.background_slot_wait",
             critical_path=True,
-            metadata={"limit": int(self.BACKGROUND_TASK_MAX_CONCURRENCY)},
+            metadata={
+                "limit": int(self.BACKGROUND_TASK_MAX_CONCURRENCY),
+                "timeout_sec": timeout_sec,
+            },
         )
         try:
-            async with self._background_task_semaphore:
-                acquired = True
-                finish_stage(event, wait_stage)
-                wait_stage = ""
-                return await coro
+            if timeout_sec <= 0.0:
+                raise asyncio.TimeoutError
+            if getattr(self._background_task_semaphore, "_value", 0) > 0:
+                await self._background_task_semaphore.acquire()
+            else:
+                await asyncio.wait_for(
+                    self._background_task_semaphore.acquire(),
+                    timeout=max(0.1, timeout_sec),
+                )
+            acquired = True
+            finish_stage(event, wait_stage, metadata={"timeout_sec": timeout_sec})
+        except asyncio.TimeoutError:
+            finish_stage(event, wait_stage, status="timeout", reason="queue_timeout")
+            if event is not None and hasattr(event, "set_extra"):
+                event.set_extra("astrmai_execution_status", "background_queue_timeout")
+                event.set_extra(
+                    "astrmai_queue_timeout_stage",
+                    "attention.background_slot_wait",
+                )
+                await self._finalize_pre_planner_turn(
+                    event,
+                    str(getattr(event, "unified_msg_origin", "") or ""),
+                    status="background_queue_timeout",
+                )
+            raise
         except asyncio.CancelledError:
             finish_stage(event, wait_stage, status="cancelled", reason="superseded_or_shutdown")
-            if not acquired and hasattr(coro, "close"):
-                coro.close()
             raise
         except Exception as exc:
             finish_stage(event, wait_stage, status="error", reason=type(exc).__name__)
             raise
+        try:
+            return await awaitable_factory()
+        finally:
+            if acquired:
+                self._background_task_semaphore.release()
 
-    async def _run_background_task(self, coro, event=None):
-        async def _run() -> Any:
-            if event is not None:
-                return await self._run_managed_system2_task(
-                    self._run_background_slot(coro, event),
-                    event,
-                )
-            return await self._run_background_slot(coro)
+    async def _run_background_task(self, coro, event=None, *, task_name: str = "attention.misc"):
+        started = False
+
+        async def _execute() -> Any:
+            nonlocal started
+            started = True
+            return await coro
 
         budget = getattr(self, "background_task_budget", None)
-        if budget is not None:
-            return await budget.run(_run, task_name="attention")
-        return await _run()
 
-    def _fire_background_task(self, coro, event=None):
-        task = asyncio.create_task(self._run_background_task(coro, event))
+        async def _after_slot() -> Any:
+            if budget is not None:
+                scope_id = str(getattr(event, "unified_msg_origin", "") or "")
+                try:
+                    budget_parameters = inspect.signature(budget.run).parameters
+                except (TypeError, ValueError):
+                    budget_parameters = {}
+                supports_scope = "scope_id" in budget_parameters
+                supports_acquired_callback = "on_acquired" in budget_parameters
+                budget_wait_stage = None
+                budget_acquired = False
+
+                def _on_budget_acquired() -> None:
+                    nonlocal budget_acquired
+                    budget_acquired = True
+                    finish_stage(
+                        event,
+                        budget_wait_stage,
+                        metadata={"task_name": task_name, "scope_id": scope_id},
+                    )
+
+                run_kwargs = {"task_name": task_name}
+                if supports_scope:
+                    run_kwargs["scope_id"] = scope_id
+                if supports_acquired_callback:
+                    budget_wait_stage = begin_stage(
+                        event,
+                        "attention.background_budget_wait",
+                        critical_path=True,
+                        metadata={"task_name": task_name, "scope_id": scope_id},
+                    )
+                    run_kwargs["on_acquired"] = _on_budget_acquired
+                try:
+                    return await budget.run(_execute, **run_kwargs)
+                except BackgroundTaskQueueTimeout:
+                    if budget_wait_stage and not budget_acquired:
+                        finish_stage(
+                            event,
+                            budget_wait_stage,
+                            status="timeout",
+                            reason="queue_timeout",
+                            metadata={"task_name": task_name, "scope_id": scope_id},
+                        )
+                    if event is not None and hasattr(event, "set_extra"):
+                        event.set_extra("astrmai_execution_status", "background_queue_timeout")
+                        event.set_extra(
+                            "astrmai_queue_timeout_stage",
+                            "attention.background_budget_wait",
+                        )
+                        await self._finalize_pre_planner_turn(
+                            event,
+                            scope_id,
+                            status="background_queue_timeout",
+                        )
+                    raise
+                except BackgroundTaskQueueFull:
+                    if budget_wait_stage and not budget_acquired:
+                        finish_stage(
+                            event,
+                            budget_wait_stage,
+                            status="rejected",
+                            reason="queue_full",
+                            metadata={"task_name": task_name, "scope_id": scope_id},
+                        )
+                    if event is not None and hasattr(event, "set_extra"):
+                        event.set_extra("astrmai_execution_status", "background_queue_rejected")
+                        event.set_extra(
+                            "astrmai_queue_timeout_stage",
+                            "attention.background_budget_wait",
+                        )
+                        await self._finalize_pre_planner_turn(
+                            event,
+                            scope_id,
+                            status="background_queue_rejected",
+                        )
+                    raise
+                except asyncio.CancelledError:
+                    if budget_wait_stage and not budget_acquired:
+                        finish_stage(
+                            event,
+                            budget_wait_stage,
+                            status="cancelled",
+                            reason="superseded_or_shutdown",
+                        )
+                    raise
+                except Exception as exc:
+                    if budget_wait_stage and not budget_acquired:
+                        finish_stage(
+                            event,
+                            budget_wait_stage,
+                            status="error",
+                            reason=type(exc).__name__,
+                        )
+                    raise
+            return await _execute()
+
+        try:
+            slot_wait_and_execute = self._run_background_slot(_after_slot, event)
+            if event is not None:
+                return await self._run_managed_system2_task(
+                    slot_wait_and_execute,
+                    event,
+                )
+            return await slot_wait_and_execute
+        finally:
+            if not started and hasattr(coro, "close"):
+                coro.close()
+
+    def _fire_background_task(self, coro, event=None, *, task_name: str = "attention.misc"):
+        task = asyncio.create_task(
+            self._run_background_task(coro, event, task_name=task_name)
+        )
         task._astrmai_inner_coro = coro
         self._background_tasks.add(task)
         attach_background_task_trace(
             task,
             event,
             "attention.background",
-            metadata={"chat_id": str(getattr(event, "unified_msg_origin", "") or "")},
+            metadata={
+                "chat_id": str(getattr(event, "unified_msg_origin", "") or ""),
+                "task_name": task_name,
+            },
         )
         task.add_done_callback(self._handle_task_result)
         return task
@@ -607,7 +760,8 @@ class AttentionGate:
                 chat_id,
                 focus_context=focus_context,
                 message_source="user",
-            )
+            ),
+            task_name="attention.compaction",
         )
 
     def _judge_ignore_cooldown_enabled(self) -> bool:
@@ -1422,6 +1576,12 @@ class AttentionGate:
         status: str,
         reply_text: str | None = None,
     ) -> None:
+        trace_state = str(event.get_extra("astrmai_pre_planner_trace_state", "") or "")
+        if trace_state in {"pending", "persisted"} or bool(
+            event.get_extra("astrmai_pre_planner_trace_finalized", False)
+        ):
+            return
+        event.set_extra("astrmai_pre_planner_trace_state", "pending")
         # OPT-03/PL-02: pre-planner 终结路径也要填充 proactive 快照，否则合成事件
         # 死在传感器/节流层时 trace.proactive 恒空，三层诊断都看不出主动链死在哪
         try:
@@ -1439,6 +1599,7 @@ class AttentionGate:
             logger.debug("[AttentionGate] proactive trace fill degraded", exc_info=True)
         callback = self.turn_trace_callback
         if not callable(callback):
+            event.set_extra("astrmai_pre_planner_trace_state", "retryable")
             return
         try:
             result = callback(
@@ -1449,11 +1610,18 @@ class AttentionGate:
             )
             if inspect.isawaitable(result):
                 await result
+        except asyncio.CancelledError:
+            event.set_extra("astrmai_pre_planner_trace_state", "retryable")
+            raise
         except Exception as exc:
+            event.set_extra("astrmai_pre_planner_trace_state", "retryable")
             logger.warning(
                 "[AttentionGate] pre-planner turn trace failed "
                 f"status={status} error_type={type(exc).__name__}"
             )
+            return
+        event.set_extra("astrmai_pre_planner_trace_finalized", True)
+        event.set_extra("astrmai_pre_planner_trace_state", "persisted")
 
     async def inject_external_event(self, chat_id: str, event_data: dict):
         event = _SyntheticExternalEvent(dict(event_data or {}, unified_msg_origin=chat_id))
@@ -2215,6 +2383,7 @@ class AttentionGate:
                                 self._fire_background_task(
                                     self.sys2_process(focus_event, focus_thread.all_thread_events()),
                                     focus_event,
+                                    task_name="attention.system2",
                                 )
 
             async with session.lock:

@@ -16,7 +16,7 @@ from ...conversation.contracts.committed_reply import (
 )
 from ...conversation.contracts.turn_context import get_turn_context
 from ...conversation.contracts.turn_target import TargetKind, TurnTarget
-from ...infrastructure.runtime.lane_manager import LaneKey
+from ...infrastructure.runtime.dialog_lane_identity import resolve_dialog_lane_identity
 from ...multimodal import MEMES_DIR, send_meme
 from ...shared.emotion_tags import build_emotion_tag_catalog, normalize_emotion_tag
 from ...state.relationship.affection_router import AffectionRouter
@@ -429,15 +429,15 @@ class ReplyPostSendMixin:
             logger.warning(f"[ReplyService] no-send affection settlement failed: {exc}")
 
     async def _fetch_history(self, chat_id: str, anchor_text: str, anchor_event: AstrMessageEvent = None) -> list:
-        del anchor_event
         fetch_count = getattr(self.config.attention, "bg_pool_size", 20) if self.config else 20
         lane_manager = getattr(getattr(self.state_engine, "gateway", None), "lane_manager", None)
         if lane_manager is None:
             return []
         try:
+            lane_key, base_origin = resolve_dialog_lane_identity(anchor_event, chat_id)
             raw_history = await lane_manager.get_lane_history(
-                lane_key=LaneKey(subsystem="sys2", task_family="dialog", scope_id=chat_id),
-                base_origin=chat_id,
+                lane_key=lane_key,
+                base_origin=base_origin,
             )
             clean_anchor = re.sub(r"\s+", "", anchor_text or "")
             if clean_anchor:

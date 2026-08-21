@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -19,7 +20,7 @@ from ..runtime.turn_call_ledger import (
     record_llm_attempt,
     remaining_turn_budget,
 )
-from .gateway_exceptions import LLMCascadeFailureException
+from .gateway_exceptions import GatewayQueueTimeout, LLMCascadeFailureException
 from .output_guard import validate_visible_output_text
 
 
@@ -40,7 +41,13 @@ class GatewayLaneMixin:
             configured = 5.0
         return clamp_timeout_to_turn_budget(event, max(0.1, configured), reserve_for_reply=True)
 
-    async def _ensure_lane_bounded(self, event: Any, **kwargs):
+    async def _ensure_lane_bounded(
+        self,
+        event: Any,
+        *,
+        propagate_queue_timeout_status: bool = True,
+        **kwargs,
+    ):
         stage_id = begin_stage(
             event,
             "gateway.lane_prepare",
@@ -51,8 +58,18 @@ class GatewayLaneMixin:
         if timeout_sec <= 0.0:
             finish_stage(event, stage_id, status="timeout", reason="queue_timeout")
             if event is not None and hasattr(event, "set_extra"):
-                event.set_extra("astrmai_execution_status", "queue_timeout")
-                event.set_extra("astrmai_queue_timeout_stage", "gateway.lane_prepare")
+                timeout_record = {
+                    "stage": "gateway.lane_prepare",
+                    "critical_path": True,
+                    "terminal": bool(propagate_queue_timeout_status),
+                }
+                timeouts = list(event.get_extra("astrmai_gateway_queue_timeouts", []) or [])
+                timeouts.append(timeout_record)
+                event.set_extra("astrmai_gateway_queue_timeouts", timeouts[-32:])
+                event.set_extra("astrmai_last_gateway_queue_timeout", timeout_record)
+                if propagate_queue_timeout_status:
+                    event.set_extra("astrmai_execution_status", "queue_timeout")
+                    event.set_extra("astrmai_queue_timeout_stage", "gateway.lane_prepare")
             raise asyncio.TimeoutError("lane preparation exceeded turn budget")
         try:
             result = await asyncio.wait_for(
@@ -62,8 +79,18 @@ class GatewayLaneMixin:
         except asyncio.TimeoutError:
             finish_stage(event, stage_id, status="timeout", reason="queue_timeout")
             if event is not None and hasattr(event, "set_extra"):
-                event.set_extra("astrmai_execution_status", "queue_timeout")
-                event.set_extra("astrmai_queue_timeout_stage", "gateway.lane_prepare")
+                timeout_record = {
+                    "stage": "gateway.lane_prepare",
+                    "critical_path": True,
+                    "terminal": bool(propagate_queue_timeout_status),
+                }
+                timeouts = list(event.get_extra("astrmai_gateway_queue_timeouts", []) or [])
+                timeouts.append(timeout_record)
+                event.set_extra("astrmai_gateway_queue_timeouts", timeouts[-32:])
+                event.set_extra("astrmai_last_gateway_queue_timeout", timeout_record)
+                if propagate_queue_timeout_status:
+                    event.set_extra("astrmai_execution_status", "queue_timeout")
+                    event.set_extra("astrmai_queue_timeout_stage", "gateway.lane_prepare")
             raise
         except asyncio.CancelledError:
             finish_stage(event, stage_id, status="cancelled", reason="acquire_cancelled")
@@ -294,6 +321,158 @@ class GatewayLaneMixin:
         reserve = float(getattr(context, "main_reply_reserve_sec", 0.0) or 0.0)
         return max(0.1, min(base, max(remaining, reserve)))
 
+    async def _run_tool_loop_agent_with_provider_slots(
+        self,
+        *,
+        event: Any,
+        chat_provider_id: str,
+        prompt: str,
+        system_prompt: str,
+        contexts: List[Any],
+        image_urls: Optional[List[str]],
+        tools: Any,
+        max_steps: int,
+        tool_call_timeout: int,
+        attempt: int = 0,
+        propagate_queue_timeout_status: bool = True,
+        **kwargs: Any,
+    ) -> Any:
+        """Run AstrBot's agent loop while leasing capacity per provider request.
+
+        AstrBot's public ``tool_loop_agent`` owns the whole ReAct lifecycle, so an
+        outer semaphore would also cover tool execution and nested SubAgents.  The
+        provider proxy keeps the host runner unchanged while limiting only the
+        actual model request/stream intervals.
+        """
+        provider_manager = getattr(self.context, "provider_manager", None)
+        get_provider = getattr(provider_manager, "get_provider_by_id", None)
+        if not callable(get_provider):
+            # Test doubles and old hosts without an exposed provider manager keep
+            # the legacy bounded behavior instead of bypassing concurrency limits.
+            async with self._concurrency_slot(
+                True,
+                event=event,
+                stage="gateway.tool_semaphore_wait",
+                propagate_queue_timeout_status=propagate_queue_timeout_status,
+            ):
+                return await self.context.tool_loop_agent(
+                    event=event,
+                    chat_provider_id=chat_provider_id,
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    contexts=contexts,
+                    image_urls=image_urls,
+                    tools=tools,
+                    max_steps=max_steps,
+                    tool_call_timeout=tool_call_timeout,
+                    **kwargs,
+                )
+
+        from astrbot.core.agent.hooks import BaseAgentRunHooks
+        from astrbot.core.agent.message import Message
+        from astrbot.core.agent.runners.tool_loop_agent_runner import ToolLoopAgentRunner
+        from astrbot.core.astr_agent_context import AgentContextWrapper, AstrAgentContext
+        from astrbot.core.astr_agent_tool_exec import FunctionToolExecutor
+        from astrbot.core.provider.entities import ProviderRequest
+
+        provider_result = get_provider(chat_provider_id)
+        provider = await provider_result if inspect.isawaitable(provider_result) else provider_result
+        if provider is None:
+            raise RuntimeError(f"Provider {chat_provider_id} not found")
+
+        self_gateway = self
+
+        class _ProviderAttemptProxy:
+            def __init__(self, wrapped_provider: Any):
+                self._wrapped_provider = wrapped_provider
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._wrapped_provider, name)
+
+            async def text_chat(self, **request_kwargs: Any) -> Any:
+                async with self_gateway._concurrency_slot(
+                    True,
+                    event=event,
+                    stage="gateway.tool_semaphore_wait",
+                    propagate_queue_timeout_status=propagate_queue_timeout_status,
+                ):
+                    async with self_gateway._provider_request_stage(
+                        event,
+                        critical_path=True,
+                        model_id=chat_provider_id,
+                        attempt=attempt,
+                        tool_mode=True,
+                    ):
+                        return await self._wrapped_provider.text_chat(**request_kwargs)
+
+            def text_chat_stream(self, **request_kwargs: Any):
+                async def _stream():
+                    async with self_gateway._concurrency_slot(
+                        True,
+                        event=event,
+                        stage="gateway.tool_semaphore_wait",
+                        propagate_queue_timeout_status=propagate_queue_timeout_status,
+                    ):
+                        async with self_gateway._provider_request_stage(
+                            event,
+                            critical_path=True,
+                            model_id=chat_provider_id,
+                            attempt=attempt,
+                            tool_mode=True,
+                        ):
+                            async for item in self._wrapped_provider.text_chat_stream(
+                                **request_kwargs
+                            ):
+                                yield item
+
+                return _stream()
+        normalized_contexts = [
+            item.model_dump() if isinstance(item, Message) else item
+            for item in list(contexts or [])
+        ]
+        request = ProviderRequest(
+            prompt=prompt,
+            image_urls=image_urls or [],
+            func_tool=tools,
+            contexts=normalized_contexts,
+            system_prompt=system_prompt or "",
+        )
+        agent_hooks = kwargs.get("agent_hooks") or BaseAgentRunHooks()
+        agent_context = kwargs.get("agent_context") or AstrAgentContext(
+            context=self.context,
+            event=event,
+        )
+        streaming = bool(kwargs.get("stream", False))
+        runner_kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key not in {"stream", "agent_hooks", "agent_context"}
+        }
+        compression_provider = runner_kwargs.get("llm_compress_provider")
+        if compression_provider is not None:
+            runner_kwargs["llm_compress_provider"] = _ProviderAttemptProxy(
+                compression_provider
+            )
+        runner = ToolLoopAgentRunner()
+        await runner.reset(
+            provider=_ProviderAttemptProxy(provider),
+            request=request,
+            run_context=AgentContextWrapper(
+                context=agent_context,
+                tool_call_timeout=tool_call_timeout,
+            ),
+            tool_executor=FunctionToolExecutor(),
+            agent_hooks=agent_hooks,
+            streaming=streaming,
+            **runner_kwargs,
+        )
+        async for _ in runner.step_until_done(max_steps):
+            pass
+        response = runner.get_final_llm_resp()
+        if response is None:
+            raise RuntimeError("Agent did not produce a final LLM response")
+        return response
+
     @staticmethod
     def _tool_side_effect_count(event: Any) -> int:
         if event is None or not hasattr(event, "get_extra"):
@@ -412,6 +591,7 @@ class GatewayLaneMixin:
         max_models_override: Optional[int] = None,
         allow_cooldown_override: bool = True,
         reserve_for_reply: bool = False,
+        propagate_queue_timeout_status: bool = True,
     ) -> LLMCallResult:
         workload_request = self.context_economy.build_request(
             family=self._lane_workload_family(lane_key, tool_mode=False),
@@ -464,6 +644,8 @@ class GatewayLaneMixin:
                     max_models_override=max_models_override,
                     allow_cooldown_override=allow_cooldown_override,
                     reserve_for_reply=reserve_for_reply,
+                    event=event,
+                    propagate_queue_timeout_status=propagate_queue_timeout_status,
                 )
             except asyncio.CancelledError:
                 finish_llm_call(
@@ -500,6 +682,7 @@ class GatewayLaneMixin:
         model_hint = models[0]
         lane_umo, conversation_id, history, _ = await self._ensure_lane_bounded(
             event,
+            propagate_queue_timeout_status=propagate_queue_timeout_status,
             lane_key=effective_lane_key,
             base_origin=base_origin,
             prefix_hash=workload_policy.effective_prefix_hash,
@@ -570,6 +753,8 @@ class GatewayLaneMixin:
                 max_models_override=max_models_override,
                 allow_cooldown_override=allow_cooldown_override,
                 reserve_for_reply=reserve_for_reply,
+                event=event,
+                propagate_queue_timeout_status=propagate_queue_timeout_status,
             )
         except asyncio.CancelledError:
             finish_llm_call(
@@ -716,57 +901,58 @@ class GatewayLaneMixin:
         persona_id: str = "",
         raw_user_text: str = "",
         template_envelope: Optional[PromptEnvelope] = None,
+        propagate_queue_timeout_status: bool = True,
     ) -> LLMCallResult:
-        async with self._global_semaphore:
-            call_id = begin_llm_call(
-                event,
-                stage="gateway.tool",
-                family=self._lane_workload_family(lane_key, tool_mode=True).value,
-                pool=lane_key.task_family,
+        call_id = begin_llm_call(
+            event,
+            stage="gateway.tool",
+            family=self._lane_workload_family(lane_key, tool_mode=True).value,
+            pool=lane_key.task_family,
+            prompt=prompt,
+            system_prompt=system_prompt,
+            tools=tools,
+            max_steps=max_steps,
+            metadata={"model_count": len(models or []), "timeout_sec": int(timeout or 0)},
+        )
+        try:
+            result = await self._tool_chat_in_lane_result_unlimited(
+                lane_key=lane_key,
+                base_origin=base_origin,
+                event=event,
                 prompt=prompt,
                 system_prompt=system_prompt,
                 tools=tools,
+                models=models,
                 max_steps=max_steps,
-                metadata={"model_count": len(models or []), "timeout_sec": int(timeout or 0)},
+                timeout=timeout,
+                image_urls=image_urls,
+                prefix_hash=prefix_hash,
+                persona_id=persona_id,
+                raw_user_text=raw_user_text,
+                template_envelope=template_envelope,
+                ledger_call_id=call_id,
+                propagate_queue_timeout_status=propagate_queue_timeout_status,
             )
-            try:
-                result = await self._tool_chat_in_lane_result_unlimited(
-                    lane_key=lane_key,
-                    base_origin=base_origin,
-                    event=event,
-                    prompt=prompt,
-                    system_prompt=system_prompt,
-                    tools=tools,
-                    models=models,
-                    max_steps=max_steps,
-                    timeout=timeout,
-                    image_urls=image_urls,
-                    prefix_hash=prefix_hash,
-                    persona_id=persona_id,
-                    raw_user_text=raw_user_text,
-                    template_envelope=template_envelope,
-                    ledger_call_id=call_id,
-                )
-            except Exception as exc:
-                finish_llm_call(
-                    event,
-                    call_id,
-                    status="error",
-                    error=exc,
-                    error_kind=getattr(exc, "failure_kind", ""),
-                )
-                raise
+        except Exception as exc:
             finish_llm_call(
                 event,
                 call_id,
-                status="success" if result.ok else "error",
-                model=result.model_id,
-                provider=result.provider_family,
-                output=result.text or result.raw_completion,
-                error_kind=getattr(result.error_kind, "value", result.error_kind),
-                error=result.error_message,
+                status="error",
+                error=exc,
+                error_kind=getattr(exc, "failure_kind", ""),
             )
-            return result
+            raise
+        finish_llm_call(
+            event,
+            call_id,
+            status="success" if result.ok else "error",
+            model=result.model_id,
+            provider=result.provider_family,
+            output=result.text or result.raw_completion,
+            error_kind=getattr(result.error_kind, "value", result.error_kind),
+            error=result.error_message,
+        )
+        return result
 
     # ponytail: ~200 lines duplicated from _elastic_call_result. Refactor when
     # tool_chat diverges significantly or test coverage of both paths is sufficient.
@@ -787,6 +973,7 @@ class GatewayLaneMixin:
         raw_user_text: str = "",
         template_envelope: Optional[PromptEnvelope] = None,
         ledger_call_id: str = "",
+        propagate_queue_timeout_status: bool = True,
     ) -> LLMCallResult:
         if not self.lane_manager:
             raise LLMCascadeFailureException("lane manager is required for tool_chat_in_lane")
@@ -830,6 +1017,7 @@ class GatewayLaneMixin:
 
         lane_umo, conversation_id, history, _ = await self._ensure_lane_bounded(
             event,
+            propagate_queue_timeout_status=propagate_queue_timeout_status,
             lane_key=effective_lane_key,
             base_origin=base_origin,
             prefix_hash=workload_policy.effective_prefix_hash,
@@ -877,7 +1065,7 @@ class GatewayLaneMixin:
             attempt_started = asyncio.get_running_loop().time()
             try:
                 response = await asyncio.wait_for(
-                    self.context.tool_loop_agent(
+                    self._run_tool_loop_agent_with_provider_slots(
                         event=event,
                         chat_provider_id=model_id,
                         prompt=prompt,
@@ -887,6 +1075,8 @@ class GatewayLaneMixin:
                         tools=tools,
                         max_steps=max_steps,
                         tool_call_timeout=timeout,
+                        attempt=attempt,
+                        propagate_queue_timeout_status=propagate_queue_timeout_status,
                         **tool_kwargs,
                     ),
                     timeout=self._tool_loop_total_timeout(timeout, max_steps),
@@ -1101,6 +1291,18 @@ class GatewayLaneMixin:
                 )
                 return result
             except Exception as exc:
+                # Tests and hot-reload paths can reload the exception module while
+                # this mixin still holds an older class object.  Preserve the
+                # stable stage marker so queue timeouts never enter model fallback.
+                if (
+                    isinstance(exc, GatewayQueueTimeout)
+                    or type(exc).__name__ == "GatewayQueueTimeout"
+                    or (
+                        isinstance(exc, asyncio.TimeoutError)
+                        and str(getattr(exc, "stage", "") or "").startswith("gateway.")
+                    )
+                ):
+                    raise
                 last_error = str(exc)
                 last_failure_kind = self._classify_failure_kind(last_error, error=exc)
                 is_fatal = self._is_fatal_failure(last_error, error=exc)
@@ -1155,7 +1357,14 @@ class GatewayLaneMixin:
                         f"({attempt + 1}/{max_retries + 1}), retrying: {last_error}"
                     )
                     if backoff_factor > 0:
-                        await asyncio.sleep(backoff_factor ** attempt)
+                        await self._wait_retry_backoff(
+                            backoff_factor ** attempt,
+                            event=event,
+                            critical_path=True,
+                            model_id=model_id,
+                            attempt=attempt,
+                            tool_mode=True,
+                        )
                 else:
                     logger.warning(f"[Gateway] tool_loop model {model_id} failed, trying next: {last_error}")
                 continue

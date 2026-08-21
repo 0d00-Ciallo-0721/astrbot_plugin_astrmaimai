@@ -1,6 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Iterable
+
+
+class GatewayQueueTimeout(asyncio.TimeoutError):
+    """A bounded wait for a Gateway concurrency slot expired."""
+
+    def __init__(self, stage: str, timeout_sec: float) -> None:
+        self.stage = str(stage or "gateway.semaphore_wait")
+        self.timeout_sec = max(0.0, float(timeout_sec or 0.0))
+        super().__init__(f"{self.stage} exceeded {self.timeout_sec:.3f}s")
 
 
 class LLMCascadeFailureException(Exception):

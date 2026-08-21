@@ -200,7 +200,7 @@ class GatewayTaskMixin:
 
     async def call_judge_task(self, prompt: str, system_prompt: str = "", template_envelope: Optional[PromptEnvelope] = None) -> Dict[str, Any]:
         timing = getattr(getattr(self, "config", None), "timing", None)
-        timeout_sec = float(getattr(timing, "attention_judge_timeout_sec", 3.0) or 3.0)
+        timeout_sec = float(getattr(timing, "attention_judge_timeout_sec", 20.0) or 20.0)
         workload_policy = self.context_economy.resolve_policy(
             self.context_economy.build_request(
                 family=WorkloadFamily.JUDGE,

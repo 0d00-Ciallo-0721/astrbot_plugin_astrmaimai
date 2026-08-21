@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -67,6 +68,36 @@ class BackgroundTaskBudgetTests(unittest.TestCase):
             release.set()
             self.assertEqual(await first_task, "first")
             self.assertEqual(await second_task, "second")
+
+        asyncio.run(run())
+
+    def test_compaction_provider_uses_gateway_concurrency_slot(self):
+        async def run():
+            entered = asyncio.Event()
+            release = asyncio.Event()
+            stages = []
+
+            class Gateway:
+                @asynccontextmanager
+                async def _concurrency_slot(self, critical_path, *, event, stage):
+                    self.critical_path = critical_path
+                    self.event = event
+                    stages.append(stage)
+                    entered.set()
+                    await release.wait()
+                    yield
+
+            engine = ContextCompactionEngine(None, gateway=Gateway())
+
+            async def work():
+                return "summary"
+
+            task = asyncio.create_task(engine._run_compaction_model(work))
+            await entered.wait()
+            self.assertEqual(stages, ["gateway.compaction_semaphore_wait"])
+            self.assertFalse(task.done())
+            release.set()
+            self.assertEqual(await task, "summary")
 
         asyncio.run(run())
 
@@ -271,6 +302,77 @@ class BackgroundTaskBudgetTests(unittest.TestCase):
             await running
             await waiting
             self.assertEqual(budget.status()["rejected"], 1)
+
+        asyncio.run(run())
+
+    def test_scope_diagnostics_separate_attention_groups(self):
+        async def run():
+            budget = BackgroundTaskBudget(1, max_queue=1)
+            release = asyncio.Event()
+
+            async def first():
+                await release.wait()
+
+            async def second():
+                return "second"
+
+            running = asyncio.create_task(
+                budget.run(
+                    first,
+                    task_name="attention.system2",
+                    scope_id="group-a",
+                )
+            )
+            await asyncio.sleep(0)
+            waiting = asyncio.create_task(
+                budget.run(
+                    second,
+                    task_name="attention.system2",
+                    scope_id="group-b",
+                )
+            )
+            await asyncio.sleep(0)
+            status = budget.status()
+            self.assertEqual(
+                status["scope_stats"]["attention.system2|group-a"]["active"],
+                1,
+            )
+            self.assertEqual(
+                status["scope_stats"]["attention.system2|group-b"]["queued"],
+                1,
+            )
+            release.set()
+            await running
+            self.assertEqual(await waiting, "second")
+            final_status = budget.status()
+            self.assertEqual(
+                final_status["scope_stats"]["attention.system2|group-a"]["completed"],
+                1,
+            )
+            self.assertEqual(
+                final_status["scope_stats"]["attention.system2|group-b"]["completed"],
+                1,
+            )
+
+        asyncio.run(run())
+
+    def test_scope_diagnostics_are_bounded(self):
+        async def run():
+            budget = BackgroundTaskBudget(1)
+
+            async def work():
+                return None
+
+            for index in range(300):
+                await budget.run(
+                    work,
+                    task_name="attention.system2",
+                    scope_id=f"group-{index}",
+                )
+            scope_stats = budget.status()["scope_stats"]
+            self.assertEqual(len(scope_stats), 256)
+            self.assertNotIn("attention.system2|group-0", scope_stats)
+            self.assertIn("attention.system2|group-299", scope_stats)
 
         asyncio.run(run())
 

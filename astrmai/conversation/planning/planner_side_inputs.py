@@ -382,13 +382,17 @@ class PlannerSideInputMixin:
         async def _load_jargons():
             return ""
 
-        slang_context, expression_habits, jargon_explanation = await asyncio.gather(
+        slang_context, expression_habits, jargon_explanation, goal_text = await asyncio.gather(
             _load_slang(),
             _load_expressions(),
             _load_jargons(),
+            _load_goals(),
             return_exceptions=True,
         )
-        goal_text = await _load_goals()
+        slang_context = "" if isinstance(slang_context, BaseException) else slang_context
+        expression_habits = "" if isinstance(expression_habits, BaseException) else expression_habits
+        jargon_explanation = "" if isinstance(jargon_explanation, BaseException) else jargon_explanation
+        goal_text = "" if isinstance(goal_text, BaseException) else goal_text
         return {
             "slang_context": slang_context,
             "goal_text": goal_text,

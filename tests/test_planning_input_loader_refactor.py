@@ -254,6 +254,66 @@ def test_budgeted_prompt_inputs_respect_think_level(tmp_path):
     assert level_two["goals_context"] == "goal context"
 
 
+def test_level_two_goal_update_runs_with_other_side_inputs_before_context_snapshot(tmp_path):
+    module = _load_loader_module(tmp_path)
+    planner = _Planner()
+    loader = module.PlanningInputLoader(planner)
+    started = set()
+    release = asyncio.Event()
+
+    async def slow_expression(*args, **kwargs):
+        started.add("expression")
+        await release.wait()
+        return "expression habits"
+
+    async def slow_goal(*args, **kwargs):
+        started.add("goal")
+        await release.wait()
+        return "keep current topic"
+
+    goal_updated = False
+
+    async def slow_goals_context(*args, **kwargs):
+        started.add("goals_context")
+        return "new goal context" if goal_updated else "old goal context"
+
+    async def updating_goal(*args, **kwargs):
+        nonlocal goal_updated
+        started.add("goal")
+        await release.wait()
+        goal_updated = True
+        return "keep current topic"
+
+    loader._load_expression_habits = slow_expression
+    loader._load_goal_update = updating_goal
+    loader._load_goals_context = slow_goals_context
+
+    async def run():
+        task = asyncio.create_task(
+            loader.load_prompt_inputs(
+                _Event(),
+                "chat-1",
+                None,
+                ["please analyze this"],
+                2,
+                user_id="user-1",
+            )
+        )
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if started == {"expression", "goal"}:
+                break
+        self_started = set(started)
+        release.set()
+        result = await task
+        return self_started, result
+
+    started_snapshot, result = asyncio.run(run())
+    assert started_snapshot == {"expression", "goal"}
+    assert result["planner_reasoning"] == "keep current topic"
+    assert result["goals_context"] == "new goal context"
+
+
 def test_jargon_loader_routes_known_term_through_global_dictionary(tmp_path):
     module = _load_loader_module(tmp_path)
     planner = _Planner()
