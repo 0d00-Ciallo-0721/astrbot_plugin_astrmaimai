@@ -146,6 +146,7 @@ class ExecutedTraceFieldContractTests(unittest.TestCase):
         event.set_extra("astrmai_topic_activity_reason", "semantic_topic_text")
         event.set_extra("astrmai_topic_activity_source", "attention_gate")
         event.set_extra("astrmai_effective_user_response", True)
+        event.set_extra("astrmai_topic_activity_state_transition_status", "persisted")
         event.set_extra("astrmai_topic_activity_state_before", {"unanswered_count": 1})
         event.set_extra("astrmai_topic_activity_state_after", {"unanswered_count": 0})
 
@@ -157,6 +158,7 @@ class ExecutedTraceFieldContractTests(unittest.TestCase):
         self.assertEqual(observation["reason"], "semantic_topic_text")
         self.assertEqual(observation["source"], "attention_gate")
         self.assertTrue(observation["effective_user_response"])
+        self.assertEqual(observation["state_transition_status"], "persisted")
         self.assertEqual(observation["state_before"]["unanswered_count"], 1)
         self.assertEqual(observation["state_after"]["unanswered_count"], 0)
 

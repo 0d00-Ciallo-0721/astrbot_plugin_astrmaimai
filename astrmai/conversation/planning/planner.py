@@ -1342,6 +1342,12 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                 "effective_user_response": bool(
                     event.get_extra("astrmai_effective_user_response", False)
                 ),
+                "state_transition_status": str(
+                    event.get_extra("astrmai_topic_activity_state_transition_status", "") or ""
+                ),
+                "state_transition_error": str(
+                    event.get_extra("astrmai_topic_activity_state_transition_error", "") or ""
+                ),
                 "state_before": dict(
                     event.get_extra("astrmai_topic_activity_state_before", {}) or {}
                 ),

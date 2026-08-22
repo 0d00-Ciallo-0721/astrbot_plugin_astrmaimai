@@ -7,6 +7,7 @@ import inspect
 import math
 import time
 import uuid
+from dataclasses import dataclass
 from time import monotonic
 from typing import Any, Dict, List
 
@@ -22,6 +23,24 @@ from .relationship.affection_router import AffectionRouter
 from .relationship.relationship_ledger import RelationshipEventProposal, RelationshipLedgerEntry
 from .relationship.relationship_engine import RelationshipEngine, RelationshipEvent
 from .user_profile_service import UserProfileService
+
+
+@dataclass(frozen=True)
+class RealUserActivityTransition:
+    before: ChatState
+    after: ChatState
+    applied: bool = True
+    reason: str = ""
+
+    def __iter__(self):
+        yield self.before
+        yield self.after
+
+    def __len__(self) -> int:
+        return 2
+
+    def __getitem__(self, index: int) -> ChatState:
+        return (self.before, self.after)[index]
 
 
 class ChatStateService:
@@ -274,6 +293,22 @@ class ChatStateService:
         occurred_at: float | None = None,
         effective_response: bool = True,
     ) -> ChatState:
+        _, state_after = await self.record_real_user_activity_transition(
+            chat_id,
+            chat_kind=chat_kind,
+            occurred_at=occurred_at,
+            effective_response=effective_response,
+        )
+        return state_after
+
+    async def record_real_user_activity_transition(
+        self,
+        chat_id: str,
+        *,
+        chat_kind: str = "",
+        occurred_at: float | None = None,
+        effective_response: bool = True,
+    ) -> RealUserActivityTransition:
         """Record a semantic human message, not arbitrary runtime activity.
 
         ``effective_response`` distinguishes a member's ordinary group
@@ -284,8 +319,15 @@ class ChatStateService:
         generation = self._chat_generation(chat_id)
         async with self._get_chat_lock(chat_id):
             if not self._is_current_generation(chat_id, generation):
-                return self._create_default_state(chat_id)
+                state = self._create_default_state(chat_id)
+                return RealUserActivityTransition(
+                    state,
+                    copy.deepcopy(state),
+                    applied=False,
+                    reason="generation_invalidated",
+                )
             state = await self._get_state_inner(chat_id)
+            state_before = copy.deepcopy(state)
             life = getattr(self.config, "life", None)
             silence_minutes = max(0.0, float(getattr(life, "silence_threshold", 120) or 0.0))
             state.chat_kind = str(chat_kind or state.chat_kind or "")
@@ -307,7 +349,7 @@ class ChatStateService:
             self._mark_dirty(state)
             await self.persistence.save_chat_state(chat_id, state)
             state.is_dirty = False
-            return state
+            return RealUserActivityTransition(state_before, copy.deepcopy(state))
 
     async def record_committed_bot_reply(
         self,
@@ -933,6 +975,21 @@ class StateEngine:
         effective_response: bool = True,
     ) -> ChatState:
         return await self.chat_state_service.record_real_user_activity(
+            chat_id,
+            chat_kind=chat_kind,
+            occurred_at=occurred_at,
+            effective_response=effective_response,
+        )
+
+    async def record_real_user_activity_transition(
+        self,
+        chat_id: str,
+        *,
+        chat_kind: str = "",
+        occurred_at: float | None = None,
+        effective_response: bool = True,
+    ) -> RealUserActivityTransition:
+        return await self.chat_state_service.record_real_user_activity_transition(
             chat_id,
             chat_kind=chat_kind,
             occurred_at=occurred_at,

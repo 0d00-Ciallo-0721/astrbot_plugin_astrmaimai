@@ -264,6 +264,12 @@ def build_architecture_trace_contract(
             "reason": str(_extra(event, "astrmai_topic_activity_reason", "") or ""),
             "source": str(_extra(event, "astrmai_topic_activity_source", "") or ""),
             "effective_user_response": bool(_extra(event, "astrmai_effective_user_response", False)),
+            "state_transition_status": str(
+                _extra(event, "astrmai_topic_activity_state_transition_status", "") or ""
+            ),
+            "state_transition_error": str(
+                _extra(event, "astrmai_topic_activity_state_transition_error", "") or ""
+            ),
             "state_before": dict(_extra(event, "astrmai_topic_activity_state_before", {}) or {}),
             "state_after": dict(_extra(event, "astrmai_topic_activity_state_after", {}) or {}),
         },

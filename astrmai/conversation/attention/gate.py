@@ -79,7 +79,7 @@ class _SyntheticExternalEvent(AstrMessageEvent):
 
 class AttentionGate:
     @staticmethod
-    def _proactive_activity_snapshot(state: Any) -> dict[str, float | int]:
+    def _proactive_activity_snapshot(state: Any) -> dict[str, float | int | str]:
         if state is None:
             return {}
         return {
@@ -92,6 +92,15 @@ class AttentionGate:
             "unanswered_proactive_count": int(
                 getattr(state, "unanswered_proactive_count", 0) or 0
             ),
+            "proactive_generation": int(getattr(state, "proactive_generation", 0) or 0),
+            "last_proactive_cancel_reason": str(
+                getattr(state, "last_proactive_cancel_reason", "") or ""
+            ),
+            "proactive_claim_token": str(getattr(state, "proactive_claim_token", "") or ""),
+            "proactive_claimed_at": float(getattr(state, "proactive_claimed_at", 0.0) or 0.0),
+            "next_wakeup_timestamp": float(getattr(state, "next_wakeup_timestamp", 0.0) or 0.0),
+            "last_reply_time": float(getattr(state, "last_reply_time", 0.0) or 0.0),
+            "chat_kind": str(getattr(state, "chat_kind", "") or ""),
         }
 
     ATTENTION_WINDOW_TTL_SECONDS = 180.0
@@ -948,9 +957,14 @@ class AttentionGate:
         result["valid"] = True
         return result
 
-    async def _record_event_activity(self, chat_id: str, event: AstrMessageEvent, sender_id: str) -> float:
-        session = await self._get_or_create_session(chat_id)
-        now = time.time()
+    def _set_topic_activity_observation(
+        self,
+        chat_id: str,
+        event: AstrMessageEvent,
+        sender_id: str,
+        *,
+        is_private: bool,
+    ) -> dict[str, Any]:
         is_anonymous_sender = str(sender_id or "").startswith("80000000")
         activity_sender_id = "" if is_anonymous_sender else sender_id
         provenance = str(event.get_extra("astrmai_event_provenance", "original") or "original")
@@ -968,61 +982,147 @@ class AttentionGate:
                 chat_id,
                 event,
                 activity_sender_id,
-                is_private=not bool(event.get_group_id()),
+                is_private=is_private,
             )
             if is_real_user_activity
             else {
                 "valid": False,
                 "kind": "",
                 "reason": "non_user_source",
-                "source": "non_user_source",
+                "source": (
+                    "bot_proactive_event"
+                    if bool(event.get_extra("astrmai_is_proactive_event", False))
+                    else "non_user_source"
+                ),
                 "effective_response": False,
                 "preview": "",
             }
         )
+        if bool(event.get_extra("astrmai_is_proactive_event", False)):
+            topic_activity["reason"] = "proactive_event"
         if hasattr(event, "set_extra"):
-            event.set_extra("astrmai_timestamp", now)
-            ensure_turn_context(event).perception.timestamp = now
             event.set_extra("astrmai_topic_activity_valid", bool(topic_activity.get("valid", False)))
             event.set_extra("astrmai_topic_activity_kind", str(topic_activity.get("kind", "") or ""))
             event.set_extra("astrmai_topic_activity_reason", str(topic_activity.get("reason", "") or ""))
             event.set_extra("astrmai_topic_activity_source", str(topic_activity.get("source", "") or ""))
             event.set_extra("astrmai_topic_activity_preview", str(topic_activity.get("preview", "") or ""))
             event.set_extra("astrmai_effective_user_response", bool(topic_activity.get("effective_response", False)))
+            event.set_extra("astrmai_topic_activity_state_transition_status", "not_applicable")
+            event.set_extra("astrmai_topic_activity_state_transition_error", "")
+        return {
+            "is_real_user_activity": is_real_user_activity,
+            "activity_sender_id": activity_sender_id,
+            "topic_activity": topic_activity,
+        }
+
+    async def _record_event_activity(self, chat_id: str, event: AstrMessageEvent, sender_id: str) -> float:
+        session = await self._get_or_create_session(chat_id)
+        now = time.time()
+        observation = self._set_topic_activity_observation(
+            chat_id,
+            event,
+            sender_id,
+            is_private=not bool(event.get_group_id()),
+        )
+        is_real_user_activity = bool(observation["is_real_user_activity"])
+        activity_sender_id = str(observation["activity_sender_id"] or "")
+        topic_activity = observation["topic_activity"]
+        if hasattr(event, "set_extra"):
+            event.set_extra("astrmai_timestamp", now)
+            ensure_turn_context(event).perception.timestamp = now
         if is_real_user_activity and bool(topic_activity.get("valid", False)):
             session.last_active_user_time = now
             recorder = getattr(self.state_engine, "record_real_user_activity", None)
             if callable(recorder):
+                event.set_extra("astrmai_topic_activity_state_transition_status", "pending")
+                state_loader = getattr(self.state_engine, "get_state", None)
+                transition_recorder = getattr(
+                    self.state_engine,
+                    "record_real_user_activity_transition",
+                    None,
+                )
+                transition_applied = True
                 try:
-                    state_loader = getattr(self.state_engine, "get_state", None)
-                    if callable(state_loader):
-                        state_before = state_loader(chat_id)
-                        if inspect.isawaitable(state_before):
-                            state_before = await state_before
-                        snapshot_before = self._proactive_activity_snapshot(state_before)
-                        if snapshot_before:
-                            event.set_extra("astrmai_topic_activity_state_before", snapshot_before)
-                    try:
-                        state = await recorder(
-                            chat_id,
-                            chat_kind="group" if bool(event.get_group_id()) else "private",
-                            occurred_at=now,
-                            effective_response=bool(topic_activity.get("effective_response", False)),
+                    if callable(transition_recorder):
+                        transition_kwargs = {
+                            "chat_kind": "group" if bool(event.get_group_id()) else "private",
+                            "occurred_at": now,
+                        }
+                        try:
+                            transition_parameters = inspect.signature(transition_recorder).parameters.values()
+                            supports_effective_response = any(
+                                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                                or parameter.name == "effective_response"
+                                for parameter in transition_parameters
+                            )
+                        except (TypeError, ValueError):
+                            supports_effective_response = True
+                        if supports_effective_response:
+                            transition_kwargs["effective_response"] = bool(
+                                topic_activity.get("effective_response", False)
+                            )
+                        transition = await transition_recorder(chat_id, **transition_kwargs)
+                        applied = bool(getattr(transition, "applied", True))
+                        transition_reason = str(getattr(transition, "reason", "") or "")
+                        state_before, state_after = transition
+                        event.set_extra(
+                            "astrmai_topic_activity_state_before",
+                            self._proactive_activity_snapshot(state_before),
                         )
-                    except TypeError:
-                        state = await recorder(
-                            chat_id,
-                            chat_kind="group" if bool(event.get_group_id()) else "private",
-                            occurred_at=now,
-                        )
-                    if state is not None:
                         event.set_extra(
                             "astrmai_topic_activity_state_after",
-                            self._proactive_activity_snapshot(state),
+                            self._proactive_activity_snapshot(state_after),
                         )
-                    event.set_extra("astrmai_proactive_generation_invalidated", True)
+                        if not applied:
+                            event.set_extra(
+                                "astrmai_topic_activity_state_transition_status",
+                                "superseded",
+                            )
+                            event.set_extra(
+                                "astrmai_topic_activity_state_transition_error",
+                                transition_reason or "generation_invalidated",
+                            )
+                            transition_applied = False
+                    else:
+                        if callable(state_loader):
+                            try:
+                                state_before = state_loader(chat_id)
+                                if inspect.isawaitable(state_before):
+                                    state_before = await state_before
+                                snapshot_before = self._proactive_activity_snapshot(state_before)
+                                if snapshot_before:
+                                    event.set_extra("astrmai_topic_activity_state_before", snapshot_before)
+                            except Exception as exc:
+                                logger.warning(
+                                    f"[AttentionGate] proactive state snapshot before degraded for {chat_id}: {exc}"
+                                )
+                        try:
+                            state = await recorder(
+                                chat_id,
+                                chat_kind="group" if bool(event.get_group_id()) else "private",
+                                occurred_at=now,
+                                effective_response=bool(topic_activity.get("effective_response", False)),
+                            )
+                        except TypeError:
+                            state = await recorder(
+                                chat_id,
+                                chat_kind="group" if bool(event.get_group_id()) else "private",
+                                occurred_at=now,
+                            )
+                        if state is not None:
+                            event.set_extra(
+                                "astrmai_topic_activity_state_after",
+                                self._proactive_activity_snapshot(state),
+                            )
+                    if transition_applied:
+                        event.set_extra("astrmai_proactive_generation_invalidated", True)
+                        event.set_extra("astrmai_topic_activity_state_transition_status", "persisted")
                 except Exception as exc:
+                    event.set_extra("astrmai_topic_activity_state_transition_status", "failed")
+                    event.set_extra("astrmai_topic_activity_state_transition_error", type(exc).__name__)
                     logger.warning(f"[AttentionGate] proactive user watermark degraded for {chat_id}: {exc}")
+            else:
+                event.set_extra("astrmai_topic_activity_state_transition_status", "unavailable")
         if is_real_user_activity and self.runtime_coordinator and hasattr(self.runtime_coordinator, "mark_activity"):
             try:
                 # ingress 时刻 astrmai_thread_signature 尚未生成（focus 构建后才写入），
@@ -1547,6 +1647,8 @@ class AttentionGate:
         if hasattr(self.sensors, "is_command"):
             try:
                 if await self.sensors.is_command(msg_str):
+                    if hasattr(event, "set_extra"):
+                        event.set_extra("astrmai_is_command", True)
                     return False
             except Exception:
                 try:
@@ -1779,6 +1881,17 @@ class AttentionGate:
         turn_context = ensure_turn_context(event)
 
         _chat_id = getattr(event, "unified_msg_origin", "") or ""
+        # Classify ingress before duplicate/sensor/throttle early exits so every
+        # persisted pre-planner trace distinguishes invalid activity from missing instrumentation.
+        try:
+            self._set_topic_activity_observation(
+                _chat_id,
+                event,
+                str(getattr(event, "get_sender_id", lambda: "")() or ""),
+                is_private=not bool(getattr(event, "get_group_id", lambda: "")()),
+            )
+        except Exception as exc:
+            logger.debug(f"[AttentionGate] ingress topic activity observation degraded: {exc}")
         if self._proactive_dispatching.get(_chat_id, False) and not event.get_extra(
             "astrmai_is_proactive_event",
             False,
@@ -1808,6 +1921,12 @@ class AttentionGate:
         sensor_checked = False
         if private_ingress:
             if not await self._passes_sensor_filters(event, str(getattr(event, "message_str", "") or "")):
+                self._set_topic_activity_observation(
+                    _chat_id,
+                    event,
+                    str(getattr(event, "get_sender_id", lambda: "")() or ""),
+                    is_private=True,
+                )
                 is_proactive_event = bool(event.get_extra("astrmai_is_proactive_event", False))
                 if is_proactive_event:
                     append_proactive_stage(event, "proactive.sensor", "blocked", "sensor_filtered")
@@ -1850,6 +1969,12 @@ class AttentionGate:
 
         if not sensor_checked:
             if not await self._passes_sensor_filters(event, msg_str):
+                self._set_topic_activity_observation(
+                    chat_id,
+                    event,
+                    sender_id,
+                    is_private=is_private,
+                )
                 rejected_perception = self.perception_builder.build(event)
                 if not is_private and rejected_perception.is_strong_wakeup:
                     fast_result = await self._handle_fast_wakeup(

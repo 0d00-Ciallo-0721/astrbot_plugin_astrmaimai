@@ -252,6 +252,161 @@ class RefactoredAttentionGateTests(unittest.TestCase):
         self.assertTrue(response.get_extra("astrmai_effective_user_response"))
         self.assertTrue(calls[-1][1]["effective_response"])
 
+    def test_state_snapshot_failure_does_not_skip_real_activity_update(self):
+        calls = []
+
+        async def get_state(_chat_id):
+            raise RuntimeError("snapshot unavailable")
+
+        async def record_real_user_activity(chat_id, **kwargs):
+            calls.append((chat_id, kwargs))
+            return SimpleNamespace(
+                proactive_generation=4,
+                proactive_claim_token="",
+                unanswered_proactive_count=0,
+            )
+
+        self.gate.state_engine.bot_id = "bot-1"
+        self.gate.state_engine.get_state = get_state
+        self.gate.state_engine.record_real_user_activity = record_real_user_activity
+
+        asyncio.run(
+            self.gate._record_event_activity(
+                "default:GroupMessage:group-1",
+                _FakeEvent("user-1", "Alice", "今天继续聊电影"),
+                "user-1",
+            )
+        )
+
+        self.assertEqual(len(calls), 1)
+
+    def test_internal_transition_type_error_is_not_retried(self):
+        transition_calls = []
+        recorder_calls = []
+
+        async def transition(*args, **kwargs):
+            transition_calls.append((args, kwargs))
+            raise TypeError("internal transition failure")
+
+        async def recorder(*args, **kwargs):
+            recorder_calls.append((args, kwargs))
+
+        self.gate.state_engine.bot_id = "bot-1"
+        self.gate.state_engine.record_real_user_activity_transition = transition
+        self.gate.state_engine.record_real_user_activity = recorder
+        event = _FakeEvent("user-1", "Alice", "继续聊电影")
+
+        asyncio.run(
+            self.gate._record_event_activity(
+                event.unified_msg_origin,
+                event,
+                "user-1",
+            )
+        )
+
+        self.assertEqual(len(transition_calls), 1)
+        self.assertEqual(recorder_calls, [])
+        self.assertEqual(
+            event.get_extra("astrmai_topic_activity_state_transition_status"),
+            "failed",
+        )
+
+    def test_generation_invalidated_transition_is_not_reported_persisted(self):
+        class SupersededTransition:
+            applied = False
+            reason = "generation_invalidated"
+
+            def __iter__(self):
+                state = SimpleNamespace(proactive_generation=0)
+                yield state
+                yield state
+
+        async def transition(*args, **kwargs):
+            return SupersededTransition()
+
+        self.gate.state_engine.bot_id = "bot-1"
+        self.gate.state_engine.record_real_user_activity_transition = transition
+        self.gate.state_engine.record_real_user_activity = lambda *args, **kwargs: None
+        event = _FakeEvent("user-1", "Alice", "继续聊电影")
+
+        asyncio.run(
+            self.gate._record_event_activity(
+                event.unified_msg_origin,
+                event,
+                "user-1",
+            )
+        )
+
+        self.assertEqual(
+            event.get_extra("astrmai_topic_activity_state_transition_status"),
+            "superseded",
+        )
+        self.assertEqual(
+            event.get_extra("astrmai_topic_activity_state_transition_error"),
+            "generation_invalidated",
+        )
+        self.assertFalse(event.get_extra("astrmai_proactive_generation_invalidated", False))
+
+    def test_ingress_proactive_activity_observation_is_explicit(self):
+        event = _FakeEvent(
+            "astrmai_candidate",
+            "AstrMai",
+            "顺便聊聊周末吧",
+            extras={"astrmai_is_proactive_event": True},
+        )
+
+        result = self.gate._set_topic_activity_observation(
+            event.unified_msg_origin,
+            event,
+            event.get_sender_id(),
+            is_private=False,
+        )
+
+        self.assertFalse(result["topic_activity"]["valid"])
+        self.assertEqual(event.get_extra("astrmai_topic_activity_source"), "bot_proactive_event")
+        self.assertEqual(event.get_extra("astrmai_topic_activity_reason"), "proactive_event")
+
+    def test_sensor_command_marker_prevents_topic_activity_classification(self):
+        class CommandSensors(_FakeSensors):
+            async def is_command(self, msg_str):
+                return msg_str.strip().startswith("/")
+
+        self.gate.sensors = CommandSensors()
+        event = _FakeEvent("user-1", "Alice", "/status")
+
+        self.assertFalse(asyncio.run(self.gate._passes_sensor_filters(event, event.message_str)))
+        self.gate._set_topic_activity_observation(
+            event.unified_msg_origin,
+            event,
+            event.get_sender_id(),
+            is_private=False,
+        )
+
+        self.assertTrue(event.get_extra("astrmai_is_command"))
+        self.assertFalse(event.get_extra("astrmai_topic_activity_valid"))
+        self.assertEqual(event.get_extra("astrmai_topic_activity_reason"), "command")
+
+    def test_process_event_sensor_command_trace_is_not_human_activity(self):
+        class CommandSensors(_FakeSensors):
+            async def is_command(self, msg_str):
+                return msg_str.strip().startswith("/")
+
+        traced = []
+
+        async def trace_callback(chat_id, event, *, status, reply_text=None):
+            traced.append((chat_id, status, reply_text))
+
+        self.gate.sensors = CommandSensors()
+        self.gate.turn_trace_callback = trace_callback
+        event = _FakeEvent("user-1", "Alice", "/status")
+
+        result = asyncio.run(self.gate.process_event(event))
+
+        self.assertEqual(result, "FILTERED")
+        self.assertFalse(event.get_extra("astrmai_topic_activity_valid"))
+        self.assertEqual(event.get_extra("astrmai_topic_activity_reason"), "command")
+        self.assertEqual(traced[0][1], "skipped_sensor_filter")
+
     def test_topic_activity_rejects_mixed_and_image_messages(self):
         image = SimpleNamespace(type="image")
         plain = SimpleNamespace(type="plain")

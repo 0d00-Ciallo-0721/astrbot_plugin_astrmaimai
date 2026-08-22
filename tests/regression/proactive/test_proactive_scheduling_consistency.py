@@ -143,6 +143,83 @@ def test_ordinary_group_activity_resets_silence_but_not_unanswered_proactive_cou
         asyncio.run(_run(Path(temp_dir) / "state.db"))
 
 
+def test_real_user_activity_transition_returns_isolated_before_and_after_snapshots():
+    async def _run(db_path: Path):
+        persistence = _SqliteStatePersistence(db_path)
+        service = ChatStateService(persistence, _config())
+        state = await service.record_real_user_activity(
+            "ff:GroupMessage:42",
+            chat_kind="group",
+            occurred_at=100.0,
+            effective_response=True,
+        )
+        service.chat_states["ff:GroupMessage:42"].proactive_claim_token = "claim-1"
+        service.chat_states["ff:GroupMessage:42"].proactive_claimed_at = 120.0
+        before, after = await service.record_real_user_activity_transition(
+            "ff:GroupMessage:42",
+            chat_kind="group",
+            occurred_at=200.0,
+            effective_response=False,
+        )
+
+        assert before is not after
+        assert before.proactive_generation == 1
+        assert after.proactive_generation == 2
+        assert before.proactive_claim_token == "claim-1"
+        assert after.proactive_claim_token == ""
+        assert before.last_proactive_cancel_reason == "user_activity"
+        assert after.last_proactive_cancel_reason == "meaningful_group_activity"
+        after.proactive_generation = 999
+        assert service.chat_states["ff:GroupMessage:42"].proactive_generation == 2
+
+        transitions = await asyncio.gather(
+            service.record_real_user_activity_transition(
+                "ff:GroupMessage:42",
+                chat_kind="group",
+                occurred_at=300.0,
+                effective_response=False,
+            ),
+            service.record_real_user_activity_transition(
+                "ff:GroupMessage:42",
+                chat_kind="group",
+                occurred_at=400.0,
+                effective_response=False,
+            ),
+        )
+        assert {item[0].proactive_generation for item in transitions} == {2, 3}
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+        asyncio.run(_run(Path(temp_dir) / "state.db"))
+
+
+def test_real_user_activity_transition_reports_generation_invalidation():
+    async def _run():
+        persistence = SimpleNamespace(
+            load_chat_state=lambda _chat_id: None,
+            save_chat_state=lambda _chat_id, _state: None,
+        )
+        service = ChatStateService(persistence, _config())
+        lock = service._get_chat_lock("ff:GroupMessage:42")
+        await lock.acquire()
+        task = asyncio.create_task(
+            service.record_real_user_activity_transition(
+                "ff:GroupMessage:42",
+                chat_kind="group",
+                occurred_at=100.0,
+            )
+        )
+        await asyncio.sleep(0)
+        service._chat_generations["ff:GroupMessage:42"] = 1
+        lock.release()
+        transition = await task
+
+        assert transition.applied is False
+        assert transition.reason == "generation_invalidated"
+        assert "ff:GroupMessage:42" not in service.chat_states
+
+    asyncio.run(_run())
+
+
 def test_persistent_due_scan_and_atomic_claim_are_restart_safe():
     async def _run(db_path: Path):
         persistence = _SqliteStatePersistence(db_path)
