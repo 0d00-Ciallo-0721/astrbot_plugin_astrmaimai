@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import threading
 import time
@@ -28,7 +29,7 @@ class VectorRetriever:
     向量密集检索器 (基于 AstrBot FaissVecDB 原生底座)
     完全重构：废弃脆弱的本地 bin 文件维护，全面接入平台提供的一致性存储。
     """
-    def __init__(self, faiss_db: FaissVecDB, config=None):
+    def __init__(self, faiss_db: FaissVecDB, config=None, *, projection_count_provider=None):
         self.faiss_db = faiss_db
         self.processor = TextProcessor()
         self.config = config or {}
@@ -53,6 +54,12 @@ class VectorRetriever:
         self._timeout_origin_counts: Dict[str, int] = {}
         self._stage_latency_samples: Dict[str, list[float]] = {}
         self._index_lock_wait_samples: list[float] = []
+        self._projection_count_provider = projection_count_provider
+        self._document_count_cache: int | None = None
+        self._projection_count_cache: int | None = None
+        self._storage_metrics_refreshed_at = 0.0
+        self._storage_metrics_refreshed_mono = 0.0
+        self._storage_metrics_task: asyncio.Task | None = None
 
     def _timing_value(self, name: str, default: float) -> float:
         timing = getattr(self.config, "timing", None)
@@ -89,6 +96,9 @@ class VectorRetriever:
             previous_executor.shutdown(wait=False, cancel_futures=True)
 
     def close(self) -> None:
+        metrics_task = self._storage_metrics_task
+        if metrics_task is not None and not metrics_task.done():
+            metrics_task.cancel()
         self._index_executor.shutdown(wait=False, cancel_futures=True)
 
     def _supports_phased_retrieval(self) -> bool:
@@ -372,6 +382,9 @@ class VectorRetriever:
             for status, count in self._status_counts.items()
             if status in {"timeout", "query_queue_timeout", "error", "circuit_open"}
         )
+        index_count = self._index_count()
+        projection_count = self._projection_count_cache
+        document_count = self._document_count_cache
         return {
             "query_concurrency": int(self._query_limit),
             "faiss_thread_count": int(self._faiss_thread_count()),
@@ -391,8 +404,20 @@ class VectorRetriever:
                 for stage, samples in self._stage_latency_samples.items()
             },
             "index_lock_wait_ms": self._latency_summary(self._index_lock_wait_samples),
-            "index_ntotal": self._index_count(),
-            "document_storage_count": self._document_storage_count(),
+            "index_ntotal": index_count,
+            "document_storage_count": document_count,
+            "projection_count": projection_count,
+            "index_delta_vs_projection": (
+                index_count - projection_count
+                if index_count is not None and projection_count is not None
+                else None
+            ),
+            "document_delta_vs_projection": (
+                document_count - projection_count
+                if document_count is not None and projection_count is not None
+                else None
+            ),
+            "storage_metrics_refreshed_at": self._storage_metrics_refreshed_at or None,
             "last_stage_timings": dict(self._last_stage_timings),
         }
 
@@ -404,13 +429,15 @@ class VectorRetriever:
         except (TypeError, ValueError):
             return None
 
-    def _document_storage_count(self) -> int | None:
-        storage = getattr(self.faiss_db, "document_storage", None)
-        for name in ("count_documents", "count", "document_count", "size"):
-            value = getattr(storage, name, None)
+    @staticmethod
+    async def _resolve_count(source: Any, names: tuple[str, ...]) -> int | None:
+        for name in names:
+            value = getattr(source, name, None)
             if callable(value):
                 try:
                     value = value()
+                    if inspect.isawaitable(value):
+                        value = await value
                 except Exception:
                     continue
             try:
@@ -418,14 +445,44 @@ class VectorRetriever:
                     return int(value)
             except (TypeError, ValueError):
                 continue
-        for name in ("documents", "_documents"):
-            value = getattr(storage, name, None)
-            if value is not None:
-                try:
-                    return len(value)
-                except TypeError:
-                    pass
         return None
+
+    async def refresh_storage_metrics(self, *, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self._storage_metrics_refreshed_mono < 30.0:
+            return
+        storage = getattr(self.faiss_db, "document_storage", None)
+        self._document_count_cache = await self._resolve_count(
+            storage,
+            ("count_documents", "count", "document_count", "size"),
+        )
+        provider = self._projection_count_provider
+        if callable(provider):
+            try:
+                value = provider()
+                if inspect.isawaitable(value):
+                    value = await value
+                self._projection_count_cache = int(value) if value is not None else None
+            except Exception:
+                self._projection_count_cache = None
+        self._storage_metrics_refreshed_at = time.time()
+        self._storage_metrics_refreshed_mono = time.monotonic()
+
+    def _schedule_storage_metrics_refresh(self) -> None:
+        task = self._storage_metrics_task
+        if task is not None and not task.done():
+            return
+        if time.monotonic() - self._storage_metrics_refreshed_mono < 30.0:
+            return
+        try:
+            task = asyncio.create_task(
+                self.refresh_storage_metrics(),
+                name="astrmai-vector-storage-metrics",
+            )
+        except RuntimeError:
+            return
+        self._storage_metrics_task = task
+        task.add_done_callback(lambda completed: completed.exception() if not completed.cancelled() else None)
 
     @staticmethod
     def _latency_summary(samples: list[float]) -> Dict[str, float | int]:
@@ -651,6 +708,10 @@ class VectorRetriever:
         except _QueryQueueTimeout:
             self._mark_failure("query_queue_timeout")
             logger.warning("[VectorStore] query slot wait timed out; using lexical fallback")
+            query_wait_ms = round(
+                max(0.0, time.monotonic() - started_at) * 1000.0,
+                1,
+            )
             self._record_observation(
                 observation,
                 status="query_queue_timeout",
@@ -661,9 +722,8 @@ class VectorRetriever:
                 requested_k=k,
                 fetch_k=fetch_k,
                 metadata_filter_count=metadata_filter_count,
+                query_queue_wait_ms=query_wait_ms,
             )
-            if observation is not None:
-                observation["query_queue_wait_ms"] = round(max(0.0, time.monotonic() - started_at) * 1000.0, 1)
             return []
         except asyncio.CancelledError:
             self._half_open_probe_active = False
@@ -735,4 +795,5 @@ class VectorRetriever:
             stage_timings=stage_timings,
             query_queue_wait_ms=query_wait_ms,
         )
+        self._schedule_storage_metrics_refresh()
         return out

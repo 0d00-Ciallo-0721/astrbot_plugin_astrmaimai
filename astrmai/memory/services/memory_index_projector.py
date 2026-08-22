@@ -460,6 +460,9 @@ class MemoryIndexProjector:
                 continue
         return result
 
+    async def projection_count(self) -> int:
+        return len(await self._projection_rows())
+
     async def _delete_fts_rows(self, doc_ids: list[int]) -> int:
         ids = [item for item in doc_ids if item is not None]
         if not ids or not hasattr(self.engine, "_execute_documents_write"):

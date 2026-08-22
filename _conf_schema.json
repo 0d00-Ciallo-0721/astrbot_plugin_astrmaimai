@@ -1893,6 +1893,30 @@
         "maximum": 120,
         "hint": "查询改写、记忆重排和记忆压缩共同使用这段时间。预算耗尽后立即使用已有文字检索结果继续回复，避免多阶段串行等待。"
       },
+      "memory_retrieval_timeout_sec": {
+        "description": "单次记忆检索总上限（秒）",
+        "type": "float",
+        "default": 20.0,
+        "minimum": 0.5,
+        "maximum": 120,
+        "hint": "文字检索与向量检索共同使用这段时间。超时后保留已经完成的分支结果。"
+      },
+      "memory_fts_timeout_sec": {
+        "description": "规范文字检索上限（秒）",
+        "type": "float",
+        "default": 8.0,
+        "minimum": 0.1,
+        "maximum": 60,
+        "hint": "规范记忆文字查询的单步等待时间。超时后继续使用其他已完成的检索结果。"
+      },
+      "memory_bm25_timeout_sec": {
+        "description": "兼容文字检索上限（秒）",
+        "type": "float",
+        "default": 8.0,
+        "minimum": 0.1,
+        "maximum": 60,
+        "hint": "兼容记忆文字查询的单步等待时间。超时后继续使用向量或规范文字检索结果。"
+      },
       "memory_rerank_timeout_sec": {
         "description": "记忆智能重排单步上限（秒）",
         "type": "float",
@@ -1932,6 +1956,14 @@
         "minimum": 0.5,
         "maximum": 60,
         "hint": "向量检索默认最多等待 20 秒；超时后立即使用文字检索，不会中断本轮聊天。"
+      },
+      "faiss_bootstrap_timeout_sec": {
+        "description": "向量索引后台准备上限（秒）",
+        "type": "float",
+        "default": 1800.0,
+        "minimum": 30,
+        "maximum": 7200,
+        "hint": "启动、重建和一致性修复在后台共用这段时间。准备期间聊天只使用文字检索。"
       },
       "faiss_query_concurrency": {
         "description": "向量检索最大并发数",

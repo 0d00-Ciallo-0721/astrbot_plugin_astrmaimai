@@ -2,6 +2,7 @@ import asyncio
 import base64
 import tempfile
 import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -425,6 +426,106 @@ class P0PrelaunchRegressionTests(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertEqual(observation["fallback_source"], "bm25")
         self.assertEqual(observation["vector"]["status"], "circuit_open")
+
+    def test_hybrid_retriever_times_out_bm25_and_keeps_vector_results(self):
+        from astrmai.memory.retrieval.hybrid_retriever import HybridRetriever
+        from astrmai.memory.utils import SearchResult
+
+        class _BM25:
+            async def search(self, *args, **kwargs):
+                await asyncio.Event().wait()
+
+        class _Vector:
+            async def search(self, *args, observation=None, **kwargs):
+                observation["status"] = "success"
+                return [
+                    SearchResult(
+                        doc_id=1,
+                        score=0.9,
+                        content="vector result",
+                        metadata={},
+                        source="vector",
+                    )
+                ]
+
+        config = SimpleNamespace(
+            timing=SimpleNamespace(memory_bm25_timeout_sec=0.01),
+            memory=SimpleNamespace(time_decay_rate=0.01),
+        )
+        observation = {}
+        started = time.monotonic()
+        results = asyncio.run(
+            HybridRetriever(_BM25(), _Vector(), config=config).search(
+                "hello",
+                observation=observation,
+            )
+        )
+
+        self.assertLess(time.monotonic() - started, 0.2)
+        self.assertEqual([item.content for item in results], ["vector result"])
+        self.assertEqual(observation["bm25_status"], "timeout")
+        self.assertEqual(observation["fallback_source"], "vector")
+
+    def test_vector_status_awaits_document_and_projection_counts(self):
+        from astrmai.memory.retrieval.vector_store import VectorRetriever
+
+        class _DocumentStorage:
+            async def count_documents(self):
+                return 7
+
+        async def _projection_count():
+            return 6
+
+        retriever = VectorRetriever(
+            SimpleNamespace(
+                embedding_storage=SimpleNamespace(index=SimpleNamespace(ntotal=5)),
+                document_storage=_DocumentStorage(),
+            ),
+            projection_count_provider=_projection_count,
+        )
+
+        asyncio.run(retriever.refresh_storage_metrics(force=True))
+        status = retriever.describe_status()
+
+        self.assertEqual(status["index_ntotal"], 5)
+        self.assertEqual(status["document_storage_count"], 7)
+        self.assertEqual(status["projection_count"], 6)
+        self.assertEqual(status["index_delta_vs_projection"], -1)
+        self.assertEqual(status["document_delta_vs_projection"], 1)
+
+    def test_vector_queue_timeout_is_included_in_latency_samples(self):
+        from astrmai.memory.retrieval.vector_store import VectorRetriever
+
+        class _Faiss:
+            async def retrieve(self, **kwargs):
+                return []
+
+        retriever = VectorRetriever(
+            _Faiss(),
+            SimpleNamespace(
+                timing=SimpleNamespace(
+                    faiss_timeout_sec=0.01,
+                    faiss_query_concurrency=1,
+                    faiss_failure_threshold=10,
+                )
+            ),
+        )
+
+        async def _run():
+            await retriever._query_semaphore.acquire()
+            try:
+                observation = {}
+                await retriever.search("blocked", observation=observation)
+                return observation
+            finally:
+                retriever._query_semaphore.release()
+
+        observation = asyncio.run(_run())
+        samples = retriever.describe_status()["stage_latency_ms"]["query_queue_wait_ms"]
+
+        self.assertEqual(observation["status"], "query_queue_timeout")
+        self.assertEqual(samples["count"], 1)
+        self.assertGreater(samples["max"], 0.0)
 
     def test_dream_update_resolves_legacy_id_to_canonical_memory(self):
         from astrmai.memory.dream.dream_agent import DreamAgent

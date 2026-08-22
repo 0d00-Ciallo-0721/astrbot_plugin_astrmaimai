@@ -393,12 +393,16 @@ class PluginRuntimeContext:
         )
 
     def build_diagnostics(self) -> dict[str, Any]:
-        vector_retriever = getattr(self.memory_engine, "vec_retriever", None)
-        vector_status = (
-            vector_retriever.describe_status()
-            if vector_retriever is not None and hasattr(vector_retriever, "describe_status")
-            else {"available": False}
-        )
+        describe_vector = getattr(self.memory_engine, "describe_vector_status", None)
+        if callable(describe_vector):
+            vector_status = describe_vector()
+        else:
+            vector_retriever = getattr(self.memory_engine, "vec_retriever", None)
+            vector_status = (
+                vector_retriever.describe_status()
+                if vector_retriever is not None and hasattr(vector_retriever, "describe_status")
+                else {"available": False}
+            )
         attention_router = getattr(self.attention_gate, "decision_router", None)
         attention_status = (
             attention_router.describe_status()

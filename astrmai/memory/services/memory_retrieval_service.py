@@ -70,9 +70,60 @@ class MemoryRetrievalService:
     def _timing_config(self):
         return getattr(getattr(self.engine, "config", None), "timing", None) if self.engine else None
 
+    def _timing_value(self, name: str, default: float) -> float:
+        timing = self._timing_config()
+        try:
+            return max(0.01, float(getattr(timing, name, default) or default))
+        except (TypeError, ValueError):
+            return float(default)
+
+    def _retrieval_timeout_sec(self, query: MemoryQuery) -> float:
+        configured = self._timing_value("memory_retrieval_timeout_sec", 20.0)
+        effective = clamp_timeout_to_turn_budget(
+            None,
+            configured,
+            reserve_for_reply=True,
+        )
+        remaining = self._remaining_deep_memory_budget(query)
+        if remaining is not None:
+            effective = min(effective, remaining)
+        return max(0.0, float(effective or 0.0))
+
+    @classmethod
+    async def _run_retrieval_branch(
+        cls,
+        awaitable,
+        *,
+        timeout_sec: float,
+        timing: dict[str, float] | None = None,
+    ):
+        started = time.monotonic()
+        if timeout_sec <= 0.0:
+            if inspect.iscoroutine(awaitable):
+                awaitable.close()
+            if timing is not None:
+                timing["elapsed_ms"] = 0.0
+            raise asyncio.TimeoutError("memory retrieval budget exhausted")
+        try:
+            task = asyncio.create_task(awaitable)
+            done, _ = await asyncio.wait({task}, timeout=timeout_sec)
+            if task not in done:
+                task.cancel()
+                task.add_done_callback(cls._consume_background_task)
+                raise asyncio.TimeoutError(
+                    f"memory retrieval branch timed out after {timeout_sec:.3f}s"
+                )
+            return task.result()
+        finally:
+            if timing is not None:
+                timing["elapsed_ms"] = round(
+                    max(0.0, time.monotonic() - started) * 1000.0,
+                    1,
+                )
+
     def _begin_deep_memory_budget(self, query: MemoryQuery) -> float:
         timing = self._timing_config()
-        configured = max(1.0, float(getattr(timing, "deep_memory_total_budget_sec", 60.0) or 60.0))
+        configured = max(0.01, float(getattr(timing, "deep_memory_total_budget_sec", 60.0) or 60.0))
         effective = clamp_timeout_to_turn_budget(None, configured, reserve_for_reply=True)
         metadata = dict(query.metadata or {})
         metadata["_deep_memory_deadline_mono"] = time.monotonic() + max(0.0, effective)
@@ -483,53 +534,69 @@ class MemoryRetrievalService:
 
     async def retrieve_deep(self, query: MemoryQuery) -> list[MemoryCandidate]:
         queries = [query.query]
+        candidates: list[MemoryCandidate] = []
+        actor_safe_candidates: list[MemoryCandidate] = []
         deep_started = time.perf_counter()
         deep_budget = self._begin_deep_memory_budget(query)
         if deep_budget <= 0.0:
-            candidates = await self._retrieve_queries(
-                query,
-                [query.query],
-                top_k=query.top_k,
-                candidate_pool_limit=self._candidate_limit(query),
-            )
-            candidates = await self._prepare_actor_scoped_candidates(query, candidates)
-            return await self._finalize_retrieval(query, candidates)
+            trace = dict((query.metadata or {}).get("deep_memory_budget_trace") or {})
+            trace["status"] = "budget_exhausted"
+            trace["elapsed_ms"] = round((time.perf_counter() - deep_started) * 1000, 2)
+            query.metadata["deep_memory_budget_trace"] = trace
+            return []
         try:
-            if self._query_rewrite_eligible(query):
-                queries = await self._rewrite_queries(query)
-            else:
-                self._record_query_rewrite_trace(
-                    query,
-                    status="skipped_not_eligible",
-                    elapsed_ms=0.0,
-                    rewrite_count=0,
-                    skip_reason="query_policy",
+            async with asyncio.timeout(deep_budget):
+                if self._query_rewrite_eligible(query):
+                    queries = await self._rewrite_queries(query)
+                else:
+                    self._record_query_rewrite_trace(
+                        query,
+                        status="skipped_not_eligible",
+                        elapsed_ms=0.0,
+                        rewrite_count=0,
+                        skip_reason="query_policy",
+                    )
+                candidate_pool_limit = self._explicit_candidate_limit(query) or max(
+                    int(query.top_k or 5) * max(int(self.scoring.deep_temporal_candidate_pool_factor or 4), 1),
+                    max(int(self.scoring.deep_temporal_candidate_pool_min or 20), 1),
                 )
-            candidate_pool_limit = self._explicit_candidate_limit(query) or max(
-                int(query.top_k or 5) * max(int(self.scoring.deep_temporal_candidate_pool_factor or 4), 1),
-                max(int(self.scoring.deep_temporal_candidate_pool_min or 20), 1),
-            )
-            candidates = await self._retrieve_queries(query, queries, top_k=candidate_pool_limit)
-            candidates = await self._prepare_actor_scoped_candidates(query, candidates)
-            try:
-                candidates = rerank_candidates(candidates, config=self.scoring)
-            except Exception as exc:
-                logger.warning(f"[MemoryRetrievalService] temporal rerank degraded: {exc}")
-            llm_window = max(int(self.scoring.deep_temporal_llm_window or 8), 1)
-            temporal_top = candidates[:llm_window]
-            temporal_tail = candidates[llm_window:]
-            reranked = await self._rerank_candidates(query, temporal_top)
-            candidates = list(reranked) + list(temporal_tail)
-            guidance = await self._compress_guidance(query, candidates[: max(int(query.top_k or 5), 1)])
-            if guidance:
-                for item in candidates:
-                    item.metadata.setdefault("deep_guidance", guidance)
-            result = await self._finalize_retrieval(query, candidates)
+                candidates = await self._retrieve_queries(
+                    query,
+                    queries,
+                    top_k=candidate_pool_limit,
+                    accumulator=candidates,
+                )
+                candidates = await self._prepare_actor_scoped_candidates(query, candidates)
+                actor_safe_candidates = list(candidates)
+                try:
+                    candidates = rerank_candidates(candidates, config=self.scoring)
+                except Exception as exc:
+                    logger.warning(f"[MemoryRetrievalService] temporal rerank degraded: {exc}")
+                llm_window = max(int(self.scoring.deep_temporal_llm_window or 8), 1)
+                temporal_top = candidates[:llm_window]
+                temporal_tail = candidates[llm_window:]
+                reranked = await self._rerank_candidates(query, temporal_top)
+                candidates = list(reranked) + list(temporal_tail)
+                guidance = await self._compress_guidance(query, candidates[: max(int(query.top_k or 5), 1)])
+                if guidance:
+                    for item in candidates:
+                        item.metadata.setdefault("deep_guidance", guidance)
+                result = await self._finalize_retrieval(query, candidates)
             trace = dict((query.metadata or {}).get("deep_memory_budget_trace") or {})
             trace["status"] = "completed"
             trace["elapsed_ms"] = round((time.perf_counter() - deep_started) * 1000, 2)
             query.metadata["deep_memory_budget_trace"] = trace
             return result
+        except asyncio.TimeoutError:
+            trace = dict((query.metadata or {}).get("deep_memory_budget_trace") or {})
+            trace["status"] = "timeout"
+            trace["elapsed_ms"] = round((time.perf_counter() - deep_started) * 1000, 2)
+            query.metadata["deep_memory_budget_trace"] = trace
+            return (
+                self._finalize_candidates(query, actor_safe_candidates)
+                if actor_safe_candidates
+                else []
+            )
         except Exception as exc:
             logger.warning(f"[MemoryRetrievalService] deep retrieval degraded: {exc}")
             trace = dict((query.metadata or {}).get("deep_memory_budget_trace") or {})
@@ -599,9 +666,10 @@ class MemoryRetrievalService:
         *,
         top_k: int | None = None,
         candidate_pool_limit: int | None = None,
+        accumulator: list[MemoryCandidate] | None = None,
     ) -> list[MemoryCandidate]:
-        candidates: list[MemoryCandidate] = []
-        seen: set[str] = set()
+        candidates = accumulator if accumulator is not None else []
+        seen: set[str] = {str(item.id) for item in candidates}
         self._trace_bucket(query)
         limit = max(int(top_k or query.top_k or 5), 1)
         collection_limit = max(int(candidate_pool_limit or limit), limit)
@@ -685,28 +753,87 @@ class MemoryRetrievalService:
 
         limit = max(int(query.top_k or 5), 1)
         resolved_session_id = self._resolved_session_id(query)
-        canonical_task = self.store.search(
-            query.query,
-            session_id=resolved_session_id,
-            persona_id=query.persona_id,
-            layers=query.layers,
-            top_k=limit,
-            candidate_limit=self._explicit_candidate_limit(query),
-            exclude_ids=query.exclude_ids,
-            allow_stale=query.allow_stale,
-            visibility_mode=visibility_mode,
-            track_access=False,
+        retrieval_timeout = self._retrieval_timeout_sec(query)
+        branch_trace = trace.setdefault("retrieval_branches", {})
+        if retrieval_timeout <= 0.0:
+            branch_trace.update(
+                {
+                    "canonical_fts": {"status": "budget_exhausted", "timeout_sec": 0.0},
+                    "hybrid": {"status": "budget_exhausted", "timeout_sec": 0.0},
+                }
+            )
+            self._mark_degraded(query, "retrieval_budget")
+            return []
+        canonical_timeout = min(
+            retrieval_timeout,
+            self._timing_value("memory_fts_timeout_sec", 8.0),
         )
-        hybrid_task = self._hybrid_search(query, visibility_mode)
+        canonical_timing: dict[str, float] = {}
+        hybrid_timing: dict[str, float] = {}
+        canonical_task = self._run_retrieval_branch(
+            self.store.search(
+                query.query,
+                session_id=resolved_session_id,
+                persona_id=query.persona_id,
+                layers=query.layers,
+                top_k=limit,
+                candidate_limit=self._explicit_candidate_limit(query),
+                exclude_ids=query.exclude_ids,
+                allow_stale=query.allow_stale,
+                visibility_mode=visibility_mode,
+                track_access=False,
+            ),
+            timeout_sec=canonical_timeout,
+            timing=canonical_timing,
+        )
+        hybrid_task = self._run_retrieval_branch(
+            self._hybrid_search(query, visibility_mode),
+            timeout_sec=retrieval_timeout,
+            timing=hybrid_timing,
+        )
         canonical_results, hybrid_results = await asyncio.gather(canonical_task, hybrid_task, return_exceptions=True)
         if isinstance(canonical_results, Exception):
             logger.warning(f"[MemoryRetrievalService] canonical search degraded: {canonical_results}")
             self._mark_degraded(query, "canonical")
+            branch_trace["canonical_fts"] = {
+                "status": (
+                    "timeout"
+                    if isinstance(canonical_results, (asyncio.TimeoutError, TimeoutError))
+                    else "error"
+                ),
+                "timeout_sec": round(canonical_timeout, 3),
+                "elapsed_ms": float(canonical_timing.get("elapsed_ms", 0.0)),
+                "error_type": type(canonical_results).__name__,
+            }
             canonical_results = []
+        else:
+            branch_trace["canonical_fts"] = {
+                "status": "success",
+                "timeout_sec": round(canonical_timeout, 3),
+                "elapsed_ms": float(canonical_timing.get("elapsed_ms", 0.0)),
+                "result_count": len(canonical_results or []),
+            }
         if isinstance(hybrid_results, Exception):
             logger.warning(f"[MemoryRetrievalService] hybrid search degraded: {hybrid_results}")
             self._mark_degraded(query, "hybrid")
+            branch_trace["hybrid"] = {
+                "status": (
+                    "timeout"
+                    if isinstance(hybrid_results, (asyncio.TimeoutError, TimeoutError))
+                    else "error"
+                ),
+                "timeout_sec": round(retrieval_timeout, 3),
+                "elapsed_ms": float(hybrid_timing.get("elapsed_ms", 0.0)),
+                "error_type": type(hybrid_results).__name__,
+            }
             hybrid_results = []
+        else:
+            branch_trace["hybrid"] = {
+                "status": "success",
+                "timeout_sec": round(retrieval_timeout, 3),
+                "elapsed_ms": float(hybrid_timing.get("elapsed_ms", 0.0)),
+                "result_count": len(hybrid_results or []),
+            }
         hybrid_observations = trace.get("hybrid_observations", [])
         latest_hybrid_observation = hybrid_observations[-1] if hybrid_observations else {}
         vector_status = str(

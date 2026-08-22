@@ -1,11 +1,14 @@
 import aiosqlite
 import asyncio
 import hashlib
+import inspect
 import json
 import os
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, List
 
 from astrbot.api import logger
@@ -95,6 +98,15 @@ class MemoryEngine:
 
         self._faiss_lock = asyncio.Lock()
         self._is_ready = False
+        self._vector_state = "uninitialized"
+        self._vector_bootstrap_task: asyncio.Task | None = None
+        self._vector_retirement_tasks: set[asyncio.Task] = set()
+        self._vector_last_error = ""
+        self._vector_bootstrap_started_at = 0.0
+        self._vector_bootstrap_completed_at = 0.0
+        self._vector_consistency_report: dict[str, Any] = {}
+        self._vector_generation = 0
+        self._vector_index_path = ""
         self._init_failures = 0
         self._next_retry_time = 0.0
         self._index_consistency_repaired = False
@@ -143,13 +155,21 @@ class MemoryEngine:
                 refresh(config)
         self.embedding_models = self._configured_embedding_models(config)
         if self.embedding_models != old_embedding_models:
+            self._vector_generation += 1
+            bootstrap_task = self._vector_bootstrap_task
+            if bootstrap_task is not None and not bootstrap_task.done():
+                bootstrap_task.cancel()
             previous_retriever = self.vec_retriever
-            if previous_retriever is not None and hasattr(previous_retriever, "close"):
-                previous_retriever.close()
+            previous_faiss_db = self.faiss_db
+            self._schedule_vector_stack_retirement(previous_retriever, previous_faiss_db)
             self.faiss_db = None
             self.vec_retriever = None
             self.retriever = None
             self._is_ready = False
+            self._vector_state = "uninitialized"
+            self._vector_last_error = ""
+            self._vector_consistency_report = {}
+            self._vector_index_path = ""
             self._init_failures = 0
             self._next_retry_time = 0.0
             self._index_consistency_repaired = False
@@ -162,6 +182,73 @@ class MemoryEngine:
                 index_path.unlink()
         except Exception as exc:
             logger.warning(f"[AstrMai] vector index reset degraded: {exc}")
+
+    @property
+    def _vector_manifest_path(self) -> Path:
+        return self.data_path / "vector_index_manifest.json"
+
+    def _load_published_vector_index(self, embedding_models: list[str]) -> Path | None:
+        try:
+            payload = json.loads(self._vector_manifest_path.read_text(encoding="utf-8"))
+            if list(payload.get("embedding_models") or []) != list(embedding_models):
+                return None
+            file_name = str(payload.get("file_name") or "").strip()
+            if not file_name or Path(file_name).name != file_name:
+                return None
+            index_path = self.data_path / file_name
+            return index_path if index_path.is_file() else None
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return None
+
+    def _new_vector_index_path(self, generation: int) -> Path:
+        return self.data_path / f"vectors.g{generation}.{uuid.uuid4().hex}.index"
+
+    def _publish_vector_index_manifest(
+        self,
+        index_path: Path,
+        embedding_models: list[str],
+    ) -> None:
+        payload = {
+            "file_name": index_path.name,
+            "embedding_models": list(embedding_models),
+            "published_at": time.time(),
+        }
+        manifest_path = self._vector_manifest_path
+        temporary_path = manifest_path.with_name(
+            f"{manifest_path.name}.{uuid.uuid4().hex}.tmp"
+        )
+        temporary_path.write_text(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        os.replace(temporary_path, manifest_path)
+
+    def _cleanup_stale_vector_indexes(
+        self,
+        current_index_path: Path,
+        *,
+        keep_history: int = 1,
+    ) -> int:
+        current_path = Path(current_index_path).resolve()
+        historical: list[tuple[int, Path]] = []
+        for candidate in self.data_path.glob("vectors.g*.index"):
+            try:
+                if candidate.is_file() and candidate.resolve() != current_path:
+                    historical.append((candidate.stat().st_mtime_ns, candidate))
+            except OSError:
+                continue
+        historical.sort(key=lambda item: item[0], reverse=True)
+        removed = 0
+        for _, stale_path in historical[max(0, int(keep_history or 0)):]:
+            try:
+                stale_path.unlink()
+                removed += 1
+            except OSError as exc:
+                logger.warning(
+                    f"[AstrMai] stale vector generation cleanup degraded "
+                    f"path={stale_path.name}: {exc}"
+                )
+        return removed
 
     def _remember_learning_event(self, event_name: str, payload: dict | None) -> None:
         event_payload = dict(payload or {})
@@ -224,7 +311,7 @@ class MemoryEngine:
                 observation.clear()
                 observation.update(
                     {
-                        "vector": {"status": "initialization_failed"},
+                        "vector": {"status": str(self._vector_state or "uninitialized")},
                         "fallback_source": "none",
                         "fused_result_count": 0,
                     }
@@ -419,18 +506,142 @@ class MemoryEngine:
             await self.v2_store.record_migration(version, status="failed", detail=str(exc)[:500])
             logger.warning(f"[MemoryV2] learning scope migration degraded: {exc}")
 
-    async def _ensure_faiss_initialized(self):
-        if self._is_ready:
-            return True
+    def _timing_value(self, name: str, default: float) -> float:
+        timing = getattr(self.config, "timing", None)
+        try:
+            return float(getattr(timing, name, default) or default)
+        except (TypeError, ValueError):
+            return float(default)
 
-        now = time.time()
-        if now < self._next_retry_time:
-            return False
+    def _schedule_vector_bootstrap(self) -> None:
+        task = self._vector_bootstrap_task
+        if task is not None and not task.done():
+            return
+        if time.time() < self._next_retry_time:
+            return
+        try:
+            task = asyncio.create_task(
+                self._run_vector_bootstrap_budgeted(),
+                name="astrmai-vector-bootstrap",
+            )
+        except RuntimeError:
+            return
+        self._vector_bootstrap_task = task
 
+        def _consume(completed: asyncio.Task) -> None:
+            if self._vector_bootstrap_task is completed:
+                self._vector_bootstrap_task = None
+            if not completed.cancelled():
+                completed.exception()
+
+        task.add_done_callback(_consume)
+
+    async def _run_vector_bootstrap_budgeted(self) -> None:
+        budget = getattr(self, "background_task_budget", None)
+        timeout_sec = max(1.0, self._timing_value("faiss_bootstrap_timeout_sec", 1800.0))
+        try:
+            if budget is not None:
+                await budget.run(
+                    self._bootstrap_vector_index,
+                    task_name="memory.vector_bootstrap",
+                    execution_timeout_sec=timeout_sec,
+                )
+            else:
+                async with asyncio.timeout(timeout_sec):
+                    await self._bootstrap_vector_index()
+        except asyncio.CancelledError:
+            if self._vector_state != "ready":
+                self._vector_state = "uninitialized"
+            raise
+        except Exception as exc:
+            self._mark_vector_bootstrap_failed(exc, include_trace=True)
+
+    def _mark_vector_bootstrap_failed(
+        self,
+        exc: Exception,
+        *,
+        include_trace: bool = False,
+    ) -> None:
+        self._init_failures += 1
+        backoff = min(3600, 30 * (2 ** (self._init_failures - 1)))
+        self._next_retry_time = time.time() + backoff
+        self._is_ready = False
+        self._vector_state = "degraded"
+        self._vector_last_error = f"{type(exc).__name__}: {exc}"[:500]
+        self._vector_bootstrap_completed_at = time.time()
+        logger.error(
+            f"[AstrMai] vector bootstrap failed: {exc}; retry in {backoff}s.",
+            exc_info=include_trace,
+        )
+
+    @staticmethod
+    async def _close_vector_stack(retriever, faiss_db) -> None:
+        if retriever is not None:
+            try:
+                close_retriever = getattr(retriever, "close", None)
+                if callable(close_retriever):
+                    result = close_retriever()
+                    if inspect.isawaitable(result):
+                        await result
+            except Exception as exc:
+                logger.warning(f"[AstrMai] vector retriever close degraded: {exc}")
+        if faiss_db is not None:
+            try:
+                close_database = getattr(faiss_db, "close", None)
+                if callable(close_database):
+                    result = close_database()
+                    if inspect.isawaitable(result):
+                        await result
+            except Exception as exc:
+                logger.warning(f"[AstrMai] vector database close degraded: {exc}")
+
+    def _schedule_vector_stack_retirement(self, retriever, faiss_db) -> None:
+        if retriever is None and faiss_db is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(self._close_vector_stack(retriever, faiss_db))
+            return
+        task = loop.create_task(
+            self._close_vector_stack(retriever, faiss_db),
+            name="astrmai-vector-stack-retirement",
+        )
+        self._vector_retirement_tasks.add(task)
+
+        def _consume(completed: asyncio.Task) -> None:
+            self._vector_retirement_tasks.discard(completed)
+            if not completed.cancelled():
+                completed.exception()
+
+        task.add_done_callback(_consume)
+
+    async def _bootstrap_vector_index(self) -> None:
+        lifecycle = SimpleNamespace(
+            retriever=None,
+            faiss_db=None,
+            index_path=None,
+            discard_index=False,
+            published=False,
+        )
+        try:
+            await self._build_and_publish_vector_index(lifecycle)
+        finally:
+            if not lifecycle.published:
+                await self._close_vector_stack(lifecycle.retriever, lifecycle.faiss_db)
+                if lifecycle.discard_index and lifecycle.index_path is not None:
+                    try:
+                        lifecycle.index_path.unlink(missing_ok=True)
+                    except OSError as exc:
+                        logger.warning(f"[AstrMai] stale vector candidate cleanup degraded: {exc}")
+
+    async def _build_and_publish_vector_index(self, lifecycle) -> None:
+        generation = self._vector_generation
+        self._vector_state = "initializing"
+        self._vector_last_error = ""
+        self._vector_bootstrap_started_at = time.time()
         if not HAS_FAISS:
-            logger.error("[AstrMai] memory wakeup failed: faiss is unavailable in current environment.")
-            self._next_retry_time = now + 86400
-            return False
+            raise RuntimeError("faiss is unavailable in current environment")
 
         provider_instance = None
         clean_models = [m.strip() for m in self.embedding_models if m and m.strip()]
@@ -442,67 +653,201 @@ class MemoryEngine:
                 provider_instance = self.context.get_provider(model_id)
             if provider_instance:
                 break
-
         if not provider_instance:
-            self._init_failures += 1
-            backoff = min(3600, 30 * (2 ** (self._init_failures - 1)))
-            self._next_retry_time = now + backoff
             models_str = ", ".join(unique_models) if unique_models else "unconfigured"
-            logger.error(f"[AstrMai] memory wakeup failed: no valid embedding model found [{models_str}]; retry in {backoff}s.")
-            return False
+            raise RuntimeError(f"no valid embedding model found [{models_str}]")
 
         async with self._faiss_lock:
-            if self._is_ready:
+            if generation != self._vector_generation:
+                return
+            if self._is_ready and self._vector_state == "ready":
+                return
+            migration_applied = await self.v2_store.migration_applied("2_index_rebuild")
+            published_index_path = (
+                None
+                if self._force_index_rebuild
+                else self._load_published_vector_index(unique_models)
+            )
+            rebuild_required = self._force_index_rebuild or not migration_applied or published_index_path is None
+            candidate_index_path = (
+                self._new_vector_index_path(generation)
+                if rebuild_required
+                else published_index_path
+            )
+            lifecycle.index_path = candidate_index_path
+            lifecycle.discard_index = rebuild_required
+            candidate_db = await asyncio.to_thread(
+                FaissVecDB,
+                doc_store_path=str(self.data_path / "docs.db"),
+                index_store_path=str(candidate_index_path),
+                embedding_provider=provider_instance,
+            )
+            lifecycle.faiss_db = candidate_db
+            await candidate_db.initialize()
+            candidate_retriever = VectorRetriever(candidate_db, self.config)
+            lifecycle.retriever = candidate_retriever
+            candidate_hybrid = HybridRetriever(
+                self.bm25_retriever,
+                candidate_retriever,
+                config=self.config,
+            )
+
+            async def _candidate_ready() -> bool:
                 return True
 
-            try:
-                if self._force_index_rebuild:
-                    self._reset_vector_index_file()
-                self.faiss_db = FaissVecDB(
-                    doc_store_path=str(self.data_path / "docs.db"),
-                    index_store_path=str(self.data_path / "vectors.index"),
-                    embedding_provider=provider_instance,
+            candidate_engine = SimpleNamespace(
+                config=self.config,
+                v2_store=self.v2_store,
+                db_path=self.db_path,
+                faiss_db=candidate_db,
+                vec_retriever=candidate_retriever,
+                retriever=candidate_hybrid,
+                background_task_budget=getattr(self, "background_task_budget", None),
+                _ensure_faiss_initialized=_candidate_ready,
+                _run_documents_query=self._run_documents_query,
+                _execute_documents_write=self._execute_documents_write,
+                _build_memory_metadata=self._build_memory_metadata,
+            )
+            candidate_projector = MemoryIndexProjector(candidate_engine)
+            candidate_retriever._projection_count_provider = candidate_projector.projection_count
+            self._vector_state = "rebuilding"
+            if rebuild_required:
+                rebuilt = await candidate_projector.rebuild_all()
+                await self.v2_store.record_migration(
+                    "2_index_rebuild",
+                    status="applied",
+                    detail=f"rebuilt={rebuilt}",
                 )
-                await self.faiss_db.initialize()
-            except Exception as exc:
-                self._init_failures += 1
-                backoff = min(3600, 30 * (2 ** (self._init_failures - 1)))
-                self._next_retry_time = now + backoff
-                logger.error(f"[AstrMai] FaissVecDB initialization failed: {exc}; retry in {backoff}s.", exc_info=True)
-                return False
-
-            self.vec_retriever = VectorRetriever(self.faiss_db, self.config)
-            self.retriever = HybridRetriever(self.bm25_retriever, self.vec_retriever, config=self.config)
-            self._is_ready = True
-            self._init_failures = 0
-            if self._force_index_rebuild or not await self.v2_store.migration_applied("2_index_rebuild"):
-                try:
-                    rebuilt = await self.index_projector.rebuild_all()
-                    self._force_index_rebuild = False
-                    await self.v2_store.record_migration("2_index_rebuild", status="applied", detail=f"rebuilt={rebuilt}")
-                except Exception as exc:
-                    await self.v2_store.record_migration("2_index_rebuild", status="failed", detail=str(exc)[:500])
-                    logger.warning(f"[MemoryV2] index rebuild degraded: {exc}")
-            if not self._index_consistency_repaired:
-                try:
-                    report = await self.index_projector.check_consistency()
-                    needs_repair = any(
-                        report.get(key)
-                        for key in (
-                            "missing_projection_ids",
-                            "orphan_projection_ids",
-                            "inactive_projection_ids",
-                            "duplicate_projection_ids",
-                        )
+            report = await candidate_projector.check_consistency()
+            if report.get("error"):
+                raise RuntimeError(f"vector consistency scan failed: {report['error']}")
+            needs_repair = any(
+                report.get(key)
+                for key in (
+                    "missing_projection_ids",
+                    "orphan_projection_ids",
+                    "inactive_projection_ids",
+                    "duplicate_projection_ids",
+                )
+            )
+            index_count_mismatch = bool(
+                report.get("faiss_index_count_observed")
+                and int(report.get("faiss_index_count_delta_vs_projection") or 0) != 0
+            )
+            if index_count_mismatch and not rebuild_required:
+                rebuilt = await candidate_projector.rebuild_all()
+                await self.v2_store.record_migration(
+                    "2_index_rebuild",
+                    status="applied",
+                    detail=f"rebuilt={rebuilt},reason=index_count_mismatch",
+                )
+                report = await candidate_projector.check_consistency()
+                if report.get("error"):
+                    raise RuntimeError(f"vector consistency scan failed: {report['error']}")
+                needs_repair = any(
+                    report.get(key)
+                    for key in (
+                        "missing_projection_ids",
+                        "orphan_projection_ids",
+                        "inactive_projection_ids",
+                        "duplicate_projection_ids",
                     )
-                    if needs_repair:
-                        repaired = await self.index_projector.repair_consistency(report)
-                        logger.info(f"[MemoryV2] index consistency repaired: {repaired}")
-                    self._index_consistency_repaired = True
-                except Exception as exc:
-                    logger.warning(f"[MemoryV2] index consistency repair degraded: {exc}")
+                )
+            if needs_repair:
+                report["repair"] = await candidate_projector.repair_consistency(report)
+                report = await candidate_projector.check_consistency()
+                if report.get("error"):
+                    raise RuntimeError(f"vector consistency scan failed: {report['error']}")
+            unresolved = {
+                key: list(report.get(key) or [])
+                for key in (
+                    "missing_projection_ids",
+                    "orphan_projection_ids",
+                    "inactive_projection_ids",
+                    "duplicate_projection_ids",
+                )
+                if report.get(key)
+            }
+            if unresolved:
+                raise RuntimeError(f"vector index consistency repair incomplete: {unresolved}")
+            if (
+                report.get("faiss_index_count_observed")
+                and int(report.get("faiss_index_count_delta_vs_projection") or 0) != 0
+            ):
+                raise RuntimeError(
+                    "vector index count does not match canonical projections: "
+                    f"delta={report.get('faiss_index_count_delta_vs_projection')}"
+                )
+            await candidate_retriever.refresh_storage_metrics(force=True)
+            if generation != self._vector_generation:
+                return
+
+            previous_retriever = self.vec_retriever
+            previous_faiss_db = self.faiss_db
+            if rebuild_required:
+                self._publish_vector_index_manifest(candidate_index_path, unique_models)
+            self.faiss_db = candidate_db
+            self.vec_retriever = candidate_retriever
+            self.retriever = candidate_hybrid
+            self._vector_index_path = str(candidate_index_path)
+            self._vector_consistency_report = dict(report or {})
+            self._force_index_rebuild = False
+            self._index_consistency_repaired = True
+            self._init_failures = 0
+            self._next_retry_time = 0.0
+            self._is_ready = True
+            self._vector_state = "ready"
+            self._vector_bootstrap_completed_at = time.time()
+            lifecycle.published = True
+            lifecycle.discard_index = False
+            if previous_retriever is not candidate_retriever or previous_faiss_db is not candidate_db:
+                await self._close_vector_stack(previous_retriever, previous_faiss_db)
+            self._cleanup_stale_vector_indexes(candidate_index_path, keep_history=1)
             logger.info("[AstrMai] hybrid memory engine ready (BM25 + FaissVecDB).")
+
+    async def _ensure_faiss_initialized(self):
+        if self._is_ready:
+            self._vector_state = "ready"
             return True
+        if not HAS_FAISS:
+            if time.time() >= self._next_retry_time:
+                self._mark_vector_bootstrap_failed(
+                    RuntimeError("faiss is unavailable in current environment")
+                )
+            return False
+        if not [str(item).strip() for item in self.embedding_models or [] if str(item).strip()]:
+            if time.time() >= self._next_retry_time:
+                self._mark_vector_bootstrap_failed(
+                    RuntimeError("no embedding model configured")
+                )
+            return False
+        self._schedule_vector_bootstrap()
+        return False
+
+    def describe_vector_status(self) -> dict[str, Any]:
+        retriever = self.vec_retriever
+        runtime = (
+            retriever.describe_status()
+            if retriever is not None and hasattr(retriever, "describe_status")
+            else {"available": False}
+        )
+        runtime.update(
+            {
+                "state": self._vector_state,
+                "available": bool(self._is_ready and self._vector_state == "ready"),
+                "bootstrap_running": bool(
+                    self._vector_bootstrap_task is not None
+                    and not self._vector_bootstrap_task.done()
+                ),
+                "bootstrap_started_at": self._vector_bootstrap_started_at or None,
+                "bootstrap_completed_at": self._vector_bootstrap_completed_at or None,
+                "last_error": self._vector_last_error,
+                "next_retry_at": self._next_retry_time or None,
+                "consistency": dict(self._vector_consistency_report),
+                "index_path": self._vector_index_path,
+            }
+        )
+        return runtime
 
     async def add_memory(
         self,
@@ -1073,8 +1418,20 @@ class MemoryEngine:
             background_task_budget=getattr(self, "background_task_budget", None),
         )
         await self.memory_pipeline.start()
+        self._schedule_vector_bootstrap()
 
     async def stop_background_tasks(self):
+        bootstrap_task = self._vector_bootstrap_task
+        self._vector_bootstrap_task = None
+        if bootstrap_task is not None and not bootstrap_task.done():
+            bootstrap_task.cancel()
+            try:
+                await bootstrap_task
+            except asyncio.CancelledError:
+                pass
+        retirement_tasks = list(self._vector_retirement_tasks)
+        if retirement_tasks:
+            await asyncio.gather(*retirement_tasks, return_exceptions=True)
         pipeline = getattr(self, "memory_pipeline", None)
         if pipeline is not None:
             await pipeline.stop()
@@ -1082,8 +1439,13 @@ class MemoryEngine:
         if projector is not None:
             await projector.stop()
         retriever = getattr(self, "vec_retriever", None)
-        if retriever is not None and hasattr(retriever, "close"):
-            retriever.close()
+        faiss_db = getattr(self, "faiss_db", None)
+        await self._close_vector_stack(retriever, faiss_db)
+        self.faiss_db = None
+        self.vec_retriever = None
+        self.retriever = None
+        self._is_ready = False
+        self._vector_state = "uninitialized"
 
     async def run_memory_maintenance(self, chat_id: str) -> dict:
         pipeline = getattr(self, "memory_pipeline", None)

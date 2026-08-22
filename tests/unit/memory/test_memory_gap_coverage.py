@@ -5,9 +5,11 @@ import importlib
 import json
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from tests.helpers.astrbot_stubs import install_astrbot_stubs
 
@@ -79,6 +81,151 @@ class MemoryGapCoverageTests(unittest.TestCase):
 
         self.assertEqual([item.id for item in result], ["fallback-1"])
         self.assertEqual([call[0] for call in store.search_calls], ["Alice project"])
+
+    def test_retrieval_deadline_keeps_hybrid_when_canonical_fts_blocks(self):
+        class _Store:
+            async def search(self, *args, **kwargs):
+                await asyncio.Event().wait()
+
+        class _Engine:
+            config = SimpleNamespace(
+                timing=SimpleNamespace(
+                    memory_retrieval_timeout_sec=0.05,
+                    memory_fts_timeout_sec=0.01,
+                )
+            )
+
+            async def search_memories(self, *args, **kwargs):
+                return [
+                    self_result
+                ]
+
+        self_result = self.utils_mod.SearchResult(
+            doc_id=1,
+            score=0.9,
+            content="hybrid survived",
+            metadata={"status": "active", "visibility": "auto_and_tool"},
+            source="vector",
+        )
+        service = self.retrieval_mod.MemoryRetrievalService(_Store(), engine=_Engine())
+        query = self.contracts.MemoryQuery(query="Alice", session_id="chat-1", top_k=2)
+
+        started = time.monotonic()
+        results = asyncio.run(service._retrieve_once(query))
+
+        self.assertLess(time.monotonic() - started, 0.2)
+        self.assertEqual([item.content for item in results], ["hybrid survived"])
+        branches = query.metadata["_trace"]["retrieval_branches"]
+        self.assertEqual(branches["canonical_fts"]["status"], "timeout")
+        self.assertEqual(branches["hybrid"]["status"], "success")
+
+    def test_deep_memory_total_budget_is_a_hard_deadline(self):
+        class _Store:
+            async def search(self, *args, **kwargs):
+                await asyncio.Event().wait()
+
+        engine = SimpleNamespace(
+            gateway=SimpleNamespace(),
+            config=SimpleNamespace(
+                timing=SimpleNamespace(
+                    deep_memory_total_budget_sec=0.02,
+                    memory_retrieval_timeout_sec=1.0,
+                    memory_fts_timeout_sec=1.0,
+                )
+            ),
+        )
+        service = self.retrieval_mod.MemoryRetrievalService(_Store(), engine=engine)
+        query = self.contracts.MemoryQuery(
+            query="Alice",
+            session_id="chat-1",
+            policy="deep",
+            top_k=2,
+        )
+
+        started = time.monotonic()
+        results = asyncio.run(service.retrieve_deep(query))
+
+        self.assertLess(time.monotonic() - started, 0.2)
+        self.assertEqual(results, [])
+        self.assertEqual(
+            query.metadata["deep_memory_budget_trace"]["status"],
+            "timeout",
+        )
+
+    def test_deep_memory_timeout_never_returns_unfiltered_actor_candidates(self):
+        service = self.retrieval_mod.MemoryRetrievalService(
+            SimpleNamespace(),
+            engine=SimpleNamespace(
+                gateway=SimpleNamespace(),
+                config=SimpleNamespace(
+                    timing=SimpleNamespace(deep_memory_total_budget_sec=0.03)
+                ),
+            ),
+        )
+        foreign = _candidate(
+            self.contracts,
+            "foreign-memory",
+            kind="identity",
+            metadata={"sender_id": "other"},
+        )
+
+        async def _rewrite(_query):
+            return ["first", "second"]
+
+        async def _retrieve_once(scoped_query):
+            if scoped_query.query == "first":
+                return [foreign]
+            await asyncio.Event().wait()
+
+        service._rewrite_queries = _rewrite
+        service._retrieve_once = _retrieve_once
+        query = self.contracts.MemoryQuery(
+            query="remember",
+            session_id="group-1",
+            sender_id="current",
+            policy="deep",
+            top_k=5,
+            metadata={
+                "actor_memory_scope": {
+                    "is_group": True,
+                    "group_id": "group-1",
+                    "current_actor_id": "current",
+                    "allowed_actor_ids": ["current"],
+                }
+            },
+        )
+
+        result = asyncio.run(service.retrieve_deep(query))
+
+        self.assertEqual(result, [])
+        self.assertEqual(query.metadata["deep_memory_budget_trace"]["status"], "timeout")
+
+    def test_retrieval_branch_trace_uses_each_branch_actual_elapsed_time(self):
+        class _Store:
+            async def search(self, *args, **kwargs):
+                await asyncio.sleep(0.01)
+                return []
+
+        class _Engine:
+            config = SimpleNamespace(
+                timing=SimpleNamespace(
+                    memory_retrieval_timeout_sec=0.2,
+                    memory_fts_timeout_sec=0.2,
+                )
+            )
+
+            async def search_memories(self, *args, **kwargs):
+                await asyncio.sleep(0.09)
+                return []
+
+        service = self.retrieval_mod.MemoryRetrievalService(_Store(), engine=_Engine())
+        query = self.contracts.MemoryQuery(query="timing", session_id="chat-1")
+
+        asyncio.run(service._retrieve_once(query))
+
+        branches = query.metadata["_trace"]["retrieval_branches"]
+        self.assertLess(branches["canonical_fts"]["elapsed_ms"], 50.0)
+        self.assertGreater(branches["hybrid"]["elapsed_ms"], 70.0)
 
     def test_session_summarizer_skips_low_importance_without_writing_memory(self):
         observed = []
@@ -324,6 +471,226 @@ class MemoryGapCoverageTests(unittest.TestCase):
         result = asyncio.run(engine.search_memories("query", top_k=3, session_id="chat-1"))
 
         self.assertEqual(result, [])
+
+    def test_memory_engine_first_search_does_not_wait_for_background_rebuild(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        gateway = SimpleNamespace(
+            config=SimpleNamespace(
+                provider=SimpleNamespace(embedding_models=["embedding"]),
+                memory=SimpleNamespace(recall_top_k=5),
+                timing=SimpleNamespace(faiss_bootstrap_timeout_sec=60),
+            )
+        )
+        engine = memory_engine_mod.MemoryEngine(
+            SimpleNamespace(),
+            gateway,
+            embedding_models=["embedding"],
+            config=gateway.config,
+        )
+        rebuild_started = asyncio.Event()
+        release_rebuild = asyncio.Event()
+
+        async def _bootstrap():
+            engine._vector_state = "rebuilding"
+            rebuild_started.set()
+            await release_rebuild.wait()
+            engine._vector_state = "ready"
+            engine._is_ready = True
+
+        engine._bootstrap_vector_index = _bootstrap
+
+        async def _run():
+            self.assertFalse(await engine._ensure_faiss_initialized())
+            await rebuild_started.wait()
+            started = time.monotonic()
+            observation = {}
+            result = await engine.search_memories(
+                "query",
+                top_k=3,
+                session_id="chat-1",
+                observation=observation,
+            )
+            elapsed = time.monotonic() - started
+            self.assertEqual(engine.describe_vector_status()["state"], "rebuilding")
+            release_rebuild.set()
+            await engine._vector_bootstrap_task
+            return result, observation, elapsed
+
+        result, observation, elapsed = asyncio.run(_run())
+
+        self.assertEqual(result, [])
+        self.assertLess(elapsed, 0.1)
+        self.assertEqual(observation["vector"]["status"], "rebuilding")
+
+    def test_memory_engine_failed_candidate_bootstrap_closes_candidate_stack(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=["embedding"]),
+            memory=SimpleNamespace(recall_top_k=5),
+            timing=SimpleNamespace(faiss_bootstrap_timeout_sec=60),
+        )
+        provider = object()
+        engine = memory_engine_mod.MemoryEngine(
+            SimpleNamespace(get_provider_by_id=lambda _model_id: provider),
+            SimpleNamespace(config=config),
+            config=config,
+        )
+        engine.bm25_retriever = object()
+
+        class _Store:
+            async def migration_applied(self, _version):
+                return True
+
+            async def record_migration(self, *args, **kwargs):
+                return None
+
+        engine.v2_store = _Store()
+
+        class _Faiss:
+            def __init__(self, **kwargs):
+                self.closed = False
+
+            async def initialize(self):
+                return None
+
+            async def close(self):
+                self.closed = True
+
+        class _Vector:
+            instances = []
+
+            def __init__(self, faiss_db, config):
+                self.faiss_db = faiss_db
+                self.closed = False
+                self.__class__.instances.append(self)
+
+            def close(self):
+                self.closed = True
+
+            async def refresh_storage_metrics(self, *, force=False):
+                return None
+
+        class _Hybrid:
+            def __init__(self, *args, **kwargs):
+                pass
+
+        class _Projector:
+            def __init__(self, candidate_engine):
+                self.engine = candidate_engine
+
+            async def check_consistency(self):
+                return {"error": "consistency failed"}
+
+            async def rebuild_all(self):
+                return 0
+
+            async def projection_count(self):
+                return 0
+
+        with (
+            patch.object(memory_engine_mod, "FaissVecDB", _Faiss),
+            patch.object(memory_engine_mod, "VectorRetriever", _Vector),
+            patch.object(memory_engine_mod, "HybridRetriever", _Hybrid),
+            patch.object(memory_engine_mod, "MemoryIndexProjector", _Projector),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "vector consistency scan failed"):
+                asyncio.run(engine._bootstrap_vector_index())
+
+        self.assertTrue(_Vector.instances[0].closed)
+        self.assertTrue(_Vector.instances[0].faiss_db.closed)
+
+    def test_memory_engine_vector_generations_use_isolated_published_index_files(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=["embedding"]),
+            memory=SimpleNamespace(recall_top_k=5),
+        )
+        engine = memory_engine_mod.MemoryEngine(
+            SimpleNamespace(),
+            SimpleNamespace(config=config),
+            config=config,
+        )
+        engine.data_path = Path(self.temp_dir.name)
+        first = engine._new_vector_index_path(1)
+        second = engine._new_vector_index_path(2)
+        first.write_bytes(b"index")
+
+        engine._publish_vector_index_manifest(first, ["embedding"])
+
+        self.assertNotEqual(first, second)
+        self.assertEqual(engine._load_published_vector_index(["embedding"]), first)
+        self.assertIsNone(engine._load_published_vector_index(["other-embedding"]))
+
+    def test_memory_engine_hot_refresh_without_running_loop_closes_full_vector_stack(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        old_config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=["embedding"]),
+            memory=SimpleNamespace(recall_top_k=5),
+        )
+        new_config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=["embedding-next"]),
+            memory=SimpleNamespace(recall_top_k=5),
+        )
+        engine = memory_engine_mod.MemoryEngine(
+            SimpleNamespace(),
+            SimpleNamespace(config=old_config),
+            config=old_config,
+        )
+
+        class _Retriever:
+            closed = False
+
+            def close(self):
+                self.closed = True
+
+        class _Faiss:
+            closed = False
+
+            async def close(self):
+                await asyncio.sleep(0)
+                self.closed = True
+
+        retriever = _Retriever()
+        faiss_db = _Faiss()
+        engine.vec_retriever = retriever
+        engine.faiss_db = faiss_db
+        engine.retriever = object()
+        engine._is_ready = True
+
+        engine.refresh_config(new_config)
+
+        self.assertTrue(retriever.closed)
+        self.assertTrue(faiss_db.closed)
+        self.assertIsNone(engine.vec_retriever)
+        self.assertIsNone(engine.faiss_db)
+        self.assertFalse(engine._is_ready)
+
+    def test_memory_engine_vector_generation_cleanup_keeps_current_and_one_history(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=["embedding"]),
+            memory=SimpleNamespace(recall_top_k=5),
+        )
+        engine = memory_engine_mod.MemoryEngine(
+            SimpleNamespace(),
+            SimpleNamespace(config=config),
+            config=config,
+        )
+        engine.data_path = Path(self.temp_dir.name)
+        first = engine.data_path / "vectors.g1.first.index"
+        second = engine.data_path / "vectors.g2.second.index"
+        current = engine.data_path / "vectors.g3.current.index"
+        for position, path in enumerate((first, second, current), start=1):
+            path.write_bytes(b"index")
+            path.touch()
+            time.sleep(0.01 * position)
+
+        removed = engine._cleanup_stale_vector_indexes(current, keep_history=1)
+
+        self.assertEqual(removed, 1)
+        self.assertFalse(first.exists())
+        self.assertTrue(second.exists())
+        self.assertTrue(current.exists())
 
     def test_memory_engine_refresh_config_updates_embedding_models_and_invalidates_vector_state(self):
         memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")

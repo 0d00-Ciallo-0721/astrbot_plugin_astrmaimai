@@ -25,6 +25,20 @@ class HybridRetriever:
         if self.vector is not None and hasattr(self.vector, "refresh_config"):
             self.vector.refresh_config(config)
 
+    def _timing_value(self, name: str, default: float) -> float:
+        timing = getattr(self.config, "timing", None) if self.config is not None else None
+        value = getattr(timing, name, default) if timing is not None else default
+        try:
+            return max(0.01, float(value or default))
+        except (TypeError, ValueError):
+            return float(default)
+
+    async def _search_bm25_bounded(self, *args, **kwargs):
+        return await asyncio.wait_for(
+            self.bm25.search(*args, **kwargs),
+            timeout=self._timing_value("memory_bm25_timeout_sec", 8.0),
+        )
+
     async def add_memory(self, content: str, metadata: Dict[str, Any]) -> int:
         doc_id = None
         
@@ -57,7 +71,14 @@ class HybridRetriever:
         vector_observation: Dict[str, Any] = {}
         
         if self.bm25:
-            tasks.append(self.bm25.search(query, k=k*2, session_id=session_id, persona_id=persona_id))
+            tasks.append(
+                self._search_bm25_bounded(
+                    query,
+                    k=k * 2,
+                    session_id=session_id,
+                    persona_id=persona_id,
+                )
+            )
         else:
             async def dummy_bm25(): return []
             tasks.append(dummy_bm25())
@@ -83,7 +104,12 @@ class HybridRetriever:
         bm25_res = results[0] if not isinstance(results[0], Exception) else []
         vec_res = results[1] if not isinstance(results[1], Exception) else []
         
-        if isinstance(results[0], Exception):
+        bm25_status = "success"
+        if isinstance(results[0], (asyncio.TimeoutError, TimeoutError)):
+            bm25_status = "timeout"
+            logger.warning("[Hybrid] BM25 search timed out; keeping completed vector results")
+        elif isinstance(results[0], Exception):
+            bm25_status = "error"
             logger.error(f"[Hybrid] BM25 查询异常 (已被沙盒隔离): {results[0]}")
         if isinstance(results[1], Exception):
             logger.error(f"[Hybrid] Vector 查询异常 (已被沙盒隔离): {results[1]}")
@@ -92,7 +118,7 @@ class HybridRetriever:
             observation.clear()
             observation.update(
                 {
-                    "bm25_status": "error" if isinstance(results[0], Exception) else "success",
+                    "bm25_status": bm25_status,
                     "bm25_result_count": len(bm25_res or []),
                     "vector": dict(vector_observation),
                     "vector_result_count": len(vec_res or []),
