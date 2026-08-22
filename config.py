@@ -191,6 +191,12 @@ class AttentionConfig(BaseModel):
         le=15.0,
         description="同一群同一话题被忽略后的环境消息短暂冷却时间（秒）",
     )
+    judge_validation_sample_rate: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="对预过滤和缓存忽略结果进行只观测复判的抽样比例",
+    )
     cognitive_loop_min_think_level: int = Field(
         default=2,
         ge=1,

@@ -160,6 +160,7 @@ class CommittedBotTurn:
     send_status: ReplyCommitStatus
     failure_reason: str
     reply_hash: str
+    attention_topic_key: str = ""
     provenance: str = "astrmai_send_commit_v1"
 
     @classmethod
@@ -205,6 +206,7 @@ class CommittedBotTurn:
             send_status=receipt.status,
             failure_reason=str(receipt.failure_reason or ""),
             reply_hash=reply_hash,
+            attention_topic_key=str(plan.target.attention_topic_key or ""),
         )
 
     @classmethod
@@ -238,6 +240,7 @@ class CommittedBotTurn:
             ),
             failure_reason=str(value.get("failure_reason", "") or ""),
             reply_hash=str(value.get("reply_hash", "") or ""),
+            attention_topic_key=str(value.get("attention_topic_key", "") or "").strip(),
             provenance=str(
                 value.get("provenance", "astrmai_send_commit_v1")
                 or "astrmai_send_commit_v1"
@@ -264,6 +267,7 @@ class CommittedBotTurn:
             "send_status": self.send_status.value,
             "failure_reason": self.failure_reason,
             "reply_hash": self.reply_hash,
+            "attention_topic_key": self.attention_topic_key,
             "provenance": self.provenance,
         }
 

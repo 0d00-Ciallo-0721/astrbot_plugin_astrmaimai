@@ -1,6 +1,7 @@
 from importlib import import_module
 
 _EXPORTS = {
+    "AttentionTopicIdentity": ".attention_topic",
     "FocusThreadContext": ".focus_context",
     "FreshnessState": ".focus_context",
     "ReplyFreshnessBudget": ".focus_context",

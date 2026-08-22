@@ -9,8 +9,17 @@ from typing import Any
 
 from astrbot.api import logger
 
-from ...infrastructure.runtime.turn_call_ledger import clamp_timeout_to_turn_budget
+from ...infrastructure.runtime.background_task_budget import (
+    BackgroundTaskExecutionTimeout,
+    BackgroundTaskQueueFull,
+    BackgroundTaskQueueTimeout,
+)
+from ...infrastructure.runtime.turn_call_ledger import (
+    clamp_timeout_to_turn_budget,
+    detach_turn_telemetry,
+)
 from ...shared.helpers.plugin_helpers import is_direct_call_event
+from ..contracts.attention_topic import AttentionTopicIdentity
 from ..reply_shape_policy import resolve_reply_shape_policy
 from ..runtime.architecture_rollout import (
     ArchitectureTimer,
@@ -22,6 +31,7 @@ from .participation_policy import (
     ParticipationResult,
     ParticipationState,
 )
+from .topic_identity import attention_topic_anchors_match
 
 
 @dataclass(slots=True)
@@ -46,8 +56,13 @@ class AttentionDecisionRouter:
         self.participation_policy = ParticipationPolicy()
         self._participation_states: dict[str, ParticipationState] = {}
         self._judge_ignore_cache: dict[str, tuple[float, str, int]] = {}
-        self._ambient_ignore_cache: dict[str, float] = {}
+        self._ambient_ignore_cache: dict[
+            str,
+            tuple[float, str, AttentionTopicIdentity] | float,
+        ] = {}
         self._diagnostic_counts: dict[str, int] = {}
+        self._validation_tasks: set[asyncio.Task] = set()
+        self._validation_tasks_by_chat: dict[str, asyncio.Task] = {}
 
     def _count(self, name: str, amount: int = 1) -> None:
         key = str(name or "unknown")
@@ -55,11 +70,13 @@ class AttentionDecisionRouter:
 
     def describe_status(self) -> dict[str, Any]:
         self._prune_ignore_caches()
+        self._prune_participation_states()
         return {
             "counts": dict(self._diagnostic_counts),
             "judge_ignore_cache_size": len(self._judge_ignore_cache),
             "ambient_ignore_cache_size": len(self._ambient_ignore_cache),
             "participation_state_count": len(self._participation_states),
+            "judge_validation_active": len(self._validation_tasks),
         }
 
     @staticmethod
@@ -77,6 +94,18 @@ class AttentionDecisionRouter:
             return True
         return any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters) or any(
             parameter.name == "focus_thread" for parameter in parameters
+        )
+
+    @staticmethod
+    def _trace_callback_supports_snapshot_refresh(callback: Any) -> bool:
+        try:
+            parameters = inspect.signature(callback).parameters.values()
+        except (TypeError, ValueError):
+            return False
+        return any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            or parameter.name == "refresh_snapshot_only"
+            for parameter in parameters
         )
 
     @staticmethod
@@ -181,35 +210,250 @@ class AttentionDecisionRouter:
         except (TypeError, ValueError):
             return 3.0
 
-    @staticmethod
-    def _topic_epoch(focus_event: Any, focus_thread: Any) -> int:
-        try:
-            thread_epoch = int(getattr(focus_thread, "topic_epoch", 0) or 0)
-        except (TypeError, ValueError):
-            thread_epoch = 0
-        if thread_epoch > 0:
-            return thread_epoch
-        if focus_event is None or not hasattr(focus_event, "get_extra"):
-            return 0
-        canonical = focus_event.get_extra("astrmai_conversation_event", None)
-        try:
-            canonical_epoch = int(getattr(canonical, "topic_epoch", 0) or 0)
-        except (TypeError, ValueError):
-            canonical_epoch = 0
-        if canonical_epoch > 0:
-            return canonical_epoch
-        policy = focus_event.get_extra("astrmai_dialog_history_policy", None)
+    def _validation_sample_rate(self) -> float:
+        config = self._attention_config()
         try:
             return max(
-                0,
-                int(
-                    policy.get("topic_epoch", 0)
-                    if isinstance(policy, dict)
-                    else getattr(policy, "topic_epoch", 0)
+                0.0,
+                min(
+                    1.0,
+                    float(getattr(config, "judge_validation_sample_rate", 0.0) or 0.0),
                 ),
             )
         except (TypeError, ValueError):
-            return 0
+            return 0.0
+
+    def _should_sample_validation(self, chat_id: str, event: Any, source: str) -> bool:
+        rate = self._validation_sample_rate()
+        if rate <= 0.0 or event is None or self._is_private_event(event) or self._is_direct_event(event):
+            return False
+        if hasattr(event, "get_extra") and bool(
+            event.get_extra("astrmai_is_proactive_event", False)
+        ):
+            return False
+        material = "\x1f".join(
+            (
+                str(chat_id or ""),
+                self._event_id(event),
+                str(source or ""),
+                self._event_text(event),
+            )
+        )
+        bucket = int(hashlib.sha256(material.encode("utf-8")).hexdigest()[:8], 16)
+        return bucket / 0xFFFFFFFF <= rate
+
+    async def _sample_avoided_decision(
+        self,
+        chat_id: str,
+        focus_event: Any,
+        focus_thread: Any,
+        events: list[Any],
+        *,
+        source: str,
+    ) -> None:
+        if focus_event is None or not hasattr(focus_event, "set_extra"):
+            return
+        focus_event.set_extra("astrmai_judge_validation_source", source)
+        sampled = self._should_sample_validation(chat_id, focus_event, source)
+        focus_event.set_extra("astrmai_judge_validation_sampled", sampled)
+        if not sampled:
+            return
+        self._count("judge_validation_sampled")
+        judge = getattr(self.gate, "judge", None)
+        judge_evaluate = getattr(judge, "evaluate_shadow", None)
+        if not callable(judge_evaluate):
+            focus_event.set_extra("astrmai_judge_validation_status", "unavailable")
+            self._count("judge_validation_unavailable")
+            return
+        active_task = self._validation_tasks_by_chat.get(str(chat_id or ""))
+        if active_task is not None and not active_task.done():
+            focus_event.set_extra("astrmai_judge_validation_status", "busy")
+            self._count("judge_validation_busy")
+            return
+        message = self.build_judge_window_message(events) or self._event_text(focus_event)
+        timeout = float(
+            getattr(
+                self._attention_config(),
+                "judge_timeout",
+                getattr(getattr(self.gate, "config", None), "judge_timeout", 20.0),
+            )
+            or 20.0
+        )
+        focus_event.set_extra("astrmai_judge_validation_status", "scheduled")
+
+        async def _refresh_persisted_trace() -> None:
+            trace_state = str(
+                focus_event.get_extra("astrmai_pre_planner_trace_state", "") or ""
+            )
+            if trace_state == "pending":
+                focus_event.set_extra(
+                    "astrmai_judge_validation_trace_refresh_requested",
+                    True,
+                )
+                return
+            if trace_state != "persisted":
+                return
+            callback = getattr(self.gate, "turn_trace_callback", None)
+            if not callable(callback):
+                return
+            status = str(
+                focus_event.get_extra("astrmai_pre_planner_trace_status", "")
+                or "skipped_ignore"
+            )
+            try:
+                callback_kwargs = {"status": status, "reply_text": None}
+                if self._trace_callback_supports_snapshot_refresh(callback):
+                    callback_kwargs["refresh_snapshot_only"] = True
+                refreshed = callback(chat_id, focus_event, **callback_kwargs)
+                if inspect.isawaitable(refreshed):
+                    await refreshed
+                self._count("judge_validation_trace_refreshed")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                focus_event.set_extra(
+                    "astrmai_judge_validation_trace_error",
+                    type(exc).__name__,
+                )
+                self._count("judge_validation_trace_refresh_failed")
+
+        async def _run_validation() -> None:
+            try:
+                if self._judge_supports_context_kwargs(judge_evaluate):
+                    coroutine = judge_evaluate(
+                        chat_id,
+                        message,
+                        False,
+                        "",
+                        len(events),
+                        False,
+                        focus_thread=focus_thread,
+                        window_events=events,
+                        focus_event=focus_event,
+                    )
+                else:
+                    coroutine = judge_evaluate(chat_id, message, False, "", len(events), False)
+                result = await self._run_judge_with_hard_deadline(
+                    coroutine,
+                    timeout_sec=max(0.1, timeout),
+                )
+            except asyncio.TimeoutError:
+                focus_event.set_extra("astrmai_judge_validation_status", "timeout")
+                self._count("judge_validation_timeout")
+                await _refresh_persisted_trace()
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                focus_event.set_extra("astrmai_judge_validation_status", "degraded")
+                focus_event.set_extra("astrmai_judge_validation_error", type(exc).__name__)
+                self._count("judge_validation_degraded")
+                await _refresh_persisted_trace()
+                return
+            action = str(getattr(result, "action", "") or "").upper()
+            if not action:
+                focus_event.set_extra("astrmai_judge_validation_status", "empty_response")
+                self._count("judge_validation_empty_response")
+                await _refresh_persisted_trace()
+                return
+            agreement = action == "IGNORE"
+            false_filter_candidate = action in {"PASS", "REPLY", "TOOL_CALL"}
+            focus_event.set_extra("astrmai_judge_validation_status", "success")
+            focus_event.set_extra("astrmai_judge_validation_action", action)
+            focus_event.set_extra("astrmai_judge_validation_agreement", agreement)
+            focus_event.set_extra(
+                "astrmai_judge_validation_false_filter_candidate",
+                false_filter_candidate,
+            )
+            self._count(f"judge_validation_action_{action.lower()}")
+            self._count(
+                "judge_validation_agreement_true"
+                if agreement
+                else "judge_validation_agreement_false"
+            )
+            await _refresh_persisted_trace()
+
+        normalized_chat_id = str(chat_id or "")
+
+        async def _run_budgeted_validation() -> None:
+            detach_turn_telemetry()
+
+            async def _settle_budget_failure(status: str, error: BaseException) -> None:
+                focus_event.set_extra("astrmai_judge_validation_status", status)
+                focus_event.set_extra(
+                    "astrmai_judge_validation_error",
+                    type(error).__name__,
+                )
+                self._count(f"judge_validation_{status}")
+                await _refresh_persisted_trace()
+
+            try:
+                budget = getattr(self.gate, "background_task_budget", None)
+                budget_run = getattr(budget, "run", None)
+                if callable(budget_run):
+                    await budget_run(
+                        _run_validation,
+                        task_name="attention.judge_validation",
+                        scope_id=normalized_chat_id,
+                        execution_timeout_sec=max(0.1, timeout),
+                    )
+                    return
+                await _run_validation()
+            except BackgroundTaskQueueFull as exc:
+                await _settle_budget_failure("queue_full", exc)
+            except BackgroundTaskQueueTimeout as exc:
+                await _settle_budget_failure("queue_timeout", exc)
+            except BackgroundTaskExecutionTimeout as exc:
+                await _settle_budget_failure("execution_timeout", exc)
+            except asyncio.CancelledError as exc:
+                await _settle_budget_failure("cancelled", exc)
+                raise
+            except Exception as exc:
+                await _settle_budget_failure("degraded", exc)
+
+        task = asyncio.create_task(_run_budgeted_validation())
+        self._validation_tasks.add(task)
+        self._validation_tasks_by_chat[normalized_chat_id] = task
+        gate_background_tasks = getattr(self.gate, "_background_tasks", None)
+        if isinstance(gate_background_tasks, set):
+            gate_background_tasks.add(task)
+
+        def _done(completed: asyncio.Task) -> None:
+            self._validation_tasks.discard(completed)
+            if isinstance(gate_background_tasks, set):
+                gate_background_tasks.discard(completed)
+            if self._validation_tasks_by_chat.get(normalized_chat_id) is completed:
+                self._validation_tasks_by_chat.pop(normalized_chat_id, None)
+            if completed.cancelled():
+                if focus_event.get_extra("astrmai_judge_validation_status", "") == "scheduled":
+                    focus_event.set_extra("astrmai_judge_validation_status", "cancelled")
+                    self._count("judge_validation_cancelled")
+                return
+            try:
+                error = completed.exception()
+            except BaseException:
+                error = None
+            if error is not None and focus_event.get_extra(
+                "astrmai_judge_validation_status",
+                "",
+            ) == "scheduled":
+                focus_event.set_extra("astrmai_judge_validation_status", "degraded")
+                focus_event.set_extra("astrmai_judge_validation_error", type(error).__name__)
+                self._count("judge_validation_degraded")
+
+        task.add_done_callback(_done)
+
+    async def wait_for_validation_tasks(self) -> None:
+        tasks = tuple(self._validation_tasks)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    @staticmethod
+    def _attention_topic(focus_event: Any, focus_thread: Any) -> AttentionTopicIdentity:
+        thread_identity = getattr(focus_thread, "attention_topic", None)
+        if thread_identity is not None:
+            return AttentionTopicIdentity.from_value(thread_identity)
+        return AttentionTopicIdentity.from_event(focus_event)
 
     def _judge_ignore_cache_key(self, chat_id: str, focus_event: Any, focus_thread: Any) -> str:
         actor_id = ""
@@ -218,22 +462,29 @@ class AttentionDecisionRouter:
                 actor_id = str(focus_event.get_sender_id() or "").strip()
             except Exception:
                 actor_id = ""
-        topic_epoch = str(getattr(focus_thread, "topic_epoch", 0) or 0)
+        identity = self._attention_topic(focus_event, focus_thread)
+        if not identity.exact_cacheable:
+            return ""
         text = self._event_text(focus_event)
         digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:24]
-        return "\x1f".join((str(chat_id or ""), actor_id, topic_epoch, digest))
+        return "\x1f".join(
+            (str(chat_id or ""), actor_id, identity.attention_topic_key, digest)
+        )
 
     def _cached_judge_ignore(self, chat_id: str, focus_event: Any, focus_thread: Any) -> bool:
         ttl = self._judge_ignore_cache_ttl()
         if ttl <= 0.0:
             return False
         key = self._judge_ignore_cache_key(chat_id, focus_event, focus_thread)
+        if not key:
+            return False
         entry = self._judge_ignore_cache.get(key)
         if entry is None:
             return False
         expires_at, _, _ = entry
         if expires_at <= time.monotonic():
-            self._judge_ignore_cache.pop(key, None)
+            if self._judge_ignore_cache.pop(key, None) is not None:
+                self._count("judge_ignore_cache_ttl_evicted")
             return False
         if focus_event is not None and hasattr(focus_event, "set_extra"):
             focus_event.set_extra("astrmai_judge_cache_hit", True)
@@ -248,20 +499,56 @@ class AttentionDecisionRouter:
             return
         self._prune_ignore_caches()
         key = self._judge_ignore_cache_key(chat_id, focus_event, focus_thread)
+        if not key:
+            return
         self._judge_ignore_cache[key] = (time.monotonic() + ttl, str(chat_id or ""), int(time.time()))
 
     def _ambient_ignore_cache_key(self, chat_id: str, focus_event: Any, focus_thread: Any) -> str:
-        topic_epoch = self._topic_epoch(focus_event, focus_thread)
-        return f"{str(chat_id or '')}\x1f{topic_epoch}" if topic_epoch > 0 else ""
+        identity = self._attention_topic(focus_event, focus_thread)
+        if not identity.ambient_cacheable:
+            return ""
+        return f"{str(chat_id or '')}\x1f{identity.attention_topic_key}"
 
     def _cached_ambient_ignore(self, chat_id: str, focus_event: Any, focus_thread: Any) -> bool:
         ttl = self._ambient_ignore_cache_ttl()
         key = self._ambient_ignore_cache_key(chat_id, focus_event, focus_thread)
         if ttl <= 0.0 or not key:
             return False
-        expires_at = float(self._ambient_ignore_cache.get(key, 0.0) or 0.0)
-        if expires_at <= time.monotonic():
-            self._ambient_ignore_cache.pop(key, None)
+        now = time.monotonic()
+        identity = self._attention_topic(focus_event, focus_thread)
+        matched_key = ""
+        for candidate_key, raw_entry in self._ambient_ignore_cache.items():
+            if isinstance(raw_entry, tuple):
+                expires_at, entry_chat_id, entry_identity = raw_entry
+            else:
+                expires_at = float(raw_entry or 0.0)
+                entry_chat_id = candidate_key.split("\x1f", 1)[0]
+                entry_identity = AttentionTopicIdentity()
+            if float(expires_at or 0.0) <= now or str(entry_chat_id or "") != str(chat_id or ""):
+                continue
+            same_causal_root = bool(
+                candidate_key == key
+                and identity.source == "causal_root"
+                and entry_identity.source == "causal_root"
+                and identity.root_event_id
+                and identity.root_event_id == entry_identity.root_event_id
+            )
+            if same_causal_root:
+                matched_key = candidate_key
+                break
+            if not (
+                identity.is_known
+                and entry_identity.is_known
+                and identity.history_topic_epoch == entry_identity.history_topic_epoch
+            ):
+                continue
+            if attention_topic_anchors_match(
+                entry_identity.anchor_text,
+                identity.anchor_text,
+            ):
+                matched_key = candidate_key
+                break
+        if not matched_key:
             return False
         if focus_event is not None and hasattr(focus_event, "set_extra"):
             focus_event.set_extra("astrmai_judge_cache_hit", True)
@@ -276,36 +563,106 @@ class AttentionDecisionRouter:
         if ttl <= 0.0 or not key or self._is_direct_event(focus_event):
             return
         self._prune_ignore_caches()
-        self._ambient_ignore_cache[key] = time.monotonic() + ttl
+        self._ambient_ignore_cache[key] = (
+            time.monotonic() + ttl,
+            str(chat_id or ""),
+            self._attention_topic(focus_event, focus_thread),
+        )
 
     def _prune_ignore_caches(self) -> None:
         """Keep short-lived Judge caches bounded during long-running bot sessions."""
         now = time.monotonic()
+        judge_before = len(self._judge_ignore_cache)
         self._judge_ignore_cache = {
             key: entry
             for key, entry in self._judge_ignore_cache.items()
             if float(entry[0] or 0.0) > now
         }
+        ambient_before = len(self._ambient_ignore_cache)
         self._ambient_ignore_cache = {
-            key: expires_at
-            for key, expires_at in self._ambient_ignore_cache.items()
-            if float(expires_at or 0.0) > now
+            key: entry
+            for key, entry in self._ambient_ignore_cache.items()
+            if float(entry[0] if isinstance(entry, tuple) else entry or 0.0) > now
         }
+        self._count("judge_ignore_cache_ttl_evicted", judge_before - len(self._judge_ignore_cache))
+        self._count("ambient_ignore_cache_ttl_evicted", ambient_before - len(self._ambient_ignore_cache))
         max_entries = 2048
         if len(self._judge_ignore_cache) > max_entries:
+            capacity_evicted = len(self._judge_ignore_cache) - max_entries
             newest = sorted(
                 self._judge_ignore_cache.items(),
                 key=lambda item: float(item[1][0] or 0.0),
                 reverse=True,
             )[:max_entries]
             self._judge_ignore_cache = dict(newest)
+            self._count("judge_ignore_cache_capacity_evicted", capacity_evicted)
         if len(self._ambient_ignore_cache) > max_entries:
+            capacity_evicted = len(self._ambient_ignore_cache) - max_entries
             newest = sorted(
                 self._ambient_ignore_cache.items(),
-                key=lambda item: float(item[1] or 0.0),
+                key=lambda item: float(
+                    item[1][0] if isinstance(item[1], tuple) else item[1] or 0.0
+                ),
                 reverse=True,
             )[:max_entries]
             self._ambient_ignore_cache = dict(newest)
+            self._count("ambient_ignore_cache_capacity_evicted", capacity_evicted)
+
+    def _prune_participation_states(self) -> None:
+        ttl = float(
+            getattr(
+                self._attention_config(),
+                "participation_hysteresis_ttl_sec",
+                180.0,
+            )
+            or 180.0
+        )
+        now = time.time()
+        before = len(self._participation_states)
+        self._participation_states = {
+            chat_id: state
+            for chat_id, state in self._participation_states.items()
+            if state.updated_at > 0.0 and now - state.updated_at <= max(1.0, ttl)
+        }
+        self._count("participation_state_ttl_evicted", before - len(self._participation_states))
+        max_entries = 2048
+        if len(self._participation_states) > max_entries:
+            capacity_evicted = len(self._participation_states) - max_entries
+            newest = sorted(
+                self._participation_states.items(),
+                key=lambda item: float(item[1].updated_at or 0.0),
+                reverse=True,
+            )[:max_entries]
+            self._participation_states = dict(newest)
+            self._count("participation_state_capacity_evicted", capacity_evicted)
+
+    def clear_chat_state(self, chat_id: str) -> bool:
+        normalized = str(chat_id or "")
+        removed = self._participation_states.pop(normalized, None) is not None
+        validation_task = self._validation_tasks_by_chat.pop(normalized, None)
+        if validation_task is not None and not validation_task.done():
+            validation_task.cancel()
+            removed = True
+        exact_keys = [
+            key
+            for key, entry in self._judge_ignore_cache.items()
+            if str(entry[1] or "") == normalized
+        ]
+        ambient_prefix = f"{normalized}\x1f"
+        ambient_keys = []
+        for key, entry in self._ambient_ignore_cache.items():
+            entry_chat_id = (
+                str(entry[1] or "")
+                if isinstance(entry, tuple)
+                else key.split("\x1f", 1)[0]
+            )
+            if entry_chat_id == normalized or key.startswith(ambient_prefix):
+                ambient_keys.append(key)
+        for key in exact_keys:
+            self._judge_ignore_cache.pop(key, None)
+        for key in ambient_keys:
+            self._ambient_ignore_cache.pop(key, None)
+        return bool(removed or exact_keys or ambient_keys)
 
     async def _recent_committed_turn(
         self,
@@ -554,7 +911,21 @@ class AttentionDecisionRouter:
         )
         participation_result: ParticipationResult | None = None
         is_private = self._is_private_event(focus_event)
+        attention_eligible = bool(
+            not is_private
+            and not self._is_direct_event(focus_event)
+            and not bool(
+                focus_event.get_extra("astrmai_is_proactive_event", False)
+                if focus_event is not None and hasattr(focus_event, "get_extra")
+                else False
+            )
+        )
+        if focus_event is not None and hasattr(focus_event, "set_extra"):
+            focus_event.set_extra("astrmai_attention_eligible", attention_eligible)
+        if attention_eligible:
+            self._count("attention_eligible")
         if participation_enabled and not is_private:
+            self._prune_participation_states()
             ttl_seconds = float(
                 getattr(
                     attention_config,
@@ -603,6 +974,7 @@ class AttentionDecisionRouter:
                 strong_wakeup_event_ids=strong_event_ids,
                 recent_committed_turn=recent_committed_turn,
                 previous_state=self._participation_states.get(chat_id),
+                topic_identity=self._attention_topic(focus_event, focus_thread),
                 ttl_seconds=ttl_seconds,
             )
             self._participation_states[chat_id] = next_state
@@ -670,6 +1042,13 @@ class AttentionDecisionRouter:
             self._count("judge_avoided_drop")
             if focus_event is not None and hasattr(focus_event, "set_extra"):
                 focus_event.set_extra("astrmai_judge_avoided", True)
+            await self._sample_avoided_decision(
+                chat_id,
+                focus_event,
+                focus_thread,
+                events,
+                source="prefilter_drop",
+            )
             return AttentionDecision(
                 action="IGNORE",
                 raw_action="IGNORE",
@@ -677,9 +1056,23 @@ class AttentionDecisionRouter:
             )
         if self._cached_judge_ignore(chat_id, focus_event, focus_thread):
             self._count("judge_avoided_exact_cache")
+            await self._sample_avoided_decision(
+                chat_id,
+                focus_event,
+                focus_thread,
+                events,
+                source="exact_cache",
+            )
             return AttentionDecision(action="IGNORE", raw_action="IGNORE", reason="judge_ignore_cache")
         if self._cached_ambient_ignore(chat_id, focus_event, focus_thread):
             self._count("judge_avoided_ambient_cache")
+            await self._sample_avoided_decision(
+                chat_id,
+                focus_event,
+                focus_thread,
+                events,
+                source="ambient_cache",
+            )
             return AttentionDecision(action="IGNORE", raw_action="IGNORE", reason="judge_ambient_cooldown")
         if focus_event is not None and hasattr(focus_event, "set_extra"):
             focus_event.set_extra("astrmai_judge_avoided", False)

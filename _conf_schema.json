@@ -911,6 +911,14 @@
         "minimum": 0.0,
         "maximum": 15.0,
         "hint": "同一话题刚被判定忽略后，短时间内的非指向环境消息不再重复判决；明确互动和新话题不受影响。"
+      },
+      "judge_validation_sample_rate": {
+        "description": "忽略结果抽样复判比例",
+        "type": "float",
+        "default": 0.0,
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "hint": "仅用于观测预过滤和缓存忽略是否准确。抽中的消息仍保持原处理结果，复判结果只写入诊断记录；零表示关闭。"
       }
     }
   },

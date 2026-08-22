@@ -22,6 +22,7 @@ from ..vision_state import (
 )
 from ..runtime.architecture_trace import build_architecture_trace_contract
 from ...infrastructure.runtime.turn_call_ledger import (
+    current_turn_telemetry,
     finalize_turn_telemetry,
     observe_stage,
     record_context_block_stats,
@@ -1110,6 +1111,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         *,
         status: str,
         reply_text: str | None = None,
+        refresh_snapshot_only: bool = False,
     ) -> None:
         if (
             hasattr(event, "get_extra")
@@ -1188,8 +1190,21 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             reply_sent=(bool(event.get_extra("astrmai_reply_sent", False)) if hasattr(event, "get_extra") else False) or bool(reply_text),
             reply_preview=str(reply_text or ""),
         )
-        finalize_turn_telemetry(event, outcome=status)
-        telemetry = turn_telemetry_snapshot(event)
+        if not refresh_snapshot_only:
+            finalize_turn_telemetry(event, outcome=status)
+        telemetry_context = current_turn_telemetry(event)
+        telemetry_captured_at = (
+            float(
+                getattr(telemetry_context, "trace_finalized_at", 0.0)
+                or getattr(telemetry_context, "finalized_at", 0.0)
+                or 0.0
+            )
+            or None
+        )
+        telemetry = turn_telemetry_snapshot(
+            event,
+            captured_at=telemetry_captured_at,
+        )
         if telemetry:
             item.update(
                 {
@@ -1488,7 +1503,11 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                     "[TurnTrace] sample persistence failed "
                     f"chat={chat_id} status={status} error_type={type(exc).__name__}"
                 )
-        if self.raw_trace_store is not None and hasattr(self.raw_trace_store, "append_many"):
+        if (
+            not refresh_snapshot_only
+            and self.raw_trace_store is not None
+            and hasattr(self.raw_trace_store, "append_many")
+        ):
             try:
                 await self.raw_trace_store.append_many(chat_id, self._build_raw_trace_events(chat_id, event))
             except Exception as exc:
@@ -1504,12 +1523,14 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         *,
         status: str,
         reply_text: str | None = None,
+        refresh_snapshot_only: bool = False,
     ) -> None:
         await self._remember_turn_trace(
             chat_id,
             event,
             status=status,
             reply_text=reply_text,
+            refresh_snapshot_only=refresh_snapshot_only,
         )
 
     @staticmethod

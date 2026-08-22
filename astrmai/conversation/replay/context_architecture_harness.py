@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterable, Mapping
@@ -15,6 +15,7 @@ from ..contracts.committed_reply import (
     ReplyPlan,
     ReplySendReceipt,
 )
+from ..contracts.attention_topic import AttentionTopicIdentity
 from ..contracts.conversation_event import ConversationEvent
 from ..planning.message_renderer import MessageRenderer
 from ..runtime.architecture_rollout import stable_structure_hash
@@ -165,17 +166,45 @@ class ContextArchitectureReplayHarness:
             candidates,
             bot_id=str(case.get("bot_id", "bot") or "bot"),
         )
+        replay_topic_epoch = max(0, int(focus.canonical_event.topic_epoch or 0))
+        replay_topic_key = (
+            f"replay-topic:{replay_topic_epoch}" if replay_topic_epoch > 0 else ""
+        )
+        topic_identity = AttentionTopicIdentity(
+            history_topic_epoch=replay_topic_epoch,
+            attention_topic_key=replay_topic_key,
+            source="replay_fixture" if replay_topic_key else "history_topic_unknown",
+            confidence=1.0 if replay_topic_key else 0.0,
+        )
+        if replay_topic_key:
+            target = replace(target, attention_topic_key=replay_topic_key)
         target_ms = round((time.perf_counter() - target_started) * 1000.0, 3)
 
         recent_commit_raw = case.get("recent_commit")
         recent_commit = (
-            SimpleNamespace(**dict(recent_commit_raw))
+            SimpleNamespace(
+                **{
+                    **dict(recent_commit_raw),
+                    "attention_topic_key": str(
+                        dict(recent_commit_raw).get("attention_topic_key", "")
+                        or replay_topic_key
+                    ),
+                }
+            )
             if isinstance(recent_commit_raw, Mapping)
             else None
         )
         previous_state_raw = case.get("participation_state")
         previous_state = (
-            ParticipationState(**dict(previous_state_raw))
+            ParticipationState(
+                **{
+                    **dict(previous_state_raw),
+                    "attention_topic_key": str(
+                        dict(previous_state_raw).get("attention_topic_key", "")
+                        or replay_topic_key
+                    ),
+                }
+            )
             if isinstance(previous_state_raw, Mapping)
             else None
         )
@@ -185,6 +214,7 @@ class ContextArchitectureReplayHarness:
             strong_wakeup_event_ids=case.get("strong_wakeup_event_ids", ()) or (),
             recent_committed_turn=recent_commit,
             previous_state=previous_state,
+            topic_identity=topic_identity,
             now=self.clock.now(),
         )
 

@@ -29,6 +29,7 @@ class TurnTarget:
     target_actor_name: str = ""
     target_event_id: str = ""
     topic_epoch: int = 0
+    attention_topic_key: str = ""
     source_event_ids: tuple[str, ...] = field(default_factory=tuple)
     evidence: str = ""
     confidence: float = 0.0
@@ -42,6 +43,7 @@ class TurnTarget:
             "target_actor_name": self.target_actor_name,
             "target_event_id": self.target_event_id,
             "topic_epoch": int(self.topic_epoch or 0),
+            "attention_topic_key": self.attention_topic_key,
             "source_event_ids": list(self.source_event_ids),
             "evidence": self.evidence,
             "confidence": float(self.confidence or 0.0),
@@ -65,6 +67,7 @@ class TurnTarget:
             target_actor_name=str(value.get("target_actor_name", "") or ""),
             target_event_id=str(value.get("target_event_id", "") or ""),
             topic_epoch=max(0, int(value.get("topic_epoch", 0) or 0)),
+            attention_topic_key=str(value.get("attention_topic_key", "") or "").strip(),
             source_event_ids=_ordered_unique(value.get("source_event_ids", ()) or ()),
             evidence=str(value.get("evidence", "") or ""),
             confidence=max(0.0, min(1.0, float(value.get("confidence", 0.0) or 0.0))),

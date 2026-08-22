@@ -591,6 +591,7 @@ class GatewayLaneMixin:
         max_models_override: Optional[int] = None,
         allow_cooldown_override: bool = True,
         reserve_for_reply: bool = False,
+        critical_path: bool = True,
         propagate_queue_timeout_status: bool = True,
     ) -> LLMCallResult:
         workload_request = self.context_economy.build_request(
@@ -624,6 +625,7 @@ class GatewayLaneMixin:
                 pool=lane_key.task_family,
                 prompt=prompt,
                 system_prompt=system_prompt,
+                critical_path=critical_path,
                 metadata={"lane_enabled": False, "model_count": len(models or [])},
             )
             try:
@@ -644,6 +646,7 @@ class GatewayLaneMixin:
                     max_models_override=max_models_override,
                     allow_cooldown_override=allow_cooldown_override,
                     reserve_for_reply=reserve_for_reply,
+                    ledger_critical_path=critical_path,
                     event=event,
                     propagate_queue_timeout_status=propagate_queue_timeout_status,
                 )
@@ -715,6 +718,7 @@ class GatewayLaneMixin:
             pool=lane_key.task_family,
             prompt=prompt,
             system_prompt=system_prompt,
+            critical_path=critical_path,
             contexts=history,
             metadata={
                 "lane_enabled": True,
@@ -753,6 +757,7 @@ class GatewayLaneMixin:
                 max_models_override=max_models_override,
                 allow_cooldown_override=allow_cooldown_override,
                 reserve_for_reply=reserve_for_reply,
+                ledger_critical_path=critical_path,
                 event=event,
                 propagate_queue_timeout_status=propagate_queue_timeout_status,
             )

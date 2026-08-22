@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from astrmai.conversation.attention.group_dialogue_store import GroupDialogueStore
 from astrmai.conversation.contracts.dialog_history_policy import DialogHistoryPolicy
+from astrmai.conversation.contracts.focus_context import FocusThreadContext
 from astrmai.conversation.execution.executor import ConcurrentExecutor
 from astrmai.conversation.execution.reply_post_send import ReplyPostSendMixin
 from astrmai.conversation.planning.conversation_continuity import ConversationContinuityStore
@@ -76,6 +77,70 @@ def test_group_topic_history_is_shared_across_senders_but_rotates_when_stale():
     assert stale.history_mode == "none"
     assert stale.topic_epoch == first.topic_epoch + 1
     assert stale.rotation_reason == "topic_stale"
+
+
+def test_planner_reuses_gate_bound_history_policy_without_reevaluation():
+    event = _GroupEvent(sender_id="10001")
+    policy = DialogHistoryPolicy(
+        history_mode="current_topic",
+        group_id="552752264",
+        thread_key="group:552752264",
+        topic_epoch=7,
+        current_sender_id="10001",
+        allow_provider_session=True,
+    )
+    policy.bind(event)
+    focus_context = FocusThreadContext(focus_event=event, history_policy=policy)
+
+    class _Continuity:
+        def evaluate_group_message(self, *_args, **_kwargs):
+            raise AssertionError("Gate-bound policy must not be evaluated twice")
+
+    planner_prompt = object.__new__(PlannerPromptContextMixin)
+    planner_prompt.conversation_continuity = _Continuity()
+
+    resolved = planner_prompt._resolve_group_history_policy(
+        chat_id=event.unified_msg_origin,
+        focus_event=event,
+        focus_context=focus_context,
+        focus_message_text="周末天气",
+    )
+
+    assert resolved is policy
+
+
+def test_planner_legacy_focus_context_still_evaluates_history_policy():
+    event = _GroupEvent(sender_id="10001")
+    focus_context = FocusThreadContext(focus_event=event)
+    expected = DialogHistoryPolicy(
+        history_mode="none",
+        group_id="552752264",
+        thread_key="group:552752264",
+        topic_epoch=3,
+        current_sender_id="10001",
+    )
+
+    class _Continuity:
+        def __init__(self):
+            self.calls = 0
+
+        def evaluate_group_message(self, *_args, **_kwargs):
+            self.calls += 1
+            return expected
+
+    continuity = _Continuity()
+    planner_prompt = object.__new__(PlannerPromptContextMixin)
+    planner_prompt.conversation_continuity = continuity
+
+    resolved = planner_prompt._resolve_group_history_policy(
+        chat_id=event.unified_msg_origin,
+        focus_event=event,
+        focus_context=focus_context,
+        focus_message_text="新话题",
+    )
+
+    assert resolved is expected
+    assert continuity.calls == 1
 
 
 def test_explicit_group_history_recall_does_not_reuse_hidden_provider_session():

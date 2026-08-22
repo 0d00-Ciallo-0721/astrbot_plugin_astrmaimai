@@ -181,6 +181,49 @@ class GatewayContextPassthroughRefactorTests(unittest.TestCase):
         self.assertTrue(request_trace["provider_visible_system_hash"])
         self.assertTrue(request_trace["provider_visible_prompt_hash"])
 
+    def test_noncritical_chat_lane_uses_background_provider_slot(self):
+        fake_context = _FakeContext()
+        config = SimpleNamespace(
+            infra=SimpleNamespace(
+                max_concurrent_llm_calls=2,
+                critical_path_reserved_slots=1,
+                llm_retries=0,
+                backoff_factor=1.5,
+                api_timeout=10,
+            ),
+            provider=SimpleNamespace(fallback_models=[]),
+        )
+        gateway = self.gateway_mod.GlobalModelGateway(fake_context, config)
+        gateway._semaphore_wait_timeout = lambda event=None, critical_path=True: 0.01
+        lane_key = self.lane_mod.LaneKey(
+            subsystem="bg",
+            task_family="judge_validation",
+            scope_id="group-1",
+        )
+
+        async def _run():
+            await gateway._background_semaphore.acquire()
+            try:
+                with self.assertRaises(Exception) as raised:
+                    await gateway.chat_in_lane_result(
+                        lane_key=lane_key,
+                        base_origin="default:GroupMessage:group-1",
+                        prompt="shadow",
+                        system_prompt="stable prompt",
+                        models=["model-a"],
+                        use_fallback=False,
+                        critical_path=False,
+                        propagate_queue_timeout_status=False,
+                    )
+                self.assertEqual(type(raised.exception).__name__, "GatewayQueueTimeout")
+            finally:
+                gateway._background_semaphore.release()
+
+        asyncio.run(_run())
+        self.assertEqual(fake_context.calls, [])
+        family = gateway._lane_workload_family(lane_key)
+        self.assertEqual(family.value, "judge")
+
     def test_chat_lane_prepare_timeout_is_bounded_and_recorded(self):
         fake_context = _FakeContext()
         config = SimpleNamespace(

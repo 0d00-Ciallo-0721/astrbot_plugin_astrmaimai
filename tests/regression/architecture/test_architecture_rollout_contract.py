@@ -123,6 +123,23 @@ def test_architecture_trace_contract_links_full_chain_without_raw_reply_text():
     event.set_extra("astrmai_judge_cache_scope", "ambient_topic")
     event.set_extra("astrmai_judge_avoided", True)
     event.set_extra("astrmai_prefilter_judge_agreement", False)
+    event.set_extra("astrmai_attention_eligible", True)
+    event.set_extra(
+        "astrmai_attention_topic_identity",
+        {
+            "history_topic_epoch": 4,
+            "attention_topic_key": "topic-key-hash",
+            "source": "topic_similarity",
+            "confidence": 0.9,
+            "evidence": ["topic_similarity"],
+        },
+    )
+    event.set_extra("astrmai_judge_validation_sampled", True)
+    event.set_extra("astrmai_judge_validation_source", "ambient_cache")
+    event.set_extra("astrmai_judge_validation_status", "success")
+    event.set_extra("astrmai_judge_validation_action", "PASS")
+    event.set_extra("astrmai_judge_validation_agreement", False)
+    event.set_extra("astrmai_judge_validation_false_filter_candidate", True)
 
     contract = build_architecture_trace_contract(
         event=event,
@@ -153,6 +170,11 @@ def test_architecture_trace_contract_links_full_chain_without_raw_reply_text():
     assert contract["judge_decision"]["cache_scope"] == "ambient_topic"
     assert contract["judge_decision"]["avoided"] is True
     assert contract["judge_decision"]["prefilter_judge_agreement"] is False
+    assert contract["attention_topic"]["attention_topic_key"] == "topic-key-hash"
+    assert contract["participation_decision"]["eligible"] is True
+    assert contract["judge_decision"]["validation_sampled"] is True
+    assert contract["judge_decision"]["validation_action"] == "PASS"
+    assert contract["judge_decision"]["validation_false_filter_candidate"] is True
     assert contract["timing_coverage"]["unattributed_ms"] == 7.5
     assert contract["stage_ledger"][0]["stage"] == "attention.dispatch"
     assert contract["reply_plan"]["planned_char_count"] == len("绝密草稿文本")

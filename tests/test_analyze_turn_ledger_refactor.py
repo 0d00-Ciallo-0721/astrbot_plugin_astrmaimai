@@ -122,6 +122,17 @@ def test_analyze_traces_uses_real_reply_length_and_exact_attempts():
                     "cache_scope": "ambient_topic",
                     "avoided": True,
                     "prefilter_judge_agreement": False,
+                    "validation_sampled": True,
+                    "validation_source": "ambient_cache",
+                    "validation_status": "success",
+                    "validation_action": "PASS",
+                    "validation_agreement": False,
+                    "validation_false_filter_candidate": True,
+                },
+                "participation_decision": {
+                    "eligible": True,
+                    "prefilter_action": "need_judge",
+                    "prefilter_reason": "ambiguous_group_message",
                 },
                 "budget": {"remaining_ms": 120000, "exhausted": False},
                 "memory_funnel": {
@@ -168,6 +179,13 @@ def test_analyze_traces_uses_real_reply_length_and_exact_attempts():
     assert report["llm"]["judge_avoided_count"] == 1
     assert report["llm"]["judge_cache_scope_counts"] == {"ambient_topic": 1}
     assert report["llm"]["prefilter_judge_agreement_counts"] == {"false": 1}
+    assert report["attention"]["eligible_count"] == 1
+    assert report["attention"]["eligible_judge_called_count"] == 0
+    assert report["attention"]["judge_call_rate"] == 0.0
+    assert report["attention"]["validation_sampled_count"] == 1
+    assert report["attention"]["validation_source_counts"] == {"ambient_cache": 1}
+    assert report["attention"]["validation_agreement_counts"] == {"false": 1}
+    assert report["attention"]["validation_false_filter_candidate_count"] == 1
     assert report["llm"]["path_counts"] == {"critical": 1}
     assert report["context"]["duplicate_block_count"] == 2
     assert report["context"]["by_scope"]["source"]["duplicate_block_count"] == 2
@@ -206,6 +224,7 @@ def test_analyze_traces_uses_real_reply_length_and_exact_attempts():
     }
     assert "## Vision" in render_markdown(report)
     assert "Judge observed/cache-hit/avoided" in render_markdown(report)
+    assert "## Attention Prefilter" in render_markdown(report)
     assert "## Topic Activity" in render_markdown(report)
     assert "## Proactive Lifecycle" in render_markdown(report)
 

@@ -161,6 +161,23 @@ class ChatStateService:
                 return self._create_default_state(chat_id)
             return await self._get_state_inner(chat_id)
 
+    async def peek_state(self, chat_id: str) -> ChatState:
+        """Return a detached state snapshot without resets, dirty writes, or cache touches."""
+        generation = self._chat_generation(chat_id)
+        async with self._get_chat_lock(chat_id):
+            if not self._is_current_generation(chat_id, generation):
+                return self._create_default_state(chat_id)
+            cached = self.chat_states.get(chat_id)
+            if cached is not None:
+                return copy.deepcopy(cached)
+            try:
+                loaded = await self.persistence.load_chat_state(chat_id)
+            except Exception:
+                loaded = None
+            if loaded is None:
+                return self._create_default_state(chat_id)
+            return copy.deepcopy(self._coerce_chat_state(chat_id, loaded))
+
     def _check_daily_reset(self, state: ChatState) -> None:
         today = datetime.date.today().isoformat()
         if state.last_reset_date != today:
@@ -543,6 +560,9 @@ class StateEngine:
 
     async def get_state(self, chat_id: str) -> ChatState:
         return await self.chat_state_service.get_state(chat_id)
+
+    async def peek_state(self, chat_id: str) -> ChatState:
+        return await self.chat_state_service.peek_state(chat_id)
 
     async def get_user_profile(self, user_id: str) -> UserProfile:
         return await self._load_profile_with_relationship(user_id)

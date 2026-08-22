@@ -34,6 +34,7 @@ def _target() -> TurnTarget:
         target_actor_name="Alice",
         target_event_id="event-1",
         topic_epoch=7,
+        attention_topic_key="attention-topic-7",
         source_event_ids=("event-1",),
         confidence=1.0,
     )
@@ -70,6 +71,7 @@ def test_committed_turn_is_built_only_from_sent_receipt_content():
     assert committed.sent_segments == ("first",)
     assert committed.outbound_message_ids == ("message-1",)
     assert committed.target.target_actor_id == "user-1"
+    assert committed.attention_topic_key == "attention-topic-7"
 
 
 def test_failed_receipt_cannot_become_committed_visible_turn():
@@ -194,6 +196,7 @@ def test_group_store_receives_only_committed_sent_text_and_deduplicates_replay()
     assert turns[0].reply_text == "first"
     assert turns[0].source_event_ids == ["event-1"]
     assert turns[0].stance == "reject"
+    assert turns[0].attention_topic_key == "attention-topic-7"
 
 
 def test_planner_has_no_direct_assistant_history_append_path():

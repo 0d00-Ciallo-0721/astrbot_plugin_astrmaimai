@@ -178,7 +178,14 @@ def build_architecture_trace_contract(
         "signals": _ordered_unique(_extra(event, "astrmai_participation_signals", ()) or ()),
         "phase": str(_extra(event, "astrmai_participation_phase", "") or ""),
         "phase_age_ms": float(_extra(event, "astrmai_participation_phase_age_ms", 0.0) or 0.0),
+        "invalidated_reason": str(
+            _extra(event, "astrmai_observation_invalidated_reason", "") or ""
+        ),
+        "eligible": bool(_extra(event, "astrmai_attention_eligible", False)),
     }
+    attention_topic = _extra(event, "astrmai_attention_topic_identity", {})
+    if not isinstance(attention_topic, Mapping):
+        attention_topic = {}
     context_stats = list(trace_item.get("context_block_stats", ()) or ())
     memory_retrieval = {
         "vector_fallback": dict(memory_funnel.get("vector_fallback") or {})
@@ -207,6 +214,7 @@ def build_architecture_trace_contract(
         },
         "turn_target": _target_payload(target),
         "actor_whitelist": list(actor_set.allowed_actor_ids),
+        "attention_topic": dict(attention_topic),
         "participation_decision": participation,
         "judge_decision": {
             "action": str(turn_context.attention.judge_action or ""),
@@ -220,6 +228,28 @@ def build_architecture_trace_contract(
             "avoided": _extra(event, "astrmai_judge_avoided", None),
             "prefilter_judge_agreement": _extra(
                 event, "astrmai_prefilter_judge_agreement", None
+            ),
+            "validation_sampled": bool(
+                _extra(event, "astrmai_judge_validation_sampled", False)
+            ),
+            "validation_source": str(
+                _extra(event, "astrmai_judge_validation_source", "") or ""
+            ),
+            "validation_status": str(
+                _extra(event, "astrmai_judge_validation_status", "") or ""
+            ),
+            "validation_action": str(
+                _extra(event, "astrmai_judge_validation_action", "") or ""
+            ),
+            "validation_agreement": _extra(
+                event, "astrmai_judge_validation_agreement", None
+            ),
+            "validation_false_filter_candidate": bool(
+                _extra(
+                    event,
+                    "astrmai_judge_validation_false_filter_candidate",
+                    False,
+                )
             ),
         },
         "timing_coverage": dict(trace_item.get("timing_coverage", {}) or {}),

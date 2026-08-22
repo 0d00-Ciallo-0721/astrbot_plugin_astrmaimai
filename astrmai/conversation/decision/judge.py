@@ -279,6 +279,116 @@ class Judge:
             return ""
         return f"[Attention window snippets ({len(lines)})]\n" + "\n".join(lines) + "\n\n"
 
+    async def evaluate_shadow(
+        self,
+        chat_id: str,
+        message: str,
+        is_force_wakeup: bool = False,
+        persona_summary: str = "",
+        window_events_count: int = 1,
+        is_first_event_wakeup: bool = False,
+        *,
+        focus_thread=None,
+        window_events: list | None = None,
+        focus_event=None,
+    ) -> BrainActionPlan:
+        """Run a read-only validation decision on a dedicated background lane."""
+        _ = (is_force_wakeup, is_first_event_wakeup, focus_thread)
+        peek_state = getattr(self.state_engine, "peek_state", None)
+        state = (
+            await peek_state(chat_id)
+            if callable(peek_state)
+            else await self.state_engine.get_state(chat_id)
+        )
+        history_context = self._render_window_events_context(
+            window_events,
+            focus_event=focus_event,
+        )
+        if not history_context:
+            history_records = await self._load_recent_history_records(
+                chat_id,
+                max_age_seconds=self.NORMAL_HISTORY_MAX_AGE_SECONDS,
+                limit=self.DEFAULT_HISTORY_LIMIT,
+            )
+            history_context = self._render_history_context(history_records)
+
+        msg_lower = str(message or "").strip().lower()
+        keyword_reaction_block = ""
+        matched = []
+        for rule in getattr(self.config.system1, "keyword_reactions", []):
+            parts = rule.split(":", 1) if ":" in rule else rule.split("：", 1)
+            if len(parts) != 2:
+                continue
+            keyword, reaction = parts[0].strip(), parts[1].strip()
+            if keyword.lower() in msg_lower:
+                matched.append(reaction)
+        if matched:
+            keyword_reaction_block = (
+                "\n【关键词触发的特殊心理状态】\n"
+                + "\n".join(f"- {reaction}" for reaction in matched)
+                + "\n"
+            )
+
+        available_actions = self._build_dynamic_actions(state, message, window_events_count)
+        available_action_names = self._available_action_names(message)
+        action_schema = '"|"'.join(available_action_names)
+        prompt = f"""
+            你是群聊中的这个角色的潜意识大脑，请完全沉浸于以下设定中：
+            [你的核心人设]: {persona_summary if persona_summary else '保持你原本的性格特征'}
+            {keyword_reaction_block}
+            【当前可用动作】(action 只能从中选择，取值: {action_schema}):
+            {available_actions}
+
+            当前群聊情绪: {state.mood:.2f} (-1.0 到 1.0)。
+
+            {history_context}
+            【近期发生的连续对话 (请重点基于以上历史语境和以下近期对话进行最终裁决)】:
+            {message}
+            """
+        timing = getattr(self.config, "timing", None)
+        timeout = float(getattr(timing, "attention_judge_timeout_sec", 20.0) or 20.0)
+        result = await self.gateway.chat_in_lane_result(
+            lane_key=LaneKey(
+                subsystem="bg",
+                task_family="judge_validation",
+                scope_id=chat_id,
+            ),
+            base_origin=chat_id,
+            prompt=prompt,
+            system_prompt=JUDGE_STABLE_PREFIX,
+            models=getattr(self.config.provider, "task_models", []),
+            is_json=True,
+            use_fallback=False,
+            event=None,
+            timeout_override=timeout,
+            max_retries_override=0,
+            max_models_override=1,
+            allow_cooldown_override=False,
+            reserve_for_reply=False,
+            critical_path=False,
+            propagate_queue_timeout_status=False,
+        )
+        if getattr(result, "ok", True) is False:
+            raise RuntimeError("shadow Judge provider returned a failed result")
+        payload = getattr(result, "parsed_json", None)
+        if not isinstance(payload, dict):
+            raise ValueError("shadow Judge returned no JSON object")
+        action = str(payload.get("action", "") or "").upper()
+        if action not in available_action_names:
+            raise ValueError(f"shadow Judge returned invalid action: {action or 'empty'}")
+        plan = BrainActionPlan(action=action)
+        plan.thought = str(payload.get("thought", "") or "") if action in {"REPLY", "TOOL_CALL"} else ""
+        try:
+            plan.relevance = int(float(payload.get("relevance", 0) or 0))
+        except (TypeError, ValueError):
+            plan.relevance = 0
+        try:
+            plan.necessity = float(payload.get("necessity", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            plan.necessity = 0.0
+        plan.meta["retrieve_keys"] = []
+        return plan
+
     async def evaluate(
         self,
         chat_id: str,

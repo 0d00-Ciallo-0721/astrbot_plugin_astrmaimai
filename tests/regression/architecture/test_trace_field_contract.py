@@ -17,6 +17,7 @@ import unittest
 from astrmai.conversation.planning.planner import Planner
 from astrmai.infrastructure.runtime.turn_call_ledger import (
     begin_llm_call,
+    configure_turn_budget,
     finish_llm_call,
     observe_stage,
     record_context_block_stats,
@@ -227,6 +228,60 @@ class ExecutedTraceFieldContractTests(unittest.TestCase):
                 item = self._build(self._executed_event(), status=status, reply_text=None)
                 self.assertIn("decision_observation", item)
                 self.assertEqual(item["decision_observation"]["status"], status)
+
+    def test_snapshot_refresh_does_not_duplicate_raw_trace_events(self):
+        import asyncio
+
+        snapshots = []
+        raw_appends = []
+
+        class _SnapshotStore:
+            async def append(self, item):
+                snapshots.append(item)
+
+        class _RawStore:
+            async def append_many(self, chat_id, items):
+                raw_appends.append((chat_id, list(items)))
+
+        planner = Planner.__new__(Planner)
+        planner.turn_trace_store = _SnapshotStore()
+        planner.raw_trace_store = _RawStore()
+        planner.turn_trace_history = []
+        event = self._executed_event()
+        configure_turn_budget(
+            event,
+            total_budget_sec=120,
+            main_reply_reserve_sec=30,
+        )
+
+        asyncio.run(
+            planner.record_turn_trace(
+                event.unified_msg_origin,
+                event,
+                status="skipped_ignore",
+            )
+        )
+        first_elapsed_ms = snapshots[-1]["turn_total_elapsed_ms"]
+        first_timing_coverage = snapshots[-1]["timing_coverage"]
+        first_budget = snapshots[-1]["budget"]
+        time.sleep(0.08)
+        event.set_extra("astrmai_judge_validation_status", "success")
+        asyncio.run(
+            planner.record_turn_trace(
+                event.unified_msg_origin,
+                event,
+                status="skipped_ignore",
+                refresh_snapshot_only=True,
+            )
+        )
+
+        self.assertEqual(len(snapshots), 2)
+        self.assertEqual(len(raw_appends), 1)
+        self.assertEqual(snapshots[-1]["judge_decision"]["validation_status"], "success")
+        self.assertEqual(snapshots[-1]["turn_total_elapsed_ms"], first_elapsed_ms)
+        self.assertEqual(snapshots[-1]["timing_coverage"], first_timing_coverage)
+        self.assertEqual(snapshots[-1]["budget"], first_budget)
+        self.assertGreater(first_budget["remaining_ms"], 0)
 
 
 class MemoryFunnelWrapperContractTests(unittest.TestCase):

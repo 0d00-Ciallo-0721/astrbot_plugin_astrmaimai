@@ -36,6 +36,7 @@ class DialogueSegment:
     is_recalled: bool = False
     sequence: int = 0
     topic_epoch: int = 0
+    attention_topic_key: str = ""
     causal_parent_event_id: str = ""
     provenance: str = "original"
     echo_of_event_id: str = ""
@@ -109,6 +110,7 @@ class BotTurnRecord:
     stance: str = ""
     social_event: str = ""
     topic_epoch: int = 0
+    attention_topic_key: str = ""
 
 
 @dataclass(slots=True)
@@ -239,6 +241,7 @@ class GroupDialogueStore:
         is_recalled: bool = False,
         timestamp: float | None = None,
         topic_epoch: int = 0,
+        attention_topic_key: str = "",
         causal_parent_event_id: str = "",
         provenance: str = "original",
         echo_of_event_id: str = "",
@@ -269,6 +272,7 @@ class GroupDialogueStore:
             is_image_only=bool(is_image_only),
             is_recalled=bool(is_recalled),
             topic_epoch=max(0, int(topic_epoch or 0)),
+            attention_topic_key=str(attention_topic_key or "").strip(),
             causal_parent_event_id=str(causal_parent_event_id or ""),
             provenance=str(provenance or "original"),
             echo_of_event_id=str(echo_of_event_id or ""),
@@ -383,6 +387,9 @@ class GroupDialogueStore:
                 0,
                 int(getattr(committed_turn, "topic_epoch", 0) or 0),
             ),
+            attention_topic_key=str(
+                getattr(committed_turn, "attention_topic_key", "") or ""
+            ),
             causal_parent_event_id=str(
                 getattr(target, "target_event_id", "") or ""
             ),
@@ -447,6 +454,7 @@ class GroupDialogueStore:
             stance=segment.stance,
             social_event=segment.social_event,
             topic_epoch=segment.topic_epoch,
+            attention_topic_key=segment.attention_topic_key,
         )
         turns = self._bot_turns.setdefault(chat_key, [])
         turns.append(turn)

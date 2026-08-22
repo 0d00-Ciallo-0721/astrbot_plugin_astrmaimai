@@ -13,6 +13,7 @@ from tests.original_ported.helpers import _install_astrbot_stubs
 class _FakeGateway:
     def __init__(self):
         self.prompts = []
+        self.requests = []
         self.config = SimpleNamespace(
             system1=SimpleNamespace(wakeup_words=["atri"], keyword_reactions=[]),
             global_settings=SimpleNamespace(debug_mode=False),
@@ -20,6 +21,7 @@ class _FakeGateway:
         )
 
     async def chat_in_lane_result(self, **kwargs):
+        self.requests.append(kwargs)
         self.prompts.append(kwargs["prompt"])
         return SimpleNamespace(parsed_json={"action": "IGNORE", "reason": "noop", "relevance": 0, "necessity": 0.0})
 
@@ -30,6 +32,7 @@ class _ResultGateway(_FakeGateway):
         self._parsed_json = dict(parsed_json)
 
     async def chat_in_lane_result(self, **kwargs):
+        self.requests.append(kwargs)
         self.prompts.append(kwargs["prompt"])
         return SimpleNamespace(parsed_json=dict(self._parsed_json))
 
@@ -56,6 +59,24 @@ class _CaptureStateEngine(_FakeStateEngine):
     async def atomic_update_mood(self, chat_id, delta=0.0):
         self.mood_updates.append((chat_id, delta))
         return delta
+
+
+class _ShadowCaptureStateEngine(_CaptureStateEngine):
+    def __init__(self, persistence):
+        super().__init__(persistence)
+        self.energy_calls = []
+        self.peek_calls = []
+
+    async def peek_state(self, chat_id):
+        self.peek_calls.append(chat_id)
+        return SimpleNamespace(last_reply_time=0.0, mood=0.0)
+
+    async def get_state(self, chat_id):
+        raise AssertionError("shadow Judge must use the read-only state snapshot")
+
+    async def should_drop_by_energy(self, chat_id, msg_count):
+        self.energy_calls.append((chat_id, msg_count))
+        raise AssertionError("shadow Judge must not evaluate or mutate energy")
 
 
 class _LegacyHistoryPersistence:
@@ -166,6 +187,43 @@ class JudgeHistoryWindowRefactorTests(unittest.TestCase):
         self.assertNotIn("FETCH_KNOWLEDGE", prompt)
         self.assertNotIn("RETHINK_GOAL", prompt)
         self.assertEqual(plan.action, "IGNORE")
+
+    def test_shadow_judge_is_read_only_and_uses_background_lane(self):
+        gateway = _ResultGateway(
+            {
+                "action": "REPLY",
+                "reason": "shadow observation",
+                "relevance": 5,
+                "necessity": 4.0,
+                "mood_delta": 0.8,
+            }
+        )
+        state_engine = _ShadowCaptureStateEngine(_LegacyHistoryPersistence())
+        judge = self.mod.Judge(gateway, state_engine, config=gateway.config)
+        event = _FakeWindowEvent("FocusUser", "current message", time.time())
+
+        plan = asyncio.run(
+            judge.evaluate_shadow(
+                chat_id="default:GroupMessage:group-1",
+                message="FocusUser: current message",
+                persona_summary="persona",
+                window_events_count=1,
+                window_events=[event],
+                focus_event=event,
+            )
+        )
+
+        self.assertEqual(plan.action, "REPLY")
+        self.assertEqual(state_engine.energy_calls, [])
+        self.assertEqual(state_engine.peek_calls, ["default:GroupMessage:group-1"])
+        self.assertEqual(state_engine.mood_updates, [])
+        self.assertEqual(event._extra, {"astrmai_timestamp": event.timestamp})
+        request = gateway.requests[-1]
+        self.assertEqual(request["lane_key"].subsystem, "bg")
+        self.assertEqual(request["lane_key"].task_family, "judge_validation")
+        self.assertIsNone(request["event"])
+        self.assertFalse(request["reserve_for_reply"])
+        self.assertFalse(request["critical_path"])
 
     def test_normal_judge_history_keeps_only_recent_timestamped_records(self):
         now = time.time()

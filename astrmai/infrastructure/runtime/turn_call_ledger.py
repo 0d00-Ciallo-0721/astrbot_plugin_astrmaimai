@@ -303,12 +303,27 @@ def _timing_coverage_summary(context: TurnTelemetryContext, captured_at: float) 
     }
 
 
-def turn_telemetry_snapshot(event: Any = None) -> dict[str, Any]:
+def turn_telemetry_snapshot(
+    event: Any = None,
+    *,
+    captured_at: float | None = None,
+) -> dict[str, Any]:
     context = current_turn_telemetry(event)
     if context is None:
         return {}
-    captured_at = time.time()
-    remaining = remaining_turn_budget(event)
+    snapshot_captured_at = (
+        time.time()
+        if captured_at is None
+        else max(float(context.started_at or 0.0), float(captured_at))
+    )
+    if captured_at is not None and context.total_budget_sec > 0.0:
+        remaining = max(
+            0.0,
+            context.total_budget_sec
+            - max(0.0, snapshot_captured_at - context.started_at),
+        )
+    else:
+        remaining = remaining_turn_budget(event)
     reply_completed_elapsed_ms = (
         round(max(0.0, context.reply_completed_at - context.started_at) * 1000, 1)
         if context.reply_completed_at
@@ -425,8 +440,11 @@ def turn_telemetry_snapshot(event: Any = None) -> dict[str, Any]:
         "generation": context.generation,
         "message_id_hash": context.message_id_hash,
         "started_at": context.started_at,
-        "captured_at": captured_at,
-        "total_elapsed_ms": round(max(0.0, captured_at - context.started_at) * 1000, 1),
+        "captured_at": snapshot_captured_at,
+        "total_elapsed_ms": round(
+            max(0.0, snapshot_captured_at - context.started_at) * 1000,
+            1,
+        ),
         "reply_completed_at": context.reply_completed_at or None,
         "trace_finalized_at": trace_finalized_at or None,
         "reply_completed_elapsed_ms": reply_completed_elapsed_ms,
@@ -438,7 +456,7 @@ def turn_telemetry_snapshot(event: Any = None) -> dict[str, Any]:
             "remaining_ms": round(max(0.0, float(remaining or 0.0)) * 1000, 1),
             "exhausted": remaining is not None and remaining <= 0.0,
         },
-        "timing_coverage": _timing_coverage_summary(context, captured_at),
+        "timing_coverage": _timing_coverage_summary(context, snapshot_captured_at),
         "llm_call_ledger": copy.deepcopy(context.calls[-_MAX_ENTRIES:]),
         "context_block_stats": copy.deepcopy(context.context_blocks[-16:]),
         "stage_ledger": copy.deepcopy(context.stages[-_MAX_ENTRIES:]),

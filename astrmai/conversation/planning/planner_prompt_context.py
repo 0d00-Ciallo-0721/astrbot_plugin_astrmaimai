@@ -12,7 +12,7 @@ from ...infrastructure.runtime.trace_runtime import preview_text
 from ...infrastructure.runtime.turn_call_ledger import record_context_block_stats
 from ..attention.group_context_snapshot import GroupContextSnapshotBuilder
 from ..contracts.context_package import ContextBlock, ContextPackage
-from ..contracts.dialog_history_policy import DialogHistoryPolicy
+from ..contracts.dialog_history_policy import DialogHistoryPolicy, POLICY_EVENT_KEY
 from ..contracts.focus_context import FocusThreadContext, FreshnessState, ReplyMode
 from ..contracts.prompt_envelope import PromptEnvelope
 from ..reply_shape_policy import resolve_reply_shape_policy, set_reply_shape_policy
@@ -26,6 +26,34 @@ from .message_renderer import MessageRenderer
 
 
 class PlannerPromptContextMixin:
+    def _resolve_group_history_policy(
+        self,
+        *,
+        chat_id: str,
+        focus_event: AstrMessageEvent,
+        focus_context: FocusThreadContext,
+        focus_message_text: str,
+    ) -> DialogHistoryPolicy:
+        bound_policy = getattr(focus_context, "history_policy", None)
+        if not (
+            isinstance(bound_policy, DialogHistoryPolicy)
+            and bool(bound_policy.group_id)
+        ):
+            raw_policy = focus_event.get_extra(POLICY_EVENT_KEY, None)
+            bound_policy = (
+                DialogHistoryPolicy.from_value(raw_policy)
+                if raw_policy is not None
+                else None
+            )
+        if isinstance(bound_policy, DialogHistoryPolicy) and bound_policy.group_id:
+            return bound_policy
+        return self.conversation_continuity.evaluate_group_message(
+            chat_id,
+            focus_message_text,
+            sender_id=self._safe_event_sender_id(focus_event),
+            has_reply_reference=self._has_reply_reference(focus_event),
+        )
+
     @staticmethod
     def _is_near_context_query(message_text: str) -> bool:
         if not isinstance(message_text, str):
@@ -635,11 +663,11 @@ class PlannerPromptContextMixin:
         focus_message_text = self._build_focus_message_text(focus_event, focus_context)
         history_policy = DialogHistoryPolicy()
         if self._is_group_event(focus_event):
-            history_policy = self.conversation_continuity.evaluate_group_message(
-                chat_id,
-                focus_message_text,
-                sender_id=self._safe_event_sender_id(focus_event),
-                has_reply_reference=self._has_reply_reference(focus_event),
+            history_policy = self._resolve_group_history_policy(
+                chat_id=chat_id,
+                focus_event=focus_event,
+                focus_context=focus_context,
+                focus_message_text=focus_message_text,
             )
             if is_lightweight_event:
                 history_policy = replace(

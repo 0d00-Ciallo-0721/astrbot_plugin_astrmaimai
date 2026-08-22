@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from .attention_topic import AttentionTopicIdentity
+from .dialog_history_policy import DialogHistoryPolicy
 from .turn_target import ActorSet, TurnTarget
 
 
@@ -97,6 +99,8 @@ class FocusThreadContext:
     reply_mode: ReplyMode = ReplyMode.CASUAL_FOLLOWUP
     social_state: str = ""
     thread_signature: str = ""
+    history_policy: DialogHistoryPolicy = field(default_factory=DialogHistoryPolicy)
+    attention_topic: AttentionTopicIdentity = field(default_factory=AttentionTopicIdentity)
     freshness_budget: ReplyFreshnessBudget = field(default_factory=ReplyFreshnessBudget)
     vision_bundle: VisionBundle = field(default_factory=VisionBundle)
     recent_media_candidates: list[MediaCandidate] = field(default_factory=list)

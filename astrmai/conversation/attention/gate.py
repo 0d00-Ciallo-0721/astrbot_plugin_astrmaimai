@@ -6,6 +6,7 @@ import hashlib
 import inspect
 import re
 import time
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any, Dict, List, Set
 
@@ -14,6 +15,7 @@ from astrbot.api.event import AstrMessageEvent
 import astrbot.api.message_components as Comp
 
 from ..contracts.conversation_event import ConversationEvent
+from ..contracts.dialog_history_policy import DialogHistoryPolicy
 from ..contracts.turn_context import ensure_turn_context
 from ..contracts.turn_identity import TurnIdentity, build_p0_thread_id
 from ..threading.group_thread_resolver import resolve_group_thread
@@ -33,6 +35,7 @@ from ...infrastructure.runtime.turn_call_ledger import (
 )
 from ...shared.helpers.plugin_helpers import event_mentions_actor, get_event_self_id
 from ..planning.message_renderer import MessageRenderer
+from .topic_identity import resolve_attention_topic_identity
 from .decision_router import AttentionDecisionRouter
 from .event_normalizer import SessionContext, build_normalized_events
 from .focus_selector import score_focus_candidate, select_focus_event
@@ -162,6 +165,71 @@ class AttentionGate:
             if callable(refresh_continuity):
                 refresh_continuity(config)
 
+    def _prepare_group_attention_topic(
+        self,
+        chat_id: str,
+        focus_event: AstrMessageEvent,
+        focus_thread: Any,
+    ) -> DialogHistoryPolicy:
+        policy = DialogHistoryPolicy()
+        continuity = self.conversation_continuity
+        evaluate_group = getattr(continuity, "evaluate_group_message", None)
+        if callable(evaluate_group):
+            canonical = focus_event.get_extra("astrmai_conversation_event", None)
+            try:
+                event_timestamp = float(
+                    focus_event.get_extra(
+                        "astrmai_timestamp",
+                        getattr(focus_event, "timestamp", 0.0),
+                    )
+                    or 0.0
+                )
+            except (TypeError, ValueError):
+                event_timestamp = 0.0
+            try:
+                policy = evaluate_group(
+                    chat_id,
+                    str(
+                        focus_event.get_extra(
+                            "astrmai_rich_text",
+                            getattr(focus_event, "message_str", ""),
+                        )
+                        or ""
+                    ),
+                    sender_id=str(focus_event.get_sender_id() or "").strip(),
+                    has_reply_reference=bool(
+                        getattr(canonical, "reply_target_event_id", "")
+                        or getattr(canonical, "quote_event_id", "")
+                        or str(getattr(focus_thread, "root_reason", "") or "")
+                        == "explicit_reply_target"
+                    ),
+                    approved_event_ids=getattr(
+                        getattr(focus_thread, "turn_target", None),
+                        "source_event_ids",
+                        (),
+                    ),
+                    now=event_timestamp or None,
+                )
+            except Exception as exc:
+                logger.debug(f"[AttentionGate] group topic preparation degraded: {exc}")
+        focus_thread.history_policy = policy
+        policy.bind(focus_event)
+        identity = resolve_attention_topic_identity(
+            history_policy=policy,
+            focus_event=focus_event,
+            focus_thread=focus_thread,
+        )
+        focus_thread.attention_topic = identity
+        identity.bind(focus_event)
+        target = getattr(focus_thread, "turn_target", None)
+        if target is not None:
+            focus_thread.turn_target = replace(
+                target,
+                topic_epoch=policy.topic_epoch,
+                attention_topic_key=identity.attention_topic_key,
+            )
+        return policy
+
     def get_proactive_lock(self, chat_id: str) -> asyncio.Lock:
         """Return a per-chat lock for proactive injection serialization."""
         if chat_id not in self._proactive_injection_lock:
@@ -201,6 +269,9 @@ class AttentionGate:
         clear_pending = getattr(self.private_turn_coordinator, "clear_pending_batch", None)
         if callable(clear_pending):
             removed = bool(clear_pending(chat_id)) or removed
+        clear_router = getattr(self.decision_router, "clear_chat_state", None)
+        if callable(clear_router):
+            removed = bool(clear_router(chat_id)) or removed
         clear_continuity = getattr(self.conversation_continuity, "clear", None)
         if callable(clear_continuity):
             had_continuity = bool(
@@ -1568,6 +1639,18 @@ class AttentionGate:
     def bind_turn_trace_callback(self, callback) -> None:
         self.turn_trace_callback = callback
 
+    @staticmethod
+    def _trace_callback_supports_snapshot_refresh(callback) -> bool:
+        try:
+            parameters = inspect.signature(callback).parameters.values()
+        except (TypeError, ValueError):
+            return False
+        return any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            or parameter.name == "refresh_snapshot_only"
+            for parameter in parameters
+        )
+
     async def _finalize_pre_planner_turn(
         self,
         event: AstrMessageEvent,
@@ -1576,6 +1659,7 @@ class AttentionGate:
         status: str,
         reply_text: str | None = None,
     ) -> None:
+        event.set_extra("astrmai_pre_planner_trace_status", str(status or ""))
         trace_state = str(event.get_extra("astrmai_pre_planner_trace_state", "") or "")
         if trace_state in {"pending", "persisted"} or bool(
             event.get_extra("astrmai_pre_planner_trace_finalized", False)
@@ -1622,6 +1706,45 @@ class AttentionGate:
             return
         event.set_extra("astrmai_pre_planner_trace_finalized", True)
         event.set_extra("astrmai_pre_planner_trace_state", "persisted")
+        if bool(
+            event.get_extra(
+                "astrmai_judge_validation_trace_refresh_requested",
+                False,
+            )
+        ):
+            event.set_extra(
+                "astrmai_judge_validation_trace_refresh_requested",
+                False,
+            )
+            try:
+                callback_kwargs = {
+                    "status": status,
+                    "reply_text": reply_text,
+                }
+                if self._trace_callback_supports_snapshot_refresh(callback):
+                    callback_kwargs["refresh_snapshot_only"] = True
+                refreshed = callback(
+                    str(chat_id or getattr(event, "unified_msg_origin", "") or ""),
+                    event,
+                    **callback_kwargs,
+                )
+                if inspect.isawaitable(refreshed):
+                    await refreshed
+            except asyncio.CancelledError:
+                event.set_extra(
+                    "astrmai_judge_validation_trace_refresh_requested",
+                    True,
+                )
+                raise
+            except Exception as exc:
+                event.set_extra(
+                    "astrmai_judge_validation_trace_refresh_error",
+                    type(exc).__name__,
+                )
+                logger.warning(
+                    "[AttentionGate] Judge validation trace refresh failed "
+                    f"status={status} error_type={type(exc).__name__}"
+                )
 
     async def inject_external_event(self, chat_id: str, event_data: dict):
         event = _SyntheticExternalEvent(dict(event_data or {}, unified_msg_origin=chat_id))
@@ -2167,6 +2290,8 @@ class AttentionGate:
                     focus_thread = self._build_focus_thread(focus_candidate, root_candidate, normalized)
                     focus_thread.focus_reason = focus_thread.focus_reason or focus_reason or "selected_focus_event"
                     focus_thread.root_reason = focus_thread.root_reason or root_reason
+                    if not is_private:
+                        self._prepare_group_attention_topic(chat_id, focus_event, focus_thread)
 
                     emit_legacy_focus_thread_extras(focus_event, focus_thread, window_events=events)
                     retrieve_keys = ["CORE_ONLY"] if focus_candidate.is_near_context_query else ["ALL"]

@@ -37,6 +37,7 @@ class LaneManager(LaneHistoryMixin, LaneStorageMixin):
 
     DEFAULT_POLICIES: Dict[tuple[str, str], LanePolicy] = {
         ("sys1", "judge"): LanePolicy(store_mode="structured", max_raw_turns=6),
+        ("bg", "judge_validation"): LanePolicy(store_mode="structured", max_raw_turns=2),
         ("sys1", "mood"): LanePolicy(store_mode="structured", max_raw_turns=6),
         ("sys1", "vision"): LanePolicy(store_mode="structured", max_raw_turns=2),
         ("sys2", "dialog"): LanePolicy(store_mode="full", max_raw_turns=12, summarize_threshold_tokens=1800),

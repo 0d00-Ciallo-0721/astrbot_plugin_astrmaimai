@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+from astrmai.conversation.contracts.attention_topic import AttentionTopicIdentity
 from astrmai.conversation.attention.participation_policy import (
     ParticipationPolicy,
     ParticipationState,
@@ -20,11 +21,27 @@ class _Event:
         return self._extras.get(key, default)
 
 
-def _committed(actor_id: str, *, timestamp: float = 100.0, topic_epoch: int = 1):
+def _identity(epoch: int, key: str) -> AttentionTopicIdentity:
+    return AttentionTopicIdentity(
+        history_topic_epoch=epoch,
+        attention_topic_key=key,
+        source="topic_similarity",
+        confidence=0.9,
+    )
+
+
+def _committed(
+    actor_id: str,
+    *,
+    timestamp: float = 100.0,
+    topic_epoch: int = 1,
+    attention_topic_key: str = "topic-1",
+):
     return SimpleNamespace(
         target_sender_id=actor_id,
         timestamp=timestamp,
         topic_epoch=topic_epoch,
+        attention_topic_key=attention_topic_key,
         turn_id="turn-1",
         source_event_ids=("event-1",),
     )
@@ -58,6 +75,7 @@ def test_committed_target_short_continuation_forces_participation():
         focus_event=focus,
         batch_events=[focus],
         recent_committed_turn=_committed("user-1"),
+        topic_identity=_identity(1, "topic-1"),
     )
 
     assert result.action == "FORCE_PASS"
@@ -77,6 +95,7 @@ def test_other_actor_does_not_inherit_engaged_relationship():
         phase="engaged",
         actor_id="user-1",
         topic_epoch=1,
+        attention_topic_key="topic-1",
         updated_at=100.0,
     )
 
@@ -84,6 +103,7 @@ def test_other_actor_does_not_inherit_engaged_relationship():
         focus_event=focus,
         batch_events=[focus],
         previous_state=previous,
+        topic_identity=_identity(1, "topic-1"),
     )
 
     assert result.action == "NEED_JUDGE"
@@ -102,6 +122,7 @@ def test_topic_epoch_change_invalidates_hysteresis():
         phase="engaged",
         actor_id="user-1",
         topic_epoch=1,
+        attention_topic_key="topic-1",
         updated_at=100.0,
     )
 
@@ -109,10 +130,11 @@ def test_topic_epoch_change_invalidates_hysteresis():
         focus_event=focus,
         batch_events=[focus],
         previous_state=previous,
+        topic_identity=_identity(2, "topic-2"),
     )
 
     assert result.action == "NEED_JUDGE"
-    assert result.invalidated_reason == "topic_epoch_changed"
+    assert result.invalidated_reason == "topic_identity_changed"
     assert state.phase == "observing"
 
 
@@ -145,6 +167,7 @@ def test_same_actor_engaged_hysteresis_stays_on_judge_boundary():
         phase="engaged",
         actor_id="user-1",
         topic_epoch=1,
+        attention_topic_key="topic-1",
         updated_at=100.0,
     )
 
@@ -152,8 +175,34 @@ def test_same_actor_engaged_hysteresis_stays_on_judge_boundary():
         focus_event=focus,
         batch_events=[focus],
         previous_state=previous,
+        topic_identity=_identity(1, "topic-1"),
     )
 
     assert result.action == "NEED_JUDGE"
     assert result.score == 45
     assert "engaged_hysteresis" in result.signals
+
+
+def test_unknown_topic_identity_does_not_inherit_engaged_or_committed_state():
+    policy = ParticipationPolicy()
+    focus = _Event("user-1", "继续")
+    previous = ParticipationState(
+        phase="engaged",
+        actor_id="user-1",
+        topic_epoch=1,
+        attention_topic_key="topic-1",
+        updated_at=100.0,
+    )
+
+    result, state = policy.evaluate(
+        focus_event=focus,
+        batch_events=[focus],
+        recent_committed_turn=_committed("user-1"),
+        previous_state=previous,
+        topic_identity=AttentionTopicIdentity(),
+    )
+
+    assert result.action == "NEED_JUDGE"
+    assert result.score == 0
+    assert result.invalidated_reason == "topic_identity_unknown"
+    assert state.attention_topic_key == ""

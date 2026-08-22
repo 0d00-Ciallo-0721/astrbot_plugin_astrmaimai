@@ -157,6 +157,16 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
     judge_cache_scope_counts: Counter[str] = Counter()
     judge_avoidance_state_counts: Counter[str] = Counter()
     prefilter_judge_agreement_counts: Counter[str] = Counter()
+    attention_eligible_count = 0
+    attention_eligible_judge_called_count = 0
+    attention_prefilter_action_counts: Counter[str] = Counter()
+    attention_prefilter_reason_counts: Counter[str] = Counter()
+    judge_validation_source_counts: Counter[str] = Counter()
+    judge_validation_status_counts: Counter[str] = Counter()
+    judge_validation_action_counts: Counter[str] = Counter()
+    judge_validation_agreement_counts: Counter[str] = Counter()
+    judge_validation_sampled_count = 0
+    judge_validation_false_filter_count = 0
     faiss_status_counts: Counter[str] = Counter()
     faiss_timeout_origin_counts: Counter[str] = Counter()
     faiss_fallback_source_counts: Counter[str] = Counter()
@@ -273,6 +283,39 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
         cache_hit = judge_contract.get("cache_hit", None)
         avoided = judge_contract.get("avoided", None)
         agreement = judge_contract.get("prefilter_judge_agreement", None)
+        architecture_contract = _safe_dict(trace.get("architecture_contract"))
+        participation_contract = _safe_dict(
+            trace.get("participation_decision")
+            or architecture_contract.get("participation_decision")
+        )
+        current_attention_eligible = participation_contract.get("eligible") is True
+        if current_attention_eligible:
+            attention_eligible_count += 1
+        prefilter_action = str(participation_contract.get("prefilter_action", "") or "")
+        prefilter_reason = str(participation_contract.get("prefilter_reason", "") or "")
+        if prefilter_action:
+            attention_prefilter_action_counts[prefilter_action] += 1
+        if prefilter_reason:
+            attention_prefilter_reason_counts[prefilter_reason] += 1
+        validation_sampled = bool(judge_contract.get("validation_sampled", False))
+        validation_source = str(judge_contract.get("validation_source", "") or "")
+        validation_status = str(judge_contract.get("validation_status", "") or "")
+        validation_action = str(judge_contract.get("validation_action", "") or "")
+        validation_agreement = judge_contract.get("validation_agreement", None)
+        if validation_sampled:
+            judge_validation_sampled_count += 1
+        if validation_source:
+            judge_validation_source_counts[validation_source] += 1
+        if validation_status:
+            judge_validation_status_counts[validation_status] += 1
+        if validation_action:
+            judge_validation_action_counts[validation_action] += 1
+        if validation_agreement is True:
+            judge_validation_agreement_counts["true"] += 1
+        elif validation_agreement is False:
+            judge_validation_agreement_counts["false"] += 1
+        if judge_contract.get("validation_false_filter_candidate") is True:
+            judge_validation_false_filter_count += 1
         if any(
             value is not None
             for value in (cache_hit, avoided, agreement, judge_contract.get("cache_action"), judge_contract.get("cache_scope"))
@@ -326,6 +369,12 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
             if pool == "judge" or stage == "attention.judge" or "judge" in stage:
                 judge_count += 1
         judge_calls_per_turn.append(float(judge_count))
+        primary_judge_count = max(
+            0,
+            judge_count - (1 if validation_sampled and judge_count > 0 else 0),
+        )
+        if current_attention_eligible and primary_judge_count > 0:
+            attention_eligible_judge_called_count += 1
         if not calls:
             missing["llm_call_ledger"] += 1
 
@@ -657,6 +706,26 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
                 for stage, values in sorted(llm_stage_latencies.items())
             },
         },
+        "attention": {
+            "eligible_count": attention_eligible_count,
+            "eligible_judge_called_count": attention_eligible_judge_called_count,
+            "judge_call_rate": round(
+                attention_eligible_judge_called_count / attention_eligible_count,
+                4,
+            )
+            if attention_eligible_count
+            else 0.0,
+            "prefilter_action_counts": dict(attention_prefilter_action_counts.most_common()),
+            "prefilter_reason_counts": dict(attention_prefilter_reason_counts.most_common()),
+            "validation_sampled_count": judge_validation_sampled_count,
+            "validation_source_counts": dict(judge_validation_source_counts.most_common()),
+            "validation_status_counts": dict(judge_validation_status_counts.most_common()),
+            "validation_action_counts": dict(judge_validation_action_counts.most_common()),
+            "validation_agreement_counts": dict(
+                judge_validation_agreement_counts.most_common()
+            ),
+            "validation_false_filter_candidate_count": judge_validation_false_filter_count,
+        },
         "stages": {
             "status_counts": dict(stage_status_counts.most_common()),
             "latency_by_stage": {
@@ -805,6 +874,7 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
 
 def render_markdown(report: dict[str, Any]) -> str:
     llm = _safe_dict(report.get("llm"))
+    attention = _safe_dict(report.get("attention"))
     reply = _safe_dict(report.get("reply"))
     context = _safe_dict(report.get("context"))
     memory = _safe_dict(report.get("memory"))
@@ -850,6 +920,23 @@ def render_markdown(report: dict[str, Any]) -> str:
         lines.append(f"- `judge_cache_scope:{key}`: {value}")
     for key, value in _safe_dict(llm.get("prefilter_judge_agreement_counts")).items():
         lines.append(f"- `prefilter_judge_agreement:{key}`: {value}")
+    lines.extend(["", "## Attention Prefilter"])
+    lines.append(
+        f"- Eligible/Judge-called/rate: {int(attention.get('eligible_count', 0) or 0)} / "
+        f"{int(attention.get('eligible_judge_called_count', 0) or 0)} / "
+        f"{attention.get('judge_call_rate', 0)}"
+    )
+    lines.append(
+        f"- Validation sampled/false-filter candidates: "
+        f"{int(attention.get('validation_sampled_count', 0) or 0)} / "
+        f"{int(attention.get('validation_false_filter_candidate_count', 0) or 0)}"
+    )
+    for key, value in _safe_dict(attention.get("prefilter_reason_counts")).items():
+        lines.append(f"- `prefilter_reason:{key}`: {value}")
+    for key, value in _safe_dict(attention.get("validation_source_counts")).items():
+        lines.append(f"- `validation_source:{key}`: {value}")
+    for key, value in _safe_dict(attention.get("validation_agreement_counts")).items():
+        lines.append(f"- `validation_agreement:{key}`: {value}")
     lines.extend(["", "## Skip Reasons"])
     for key, value in _safe_dict(report.get("skip_reasons")).items():
         lines.append(f"- `{key}`: {value}")

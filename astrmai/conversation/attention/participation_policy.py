@@ -4,6 +4,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Iterable
 
+from ..contracts.attention_topic import AttentionTopicIdentity
 
 _EXPLICIT_CONTINUATIONS = {
     "?",
@@ -35,6 +36,7 @@ class ParticipationState:
     phase: str = "detached"
     actor_id: str = ""
     topic_epoch: int = 0
+    attention_topic_key: str = ""
     updated_at: float = 0.0
 
 
@@ -73,25 +75,6 @@ def _actor_id(event: Any) -> str:
         return ""
 
 
-def _topic_epoch(event: Any) -> int:
-    canonical = getattr(event, "get_extra", lambda *_args: None)(
-        "astrmai_conversation_event",
-        None,
-    )
-    if canonical is not None:
-        return max(0, int(getattr(canonical, "topic_epoch", 0) or 0))
-    policy = getattr(event, "get_extra", lambda *_args: None)(
-        "astrmai_dialog_history_policy",
-        None,
-    )
-    value = (
-        policy.get("topic_epoch", 0)
-        if isinstance(policy, dict)
-        else getattr(policy, "topic_epoch", 0)
-    )
-    return max(0, int(value or 0))
-
-
 def _event_text(event: Any) -> str:
     if event is None:
         return ""
@@ -124,12 +107,17 @@ class ParticipationPolicy:
         strong_wakeup_event_ids: Iterable[str] = (),
         recent_committed_turn: Any = None,
         previous_state: ParticipationState | None = None,
+        topic_identity: AttentionTopicIdentity | None = None,
         ttl_seconds: float = 180.0,
         now: float | None = None,
     ) -> tuple[ParticipationResult, ParticipationState]:
         timestamp = float(now if now is not None else (_event_timestamp(focus_event) or time.time()))
         actor_id = _actor_id(focus_event)
-        topic_epoch = _topic_epoch(focus_event)
+        identity = AttentionTopicIdentity.from_value(
+            topic_identity or AttentionTopicIdentity.from_event(focus_event)
+        )
+        topic_epoch = identity.history_topic_epoch
+        attention_topic_key = identity.attention_topic_key
         text = _event_text(focus_event).lower()
         strong_ids = tuple(dict.fromkeys(str(value) for value in strong_wakeup_event_ids if str(value)))
         score = 0
@@ -143,12 +131,15 @@ class ParticipationPolicy:
             if timestamp - previous.updated_at > max(1.0, float(ttl_seconds or 180.0)):
                 invalidated_reason = "ttl_expired"
                 previous = ParticipationState()
-            elif (
-                previous.topic_epoch > 0
-                and topic_epoch > 0
-                and previous.topic_epoch != topic_epoch
+            elif previous.attention_topic_key and (
+                not attention_topic_key
+                or previous.attention_topic_key != attention_topic_key
             ):
-                invalidated_reason = "topic_epoch_changed"
+                invalidated_reason = (
+                    "topic_identity_changed"
+                    if attention_topic_key
+                    else "topic_identity_unknown"
+                )
                 previous = ParticipationState()
 
         if strong_ids:
@@ -179,13 +170,22 @@ class ParticipationPolicy:
         if committed is not None:
             committed_actor = str(getattr(committed, "target_sender_id", "") or "").strip()
             committed_topic = max(0, int(getattr(committed, "topic_epoch", 0) or 0))
+            committed_attention_key = str(
+                getattr(committed, "attention_topic_key", "") or ""
+            ).strip()
             committed_ts = float(getattr(committed, "timestamp", 0.0) or 0.0)
             committed_age = timestamp - committed_ts if committed_ts > 0.0 else 0.0
             same_actor = bool(actor_id and committed_actor == actor_id)
             same_topic = bool(
-                topic_epoch <= 0
-                or committed_topic <= 0
-                or topic_epoch == committed_topic
+                attention_topic_key
+                and committed_attention_key
+                and attention_topic_key == committed_attention_key
+            ) or bool(
+                not committed_attention_key
+                and identity.confidence >= 0.7
+                and topic_epoch > 0
+                and committed_topic > 0
+                and topic_epoch == committed_topic
             )
             if same_actor and same_topic and committed_age <= max(1.0, float(ttl_seconds or 180.0)):
                 score += 40
@@ -213,9 +213,9 @@ class ParticipationPolicy:
         if previous.phase == "engaged":
             same_actor = bool(actor_id and previous.actor_id == actor_id)
             same_topic = bool(
-                topic_epoch <= 0
-                or previous.topic_epoch <= 0
-                or previous.topic_epoch == topic_epoch
+                attention_topic_key
+                and previous.attention_topic_key
+                and previous.attention_topic_key == attention_topic_key
             )
             if same_actor and same_topic:
                 score += 25
@@ -247,7 +247,8 @@ class ParticipationPolicy:
             next_state = ParticipationState(
                 phase=phase,
                 actor_id=actor_id if phase == "engaged" else previous.actor_id,
-                topic_epoch=topic_epoch if topic_epoch > 0 else previous.topic_epoch,
+                topic_epoch=topic_epoch,
+                attention_topic_key=attention_topic_key,
                 updated_at=timestamp,
             )
         return (

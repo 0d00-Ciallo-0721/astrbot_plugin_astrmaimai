@@ -131,6 +131,33 @@ class ChatStatePersistenceMigratedTests(unittest.TestCase):
         self.assertEqual(persistence.saved_states[0]["last_reset_date"], datetime.date.today().isoformat())
         self.assertAlmostEqual(persistence.saved_states[0]["mood"], 0.0)
 
+    def test_peek_state_does_not_reset_persist_or_warm_mutable_cache(self):
+        yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+        persistence = _ResetPersistence(
+            {
+                "chat_id": "chat-shadow",
+                "energy": 0.4,
+                "mood": 0.6,
+                "group_config": {},
+                "last_reset_date": yesterday,
+            }
+        )
+        service = ChatStateService(
+            persistence,
+            SimpleNamespace(
+                energy=SimpleNamespace(daily_recovery=0.2),
+                mood=SimpleNamespace(decay_interval=3600, decay_rate=0.05),
+            ),
+        )
+
+        snapshot = asyncio.run(service.peek_state("chat-shadow"))
+
+        self.assertEqual(snapshot.last_reset_date, yesterday)
+        self.assertAlmostEqual(snapshot.energy, 0.4)
+        self.assertAlmostEqual(snapshot.mood, 0.6)
+        self.assertEqual(persistence.saved_states, [])
+        self.assertNotIn("chat-shadow", service.chat_states)
+
     def test_get_chat_state_survives_schema_rebuild_with_column_reorder(self):
         """回归 (w11): 列缓存预热后chat_states被重建且列序变化,
         get_chat_state应按当前结果集真实列序恢复字段，不受旧缓存污染。"""

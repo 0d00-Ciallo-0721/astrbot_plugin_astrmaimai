@@ -109,6 +109,8 @@ class ContextEconomyCenter:
             # ponytail: M15 — added missing subsystem mappings
             if (lane_key.subsystem, lane_key.task_family) == ("sys1", "judge"):
                 return WorkloadFamily.JUDGE
+            if (lane_key.subsystem, lane_key.task_family) == ("bg", "judge_validation"):
+                return WorkloadFamily.JUDGE
             if (lane_key.subsystem, lane_key.task_family) == ("sys1", "mood"):
                 return WorkloadFamily.MOOD
             if (lane_key.subsystem, lane_key.task_family) == ("sys3", "direct"):
