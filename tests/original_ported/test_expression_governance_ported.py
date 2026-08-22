@@ -8,6 +8,7 @@ from astrmai.learning.review.expression_governance_runner import ExpressionGover
 from astrmai.learning.review.jargon_auto_check_task import JargonAutoCheckTask
 from astrmai.learning.review.reflect_tracker import ReflectTracker
 from astrmai.proactive.review_dispatcher import ReviewDispatcher
+from astrmai.infrastructure.runtime.background_task_budget import BackgroundTaskBudget
 
 
 class FakeGateway:
@@ -317,6 +318,34 @@ class ExpressionGovernancePortedTests(unittest.IsolatedAsyncioTestCase):
         )
         await runner.run_once()
         self.assertEqual(calls, [("jargon", "group-jargon")])
+
+    async def test_governance_does_not_enter_work_when_budget_is_full(self):
+        calls = []
+        release = asyncio.Event()
+        budget = BackgroundTaskBudget(1, max_queue=0)
+
+        async def hold():
+            await release.wait()
+
+        holder = asyncio.create_task(budget.run(hold, task_name="learning.backlog"))
+        await asyncio.sleep(0)
+
+        class _Reflector:
+            async def pending_scope_ids(self):
+                return ["group-full"]
+
+            async def reflect_batch(self, chat_id):
+                calls.append(("reflect", chat_id))
+
+        runner = ExpressionGovernanceRunner(
+            state_engine=SimpleNamespace(),
+            reflector=_Reflector(),
+            background_task_budget=budget,
+        )
+        await runner.run_once()
+        self.assertEqual(calls, [])
+        release.set()
+        await holder
 
 
 if __name__ == "__main__":

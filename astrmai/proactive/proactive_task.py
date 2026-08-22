@@ -333,10 +333,21 @@ class ProactiveTask:
             promotion_engine=promotion_engine,
         )
 
-    def _fire_background_task(self, awaitable_factory):
+    def _fire_background_task(
+        self,
+        awaitable_factory,
+        *,
+        task_name: str = "proactive",
+        scope_id: str = "GLOBAL",
+    ):
         budget = getattr(self, "background_task_budget", None)
         if budget is not None:
-            coro = budget.run(awaitable_factory, task_name="proactive")
+            coro = budget.run(
+                awaitable_factory,
+                task_name=task_name,
+                scope_id=scope_id,
+                defer_release_on_timeout=True,
+            )
         else:
             coro = awaitable_factory()
         task = asyncio.create_task(coro)
@@ -885,7 +896,8 @@ class ProactiveTask:
             logger.error(f"[ProactiveTask] group signin maintenance degraded: {exc}")
         try:
             self._fire_background_task(
-                lambda: self.heartflow_topic_digest_service.run_once(self.heartflow_manager)
+                lambda: self.heartflow_topic_digest_service.run_once(self.heartflow_manager),
+                task_name="proactive.heartflow",
             )
         except Exception as exc:
             logger.error(f"[ProactiveTask] heartflow topic digest scheduling degraded: {exc}")
@@ -947,14 +959,15 @@ class ProactiveTask:
 
                 if now - self._last_profile_run > 3600:
                     self._last_profile_run = now
-                    self._fire_background_task(self._run_profiling_task)
+                    self._fire_background_task(self._run_profiling_task, task_name="proactive.profile")
 
                 if run_maintenance and self.diary_service.should_run(self._last_diary_date, now):
                     diary_date = time.strftime("%Y-%m-%d", time.localtime(now))
                     if self._diary_pending_date != diary_date:
                         self._diary_pending_date = diary_date
                         self._fire_background_task(
-                            lambda: self._run_daily_diary_task_with_jitter(diary_date)
+                            lambda: self._run_daily_diary_task_with_jitter(diary_date),
+                            task_name="proactive.diary",
                         )
             except asyncio.CancelledError:
                 break

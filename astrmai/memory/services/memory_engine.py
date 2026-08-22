@@ -545,6 +545,7 @@ class MemoryEngine:
                     self._bootstrap_vector_index,
                     task_name="memory.vector_bootstrap",
                     execution_timeout_sec=timeout_sec,
+                    defer_release_on_timeout=True,
                 )
             else:
                 async with asyncio.timeout(timeout_sec):
@@ -1420,7 +1421,7 @@ class MemoryEngine:
         await self.memory_pipeline.start()
         self._schedule_vector_bootstrap()
 
-    async def stop_background_tasks(self):
+    async def stop_background_producers(self):
         bootstrap_task = self._vector_bootstrap_task
         self._vector_bootstrap_task = None
         if bootstrap_task is not None and not bootstrap_task.done():
@@ -1438,6 +1439,8 @@ class MemoryEngine:
         projector = getattr(self, "index_projector", None)
         if projector is not None:
             await projector.stop()
+
+    async def close_background_resources(self):
         retriever = getattr(self, "vec_retriever", None)
         faiss_db = getattr(self, "faiss_db", None)
         await self._close_vector_stack(retriever, faiss_db)
@@ -1446,6 +1449,10 @@ class MemoryEngine:
         self.retriever = None
         self._is_ready = False
         self._vector_state = "uninitialized"
+
+    async def stop_background_tasks(self):
+        await self.stop_background_producers()
+        await self.close_background_resources()
 
     async def run_memory_maintenance(self, chat_id: str) -> dict:
         pipeline = getattr(self, "memory_pipeline", None)

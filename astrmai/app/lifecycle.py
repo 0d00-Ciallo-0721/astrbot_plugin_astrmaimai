@@ -24,6 +24,9 @@ class PluginLifecycleManager:
         self._terminate_lock = asyncio.Lock()
         self._termination_complete = False
         self._isolated_shutdown_tasks: set[asyncio.Task[Any]] = set()
+        self._shutdown_pending_drain = False
+        self._shutdown_started_monotonic = 0.0
+        self._late_shutdown_cleanup_task: asyncio.Task[Any] | None = None
         self.runtime.lifecycle.manager = self
 
     def track_task(self, coro: Any) -> asyncio.Task[Any]:
@@ -70,7 +73,8 @@ class PluginLifecycleManager:
                 )
                 return
             logger.info("[AstrMai] runtime re-initialized after terminate; resetting shutdown latch")
-            await self._prepare_reinitialize()
+            if not await self._prepare_reinitialize():
+                return
             self._terminated = False
             self._termination_complete = False
         if self.runtime.status.is_running and self.runtime.status.lifecycle_started:
@@ -92,7 +96,20 @@ class PluginLifecycleManager:
         self.runtime.set_boot_phase("lifecycle.starting")
         self._startup_task = self.track_task(self._complete_startup())
 
-    async def _prepare_reinitialize(self) -> None:
+    async def _prepare_reinitialize(self) -> bool:
+        if getattr(self, "_shutdown_pending_drain", False):
+            logger.warning("[AstrMai] runtime reinitialize deferred: shutdown cleanup is pending")
+            return False
+        late_cleanup = getattr(self, "_late_shutdown_cleanup_task", None)
+        if late_cleanup is not None and not late_cleanup.done():
+            logger.warning("[AstrMai] runtime reinitialize deferred: late shutdown cleanup is running")
+            return False
+        budget = getattr(self.runtime, "background_task_budget", None)
+        resume_budget = getattr(budget, "resume", None)
+        if callable(resume_budget):
+            if resume_budget() is False:
+                logger.warning("[AstrMai] runtime reinitialize deferred: background work is still draining")
+                return False
         event_bus = getattr(self.runtime, "event_bus", None)
         reset_abort = getattr(event_bus, "reset_abort", None)
         if callable(reset_abort):
@@ -114,6 +131,7 @@ class PluginLifecycleManager:
             start_cron_guard()
 
         self._bind_learning_collaboration()
+        return True
 
     def _bind_learning_collaboration(self) -> None:
         event_bus = getattr(self.runtime, "event_bus", None)
@@ -469,6 +487,30 @@ class PluginLifecycleManager:
         except Exception as exc:
             errors.append(f"tasks:{exc}")
 
+        budget = getattr(self.runtime, "background_task_budget", None)
+        begin_drain = getattr(budget, "begin_drain", None)
+        if callable(begin_drain):
+            try:
+                begin_drain()
+            except Exception as exc:
+                errors.append(f"budget.begin_drain:{exc}")
+        pending_budget = self._background_budget_pending(budget)
+        if pending_budget:
+            self._shutdown_pending_drain = True
+            self._schedule_late_shutdown_cleanup(budget)
+            elapsed_ms = round((time.monotonic() - started) * 1000, 3)
+            self.runtime.status.shutdown_stage_stats["forced_tail"] = {
+                "status": "pending_drain",
+                "elapsed_ms": elapsed_ms,
+                "errors": errors,
+                "remaining": pending_budget,
+            }
+            logger.warning(
+                "[AstrMai] forced shutdown tail deferred while background work remains: "
+                f"remaining={pending_budget}"
+            )
+            return
+
         event_bus = getattr(self.runtime, "event_bus", None)
         stop_event_bus = getattr(event_bus, "stop", None)
         if callable(stop_event_bus):
@@ -488,6 +530,21 @@ class PluginLifecycleManager:
             "elapsed_ms": elapsed_ms,
             "errors": errors,
         }
+
+    @staticmethod
+    def _background_budget_pending(budget: Any) -> int:
+        status_fn = getattr(budget, "status", None)
+        if not callable(status_fn):
+            return 0
+        try:
+            status = status_fn() or {}
+        except Exception:
+            return 0
+        return max(
+            int(status.get("active", 0) or 0),
+            int(status.get("queued", 0) or 0),
+            int(status.get("deferred_tasks", 0) or 0),
+        )
 
     async def _run_bounded_shutdown_stage(
         self,
@@ -549,8 +606,12 @@ class PluginLifecycleManager:
         async with self._terminate_lock:
             if self._termination_complete:
                 return
+            if self._shutdown_pending_drain:
+                logger.info("[AstrMai] shutdown is waiting for deferred background work")
+                return
             logger.info("[AstrMai] 正在终止进程并卸载资源...")
             started = time.monotonic()
+            self._shutdown_started_monotonic = started
             self.begin_shutdown()
             self.runtime.status.shutdown_started_at = time.time()
             self.runtime.status.shutdown_stage_stats = {}
@@ -601,26 +662,42 @@ class PluginLifecycleManager:
                         deadline=deadline,
                     )
                 self._reset_runtime_status_flags()
-                elapsed_ms = (time.monotonic() - started) * 1000
-                self.runtime.status.shutdown_completed_at = time.time()
-                self.runtime.status.last_shutdown_elapsed_ms = round(elapsed_ms, 3)
-                stage_stats = self.runtime.status.shutdown_stage_stats
-                self.runtime.status.last_shutdown_slowest_stage = max(
-                    stage_stats,
-                    key=lambda key: float(stage_stats[key].get("elapsed_ms", 0.0) or 0.0),
-                    default="",
-                )
-                self.runtime.set_boot_phase("shutdown.complete")
-                self._termination_complete = True
-                logger.info(
-                    f"[AstrMai] shutdown complete elapsed_ms={elapsed_ms:.1f} "
-                    f"isolated={self.runtime.status.shutdown_isolated_tasks} "
-                    f"slowest={self.runtime.status.last_shutdown_slowest_stage or 'none'}"
-                )
+                if self._shutdown_pending_drain:
+                    self.runtime.set_boot_phase("shutdown.pending_drain")
+                    self._termination_complete = False
+                    logger.warning("[AstrMai] shutdown pending physical background work drain")
+                else:
+                    elapsed_ms = (time.monotonic() - started) * 1000
+                    self.runtime.status.shutdown_completed_at = time.time()
+                    self.runtime.status.last_shutdown_elapsed_ms = round(elapsed_ms, 3)
+                    stage_stats = self.runtime.status.shutdown_stage_stats
+                    self.runtime.status.last_shutdown_slowest_stage = max(
+                        stage_stats,
+                        key=lambda key: float(stage_stats[key].get("elapsed_ms", 0.0) or 0.0),
+                        default="",
+                    )
+                    self.runtime.set_boot_phase("shutdown.complete")
+                    self._termination_complete = True
+                    logger.info(
+                        f"[AstrMai] shutdown complete elapsed_ms={elapsed_ms:.1f} "
+                        f"isolated={self.runtime.status.shutdown_isolated_tasks} "
+                        f"slowest={self.runtime.status.last_shutdown_slowest_stage or 'none'}"
+                    )
 
     async def _terminate_impl(self) -> None:
+        budget = getattr(self.runtime, "background_task_budget", None)
+        begin_drain = getattr(budget, "begin_drain", None)
+        if callable(begin_drain):
+            try:
+                begin_drain()
+            except Exception as exc:
+                logger.warning(f"[AstrMai] background budget drain admission degraded: {exc}")
+        drain_budget = getattr(budget, "drain", None)
+        drain_report: dict[str, object] = {}
         try:
-            stop_memory = getattr(self.runtime.memory_engine, "stop_background_tasks", None)
+            stop_memory = getattr(self.runtime.memory_engine, "stop_background_producers", None)
+            if not callable(stop_memory):
+                stop_memory = getattr(self.runtime.memory_engine, "stop_background_tasks", None)
             if callable(stop_memory):
                 await stop_memory()
             else:
@@ -695,6 +772,40 @@ class PluginLifecycleManager:
             except Exception as exc:
                 logger.warning(f"[AstrMai] Background task cleanup degraded: {exc}")
 
+        if callable(drain_budget):
+            try:
+                drain_report = await drain_budget(
+                    timeout_sec=min(2.0, float(self.SHUTDOWN_TASK_TIMEOUT or 2.0))
+                )
+                if drain_report.get("observed", 0):
+                    logger.info(
+                        "[AstrMai] deferred background work drained: "
+                        f"observed={drain_report.get('observed', 0)} "
+                        f"remaining={drain_report.get('remaining', 0)}"
+                    )
+            except Exception as exc:
+                logger.warning(f"[AstrMai] deferred background drain degraded: {exc}")
+
+        if drain_report.get("remaining", 0):
+            self._shutdown_pending_drain = True
+            self._schedule_late_shutdown_cleanup(budget)
+            logger.warning(
+                "[AstrMai] keeping dependent resources open until background drain completes: "
+                f"remaining={drain_report.get('remaining', 0)}"
+            )
+            return
+
+        try:
+            close_memory_resources = getattr(
+                self.runtime.memory_engine,
+                "close_background_resources",
+                None,
+            )
+            if callable(close_memory_resources):
+                await close_memory_resources()
+        except Exception as exc:
+            logger.warning(f"[AstrMai] Memory resource shutdown degraded: {exc}")
+
         # 停止 EventBus workers
         event_bus = getattr(self.runtime, "event_bus", None)
         if event_bus is not None:
@@ -710,6 +821,59 @@ class PluginLifecycleManager:
                 persistence.dispose()
             except Exception as exc:
                 logger.warning(f"[AstrMai] Persistence dispose degraded: {exc}")
+
+    def _schedule_late_shutdown_cleanup(self, budget: Any) -> None:
+        if not budget or not hasattr(budget, "wait_until_idle"):
+            logger.warning("[AstrMai] late shutdown cleanup unavailable: budget has no idle waiter")
+            return
+        existing = getattr(self, "_late_shutdown_cleanup_task", None)
+        if existing is not None and not existing.done():
+            return
+
+        async def _cleanup() -> None:
+            await budget.wait_until_idle()
+            try:
+                close_memory_resources = getattr(
+                    self.runtime.memory_engine,
+                    "close_background_resources",
+                    None,
+                )
+                if callable(close_memory_resources):
+                    await close_memory_resources()
+            except Exception as exc:
+                logger.warning(f"[AstrMai] late Memory resource shutdown degraded: {exc}")
+            try:
+                event_bus = getattr(self.runtime, "event_bus", None)
+                stop_event_bus = getattr(event_bus, "stop", None)
+                if callable(stop_event_bus):
+                    await stop_event_bus()
+            except Exception as exc:
+                logger.warning(f"[AstrMai] late EventBus shutdown degraded: {exc}")
+            try:
+                persistence = getattr(self.runtime, "persistence", None)
+                dispose = getattr(persistence, "dispose", None)
+                if callable(dispose):
+                    dispose()
+            except Exception as exc:
+                logger.warning(f"[AstrMai] late Persistence dispose degraded: {exc}")
+            finally:
+                self._shutdown_pending_drain = False
+                self._reset_runtime_status_flags()
+                elapsed_ms = (time.monotonic() - self._shutdown_started_monotonic) * 1000
+                self.runtime.status.shutdown_completed_at = time.time()
+                self.runtime.status.last_shutdown_elapsed_ms = round(elapsed_ms, 3)
+                self.runtime.set_boot_phase("shutdown.complete")
+                self._termination_complete = True
+                logger.info(f"[AstrMai] deferred shutdown cleanup complete elapsed_ms={elapsed_ms:.1f}")
+
+        try:
+            task = asyncio.create_task(_cleanup(), name="astrmai:shutdown:late-cleanup")
+        except RuntimeError as exc:
+            logger.warning(f"[AstrMai] late shutdown cleanup scheduling degraded: {exc}")
+            return
+        self._late_shutdown_cleanup_task = task
+        self._isolated_shutdown_tasks.add(task)
+        task.add_done_callback(self._consume_isolated_shutdown_task)
 
     # ponytail: 10+ flags set sequentially with no atomicity guarantee.
     # Acceptable because terminate() is called once at shutdown and flags are

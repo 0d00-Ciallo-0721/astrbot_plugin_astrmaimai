@@ -161,6 +161,8 @@ class MemoryIndexProjector:
                     await background_budget.run(
                         lambda: self.retry_due(limit=limit),
                         task_name="memory_projection",
+                        scope_id="GLOBAL",
+                        defer_release_on_timeout=True,
                     )
                 else:
                     await self.retry_due(limit=limit)

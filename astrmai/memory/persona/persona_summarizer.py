@@ -71,11 +71,16 @@ class PersonaSummarizer:
     def refresh_config(self, config) -> None:
         self.config = config
 
-    async def _run_background_model(self, awaitable_factory):
+    async def _run_background_model(self, awaitable_factory, *, scope_id: str = ""):
         budget = self.background_task_budget
         if budget is None:
             return await awaitable_factory()
-        return await budget.run(awaitable_factory, task_name="persona")
+        return await budget.run(
+            awaitable_factory,
+            task_name="persona",
+            scope_id=scope_id,
+            defer_release_on_timeout=True,
+        )
 
     @classmethod
     def normalize_structured_core(cls, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -154,7 +159,7 @@ class PersonaSummarizer:
                             raise
                         await self._generate_all_shards_background(original_prompt, cache_key)
 
-                await self._run_background_model(_generate_shards)
+                await self._run_background_model(_generate_shards, scope_id=cache_key)
                 return
             except asyncio.CancelledError:
                 raise
@@ -1169,7 +1174,8 @@ Rules:
                     original_prompt,
                     staging_key,
                     force_compression=True,
-                )
+                ),
+                scope_id=cache_key,
             )
             job["stage"] = "shards"
             await self._run_background_model(
@@ -1178,7 +1184,8 @@ Rules:
                     staging_key,
                     raise_on_failure=True,
                     skip_self_lore=True,
-                )
+                ),
+                scope_id=cache_key,
             )
             staging_payload = copy.deepcopy(self.cache.get(staging_key, {}))
             if not self._full_cache_is_ready(

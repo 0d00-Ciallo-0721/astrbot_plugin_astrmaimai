@@ -6,6 +6,7 @@ import unittest
 from types import SimpleNamespace
 
 from tests.helpers.astrbot_stubs import install_astrbot_stubs
+from astrmai.infrastructure.runtime.background_task_budget import BackgroundTaskBudget
 
 
 class _FakeDB:
@@ -102,6 +103,32 @@ class LearningRefactorTests(unittest.TestCase):
 
         asyncio.run(_run())
         self.assertEqual(service.calls, [])
+
+    def test_backlog_scheduler_sleep_does_not_hold_shared_budget(self):
+        config = SimpleNamespace(
+            evolution=SimpleNamespace(
+                mining_window_sec=60,
+                mining_window_min_messages=2,
+                mining_cooldown_sec=60,
+                mining_trigger=20,
+            ),
+            reply=SimpleNamespace(fallback_text="fallback"),
+        )
+        budget = BackgroundTaskBudget(1)
+        manager = self.mod.EvolutionManager(
+            _FakeDB(),
+            SimpleNamespace(config=config),
+            config=config,
+            background_task_budget=budget,
+        )
+
+        async def _run():
+            await manager.start_background_tasks()
+            await asyncio.sleep(0.01)
+            self.assertEqual(budget.status()["active"], 0)
+            await manager.stop_background_tasks()
+
+        asyncio.run(_run())
 
     def test_get_active_patterns_canonical_sync_still_works_without_running_loop(self):
         config = SimpleNamespace(

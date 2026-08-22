@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import unittest
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -467,6 +468,303 @@ class BackgroundTaskBudgetTests(unittest.TestCase):
             self.assertIn("embedding", status["duration_ms_by_kind"])
 
         asyncio.run(run())
+
+    def test_nested_budget_reuses_outer_lease(self):
+        async def run():
+            budget = BackgroundTaskBudget(1, wait_timeout_sec=0.01)
+            started = asyncio.Event()
+
+            async def inner():
+                started.set()
+                return "ok"
+
+            async def outer():
+                return await budget.run(inner, task_name="compaction")
+
+            self.assertEqual(
+                await budget.run(outer, task_name="attention.compaction"),
+                "ok",
+            )
+            self.assertEqual(budget.status()["timed_out"], 0)
+
+        asyncio.run(run())
+
+    def test_deferred_timeout_keeps_physical_slot_until_work_finishes(self):
+        async def run():
+            budget = BackgroundTaskBudget(1, execution_timeout_sec=0.01)
+            release = asyncio.Event()
+
+            async def slow():
+                await release.wait()
+
+            task = asyncio.create_task(
+                budget.run(
+                    slow,
+                    task_name="memory.vector_bootstrap",
+                    defer_release_on_timeout=True,
+                )
+            )
+            with self.assertRaises(BackgroundTaskExecutionTimeout):
+                await task
+            self.assertEqual(budget.status()["active"], 1)
+            self.assertEqual(budget.status()["timed_out_but_running"], 1)
+            release.set()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            self.assertEqual(budget.status()["active"], 0)
+            self.assertEqual(budget.status().get("timed_out_but_running", 0), 0)
+            self.assertEqual(
+                budget.status()["late_completed_by_kind"],
+                {"memory.vector_bootstrap": 1},
+            )
+
+        asyncio.run(run())
+
+    def test_factory_failure_and_future_do_not_leak_slot(self):
+        async def run():
+            budget = BackgroundTaskBudget(1)
+
+            def fail_synchronously():
+                raise RuntimeError("factory failed")
+
+            with self.assertRaisesRegex(RuntimeError, "factory failed"):
+                await budget.run(fail_synchronously, task_name="learning.triggered")
+            self.assertEqual(budget.status()["active"], 0)
+            self.assertEqual(budget.status()["failed_by_kind"], {"learning.triggered": 1})
+
+            future = asyncio.get_running_loop().create_future()
+            future.set_result("future")
+            self.assertEqual(
+                await budget.run(
+                    lambda: future,
+                    task_name="learning.triggered",
+                    defer_release_on_timeout=True,
+                ),
+                "future",
+            )
+            self.assertEqual(budget.status()["active"], 0)
+
+        asyncio.run(run())
+
+    def test_child_task_cannot_reuse_released_lease(self):
+        async def run():
+            budget = BackgroundTaskBudget(1, max_queue=1, wait_timeout_sec=0.01)
+            child_started = False
+            child_result = None
+
+            async def child_work():
+                nonlocal child_started
+                child_started = True
+
+            async def child_runner():
+                await asyncio.sleep(0.02)
+                nonlocal child_result
+                try:
+                    await budget.run(child_work, task_name="child")
+                    child_result = "ran"
+                except BackgroundTaskQueueTimeout:
+                    child_result = "queued_timeout"
+
+            async def outer():
+                return asyncio.create_task(child_runner())
+
+            child_task = await budget.run(outer, task_name="outer")
+            release = asyncio.Event()
+            blocker = asyncio.create_task(budget.run(lambda: release.wait(), task_name="blocker"))
+            await child_task
+            self.assertEqual(child_result, "queued_timeout")
+            self.assertFalse(child_started)
+            release.set()
+            await blocker
+
+        asyncio.run(run())
+
+    def test_drain_cancels_deferred_work_and_releases_slot(self):
+        async def run():
+            budget = BackgroundTaskBudget(1, execution_timeout_sec=0.01)
+            release = asyncio.Event()
+
+            async def slow():
+                await release.wait()
+
+            with self.assertRaises(BackgroundTaskExecutionTimeout):
+                await budget.run(
+                    slow,
+                    task_name="memory.vector_bootstrap",
+                    defer_release_on_timeout=True,
+                )
+            report = await budget.drain(0.01)
+            self.assertEqual(report["observed"], 1)
+            self.assertEqual(report["remaining"], 1)
+            self.assertEqual(budget.status()["active"], 1)
+            self.assertFalse(budget.resume())
+            release.set()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            self.assertEqual(budget.status()["active"], 0)
+            self.assertEqual(budget.status().get("deferred_tasks", 0), 0)
+            self.assertTrue(budget.resume())
+
+        asyncio.run(run())
+
+    def test_deferred_work_keeps_lease_for_late_nested_budget_call(self):
+        async def run():
+            budget = BackgroundTaskBudget(1, execution_timeout_sec=0.01)
+            nested_started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def nested():
+                nested_started.set()
+                return "nested"
+
+            async def slow_outer():
+                await asyncio.sleep(0.03)
+                self.assertEqual(await budget.run(nested, task_name="nested"), "nested")
+                await release.wait()
+
+            with self.assertRaises(BackgroundTaskExecutionTimeout):
+                await budget.run(
+                    slow_outer,
+                    task_name="outer",
+                    defer_release_on_timeout=True,
+                )
+            await asyncio.wait_for(nested_started.wait(), timeout=0.2)
+            self.assertEqual(budget.status()["timed_out"], 0)
+            release.set()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            self.assertEqual(budget.status()["active"], 0)
+
+        asyncio.run(run())
+
+    def test_begin_drain_then_producer_cancel_is_observed_by_drain(self):
+        async def run():
+            budget = BackgroundTaskBudget(1, execution_timeout_sec=1.0)
+            release = asyncio.Event()
+
+            async def work():
+                await release.wait()
+
+            wrapper = asyncio.create_task(
+                budget.run(
+                    work,
+                    task_name="producer",
+                    defer_release_on_timeout=True,
+                )
+            )
+            await asyncio.sleep(0)
+            budget.begin_drain()
+            wrapper.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await wrapper
+            report = await budget.drain(0.01)
+            self.assertEqual(report["observed"], 1)
+            self.assertEqual(report["remaining"], 1)
+            self.assertEqual(budget.status()["active"], 1)
+            release.set()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            self.assertEqual(budget.status()["active"], 0)
+
+        asyncio.run(run())
+
+    def test_drain_does_not_release_slot_for_running_to_thread(self):
+        async def run():
+            budget = BackgroundTaskBudget(1, execution_timeout_sec=0.01)
+            entered = threading.Event()
+            release = threading.Event()
+
+            def blocking_work():
+                entered.set()
+                release.wait(1.0)
+
+            async def work():
+                await asyncio.to_thread(blocking_work)
+
+            with self.assertRaises(BackgroundTaskExecutionTimeout):
+                await budget.run(
+                    work,
+                    task_name="threaded",
+                    defer_release_on_timeout=True,
+                )
+            self.assertTrue(entered.wait(0.2))
+            report = await budget.drain(0.01)
+            self.assertEqual(report["remaining"], 1)
+            self.assertEqual(budget.status()["active"], 1)
+            self.assertFalse(budget.resume())
+            release.set()
+            for _ in range(20):
+                if budget.status()["active"] == 0:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(budget.status()["active"], 0)
+            self.assertTrue(budget.resume())
+
+        asyncio.run(run())
+
+    def test_drain_observes_active_owner_and_rejects_waiter(self):
+        async def run():
+            budget = BackgroundTaskBudget(1, max_queue=1)
+            release = asyncio.Event()
+            waiter_called = False
+
+            async def running():
+                await release.wait()
+
+            async def queued():
+                nonlocal waiter_called
+                waiter_called = True
+
+            running_task = asyncio.create_task(budget.run(running, task_name="running"))
+            await asyncio.sleep(0)
+            queued_task = asyncio.create_task(budget.run(queued, task_name="queued"))
+            await asyncio.sleep(0)
+            budget.begin_drain()
+            report = await budget.drain(0.01)
+            self.assertGreaterEqual(report["observed"], 1)
+            self.assertEqual(report["remaining"], 1)
+            self.assertEqual(budget.status()["active"], 1)
+            with self.assertRaises(asyncio.CancelledError):
+                await queued_task
+            self.assertFalse(waiter_called)
+            release.set()
+            await running_task
+            final_report = await budget.drain(0.01)
+            self.assertEqual(final_report["remaining"], 0)
+
+        asyncio.run(run())
+
+    def test_drain_observed_resets_after_successful_resume(self):
+        async def run():
+            budget = BackgroundTaskBudget(1, max_queue=1)
+            release = asyncio.Event()
+
+            running_task = asyncio.create_task(
+                budget.run(lambda: release.wait(), task_name="running")
+            )
+            await asyncio.sleep(0)
+            queued_task = asyncio.create_task(
+                budget.run(lambda: asyncio.sleep(0), task_name="queued")
+            )
+            await asyncio.sleep(0)
+
+            budget.begin_drain()
+            release.set()
+            await running_task
+            with self.assertRaises(asyncio.CancelledError):
+                await queued_task
+            first = await budget.drain(0.01)
+            self.assertEqual(first["observed"], 1)
+            self.assertEqual(first["remaining"], 0)
+            self.assertTrue(budget.resume())
+
+            second = await budget.drain(0.01)
+            self.assertEqual(second, {"observed": 0, "remaining": 0})
+
+        asyncio.run(run())
+
+    def test_duration_summary_uses_conservative_small_sample_p95(self):
+        self.assertEqual(BackgroundTaskBudget._duration_summary([0.0, 141.0])["p95"], 141.0)
 
 
 if __name__ == "__main__":

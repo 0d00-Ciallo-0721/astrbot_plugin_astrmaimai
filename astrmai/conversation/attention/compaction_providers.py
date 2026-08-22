@@ -38,7 +38,11 @@ class CompactionProviderMixin:
 
         if budget is None:
             return await _run_with_gateway_slot()
-        return await budget.run(_run_with_gateway_slot, task_name="compaction")
+        return await budget.run(
+            _run_with_gateway_slot,
+            task_name="compaction",
+            defer_release_on_timeout=True,
+        )
 
     def _compaction_provider_validated(self, context, configured: str) -> bool:
         cache = getattr(self, "_compaction_provider_validation", None)

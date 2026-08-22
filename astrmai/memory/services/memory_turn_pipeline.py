@@ -416,6 +416,8 @@ class MemoryTurnPipeline:
                             chat_history_text=history_text,
                         ),
                         task_name="memory_maintenance",
+                        scope_id=chat_id,
+                        defer_release_on_timeout=True,
                     )
                 else:
                     await self.session_summarizer.summarize_session(

@@ -4,6 +4,10 @@ import asyncio
 
 from astrbot.api import logger
 from ...shared.helpers.plugin_helpers import safe_create_task
+from ...infrastructure.runtime.background_task_budget import (
+    BackgroundTaskQueueFull,
+    BackgroundTaskQueueTimeout,
+)
 
 
 class ExpressionGovernanceRunner:
@@ -18,6 +22,7 @@ class ExpressionGovernanceRunner:
         review_dispatcher=None,
         interval_seconds: int = 60,
         config=None,
+        background_task_budget=None,
     ):
         self.state_engine = state_engine
         self.pattern_service = pattern_service
@@ -26,6 +31,7 @@ class ExpressionGovernanceRunner:
         self.jargon_auto_check_task = jargon_auto_check_task
         self.review_dispatcher = review_dispatcher
         self.config = config
+        self.background_task_budget = background_task_budget
         self.interval_seconds = max(int(interval_seconds or 60), 15)
         self._is_running = False
         self._task = None
@@ -86,14 +92,62 @@ class ExpressionGovernanceRunner:
             return
         for chat_id in await self._governance_groups():
             if self.reflector:
-                await self.reflector.reflect_batch(chat_id)
-                await self.reflector.auto_audit(chat_id)
+                await self._run_scoped(
+                    lambda: self.reflector.reflect_batch(chat_id),
+                    task_name="governance.reflect",
+                    scope_id=chat_id,
+                )
+                await self._run_scoped(
+                    lambda: self.reflector.auto_audit(chat_id),
+                    task_name="governance.audit",
+                    scope_id=chat_id,
+                )
             if self.auto_check_task:
-                await self.auto_check_task.run_once(chat_id)
+                await self._run_scoped(
+                    lambda: self.auto_check_task.run_once(chat_id),
+                    task_name="governance.expression_check",
+                    scope_id=chat_id,
+                )
             if self.jargon_auto_check_task:
-                await self.jargon_auto_check_task.run_once(chat_id)
+                await self._run_scoped(
+                    lambda: self.jargon_auto_check_task.run_once(chat_id),
+                    task_name="governance.jargon_check",
+                    scope_id=chat_id,
+                )
         if self.review_dispatcher:
-            await self.review_dispatcher.dispatch_pending()
+            await self._run_scoped(
+                self.review_dispatcher.dispatch_pending,
+                task_name="governance.review_dispatch",
+                scope_id="GLOBAL",
+            )
+
+    async def _run_scoped(self, awaitable_factory, *, task_name: str, scope_id: str):
+        budget = self.background_task_budget
+        if budget is None:
+            try:
+                return await awaitable_factory()
+            except Exception as exc:
+                logger.warning(
+                    f"[ExpressionGovernanceRunner] {task_name} failed for {scope_id}: {exc}"
+                )
+                return None
+        try:
+            return await budget.run(
+                awaitable_factory,
+                task_name=task_name,
+                scope_id=scope_id,
+                defer_release_on_timeout=True,
+            )
+        except (BackgroundTaskQueueFull, BackgroundTaskQueueTimeout) as exc:
+            logger.debug(
+                f"[ExpressionGovernanceRunner] {task_name} skipped for {scope_id}: {exc}"
+            )
+            return None
+        except Exception as exc:
+            logger.warning(
+                f"[ExpressionGovernanceRunner] {task_name} failed for {scope_id}: {exc}"
+            )
+            return None
 
     async def _loop(self):
         while self._is_running:

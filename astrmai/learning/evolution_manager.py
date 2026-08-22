@@ -124,6 +124,7 @@ class EvolutionManager:
         self._mining_tasks: Dict[str, asyncio.Task] = {}
         self._mining_rerun_requested: set[str] = set()
         self._backlog_task: asyncio.Task | None = None
+        self._backlog_mining_task: asyncio.Task | None = None
         self._pipeline_limit = self._learning_pipeline_concurrency()
         self._pipeline_semaphore = asyncio.Semaphore(self._pipeline_limit)
         self._active_pipeline_tasks = 0
@@ -238,15 +239,32 @@ class EvolutionManager:
                 self._mining_locks[group_id] = asyncio.Lock()
             return self._mining_locks[group_id]
 
-    def _fire_background_task(self, awaitable_factory):
+    def _fire_background_task(self, awaitable_factory, *, task_name: str = "learning.triggered", scope_id: str = ""):
         if self.background_task_budget is not None:
-            coro = self.background_task_budget.run(awaitable_factory, task_name="learning")
+            coro = self.background_task_budget.run(
+                awaitable_factory,
+                task_name=task_name,
+                scope_id=scope_id,
+                defer_release_on_timeout=True,
+            )
         else:
             coro = awaitable_factory()
         task = asyncio.create_task(coro)
         self._background_tasks.add(task)
         task.add_done_callback(self._handle_task_result)
         return task
+
+    async def _run_backlog_mining_budgeted(self) -> None:
+        budget = self.background_task_budget
+        if budget is None:
+            await self.run_backlog_mining_once()
+            return
+        await budget.run(
+            self.run_backlog_mining_once,
+            task_name="learning.backlog",
+            scope_id="GLOBAL",
+            defer_release_on_timeout=True,
+        )
 
     def _schedule_mining_if_triggered(self, group_id: str, triggered: bool) -> None:
         group_id = str(group_id or "")
@@ -256,7 +274,11 @@ class EvolutionManager:
         if current is not None and not current.done():
             self._mining_rerun_requested.add(group_id)
             return
-        task = self._fire_background_task(lambda: self._try_trigger_mining(group_id))
+        task = self._fire_background_task(
+            lambda: self._try_trigger_mining(group_id),
+            task_name="learning.triggered",
+            scope_id=group_id,
+        )
         self._mining_tasks[group_id] = task
 
         def _release(done_task: asyncio.Task) -> None:
@@ -1878,23 +1900,45 @@ class EvolutionManager:
         try:
             await asyncio.sleep(30)
             while True:
+                mining_task = asyncio.create_task(
+                    self._run_backlog_mining_budgeted(),
+                    name="astrmai-learning-backlog-mining",
+                )
+                self._backlog_mining_task = mining_task
                 try:
-                    await self.run_backlog_mining_once()
+                    await mining_task
                 except Exception as exc:
                     logger.warning(f"[Evolution-Backlog] scan degraded: {exc}")
+                finally:
+                    if self._backlog_mining_task is mining_task:
+                        self._backlog_mining_task = None
                 await asyncio.sleep(self._backlog_scan_interval())
         except asyncio.CancelledError:
+            mining_task = self._backlog_mining_task
+            if mining_task is not None and not mining_task.done():
+                mining_task.cancel()
+                await asyncio.gather(mining_task, return_exceptions=True)
+            self._backlog_mining_task = None
             logger.info("[Evolution-Backlog] backlog mining worker stopped")
             raise
 
     async def start_background_tasks(self) -> None:
         if self._backlog_task is not None and not self._backlog_task.done():
             return
-        self._backlog_task = self._fire_background_task(self._backlog_mining_loop)
+        self._backlog_task = asyncio.create_task(
+            self._backlog_mining_loop(),
+            name="astrmai-learning-backlog-scheduler",
+        )
+        self._background_tasks.add(self._backlog_task)
+        self._backlog_task.add_done_callback(self._handle_task_result)
 
     async def stop_background_tasks(self) -> None:
         self._mining_rerun_requested.clear()
-        tasks = [task for task in [self._backlog_task, *self._background_tasks] if task is not None and not task.done()]
+        tasks = [
+            task
+            for task in [self._backlog_task, self._backlog_mining_task, *self._background_tasks]
+            if task is not None and not task.done()
+        ]
         for task in tasks:
             task.cancel()
         if tasks:

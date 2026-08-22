@@ -185,6 +185,150 @@ class PluginLifecycleShutdownRegressionTests(unittest.TestCase):
 
         asyncio.run(_run())
 
+    def test_budget_drain_starts_after_producers_stop_and_before_memory_close(self):
+        async def _run():
+            from astrmai.app.lifecycle import PluginLifecycleManager
+
+            calls = []
+            runtime = self._build_runtime(calls)
+
+            async def stop_producers():
+                calls.append("memory.producers.stop")
+
+            async def close_resources():
+                calls.append("memory.resources.close")
+
+            runtime.memory_engine.stop_background_producers = stop_producers
+            runtime.memory_engine.close_background_resources = close_resources
+
+            class _Budget:
+                def begin_drain(self):
+                    calls.append("budget.begin_drain")
+
+                async def drain(self, timeout_sec):
+                    calls.append("budget.drain")
+                    return {"observed": 0, "remaining": 0}
+
+                def resume(self):
+                    return True
+
+            runtime.background_task_budget = _Budget()
+            manager = PluginLifecycleManager(runtime)
+            await manager._terminate_impl()
+
+            self.assertLess(calls.index("budget.begin_drain"), calls.index("memory.producers.stop"))
+            self.assertLess(calls.index("memory.producers.stop"), calls.index("budget.drain"))
+            self.assertLess(calls.index("budget.drain"), calls.index("memory.resources.close"))
+
+        asyncio.run(_run())
+
+    def test_pending_budget_drain_defers_dependency_close_until_late_work_finishes(self):
+        async def _run():
+            from astrmai.app.lifecycle import PluginLifecycleManager
+            from astrmai.infrastructure.runtime.background_task_budget import BackgroundTaskBudget
+
+            calls = []
+            runtime = self._build_runtime(calls)
+            release = asyncio.Event()
+            budget = BackgroundTaskBudget(1, execution_timeout_sec=0.01)
+
+            async def slow_work():
+                await release.wait()
+
+            async def close_resources():
+                calls.append("memory.resources.close")
+
+            runtime.memory_engine.close_background_resources = close_resources
+            runtime.background_task_budget = budget
+            manager = PluginLifecycleManager(runtime)
+            manager._shutdown_started_monotonic = asyncio.get_running_loop().time()
+
+            with self.assertRaises(TimeoutError):
+                await budget.run(
+                    slow_work,
+                    task_name="memory.vector_bootstrap",
+                    defer_release_on_timeout=True,
+                )
+
+            await manager._terminate_impl()
+            self.assertTrue(manager._shutdown_pending_drain)
+            self.assertNotIn("event_bus.stop", calls)
+            self.assertNotIn("persistence.dispose", calls)
+            self.assertNotIn("memory.resources.close", calls)
+
+            release.set()
+            cleanup = manager._late_shutdown_cleanup_task
+            self.assertIsNotNone(cleanup)
+            await cleanup
+            self.assertIn("memory.resources.close", calls)
+            self.assertIn("event_bus.stop", calls)
+            self.assertIn("persistence.dispose", calls)
+            self.assertFalse(manager._shutdown_pending_drain)
+            self.assertTrue(manager._termination_complete)
+
+        asyncio.run(_run())
+
+    def test_forced_shutdown_tail_defers_dependencies_when_budget_is_active(self):
+        async def _run():
+            from astrmai.app.lifecycle import PluginLifecycleManager
+            from astrmai.infrastructure.runtime.background_task_budget import BackgroundTaskBudget
+
+            calls = []
+            runtime = self._build_runtime(calls)
+            release = asyncio.Event()
+            budget = BackgroundTaskBudget(1)
+            runtime.background_task_budget = budget
+
+            async def slow_work():
+                await release.wait()
+
+            task = asyncio.create_task(budget.run(slow_work, task_name="slow"))
+            await asyncio.sleep(0)
+            manager = PluginLifecycleManager(runtime)
+            manager._shutdown_started_monotonic = asyncio.get_running_loop().time()
+            manager._force_shutdown_tail()
+
+            self.assertTrue(manager._shutdown_pending_drain)
+            self.assertNotIn("event_bus.stop", calls)
+            self.assertNotIn("persistence.dispose", calls)
+            release.set()
+            await task
+            cleanup = manager._late_shutdown_cleanup_task
+            self.assertIsNotNone(cleanup)
+            await cleanup
+            self.assertIn("event_bus.stop", calls)
+            self.assertIn("persistence.dispose", calls)
+
+        asyncio.run(_run())
+
+    def test_reinitialize_waits_for_lifecycle_late_cleanup(self):
+        async def _run():
+            from astrmai.app.lifecycle import PluginLifecycleManager
+
+            calls = []
+            runtime = SimpleNamespace(
+                background_task_budget=SimpleNamespace(
+                    resume=lambda: calls.append("resume") or True,
+                ),
+                event_bus=SimpleNamespace(reset_abort=lambda: calls.append("reset_abort")),
+                runtime_coordinator=SimpleNamespace(reopen=lambda: calls.append("reopen")),
+                persona_summarizer=SimpleNamespace(reopen=lambda: calls.append("persona")),
+                cron_guard=SimpleNamespace(start=lambda: calls.append("cron")),
+                state_engine=SimpleNamespace(),
+                memory_engine=SimpleNamespace(),
+            )
+            manager = PluginLifecycleManager.__new__(PluginLifecycleManager)
+            manager.runtime = runtime
+            manager._shutdown_pending_drain = False
+            manager._late_shutdown_cleanup_task = asyncio.create_task(asyncio.sleep(60))
+
+            self.assertFalse(await manager._prepare_reinitialize())
+            self.assertEqual(calls, [])
+            manager._late_shutdown_cleanup_task.cancel()
+            await asyncio.gather(manager._late_shutdown_cleanup_task, return_exceptions=True)
+
+        asyncio.run(_run())
+
     def test_startup_is_idempotent_after_runtime_becomes_ready(self):
         async def _run():
             from astrmai.app.lifecycle import PluginLifecycleManager
