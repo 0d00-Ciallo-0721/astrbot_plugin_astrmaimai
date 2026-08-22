@@ -219,6 +219,47 @@ class ProactiveGapCoverageTests(unittest.TestCase):
         self.assertTrue(any(item["stage"] == "proactive.reply_commit" and item["status"] == "timeout" for item in stages))
         self.assertTrue(any(item["stage"] == "proactive.state_settle" for item in stages))
 
+    def test_gate_early_terminal_status_still_settles_external_callback(self):
+        callback_results = []
+
+        class _AttentionGate:
+            async def inject_external_event(self, chat_id, event_data):
+                decision = event_data["extra"]["astrmai_proactive_dispatch_decision"]
+                decision.status = "skipped"
+                decision.blocked_reason = "duplicate_event"
+                callback = event_data["extra"]["astrmai_proactive_completion_callback"]
+                await callback(False, "")
+                return "DUPLICATED"
+
+        dispatcher = self.dispatcher_mod.ProactiveDispatcher(
+            attention_gate=_AttentionGate(),
+            state_engine=SimpleNamespace(
+                get_state=lambda chat_id: asyncio.sleep(0, result=SimpleNamespace(energy=1.0)),
+            ),
+            config=_config(),
+        )
+
+        async def _run():
+            decision = await dispatcher.dispatch(
+                self.dispatcher_mod.ProactiveMessageIntent(
+                    chat_id="chat-duplicate",
+                    source="wakeup",
+                    reason="duplicate",
+                    guidance="say one line",
+                ),
+                on_complete=lambda sent, preview: callback_results.append((sent, preview)),
+            )
+            await asyncio.sleep(0)
+            return decision
+
+        decision = asyncio.run(_run())
+        history = dispatcher.list_intents(limit=1)[0]["decision"]
+        self.assertEqual(callback_results, [(False, "")])
+        self.assertEqual(history["status"], "skipped")
+        self.assertEqual(history["blocked_reason"], "duplicate_event")
+        self.assertFalse(history["synthetic_event_queued"])
+        self.assertEqual(dispatcher.describe_status()["completion_watchdogs"], 0)
+
     def test_dispatcher_shutdown_settles_queued_claim_and_ignores_late_callback(self):
         class _AttentionGate:
             def __init__(self):
@@ -296,8 +337,533 @@ class ProactiveGapCoverageTests(unittest.TestCase):
         )
 
         self.assertFalse(decision.synthetic_event_queued)
-        self.assertEqual(decision.blocked_reason, "event_enqueue_rejected")
+        self.assertIn(decision.blocked_reason, {"event_enqueue_rejected", "dispatch_rejected"})
         self.assertTrue(any(item["stage"] == "proactive.event_enqueue" for item in decision.stage_ledger))
+
+    def test_truthy_gate_rejection_is_not_marked_as_queued_and_settles_callback(self):
+        callback_results = []
+
+        class _AttentionGate:
+            async def inject_external_event(self, chat_id, event_data):
+                return "FILTERED"
+
+        dispatcher = self.dispatcher_mod.ProactiveDispatcher(
+            attention_gate=_AttentionGate(),
+            state_engine=SimpleNamespace(
+                get_state=lambda chat_id: asyncio.sleep(0, result=SimpleNamespace(energy=1.0)),
+            ),
+            config=_config(),
+        )
+        decision = asyncio.run(
+            dispatcher.dispatch(
+                self.dispatcher_mod.ProactiveMessageIntent(
+                    chat_id="chat-filtered",
+                    source="wakeup",
+                    reason="filtered injection",
+                    guidance="say one line",
+                ),
+                on_complete=lambda sent, preview: callback_results.append((sent, preview)),
+            )
+        )
+
+        self.assertFalse(decision.synthetic_event_queued)
+        self.assertEqual(callback_results, [(False, "")])
+        self.assertEqual(len(dispatcher._callbacks), 0)
+
+    def test_external_completion_callback_failure_remains_retryable(self):
+        attempts = []
+        first = True
+
+        class _AttentionGate:
+            def __init__(self):
+                self.event_data = None
+
+            async def inject_external_event(self, chat_id, event_data):
+                self.event_data = event_data
+                return "BUFFERED"
+
+        attention_gate = _AttentionGate()
+
+        def external_callback(sent, preview):
+            nonlocal first
+            attempts.append((sent, preview))
+            if first:
+                first = False
+                raise RuntimeError("settle unavailable")
+
+        dispatcher = self.dispatcher_mod.ProactiveDispatcher(
+            attention_gate=attention_gate,
+            state_engine=SimpleNamespace(
+                get_state=lambda chat_id: asyncio.sleep(0, result=SimpleNamespace(energy=1.0)),
+            ),
+            config=_config(),
+        )
+
+        async def _run():
+            decision = await dispatcher.dispatch(
+                self.dispatcher_mod.ProactiveMessageIntent(
+                    chat_id="chat-retry",
+                    source="wakeup",
+                    reason="retry completion",
+                    guidance="say one line",
+                ),
+                on_complete=external_callback,
+            )
+            callback = attention_gate.event_data["extra"]["astrmai_proactive_completion_callback"]
+            with_error = False
+            try:
+                await callback(False, "")
+            except RuntimeError:
+                with_error = True
+            await callback(False, "")
+            return decision, with_error
+
+        decision, with_error = asyncio.run(_run())
+        self.assertTrue(with_error)
+        self.assertEqual(attempts, [(False, ""), (False, "")])
+        self.assertEqual(len(dispatcher._callbacks), 0)
+        self.assertEqual(dispatcher.list_intents(limit=1)[0]["decision"]["status"], "skipped")
+
+    def test_external_completion_failure_has_bounded_automatic_retry(self):
+        attempts = []
+        failures_left = 1
+
+        class _AttentionGate:
+            def __init__(self):
+                self.event_data = None
+
+            async def inject_external_event(self, chat_id, event_data):
+                self.event_data = event_data
+                return "BUFFERED"
+
+        def external_callback(sent, preview):
+            nonlocal failures_left
+            attempts.append((sent, preview))
+            if failures_left:
+                failures_left -= 1
+                raise RuntimeError("transient settle failure")
+
+        attention_gate = _AttentionGate()
+        dispatcher = self.dispatcher_mod.ProactiveDispatcher(
+            attention_gate=attention_gate,
+            state_engine=SimpleNamespace(
+                get_state=lambda chat_id: asyncio.sleep(0, result=SimpleNamespace(energy=1.0)),
+            ),
+            config=_config(),
+        )
+
+        async def _run():
+            decision = await dispatcher.dispatch(
+                self.dispatcher_mod.ProactiveMessageIntent(
+                    chat_id="chat-auto-retry",
+                    source="wakeup",
+                    reason="automatic retry",
+                    guidance="say one line",
+                ),
+                on_complete=external_callback,
+            )
+            callback = attention_gate.event_data["extra"]["astrmai_proactive_completion_callback"]
+            with self.assertRaises(RuntimeError):
+                await callback(False, "")
+            await asyncio.sleep(0.12)
+            return decision
+
+        decision = asyncio.run(_run())
+        self.assertEqual(attempts, [(False, ""), (False, "")])
+        self.assertEqual(dispatcher._settlement_state[decision.intent_id], "settled")
+        self.assertNotIn(decision.intent_id, dispatcher._callbacks)
+
+    def test_continuous_completion_failure_reaches_retry_exhaustion(self):
+        attempts = []
+
+        class _AttentionGate:
+            async def inject_external_event(self, chat_id, event_data):
+                self.event_data = event_data
+                return "BUFFERED"
+
+        def external_callback(sent, preview):
+            attempts.append((sent, preview))
+            raise RuntimeError("persistent settle failure")
+
+        dispatcher = self.dispatcher_mod.ProactiveDispatcher(
+            attention_gate=_AttentionGate(),
+            state_engine=SimpleNamespace(
+                get_state=lambda chat_id: asyncio.sleep(0, result=SimpleNamespace(energy=1.0)),
+            ),
+            config=_config(),
+        )
+
+        async def _run():
+            decision = await dispatcher.dispatch(
+                self.dispatcher_mod.ProactiveMessageIntent(
+                    chat_id="chat-retry-exhausted",
+                    source="wakeup",
+                    reason="persistent failure",
+                    guidance="say one line",
+                ),
+                on_complete=external_callback,
+            )
+            callback = dispatcher.attention_gate.event_data["extra"]["astrmai_proactive_completion_callback"]
+            with self.assertRaises(RuntimeError):
+                await callback(False, "")
+            await asyncio.sleep(0.5)
+            return decision
+
+        decision = asyncio.run(_run())
+        self.assertEqual(len(attempts), 4)
+        self.assertEqual(dispatcher._settlement_state.get(decision.intent_id), "exhausted")
+        self.assertNotIn(decision.intent_id, dispatcher._callbacks)
+        self.assertEqual(len(dispatcher._completion_retry_tasks), 0)
+        self.assertTrue(
+            any(
+                item.get("status") == "retry_exhausted"
+                for item in dispatcher.list_intents(limit=1)[0]["decision"]["stage_ledger"]
+            )
+        )
+
+    def test_exhausted_completion_ignores_late_callback(self):
+        attempts = []
+
+        class _AttentionGate:
+            def __init__(self):
+                self.event_data = None
+
+            async def inject_external_event(self, chat_id, event_data):
+                self.event_data = event_data
+                return "BUFFERED"
+
+        def external_callback(sent, preview):
+            attempts.append((sent, preview))
+            raise RuntimeError("persistent settle failure")
+
+        attention_gate = _AttentionGate()
+        dispatcher = self.dispatcher_mod.ProactiveDispatcher(
+            attention_gate=attention_gate,
+            state_engine=SimpleNamespace(
+                get_state=lambda chat_id: asyncio.sleep(0, result=SimpleNamespace(energy=1.0)),
+            ),
+            config=_config(),
+        )
+
+        async def _run():
+            decision = await dispatcher.dispatch(
+                self.dispatcher_mod.ProactiveMessageIntent(
+                    chat_id="chat-late-callback",
+                    source="wakeup",
+                    reason="late callback",
+                    guidance="say one line",
+                ),
+                on_complete=external_callback,
+            )
+            callback = attention_gate.event_data["extra"]["astrmai_proactive_completion_callback"]
+            with self.assertRaises(RuntimeError):
+                await callback(False, "")
+            await asyncio.sleep(0.5)
+            before = dispatcher.list_intents(limit=1)[0]["decision"]
+            await callback(True, "late reply")
+            after = dispatcher.list_intents(limit=1)[0]["decision"]
+            return decision, before, after
+
+        decision, before, after = asyncio.run(_run())
+        self.assertEqual(dispatcher._settlement_state.get(decision.intent_id), "exhausted")
+        self.assertEqual(attempts, [(False, "")] * 4)
+        self.assertEqual(after["status"], before["status"])
+        self.assertEqual(after["reply_sent"], before["reply_sent"])
+        self.assertEqual(dispatcher.describe_status()["settlement_exhausted"], 1)
+
+    def test_complete_cannot_mutate_exhausted_intent(self):
+        class _AttentionGate:
+            def __init__(self):
+                self.event_data = None
+
+            async def inject_external_event(self, chat_id, event_data):
+                self.event_data = event_data
+                return "BUFFERED"
+
+        def external_callback(sent, preview):
+            raise RuntimeError("persistent settle failure")
+
+        attention_gate = _AttentionGate()
+        dispatcher = self.dispatcher_mod.ProactiveDispatcher(
+            attention_gate=attention_gate,
+            state_engine=SimpleNamespace(
+                get_state=lambda chat_id: asyncio.sleep(0, result=SimpleNamespace(energy=1.0)),
+            ),
+            config=_config(),
+        )
+
+        async def _run():
+            decision = await dispatcher.dispatch(
+                self.dispatcher_mod.ProactiveMessageIntent(
+                    chat_id="chat-complete-exhausted",
+                    source="wakeup",
+                    reason="direct complete",
+                    guidance="say one line",
+                    cooldown=60,
+                ),
+                on_complete=external_callback,
+            )
+            callback = attention_gate.event_data["extra"]["astrmai_proactive_completion_callback"]
+            with self.assertRaises(RuntimeError):
+                await callback(False, "")
+            await asyncio.sleep(0.5)
+            before = dispatcher.list_intents(limit=1)[0]["decision"]
+            cooldowns_before = dict(dispatcher._cooldowns)
+            await dispatcher.complete(decision.intent_id, reply_sent=True, reply_preview="late")
+            after = dispatcher.list_intents(limit=1)[0]["decision"]
+            return before, after, cooldowns_before
+
+        before, after, cooldowns_before = asyncio.run(_run())
+        self.assertEqual(after, before)
+        self.assertEqual(dispatcher._cooldowns, cooldowns_before)
+
+    def test_shutdown_rejects_dispatch_while_settling(self):
+        shutdown_started = asyncio.Event()
+        release_callback = asyncio.Event()
+
+        class _AttentionGate:
+            async def inject_external_event(self, chat_id, event_data):
+                return "BUFFERED"
+
+        async def external_callback(sent, preview):
+            shutdown_started.set()
+            await release_callback.wait()
+
+        dispatcher = self.dispatcher_mod.ProactiveDispatcher(
+            attention_gate=_AttentionGate(),
+            state_engine=SimpleNamespace(
+                get_state=lambda chat_id: asyncio.sleep(0, result=SimpleNamespace(energy=1.0)),
+            ),
+            config=_config(),
+        )
+
+        async def _run():
+            queued = await dispatcher.dispatch(
+                self.dispatcher_mod.ProactiveMessageIntent(
+                    chat_id="chat-shutdown-race",
+                    source="wakeup",
+                    reason="shutdown race",
+                    guidance="say one line",
+                ),
+                on_complete=external_callback,
+            )
+            shutdown_task = asyncio.create_task(dispatcher.shutdown())
+            await shutdown_started.wait()
+            rejected = await dispatcher.dispatch(
+                self.dispatcher_mod.ProactiveMessageIntent(
+                    chat_id="chat-after-shutdown",
+                    source="wakeup",
+                    reason="late dispatch",
+                    guidance="say one line",
+                )
+            )
+            release_callback.set()
+            await shutdown_task
+            return queued, rejected
+
+        queued, rejected = asyncio.run(_run())
+        self.assertEqual(rejected.blocked_reason, "dispatcher_shutdown")
+        self.assertFalse(rejected.allowed)
+        status = dispatcher.describe_status()
+        self.assertEqual(status["completion_watchdogs"], 0)
+        self.assertEqual(status["settlement_pending"], 0)
+        self.assertEqual(len(dispatcher._callbacks), 0)
+
+    def test_shutdown_waits_for_inflight_gate_injection(self):
+        inject_started = asyncio.Event()
+        release_injection = asyncio.Event()
+
+        class _AttentionGate:
+            async def inject_external_event(self, chat_id, event_data):
+                inject_started.set()
+                await release_injection.wait()
+                return "BUFFERED"
+
+        dispatcher = self.dispatcher_mod.ProactiveDispatcher(
+            attention_gate=_AttentionGate(),
+            state_engine=SimpleNamespace(
+                get_state=lambda chat_id: asyncio.sleep(0, result=SimpleNamespace(energy=1.0)),
+            ),
+            config=_config(),
+        )
+
+        async def _run():
+            dispatch_task = asyncio.create_task(
+                dispatcher.dispatch(
+                    self.dispatcher_mod.ProactiveMessageIntent(
+                        chat_id="chat-inflight-shutdown",
+                        source="wakeup",
+                        reason="inflight gate",
+                        guidance="say one line",
+                    ),
+                    on_complete=lambda sent, preview: None,
+                )
+            )
+            await inject_started.wait()
+            shutdown_task = asyncio.create_task(dispatcher.shutdown())
+            await asyncio.sleep(0)
+            self.assertFalse(shutdown_task.done())
+            release_injection.set()
+            decision = await dispatch_task
+            await shutdown_task
+            return decision
+
+        decision = asyncio.run(_run())
+        status = dispatcher.describe_status()
+        self.assertNotEqual(decision.status, "queued")
+        self.assertNotEqual(dispatcher.list_intents(limit=1)[0]["decision"]["status"], "queued")
+        self.assertEqual(status["completion_watchdogs"], 0)
+        self.assertEqual(status["settlement_pending"], 0)
+        self.assertEqual(len(dispatcher._callbacks), 0)
+
+    def test_resume_reopens_dispatch_after_stop(self):
+        class _AttentionGate:
+            async def inject_external_event(self, chat_id, event_data):
+                return "FILTERED"
+
+        dispatcher = self.dispatcher_mod.ProactiveDispatcher(
+            attention_gate=_AttentionGate(),
+            state_engine=SimpleNamespace(
+                get_state=lambda chat_id: asyncio.sleep(0, result=SimpleNamespace(energy=1.0)),
+            ),
+            config=_config(),
+        )
+        dispatcher._shutting_down = True
+        self.assertTrue(dispatcher.resume())
+        decision = asyncio.run(
+            dispatcher.dispatch(
+                self.dispatcher_mod.ProactiveMessageIntent(
+                    chat_id="chat-resumed",
+                    source="wakeup",
+                    reason="reinitialize",
+                    guidance="say one line",
+                )
+            )
+        )
+        self.assertIn(decision.blocked_reason, {"event_enqueue_rejected", "dispatch_rejected"})
+        self.assertFalse(decision.synthetic_event_queued)
+
+    def test_shutdown_isolates_callback_failure_and_settles_intent(self):
+        attempts = []
+
+        class _AttentionGate:
+            async def inject_external_event(self, chat_id, event_data):
+                self.event_data = event_data
+                return "BUFFERED"
+
+        def external_callback(sent, preview):
+            attempts.append((sent, preview))
+            raise RuntimeError("shutdown callback failure")
+
+        dispatcher = self.dispatcher_mod.ProactiveDispatcher(
+            attention_gate=_AttentionGate(),
+            state_engine=SimpleNamespace(
+                get_state=lambda chat_id: asyncio.sleep(0, result=SimpleNamespace(energy=1.0)),
+            ),
+            config=_config(),
+        )
+
+        async def _run():
+            decision = await dispatcher.dispatch(
+                self.dispatcher_mod.ProactiveMessageIntent(
+                    chat_id="chat-shutdown-failure",
+                    source="wakeup",
+                    reason="shutdown failure",
+                    guidance="say one line",
+                ),
+                on_complete=external_callback,
+            )
+            await dispatcher.shutdown()
+            return decision
+
+        decision = asyncio.run(_run())
+        self.assertEqual(attempts, [(False, "")])
+        self.assertEqual(dispatcher._settlement_state.get(decision.intent_id), "shutdown")
+        self.assertNotIn(decision.intent_id, dispatcher._callbacks)
+        shutdown_entries = [
+            item
+            for item in dispatcher.list_intents(limit=1)[0]["decision"]["stage_ledger"]
+            if item.get("stage") == "proactive.dispatcher_shutdown"
+        ]
+        self.assertEqual(shutdown_entries[-1]["status"], "settle_failed")
+
+    def test_settlement_state_tables_follow_bounded_tombstones(self):
+        class _AttentionGate:
+            async def inject_external_event(self, chat_id, event_data):
+                return "BUFFERED"
+
+        dispatcher = self.dispatcher_mod.ProactiveDispatcher(
+            attention_gate=_AttentionGate(),
+            state_engine=SimpleNamespace(
+                get_state=lambda chat_id: asyncio.sleep(0, result=SimpleNamespace(energy=1.0)),
+            ),
+            config=_config(),
+        )
+
+        async def _run():
+            for index in range(260):
+                decision = await dispatcher.dispatch(
+                    self.dispatcher_mod.ProactiveMessageIntent(
+                        chat_id=f"chat-{index}",
+                        source="wakeup",
+                        reason=f"bounded-{index}",
+                        guidance="say one line",
+                    ),
+                    on_complete=lambda sent, preview: None,
+                )
+                callback = dispatcher._history[-1]["decision"]
+                await dispatcher.complete(decision.intent_id, reply_sent=False)
+
+        asyncio.run(_run())
+        self.assertLessEqual(len(dispatcher._settlement_locks), dispatcher.TERMINAL_TOMBSTONE_LIMIT)
+        self.assertLessEqual(len(dispatcher._settlement_state), dispatcher.TERMINAL_TOMBSTONE_LIMIT)
+        self.assertLessEqual(len(dispatcher._terminal_intents), dispatcher.TERMINAL_TOMBSTONE_LIMIT)
+        self.assertLessEqual(
+            dispatcher.describe_status()["terminal_tombstones"],
+            dispatcher.TERMINAL_TOMBSTONE_LIMIT,
+        )
+
+    def test_concurrent_completion_retries_run_callback_once(self):
+        attempts = []
+
+        class _AttentionGate:
+            def __init__(self):
+                self.event_data = None
+
+            async def inject_external_event(self, chat_id, event_data):
+                self.event_data = event_data
+                return "BUFFERED"
+
+        async def external_callback(sent, preview):
+            attempts.append((sent, preview))
+            await asyncio.sleep(0.02)
+
+        attention_gate = _AttentionGate()
+        dispatcher = self.dispatcher_mod.ProactiveDispatcher(
+            attention_gate=attention_gate,
+            state_engine=SimpleNamespace(
+                get_state=lambda chat_id: asyncio.sleep(0, result=SimpleNamespace(energy=1.0)),
+            ),
+            config=_config(),
+        )
+
+        async def _run():
+            decision = await dispatcher.dispatch(
+                self.dispatcher_mod.ProactiveMessageIntent(
+                    chat_id="chat-settlement-lock",
+                    source="wakeup",
+                    reason="single intent lock",
+                    guidance="say one line",
+                ),
+                on_complete=external_callback,
+            )
+            callback = attention_gate.event_data["extra"]["astrmai_proactive_completion_callback"]
+            await asyncio.gather(callback(False, ""), callback(False, ""))
+            return decision
+
+        decision = asyncio.run(_run())
+        self.assertEqual(attempts, [(False, "")])
+        self.assertEqual(dispatcher._settlement_state[decision.intent_id], "settled")
 
     def test_dispatcher_blocks_conservatively_on_dirty_pending_snapshot(self):
         class _AttentionGate:

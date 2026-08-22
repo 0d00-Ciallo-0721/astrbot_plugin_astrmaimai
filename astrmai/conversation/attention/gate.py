@@ -2389,6 +2389,61 @@ class AttentionGate:
                 merged_events = self._merge_attention_window(session, batch_events)
                 events = await self._format_and_filter_messages(merged_events)
                 if events:
+                    # Only a real user event in the current batch can supersede a
+                    # proactive candidate.  The merged attention window also
+                    # contains history, which must not affect this decision.
+                    current_user_events = []
+                    current_proactive_events = []
+                    for batch_event in batch_events:
+                        if bool(batch_event.get_extra("astrmai_is_proactive_event", False)):
+                            current_proactive_events.append(batch_event)
+                            continue
+                        sender_id = str(
+                            getattr(batch_event, "get_sender_id", lambda: "")() or ""
+                        ).strip()
+                        provenance = str(
+                            batch_event.get_extra("astrmai_event_provenance", "original")
+                            or "original"
+                        )
+                        is_real_user = bool(
+                            sender_id
+                            and sender_id != str(getattr(self.state_engine, "bot_id", "") or "")
+                            and sender_id != str(get_event_self_id(batch_event) or "")
+                            and not sender_id.startswith("astrmai_")
+                            and not bool(batch_event.get_extra("astrmai_is_external_bot_reply", False))
+                            and provenance == "original"
+                        )
+                        if is_real_user:
+                            current_user_events.append(batch_event)
+                    if is_private and current_user_events and current_proactive_events:
+                        for proactive_event in current_proactive_events:
+                            await self._complete_proactive_candidate(
+                                proactive_event,
+                                reason="superseded_by_user",
+                            )
+                            await self._finalize_pre_planner_turn(
+                                proactive_event,
+                                chat_id,
+                                status="skipped_superseded_by_user",
+                            )
+                        superseded = {id(event) for event in current_proactive_events}
+                        batch_events = [
+                            event
+                            for event in batch_events
+                            if id(event) not in superseded
+                        ]
+                        events = [
+                            event
+                            for event in events
+                            if id(event) not in superseded
+                        ]
+                    if not events:
+                        async with session.lock:
+                            if session.accumulation_pool:
+                                current_is_strong_wakeup = False
+                                continue
+                            session.is_evaluating = False
+                        return
                     normalized = self._build_normalized_events(events, self_id)
                     focus_event, _, focus_reason = self._select_focus_event(
                         events,
@@ -2432,7 +2487,11 @@ class AttentionGate:
                     turn_context.attention.focus_reason = focus_thread.focus_reason
                     turn_context.attention.root_reason = focus_thread.root_reason
                     topic_confirmation_required = False
-                    if is_private and self.conversation_continuity is not None:
+                    if (
+                        is_private
+                        and not bool(focus_event.get_extra("astrmai_is_proactive_event", False))
+                        and self.conversation_continuity is not None
+                    ):
                         evaluate_topic = getattr(
                             self.conversation_continuity,
                             "evaluate_private_message",

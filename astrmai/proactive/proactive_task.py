@@ -220,6 +220,10 @@ class ProactiveTask:
     async def start(self):
         if self._is_running:
             return
+        resume_dispatcher = getattr(self.proactive_dispatcher, "resume", None)
+        if callable(resume_dispatcher) and resume_dispatcher() is False:
+            logger.warning("[ProactiveTask] dispatcher is still draining; start deferred")
+            return
         self._is_running = True
         self._last_global_maintenance_run = monotonic()
         self._scheduler_poll_mode = "FAST"

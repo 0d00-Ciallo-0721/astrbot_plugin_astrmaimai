@@ -582,14 +582,22 @@ class ScheduledScenarioService:
             else:
                 reason = str(decision.blocked_reason or decision.status or "blocked")
                 blocked[reason] = blocked.get(reason, 0) + 1
-                await self.delivery_store.update(
-                    delivery_key,
-                    status="blocked",
-                    error=reason,
-                    retry_after=float(
-                        getattr(life, "proactive_failure_retry_sec", 300) or 300
-                    ),
+                has_completion_terminal = (
+                    str(getattr(decision, "status", "") or "") in {"sent", "skipped", "timeout"}
+                    and any(
+                        item.get("stage") == "proactive.reply_commit"
+                        for item in (getattr(decision, "stage_ledger", None) or [])
+                    )
                 )
+                if not has_completion_terminal:
+                    await self.delivery_store.update(
+                        delivery_key,
+                        status="blocked",
+                        error=reason,
+                        retry_after=float(
+                            getattr(life, "proactive_failure_retry_sec", 300) or 300
+                        ),
+                    )
         self._last_report = {
             "enabled": True,
             "timestamp": timestamp,
