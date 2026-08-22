@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import date, datetime
+import inspect
 import json
 import time
 from typing import Any, Awaitable, Callable
@@ -277,7 +278,7 @@ class ScheduledScenarioService:
         config: Any,
         db_path: Any,
         call_background_lane: Callable[..., Awaitable[str]],
-        task_launcher: Callable[[Callable[[], Awaitable[Any]]], None],
+        task_launcher: Callable[[Callable[[], Awaitable[Any]]], Any],
     ) -> None:
         self.state_engine = state_engine
         self.dispatcher = dispatcher
@@ -291,6 +292,8 @@ class ScheduledScenarioService:
         self._generation_started: set[str] = set()
         self._generation_attempts: dict[str, int] = {}
         self._generation_retry_at: dict[str, float] = {}
+        self._generation_state: dict[str, str] = {}
+        self._generation_last_error: dict[str, str] = {}
         self._last_tick_at = 0.0
         self._last_report: dict[str, Any] = {}
 
@@ -343,6 +346,8 @@ class ScheduledScenarioService:
         life = getattr(self.config, "life", None)
         if plan_date in self._generation_started:
             return
+        if self._generation_state.get(plan_date) in {"succeeded", "exhausted"}:
+            return
         if not bool(getattr(life, "daily_schedule_enabled", True)):
             return
         if not bool(getattr(life, "daily_schedule_ai_enabled", True)):
@@ -350,7 +355,36 @@ class ScheduledScenarioService:
         if float(self._generation_retry_at.get(plan_date, 0.0) or 0.0) > time.time():
             return
         self._generation_started.add(plan_date)
-        self.task_launcher(lambda: self._generate_schedule(plan_date))
+        self._generation_state[plan_date] = "running"
+        try:
+            task = self.task_launcher(lambda: self._generate_schedule(plan_date))
+            if inspect.isawaitable(task):
+                task = asyncio.ensure_future(task)
+            if task is None or not hasattr(task, "add_done_callback"):
+                raise RuntimeError("schedule task launcher did not return a task")
+        except BaseException as exc:
+            self._generation_state[plan_date] = "launch_rejected"
+            self._schedule_generation_failed(plan_date, exc)
+            if plan_date in self._generation_retry_at:
+                self._generation_state[plan_date] = "launch_rejected"
+            return
+
+        def _on_task_done(completed: Any) -> None:
+            try:
+                if completed.cancelled():
+                    self._schedule_generation_failed(
+                        plan_date,
+                        asyncio.CancelledError("schedule generation task cancelled before completion"),
+                    )
+                    return
+                error = completed.exception()
+            except BaseException as exc:
+                self._schedule_generation_failed(plan_date, exc)
+                return
+            if error is not None:
+                self._schedule_generation_failed(plan_date, error)
+
+        task.add_done_callback(_on_task_done)
 
     async def _generate_schedule(self, plan_date: str) -> None:
         prompt = (
@@ -366,11 +400,15 @@ class ScheduledScenarioService:
             if start < 0 or end <= start:
                 raise ValueError("missing JSON object")
             parsed = json.loads(str(raw)[start:end])
+            self._validate_schedule_payload(parsed)
             normalized = DailyScheduleStore._normalize(parsed)
             await self.schedule_store.save(plan_date, normalized, source="model")
             self._schedule_cache[plan_date] = (normalized, "model")
             self._generation_attempts.pop(plan_date, None)
             self._generation_retry_at.pop(plan_date, None)
+            self._generation_state[plan_date] = "succeeded"
+            self._generation_last_error.pop(plan_date, None)
+            self._generation_started.discard(plan_date)
             logger.info(f"[ScheduledScenario] daily schedule generated date={plan_date}")
         except (asyncio.TimeoutError, TypeError, ValueError, json.JSONDecodeError) as exc:
             logger.warning(f"[ScheduledScenario] daily schedule degraded to fallback: {type(exc).__name__}: {exc}")
@@ -383,16 +421,33 @@ class ScheduledScenarioService:
         life = getattr(self.config, "life", None)
         attempts = int(self._generation_attempts.get(plan_date, 0) or 0) + 1
         self._generation_attempts[plan_date] = attempts
+        self._generation_last_error[plan_date] = f"{type(exc).__name__}: {exc}"[:500]
         max_retries = max(0, int(getattr(life, "daily_schedule_max_retries", 2) or 0))
         if attempts <= max_retries:
             base = max(30, int(getattr(life, "daily_schedule_retry_base_sec", 300) or 300))
             retry_at = time.time() + base * (2 ** max(0, attempts - 1))
             self._generation_retry_at[plan_date] = retry_at
             self._generation_started.discard(plan_date)
+            self._generation_state[plan_date] = "retry_scheduled"
             logger.info(
                 f"[ScheduledScenario] daily schedule retry scheduled date={plan_date} "
                 f"attempt={attempts} retry_at={retry_at:.0f} reason={type(exc).__name__}"
             )
+        else:
+            self._generation_started.discard(plan_date)
+            self._generation_retry_at.pop(plan_date, None)
+            self._generation_state[plan_date] = "exhausted"
+            logger.warning(
+                f"[ScheduledScenario] daily schedule retries exhausted date={plan_date} "
+                f"attempt={attempts} reason={type(exc).__name__}"
+            )
+
+    @staticmethod
+    def _validate_schedule_payload(payload: Any) -> None:
+        if not isinstance(payload, dict) or set(payload) != set(SCHEDULE_SLOTS):
+            raise ValueError("schedule JSON must contain exactly the seven schedule slots")
+        if any(not isinstance(payload[slot], str) or not payload[slot].strip() for slot in SCHEDULE_SLOTS):
+            raise ValueError("schedule JSON slot values must be non-empty strings")
 
     def _scenario_for(self, now: datetime) -> str:
         life = getattr(self.config, "life", None)
@@ -553,6 +608,8 @@ class ScheduledScenarioService:
             "generation_dates": sorted(self._generation_started)[-7:],
             "generation_attempts": dict(self._generation_attempts),
             "generation_retry_at": dict(self._generation_retry_at),
+            "generation_state": dict(self._generation_state),
+            "generation_last_error": dict(self._generation_last_error),
             "cached_schedule_dates": sorted(self._schedule_cache)[-7:],
             "weather_cached": self.weather._cached is not None,
             "last_tick": dict(self._last_report),

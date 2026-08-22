@@ -353,6 +353,7 @@ class ProactiveTask:
         task = asyncio.create_task(coro)
         self._background_tasks.add(task)
         task.add_done_callback(self._handle_task_result)
+        return task
 
     def _handle_task_result(self, task: asyncio.Task):
         self._background_tasks.discard(task)

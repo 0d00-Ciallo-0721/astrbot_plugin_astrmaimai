@@ -205,6 +205,78 @@ class ScheduledScenarioServiceTests(unittest.TestCase):
         self.assertGreater(service._generation_retry_at["2026-05-11"], 0.0)
         self.assertEqual(service.describe_status()["generation_attempts"]["2026-05-11"], 1)
 
+    def test_launch_rejection_releases_date_and_schedules_same_day_retry(self):
+        service = self._service(
+            _Dispatcher(),
+            _config(daily_schedule_ai_enabled=True, daily_schedule_retry_base_sec=30),
+        )
+
+        def reject(_factory):
+            raise RuntimeError("budget queue full")
+
+        service.task_launcher = reject
+        service._start_schedule_generation("2026-05-11")
+
+        self.assertNotIn("2026-05-11", service._generation_started)
+        self.assertEqual(service.describe_status()["generation_state"]["2026-05-11"], "launch_rejected")
+        self.assertGreater(service._generation_retry_at["2026-05-11"], 0.0)
+        self.assertIn("RuntimeError", service.describe_status()["generation_last_error"]["2026-05-11"])
+
+    def test_invalid_schedule_shapes_are_retryable(self):
+        invalid_payloads = ("{}", '{"morning": ""}', '{"unexpected": "value"}', "[]")
+        for raw in invalid_payloads:
+            service = self._service(
+                _Dispatcher(),
+                _config(daily_schedule_ai_enabled=True, daily_schedule_retry_base_sec=30),
+            )
+            service.call_background_lane = lambda *args, raw=raw, **kwargs: asyncio.sleep(0, result=raw)
+
+            asyncio.run(service._generate_schedule("2026-05-11"))
+
+            self.assertEqual(service._generation_attempts["2026-05-11"], 1)
+            self.assertEqual(
+                service.describe_status()["generation_state"]["2026-05-11"],
+                "retry_scheduled",
+            )
+            self.assertNotEqual(service._schedule_cache.get("2026-05-11", (None, ""))[1], "model")
+
+    def test_generation_retries_exhaust_to_explicit_terminal_state(self):
+        service = self._service(
+            _Dispatcher(),
+            _config(daily_schedule_ai_enabled=True, daily_schedule_max_retries=1),
+        )
+        service._schedule_generation_failed("2026-05-11", ValueError("invalid shape"))
+        service._schedule_generation_failed("2026-05-11", ValueError("invalid shape"))
+
+        status = service.describe_status()
+        self.assertEqual(status["generation_state"]["2026-05-11"], "exhausted")
+        self.assertNotIn("2026-05-11", status["generation_retry_at"])
+        self.assertNotIn("2026-05-11", status["generation_dates"])
+
+    def test_failed_generation_can_retry_and_replace_fallback(self):
+        payload = {slot: f"{slot} activity" for slot in self.module.SCHEDULE_SLOTS}
+        service = self._service(
+            _Dispatcher(),
+            _config(daily_schedule_ai_enabled=True, daily_schedule_retry_base_sec=30),
+        )
+        service.call_background_lane = lambda *args, **kwargs: asyncio.sleep(0, result="invalid")
+        asyncio.run(service._generate_schedule("2026-05-11"))
+        service._generation_retry_at["2026-05-11"] = 0.0
+
+        async def valid_call(*args, **kwargs):
+            import json
+
+            return json.dumps(payload)
+
+        service.call_background_lane = valid_call
+        asyncio.run(service._generate_schedule("2026-05-11"))
+
+        self.assertEqual(
+            asyncio.run(service.schedule_store.load("2026-05-11")),
+            (payload, "model"),
+        )
+        self.assertEqual(service.describe_status()["generation_state"]["2026-05-11"], "succeeded")
+
     def test_festival_provider_covers_fixed_and_floating_dates(self):
         provider = self.module.FestivalProvider
 
