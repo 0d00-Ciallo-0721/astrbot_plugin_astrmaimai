@@ -564,10 +564,10 @@ class ProactiveDispatcher:
             "stage_ledger": [dict(entry) for entry in decision.stage_ledger],
         }
 
-    def _remember(self, intent: ProactiveMessageIntent, decision: ProactiveDispatchDecision) -> None:
+    async def _remember(self, intent: ProactiveMessageIntent, decision: ProactiveDispatchDecision) -> None:
         record = self._intent_record(intent, decision)
         try:
-            history_id = self._history_store.append(record)
+            history_id = await self._history_store.append_async(record)
         except Exception as exc:
             history_id = None
             logger.warning(f"[ProactiveDispatcher] history append degraded: {type(exc).__name__}")
@@ -585,7 +585,7 @@ class ProactiveDispatcher:
             item["reply_sent"] = decision.reply_sent
             item["stage_ledger"] = [dict(entry) for entry in decision.stage_ledger]
             try:
-                self._history_store.update(
+                await self._history_store.update_async(
                     int(item.get("_history_id", 0) or 0),
                     self._without_history_id(item),
                 )
@@ -623,6 +623,16 @@ class ProactiveDispatcher:
             "next_cursor": next_cursor,
             "has_more": bool(next_cursor),
         }
+
+    async def list_intents_page_async(self, *, limit: int = 50, cursor: str | None = None) -> dict[str, Any]:
+        if self._history_store.db_path is not None:
+            try:
+                page = await self._history_store.page_async(limit=limit, cursor=cursor)
+                page["items"] = [self._without_history_id(item) for item in page.get("items", [])]
+                return page
+            except Exception as exc:
+                logger.warning(f"[ProactiveDispatcher] async history page degraded: {type(exc).__name__}")
+        return self.list_intents_page(limit=limit, cursor=cursor)
 
     def describe_status(self) -> dict[str, Any]:
         return {
@@ -816,7 +826,7 @@ class ProactiveDispatcher:
                     {"stage": "proactive.dispatch", "status": "blocked", "reason": "dispatcher_shutdown", "at": time.time()},
                 ],
             )
-            self._remember(intent, decision)
+            await self._remember(intent, decision)
             return decision
         async with self._dispatch_lock:
             return await self._dispatch_locked(intent, on_complete=on_complete)
@@ -848,7 +858,7 @@ class ProactiveDispatcher:
                 status="blocked",
                 stage_ledger=stage_ledger,
             )
-            self._remember(intent, decision)
+            await self._remember(intent, decision)
             return decision
         claim_token = str(intent.metadata.get("claim_token", "") or "")
         claim_status, claim_reason = await self._claim_status(intent)
@@ -887,7 +897,7 @@ class ProactiveDispatcher:
             status="queued" if allowed else "blocked",
             stage_ledger=stage_ledger,
         )
-        self._remember(intent, decision)
+        await self._remember(intent, decision)
         if not allowed:
             if not any(
                 item.get("stage") == "proactive.safety_check"

@@ -62,7 +62,7 @@ class ProactiveGapCoverageTests(unittest.TestCase):
                 timestamp=float(index + 1),
                 status="blocked",
             )
-            dispatcher._remember(intent, decision)
+            asyncio.run(dispatcher._remember(intent, decision))
 
         first_page = dispatcher.list_intents_page(limit=2)
         self.assertEqual(first_page["total"], 3)
@@ -79,6 +79,25 @@ class ProactiveGapCoverageTests(unittest.TestCase):
             "intent-1",
             "intent-0",
         ])
+
+    def test_history_store_enforces_capacity_cleanup(self):
+        db_path = Path(self.temp_dir.name) / "proactive-history-capacity.db"
+        store = self.dispatcher_mod.ProactiveHistoryStore(db_path)
+        store.MAX_ROWS = 2
+        store.CLEANUP_EVERY_WRITES = 1
+        now = time.time()
+        for index in range(3):
+            store.append({
+                "created_at": now + index,
+                "intent": {"intent_id": f"intent-{index}"},
+                "decision": {"intent_id": f"intent-{index}"},
+            })
+        page = store.page(limit=10)
+        self.assertEqual(page["total"], 2)
+        self.assertEqual(
+            [item["intent"]["intent_id"] for item in page["items"]],
+            ["intent-2", "intent-1"],
+        )
 
     def test_dispatcher_blocks_second_intent_during_completion_cooldown(self):
         class _AttentionGate:

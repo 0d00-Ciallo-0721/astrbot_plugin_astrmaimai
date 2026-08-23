@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any
 
@@ -9,11 +11,16 @@ from typing import Any
 class ProactiveHistoryStore:
     """Small SQLite-backed store for durable proactive dispatch history."""
 
+    RETENTION_SECONDS = 30 * 86400.0
+    MAX_ROWS = 10000
+    CLEANUP_EVERY_WRITES = 32
+
     def __init__(self, db_path: Any) -> None:
         self.db_path = Path(db_path) if db_path else None
         if self.db_path:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
             self._ensure_table()
+        self._writes_since_cleanup = 0
 
     def _connect(self) -> sqlite3.Connection:
         if self.db_path is None:
@@ -31,6 +38,25 @@ class ProactiveHistoryStore:
                     payload_json TEXT NOT NULL DEFAULT '{}'
                 )
                 """
+            )
+
+    def _cleanup_sync(self, *, now: float | None = None) -> None:
+        if self.db_path is None:
+            return
+        cutoff = float(now if now is not None else time.time()) - self.RETENTION_SECONDS
+        with self._connect() as db:
+            db.execute(
+                "DELETE FROM proactive_dispatch_history WHERE created_at > 0 AND created_at < ?",
+                (cutoff,),
+            )
+            db.execute(
+                """
+                DELETE FROM proactive_dispatch_history
+                WHERE id NOT IN (
+                    SELECT id FROM proactive_dispatch_history ORDER BY id DESC LIMIT ?
+                )
+                """,
+                (self.MAX_ROWS,),
             )
             db.execute(
                 "CREATE INDEX IF NOT EXISTS ix_proactive_dispatch_history_created "
@@ -63,7 +89,12 @@ class ProactiveHistoryStore:
                 "INSERT INTO proactive_dispatch_history(intent_id, created_at, payload_json) VALUES (?, ?, ?)",
                 (intent_id, created_at, self._encode(record)),
             )
-            return int(cursor.lastrowid)
+            history_id = int(cursor.lastrowid)
+        self._writes_since_cleanup += 1
+        if self._writes_since_cleanup >= self.CLEANUP_EVERY_WRITES:
+            self._cleanup_sync()
+            self._writes_since_cleanup = 0
+        return history_id
 
     def update(self, history_id: int, record: dict[str, Any]) -> None:
         if self.db_path is None or not history_id:
@@ -80,6 +111,12 @@ class ProactiveHistoryStore:
                 """,
                 (intent_id, created_at, self._encode(record), int(history_id)),
             )
+
+    async def append_async(self, record: dict[str, Any]) -> int | None:
+        return await asyncio.to_thread(self.append, record)
+
+    async def update_async(self, history_id: int, record: dict[str, Any]) -> None:
+        await asyncio.to_thread(self.update, history_id, record)
 
     def page(self, *, limit: int = 50, cursor: str | None = None) -> dict[str, Any]:
         safe_limit = max(1, min(int(limit or 50), 500))
@@ -122,6 +159,9 @@ class ProactiveHistoryStore:
             "next_cursor": next_cursor,
             "has_more": bool(has_more),
         }
+
+    async def page_async(self, *, limit: int = 50, cursor: str | None = None) -> dict[str, Any]:
+        return await asyncio.to_thread(self.page, limit=limit, cursor=cursor)
 
     def count(self) -> int:
         if self.db_path is None:

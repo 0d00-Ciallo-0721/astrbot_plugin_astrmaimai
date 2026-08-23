@@ -152,7 +152,10 @@ def test_architecture_trace_contract_links_full_chain_without_raw_reply_text():
             "turn_id": "turn-1",
             "turn_total_elapsed_ms": 12.5,
             "timing_coverage": {"coverage_ratio": 0.4, "unattributed_ms": 7.5},
-            "stage_ledger": [{"stage": "attention.dispatch", "elapsed_ms": 2.0}],
+            "stage_ledger": [
+                {"stage": f"architecture.stage.{index}", "elapsed_ms": 2.0}
+                for index in range(80)
+            ],
             "context_block_stats": [{"block_type": "shared_timeline", "char_count": 120}],
             "memory_funnel": {
                 "vector_fallback": {"source": "bm25", "used": True},
@@ -180,7 +183,8 @@ def test_architecture_trace_contract_links_full_chain_without_raw_reply_text():
     assert contract["judge_decision"]["validation_action"] == "PASS"
     assert contract["judge_decision"]["validation_false_filter_candidate"] is True
     assert contract["timing_coverage"]["unattributed_ms"] == 7.5
-    assert contract["stage_ledger"][0]["stage"] == "attention.dispatch"
+    assert len(contract["stage_ledger"]) == 80
+    assert contract["stage_ledger"][0]["stage"] == "architecture.stage.0"
     assert len(contract["proactive_observation"]["stage_ledger"]) == 80
     assert contract["proactive_observation"]["stage_ledger"][0]["stage"] == "proactive.stage.0"
     assert contract["reply_plan"]["planned_char_count"] == len("绝密草稿文本")

@@ -255,7 +255,7 @@ def build_architecture_trace_contract(
         "timing_coverage": dict(trace_item.get("timing_coverage", {}) or {}),
         "stage_ledger": [
             dict(entry)
-            for entry in list(trace_item.get("stage_ledger", ()) or ())[-64:]
+            for entry in list(trace_item.get("stage_ledger", ()) or ())
             if isinstance(entry, Mapping)
         ],
         "topic_activity": {

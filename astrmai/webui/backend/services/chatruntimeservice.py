@@ -33,6 +33,9 @@ class ChatRuntimeService:
         if not dispatcher or not hasattr(dispatcher, "list_intents"):
             return {"status": "ok", "items": [], "total": 0, "runtime_bound": task is not None}
         safe_limit = max(1, min(int(limit or 50), 500))
+        if hasattr(dispatcher, "list_intents_page_async"):
+            page = await dispatcher.list_intents_page_async(limit=safe_limit, cursor=cursor)
+            return {"status": "ok", **dict(page or {}), "runtime_bound": True}
         if hasattr(dispatcher, "list_intents_page"):
             page = dispatcher.list_intents_page(limit=safe_limit, cursor=cursor)
             return {"status": "ok", **dict(page or {}), "runtime_bound": True}

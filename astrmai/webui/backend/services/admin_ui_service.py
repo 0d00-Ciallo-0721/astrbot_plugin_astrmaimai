@@ -1040,6 +1040,9 @@ class AdminUiService:
             safe_limit = max(1, min(int(limit or 50), 500))
         except (TypeError, ValueError):
             safe_limit = 50
+        if hasattr(dispatcher, "list_intents_page_async"):
+            page = await dispatcher.list_intents_page_async(limit=safe_limit, cursor=cursor)
+            return {"status": "ok", **dict(page or {}), "runtime_bound": True}
         if hasattr(dispatcher, "list_intents_page"):
             page = dispatcher.list_intents_page(limit=safe_limit, cursor=cursor)
             return {"status": "ok", **dict(page or {}), "runtime_bound": True}
