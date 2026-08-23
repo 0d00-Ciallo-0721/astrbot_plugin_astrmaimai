@@ -14,6 +14,7 @@ from .rhythm import evaluate_proactive_rhythm
 
 
 CompletionCallback = Callable[[bool, str], Awaitable[None] | None]
+ClaimValidator = Callable[[str], Awaitable[bool | None] | bool | None]
 
 
 def append_proactive_stage(event: Any, stage: str, status: str, reason: str = "") -> None:
@@ -40,6 +41,7 @@ class ProactiveMessageIntent:
     created_at: float = 0.0
     intent_id: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+    claim_validator: ClaimValidator | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(slots=True)
@@ -297,6 +299,78 @@ class ProactiveDispatcher:
             logger.warning(f"[ProactiveDispatcher] generation check failed closed for {intent.chat_id}: {exc}")
             return False, captured
 
+    async def _claim_status(self, intent: ProactiveMessageIntent) -> tuple[str, str]:
+        """Resolve a claim status without treating an opaque token as proof."""
+        metadata = intent.metadata
+        explicit_status = str(metadata.get("claim_status", "") or "").strip()
+        valid_statuses = {
+            "claimed",
+            "claim_rejected",
+            "claim_stale",
+            "not_required",
+            "claim_unverified",
+        }
+        if explicit_status:
+            if explicit_status in valid_statuses:
+                if explicit_status == "claimed":
+                    claim_id = str(metadata.get("claim_id", "") or "").strip()
+                    validator = intent.claim_validator
+                    if not claim_id or not callable(validator):
+                        return "claim_unverified", "claim_validator_unavailable"
+                    try:
+                        valid = await self._maybe_await(validator(claim_id))
+                    except Exception as exc:
+                        logger.warning(
+                            f"[ProactiveDispatcher] explicit claim validation failed "
+                            f"for {intent.chat_id}: {type(exc).__name__}"
+                        )
+                        return "claim_unverified", "claim_validation_error"
+                    if valid is None:
+                        return "claim_unverified", "claim_store_unavailable"
+                    if not valid:
+                        return "claim_stale", "claim_validator_rejected"
+                    return "claimed", "claim_validator_valid"
+                return explicit_status, str(metadata.get("claim_reason", "") or "")
+            return "claim_unverified", "unknown_claim_status"
+
+        claim_token = str(metadata.get("claim_token", "") or "")
+        if not claim_token:
+            return "not_required", "claim_token_absent"
+        getter = getattr(self.state_engine, "get_state", None)
+        if not callable(getter):
+            return "claim_unverified", "claim_state_unavailable"
+        try:
+            state = await self._maybe_await(getter(intent.chat_id))
+        except Exception as exc:
+            logger.warning(
+                f"[ProactiveDispatcher] claim validation degraded for {intent.chat_id}: "
+                f"{type(exc).__name__}"
+            )
+            return "claim_unverified", "claim_validation_error"
+        current_token = getattr(state, "proactive_claim_token", None)
+        if current_token is None:
+            return "claim_unverified", "claim_state_unavailable"
+        if str(current_token or "") != claim_token:
+            return "claim_stale", "claim_token_mismatch"
+        try:
+            claimed_at = float(getattr(state, "proactive_claimed_at", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return "claim_unverified", "claim_timestamp_invalid"
+        life = getattr(self.config, "life", None)
+        raw_lease_seconds = getattr(life, "proactive_claim_lease_sec", None)
+        if raw_lease_seconds is None:
+            lease_seconds = 300.0
+        else:
+            try:
+                lease_seconds = float(raw_lease_seconds)
+            except (TypeError, ValueError):
+                return "claim_unverified", "claim_lease_invalid"
+            if not lease_seconds > 0.0:
+                return "claim_unverified", "claim_lease_invalid"
+        if claimed_at <= 0.0 or time.time() - claimed_at >= max(1.0, lease_seconds):
+            return "claim_stale", "claim_lease_expired"
+        return "claimed", "claim_token_valid"
+
     async def _scheduling_snapshot(self, chat_id: str) -> dict[str, Any]:
         if not self.state_engine or not hasattr(self.state_engine, "get_state"):
             return {}
@@ -454,9 +528,13 @@ class ProactiveDispatcher:
         return True, "", checks
 
     def _intent_record(self, intent: ProactiveMessageIntent, decision: ProactiveDispatchDecision) -> dict[str, Any]:
+        intent_payload = asdict(intent)
+        # Runtime validators are callables and must not leak into management
+        # or export payloads.
+        intent_payload.pop("claim_validator", None)
         return {
             "created_at": decision.timestamp,
-            "intent": asdict(intent),
+            "intent": intent_payload,
             "decision": asdict(decision),
             "chat_id": intent.chat_id,
             "source": intent.source,
@@ -707,9 +785,24 @@ class ProactiveDispatcher:
             self._remember(intent, decision)
             return decision
         claim_token = str(intent.metadata.get("claim_token", "") or "")
-        if claim_token:
-            record_stage("proactive.claim", "success")
-        allowed, blocked_reason, checks = await self._safety_check(intent, now=now)
+        claim_status, claim_reason = await self._claim_status(intent)
+        record_stage("proactive.claim", claim_status, claim_reason)
+        if claim_status in {"claim_rejected", "claim_stale", "claim_unverified"}:
+            allowed = False
+            blocked_reason = claim_status
+            checks = {"claim_status": claim_status, "claim_reason": claim_reason}
+        else:
+            try:
+                allowed, blocked_reason, checks = await self._safety_check(intent, now=now)
+            except Exception as exc:
+                allowed = False
+                blocked_reason = f"safety_check_error:{type(exc).__name__}"
+                checks = {"error_type": type(exc).__name__}
+                record_stage("proactive.safety_check", "error", blocked_reason)
+                logger.warning(
+                    f"[ProactiveDispatcher] safety check failed closed for "
+                    f"{intent.intent_id}: {type(exc).__name__}"
+                )
         if self._shutting_down:
             allowed = False
             blocked_reason = "dispatcher_shutdown"
@@ -730,13 +823,15 @@ class ProactiveDispatcher:
         )
         self._remember(intent, decision)
         if not allowed:
-            record_stage("proactive.safety_check", "blocked", blocked_reason)
+            if not any(
+                item.get("stage") == "proactive.safety_check"
+                for item in stage_ledger
+            ):
+                record_stage("proactive.safety_check", "blocked", blocked_reason)
             record_stage("proactive.dispatch", "blocked", blocked_reason)
             await self._sync_history_for_dispatch(intent.intent_id, decision)
             return decision
 
-        if not claim_token:
-            record_stage("proactive.claim", "not_required", "claim_token_absent")
         record_stage("proactive.sensor", "delegated", "attention_gate")
 
         if on_complete:
@@ -887,6 +982,24 @@ class ProactiveDispatcher:
                 record_stage("proactive.generation_recheck", "blocked", "stale_generation")
                 return False
             record_stage("proactive.generation_recheck", "success")
+            rechecked_claim_status, rechecked_claim_reason = await self._claim_status(intent)
+            if rechecked_claim_status in {
+                "claim_rejected",
+                "claim_stale",
+                "claim_unverified",
+            }:
+                record_stage(
+                    "proactive.claim_recheck",
+                    "blocked",
+                    rechecked_claim_status,
+                )
+                decision.blocked_reason = rechecked_claim_status
+                return False
+            record_stage(
+                "proactive.claim_recheck",
+                rechecked_claim_status,
+                rechecked_claim_reason,
+            )
             record_stage("proactive.event_enqueue", "started")
             result = await self.attention_gate.inject_external_event(intent.chat_id, event_data)
             record_stage(

@@ -4,6 +4,7 @@ import importlib
 import sqlite3
 import sys
 import tempfile
+import time
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -92,6 +93,7 @@ class ScheduledScenarioServiceTests(unittest.TestCase):
                     scenario TEXT NOT NULL,
                     local_date TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'claimed',
+                    claim_token TEXT NOT NULL DEFAULT '',
                     attempts INTEGER NOT NULL DEFAULT 0,
                     next_retry_at REAL NOT NULL DEFAULT 0,
                     last_error TEXT NOT NULL DEFAULT '',
@@ -134,11 +136,14 @@ class ScheduledScenarioServiceTests(unittest.TestCase):
         intent = first_dispatcher.intents[0]
         self.assertEqual(intent.source, "scheduled_scenario")
         self.assertEqual(intent.metadata["schedule_slot"], "forenoon")
+        self.assertEqual(intent.metadata["claim_status"], "claimed")
+        self.assertEqual(intent.metadata["claim_id"], "2026-05-11:morning_greeting:ff:GroupMessage:10001")
         with sqlite3.connect(self.db_path) as db:
             row = db.execute(
-                "SELECT status, attempts FROM proactive_scenario_delivery"
+                "SELECT status, attempts, claim_token FROM proactive_scenario_delivery"
             ).fetchone()
-        self.assertEqual(row, ("queued", 1))
+        self.assertEqual(row[0:2], ("queued", 1))
+        self.assertTrue(row[2])
 
     def test_immediate_completion_is_not_overwritten_by_queued_state(self):
         timestamp = datetime(2026, 5, 11, 8, 20).timestamp()
@@ -152,6 +157,96 @@ class ScheduledScenarioServiceTests(unittest.TestCase):
                 "SELECT status FROM proactive_scenario_delivery"
             ).fetchone()[0]
         self.assertEqual(status, "sent")
+
+    def test_delivery_claim_recheck_is_bound_to_attempt_token(self):
+        store = self.module.ScenarioDeliveryStore(self.db_path)
+        key = "2026-05-11:morning_greeting:ff:GroupMessage:10001"
+
+        token_a = asyncio.run(
+            store.claim(key, chat_id="ff:GroupMessage:10001", scenario="morning_greeting", local_date="2026-05-11")
+        )
+        self.assertTrue(token_a)
+        with sqlite3.connect(self.db_path) as db:
+            db.execute(
+                "UPDATE proactive_scenario_delivery SET updated_at=? WHERE delivery_key=?",
+                (time.time() - store.CLAIM_LEASE_SECONDS - 1, key),
+            )
+            db.commit()
+
+        token_b = asyncio.run(
+            store.claim(key, chat_id="ff:GroupMessage:10001", scenario="morning_greeting", local_date="2026-05-11")
+        )
+        self.assertTrue(token_b)
+        self.assertNotEqual(token_a, token_b)
+        self.assertFalse(asyncio.run(store.is_claim_current(key, claim_token=token_a)))
+        self.assertTrue(asyncio.run(store.is_claim_current(key, claim_token=token_b)))
+
+        asyncio.run(store.update(key, status="sent", claim_token=token_a))
+        with sqlite3.connect(self.db_path) as db:
+            status, current_token = db.execute(
+                "SELECT status, claim_token FROM proactive_scenario_delivery WHERE delivery_key=?",
+                (key,),
+            ).fetchone()
+        self.assertEqual(status, "claimed")
+        self.assertEqual(current_token, token_b)
+
+    def test_memory_delivery_store_keeps_local_claim_ownership(self):
+        store = self.module.ScenarioDeliveryStore(None)
+        key = "2026-05-11:morning_greeting:private:1"
+        token = asyncio.run(
+            store.claim(key, chat_id="private:1", scenario="morning_greeting", local_date="2026-05-11")
+        )
+        self.assertTrue(token)
+        self.assertTrue(asyncio.run(store.is_claim_current(key, claim_token=token)))
+        self.assertFalse(asyncio.run(store.is_claim_current(key, claim_token="other")))
+        asyncio.run(store.update(key, status="sent", claim_token=token))
+        self.assertFalse(asyncio.run(store.is_claim_current(key, claim_token=token)))
+        self.assertIsNone(
+            asyncio.run(
+                store.claim(key, chat_id="private:1", scenario="morning_greeting", local_date="2026-05-11")
+            )
+        )
+
+    def test_memory_delivery_store_prunes_old_records_but_preserves_active_claims(self):
+        store = self.module.ScenarioDeliveryStore(None)
+        store.MEMORY_CLAIM_LIMIT = 2
+        now = time.time()
+        store._memory_claims.update(
+            {
+                "active-a": {
+                    "status": "claimed",
+                    "claim_token": "a",
+                    "updated_at": now,
+                    "next_retry_at": 0.0,
+                },
+                "active-b": {
+                    "status": "claimed",
+                    "claim_token": "b",
+                    "updated_at": now,
+                    "next_retry_at": 0.0,
+                },
+                "old-terminal": {
+                    "status": "sent",
+                    "claim_token": "old",
+                    "updated_at": now - store.MEMORY_CLAIM_RETENTION_SECONDS - 1,
+                    "next_retry_at": 0.0,
+                },
+            }
+        )
+
+        token_c = asyncio.run(
+            store.claim("new", chat_id="private:1", scenario="morning_greeting", local_date="2026-05-11")
+        )
+
+        self.assertIn("active-a", store._memory_claims)
+        self.assertIn("active-b", store._memory_claims)
+        self.assertNotIn("old-terminal", store._memory_claims)
+        self.assertIsNone(token_c)
+        self.assertLessEqual(len(store._memory_claims), store.MEMORY_CLAIM_LIMIT)
+        self.assertEqual(store._memory_claim_capacity_rejected, 1)
+        store.clear_memory_claims()
+        self.assertEqual(store._memory_claims, {})
+        self.assertEqual(store._memory_claim_capacity_rejected, 0)
 
     def test_skipped_completion_uses_configured_retry_backoff(self):
         timestamp = datetime(2026, 5, 11, 8, 20).timestamp()

@@ -13,6 +13,7 @@ from datetime import date, datetime
 import inspect
 import json
 import time
+import uuid
 from typing import Any, Awaitable, Callable
 
 import aiohttp
@@ -102,14 +103,91 @@ class DailyScheduleStore:
 
 class ScenarioDeliveryStore:
     CLAIM_LEASE_SECONDS = 300.0
+    MEMORY_CLAIM_LIMIT = 1024
+    MEMORY_CLAIM_RETENTION_SECONDS = 3600.0
 
     def __init__(self, db_path: Any) -> None:
         self.db_path = db_path
+        # Keep a process-local claim ledger when persistence is unavailable.
+        # This preserves ownership checks without pretending that claims
+        # survive a restart or are shared across processes.
+        self._memory_claims: dict[str, dict[str, Any]] = {}
+        self._memory_claim_capacity_rejected = 0
 
-    async def claim(self, delivery_key: str, *, chat_id: str, scenario: str, local_date: str) -> bool:
+    def _prune_memory_claims(self, *, now: float | None = None) -> None:
+        if self.db_path or not self._memory_claims:
+            return
+        current_time = float(now if now is not None else time.time())
+        removable: list[str] = []
+        for key, record in self._memory_claims.items():
+            try:
+                updated_at = float(record.get("updated_at", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                updated_at = 0.0
+            status = str(record.get("status", "") or "")
+            age = current_time - updated_at
+            if status == "claimed" and age < self.CLAIM_LEASE_SECONDS:
+                continue
+            if (status == "claimed" and age >= self.CLAIM_LEASE_SECONDS) or age >= self.MEMORY_CLAIM_RETENTION_SECONDS:
+                removable.append(key)
+        for key in removable:
+            self._memory_claims.pop(key, None)
+
+        if len(self._memory_claims) <= self.MEMORY_CLAIM_LIMIT:
+            return
+        candidates: list[tuple[str, float]] = []
+        for key, record in self._memory_claims.items():
+            try:
+                updated_at = float(record.get("updated_at", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                updated_at = 0.0
+            if str(record.get("status", "") or "") != "claimed" or (
+                current_time - updated_at >= self.CLAIM_LEASE_SECONDS
+            ):
+                candidates.append((key, updated_at))
+        candidates.sort(key=lambda item: item[1])
+        for key, _updated_at in candidates:
+            if len(self._memory_claims) <= self.MEMORY_CLAIM_LIMIT:
+                break
+            self._memory_claims.pop(key, None)
+
+    def clear_memory_claims(self) -> None:
+        """Drop process-local claims during teardown; persistent claims remain in SQLite."""
         if not self.db_path:
-            return True
+            self._memory_claims.clear()
+            self._memory_claim_capacity_rejected = 0
+
+    async def claim(self, delivery_key: str, *, chat_id: str, scenario: str, local_date: str) -> str | None:
+        if not self.db_path:
+            now = time.time()
+            self._prune_memory_claims(now=now)
+            current = self._memory_claims.get(delivery_key)
+            if current:
+                status = str(current.get("status", "") or "")
+                updated_at = float(current.get("updated_at", 0.0) or 0.0)
+                next_retry_at = float(current.get("next_retry_at", 0.0) or 0.0)
+                if status in {"queued", "sent"}:
+                    return None
+                if status == "claimed" and now - updated_at < self.CLAIM_LEASE_SECONDS:
+                    return None
+                if next_retry_at > now:
+                    return None
+            if len(self._memory_claims) >= self.MEMORY_CLAIM_LIMIT:
+                self._memory_claim_capacity_rejected += 1
+                return None
+            claim_token = uuid.uuid4().hex
+            self._memory_claims[delivery_key] = {
+                "status": "claimed",
+                "claim_token": claim_token,
+                "updated_at": now,
+                "next_retry_at": 0.0,
+                "chat_id": chat_id,
+                "scenario": scenario,
+                "local_date": local_date,
+            }
+            return claim_token
         now = time.time()
+        claim_token = uuid.uuid4().hex
         async with connect_aiosqlite(self.db_path) as db:
             await db.execute("BEGIN IMMEDIATE")
             cursor = await db.execute(
@@ -135,22 +213,73 @@ class ScenarioDeliveryStore:
                 """
                 INSERT INTO proactive_scenario_delivery(
                     delivery_key, chat_id, scenario, local_date, status,
-                    attempts, next_retry_at, last_error, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'claimed', 1, 0, '', ?, ?)
+                    claim_token, attempts, next_retry_at, last_error, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'claimed', ?, 1, 0, '', ?, ?)
                 ON CONFLICT(delivery_key) DO UPDATE SET
                     status='claimed',
+                    claim_token=excluded.claim_token,
                     attempts=proactive_scenario_delivery.attempts + 1,
                     next_retry_at=0,
                     last_error='',
                     updated_at=excluded.updated_at
                 """,
-                (delivery_key, chat_id, scenario, local_date, now, now),
+                (delivery_key, chat_id, scenario, local_date, claim_token, now, now),
             )
             await db.commit()
-        return True
+        return claim_token
 
-    async def update(self, delivery_key: str, *, status: str, error: str = "", retry_after: float = 0.0) -> None:
+    async def is_claim_current(self, delivery_key: str, *, claim_token: str) -> bool | None:
+        """Check that a scheduled delivery lease is still owned and live."""
         if not self.db_path:
+            self._prune_memory_claims()
+            current = self._memory_claims.get(delivery_key)
+            if not current:
+                return None
+            if str(current.get("claim_token", "") or "") != str(claim_token or ""):
+                return False
+            if str(current.get("status", "") or "") != "claimed":
+                return False
+            try:
+                updated_at = float(current.get("updated_at", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                return False
+            return time.time() - updated_at < self.CLAIM_LEASE_SECONDS
+        async with connect_aiosqlite(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                SELECT status, updated_at
+                FROM proactive_scenario_delivery
+                WHERE delivery_key=? AND claim_token=?
+                """,
+                (str(delivery_key or ""), str(claim_token or "")),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        if not row or str(row[0] or "") != "claimed":
+            return False
+        try:
+            updated_at = float(row[1] or 0.0)
+        except (TypeError, ValueError):
+            return False
+        return time.time() - updated_at < self.CLAIM_LEASE_SECONDS
+
+    async def update(
+        self,
+        delivery_key: str,
+        *,
+        status: str,
+        error: str = "",
+        retry_after: float = 0.0,
+        claim_token: str = "",
+    ) -> None:
+        if not self.db_path:
+            self._prune_memory_claims()
+            current = self._memory_claims.get(delivery_key)
+            if not current or str(current.get("claim_token", "") or "") != str(claim_token or ""):
+                return
+            current["status"] = status
+            current["next_retry_at"] = time.time() + max(0.0, retry_after)
+            current["updated_at"] = time.time()
             return
         now = time.time()
         async with connect_aiosqlite(self.db_path) as db:
@@ -158,7 +287,7 @@ class ScenarioDeliveryStore:
                 """
                 UPDATE proactive_scenario_delivery
                 SET status=?, next_retry_at=?, last_error=?, updated_at=?
-                WHERE delivery_key=?
+                WHERE delivery_key=? AND claim_token=?
                   AND NOT (status='sent' AND ?='queued')
                 """,
                 (
@@ -167,6 +296,7 @@ class ScenarioDeliveryStore:
                     str(error or "")[:500],
                     now,
                     delivery_key,
+                    str(claim_token or ""),
                     status,
                 ),
             )
@@ -519,12 +649,13 @@ class ScheduledScenarioService:
             if chat_kind == "private" and not bool(getattr(life, "enable_private_proactive", True)):
                 continue
             delivery_key = f"{plan_date}:{scenario}:{chat_id}"
-            if not await self.delivery_store.claim(
+            claim_token = await self.delivery_store.claim(
                 delivery_key,
                 chat_id=chat_id,
                 scenario=scenario,
                 local_date=plan_date,
-            ):
+            )
+            if not claim_token:
                 continue
             attempted += 1
             slot = self._slot(local_now)
@@ -540,10 +671,17 @@ class ScheduledScenarioService:
                 context_parts.append(f"客观天气信息：{weather.render()}。")
             context_parts.append("请先结合当前聊天判断是否适合开口；不适合就等待或忽略，不要机械报时。")
 
-            async def _complete(sent: bool, preview: str, *, key: str = delivery_key) -> None:
+            async def _complete(
+                sent: bool,
+                preview: str,
+                *,
+                key: str = delivery_key,
+                token: str = claim_token,
+            ) -> None:
                 await self.delivery_store.update(
                     key,
                     status="sent" if sent else "skipped",
+                    claim_token=token,
                     error="" if sent else "attention_or_reply_skipped",
                     retry_after=0.0 if sent else float(
                         getattr(life, "proactive_failure_retry_sec", 300) or 300
@@ -560,6 +698,8 @@ class ScheduledScenarioService:
                     cost=0.05,
                     cooldown=float(getattr(life, "wakeup_cooldown", 28800) or 28800),
                     metadata={
+                        "claim_status": "claimed",
+                        "claim_id": delivery_key,
                         "chat_kind": chat_kind,
                         "group_id": chat_id.rsplit(":", 1)[-1] if chat_kind == "group" else "",
                         "scenario": scenario,
@@ -572,13 +712,21 @@ class ScheduledScenarioService:
                             getattr(life, "scheduled_scenarios_allow_inactive_chat", False)
                         ),
                     },
+                    claim_validator=lambda key, token=claim_token: self.delivery_store.is_claim_current(
+                        key,
+                        claim_token=token,
+                    ),
                 ),
                 on_complete=_complete,
             )
             if decision.synthetic_event_queued:
                 queued += 1
                 if not decision.reply_sent:
-                    await self.delivery_store.update(delivery_key, status="queued")
+                    await self.delivery_store.update(
+                        delivery_key,
+                        status="queued",
+                        claim_token=claim_token,
+                    )
             else:
                 reason = str(decision.blocked_reason or decision.status or "blocked")
                 blocked[reason] = blocked.get(reason, 0) + 1
@@ -593,6 +741,7 @@ class ScheduledScenarioService:
                     await self.delivery_store.update(
                         delivery_key,
                         status="blocked",
+                        claim_token=claim_token,
                         error=reason,
                         retry_after=float(
                             getattr(life, "proactive_failure_retry_sec", 300) or 300
@@ -611,6 +760,9 @@ class ScheduledScenarioService:
         }
         return dict(self._last_report)
 
+    def clear_memory_claims(self) -> None:
+        self.delivery_store.clear_memory_claims()
+
     def describe_status(self) -> dict[str, Any]:
         return {
             "generation_dates": sorted(self._generation_started)[-7:],
@@ -620,6 +772,9 @@ class ScheduledScenarioService:
             "generation_last_error": dict(self._generation_last_error),
             "cached_schedule_dates": sorted(self._schedule_cache)[-7:],
             "weather_cached": self.weather._cached is not None,
+            "memory_claim_count": len(self.delivery_store._memory_claims),
+            "memory_claim_limit": self.delivery_store.MEMORY_CLAIM_LIMIT,
+            "memory_claim_capacity_rejected": self.delivery_store._memory_claim_capacity_rejected,
             "last_tick": dict(self._last_report),
         }
 

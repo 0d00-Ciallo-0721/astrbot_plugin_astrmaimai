@@ -233,6 +233,7 @@ _MIGRATIONS: list[tuple[int, str]] = [
     (90, "CREATE INDEX IF NOT EXISTS ix_relationship_event_ledger_user_created ON relationship_event_ledger(user_id, created_at)"),
     (91, "CREATE INDEX IF NOT EXISTS ix_relationship_event_ledger_chat_created ON relationship_event_ledger(chat_id, created_at)"),
     (92, "CREATE INDEX IF NOT EXISTS ix_relationship_event_ledger_turn_id ON relationship_event_ledger(turn_id)"),
+    (93, "ALTER TABLE proactive_scenario_delivery ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''"),
 ]
 
 
@@ -247,6 +248,22 @@ def _run_migrations(db: sqlite3.Connection) -> None:
     for version, ddl in _MIGRATIONS:
         if version <= current:
             continue
+        if version == 93:
+            table = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='proactive_scenario_delivery'"
+            ).fetchone()
+            if not table:
+                db.execute(f"PRAGMA user_version = {version}")
+                logger.info("[AstrMai-DB] migration v93 skipped (delivery table absent)")
+                continue
+            columns = {
+                str(row[1])
+                for row in db.execute("PRAGMA table_info(proactive_scenario_delivery)").fetchall()
+            }
+            if "claim_token" in columns:
+                db.execute(f"PRAGMA user_version = {version}")
+                logger.info("[AstrMai-DB] migration v93 already applied (column exists)")
+                continue
         try:
             db.execute(ddl)
             db.execute(f"PRAGMA user_version = {version}")
@@ -273,6 +290,23 @@ async def _run_migrations_async(db: aiosqlite.Connection) -> None:
     for version, ddl in _MIGRATIONS:
         if version <= current:
             continue
+        if version == 93:
+            cursor = await db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='proactive_scenario_delivery'"
+            )
+            table = await cursor.fetchone()
+            await cursor.close()
+            if not table:
+                await db.execute(f"PRAGMA user_version = {version}")
+                logger.info("[AstrMai-DB] migration v93 skipped (delivery table absent)")
+                continue
+            cursor = await db.execute("PRAGMA table_info(proactive_scenario_delivery)")
+            columns = {str(row[1]) for row in await cursor.fetchall()}
+            await cursor.close()
+            if "claim_token" in columns:
+                await db.execute(f"PRAGMA user_version = {version}")
+                logger.info("[AstrMai-DB] migration v93 already applied (column exists)")
+                continue
         try:
             await db.execute(ddl)
             await db.execute(f"PRAGMA user_version = {version}")

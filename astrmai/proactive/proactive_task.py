@@ -414,6 +414,9 @@ class ProactiveTask:
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             self._background_tasks.difference_update(tasks)
+        clear_memory_claims = getattr(getattr(self, "scheduled_scenario_service", None), "clear_memory_claims", None)
+        if callable(clear_memory_claims):
+            clear_memory_claims()
 
     def configure(
         self,

@@ -174,6 +174,320 @@ class ProactiveGapCoverageTests(unittest.TestCase):
         self.assertTrue(any(item["stage"] == "proactive.reply_commit" for item in stages))
         self.assertTrue(any(item["stage"] == "proactive.state_settle" and item["status"] == "success" for item in stages))
 
+    def test_safety_check_exception_is_recorded_and_exportable(self):
+        class _AttentionGate:
+            async def inject_external_event(self, chat_id, event_data):
+                return True
+
+        dirty_state = SimpleNamespace(
+            energy=1.0,
+            last_real_user_activity_at="bad",
+            last_committed_bot_reply_at=0.0,
+            next_proactive_due_at=0.0,
+            unanswered_proactive_count=0,
+            last_proactive_cancel_reason="",
+        )
+        dispatcher = self.dispatcher_mod.ProactiveDispatcher(
+            attention_gate=_AttentionGate(),
+            runtime_coordinator=SimpleNamespace(
+                get_activity_snapshot=lambda chat_id: asyncio.sleep(
+                    0,
+                    result={
+                        "latest_activity_ts": time.time(),
+                        "wait_targets": [],
+                        "executor_pending": 0,
+                    },
+                )
+            ),
+            state_engine=SimpleNamespace(
+                get_state=lambda chat_id: asyncio.sleep(0, result=dirty_state),
+            ),
+            config=_config(),
+        )
+
+        decision = asyncio.run(
+            dispatcher.dispatch(
+                self.dispatcher_mod.ProactiveMessageIntent(
+                    chat_id="chat-safety-error",
+                    source="wakeup",
+                    reason="dirty state",
+                    guidance="say one line",
+                )
+            )
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.blocked_reason, "safety_check_error:ValueError")
+        history = dispatcher.list_intents(limit=1)[0]
+        stages = history["decision"]["stage_ledger"]
+        self.assertTrue(
+            any(
+                item["stage"] == "proactive.safety_check"
+                and item["status"] == "error"
+                for item in stages
+            )
+        )
+        self.assertEqual(stages[-1]["stage"], "proactive.dispatch")
+        self.assertEqual(stages[-1]["status"], "blocked")
+
+    def test_stale_claim_is_not_reported_as_success(self):
+        class _AttentionGate:
+            async def inject_external_event(self, chat_id, event_data):
+                return True
+
+        state = SimpleNamespace(
+            energy=1.0,
+            proactive_claim_token="current-token",
+            proactive_claimed_at=time.time(),
+        )
+        dispatcher = self.dispatcher_mod.ProactiveDispatcher(
+            attention_gate=_AttentionGate(),
+            state_engine=SimpleNamespace(
+                get_state=lambda chat_id: asyncio.sleep(0, result=state),
+            ),
+            config=_config(),
+        )
+
+        decision = asyncio.run(
+            dispatcher.dispatch(
+                self.dispatcher_mod.ProactiveMessageIntent(
+                    chat_id="chat-stale-claim",
+                    source="wakeup",
+                    reason="stale claim",
+                    guidance="say one line",
+                    metadata={"claim_token": "old-token"},
+                )
+            )
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.blocked_reason, "claim_stale")
+        claim_stage = next(
+            item for item in decision.stage_ledger if item["stage"] == "proactive.claim"
+        )
+        self.assertEqual(claim_stage["status"], "claim_stale")
+
+    def test_unverified_claim_fails_closed(self):
+        class _AttentionGate:
+            async def inject_external_event(self, chat_id, event_data):
+                raise AssertionError("unverified claim must not dispatch")
+
+        dispatcher = self.dispatcher_mod.ProactiveDispatcher(
+            attention_gate=_AttentionGate(),
+            state_engine=SimpleNamespace(
+                get_state=lambda chat_id: asyncio.sleep(
+                    0,
+                    result=SimpleNamespace(
+                        energy=1.0,
+                        proactive_claim_token="same",
+                        proactive_claimed_at="bad",
+                    ),
+                )
+            ),
+            config=_config(),
+        )
+
+        decision = asyncio.run(
+            dispatcher.dispatch(
+                self.dispatcher_mod.ProactiveMessageIntent(
+                    chat_id="chat-unverified",
+                    source="wakeup",
+                    reason="invalid claim timestamp",
+                    guidance="say one line",
+                    metadata={"claim_token": "same"},
+                )
+            )
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.blocked_reason, "claim_unverified")
+        self.assertEqual(
+            next(item for item in decision.stage_ledger if item["stage"] == "proactive.claim")["reason"],
+            "claim_timestamp_invalid",
+        )
+
+    def test_invalid_claim_lease_configuration_is_unverified(self):
+        class _AttentionGate:
+            async def inject_external_event(self, chat_id, event_data):
+                raise AssertionError("invalid lease must not dispatch")
+
+        dispatcher = self.dispatcher_mod.ProactiveDispatcher(
+            attention_gate=_AttentionGate(),
+            state_engine=SimpleNamespace(
+                get_state=lambda chat_id: asyncio.sleep(
+                    0,
+                    result=SimpleNamespace(
+                        energy=1.0,
+                        proactive_claim_token="same",
+                        proactive_claimed_at=time.time(),
+                    ),
+                )
+            ),
+            config=SimpleNamespace(
+                life=SimpleNamespace(proactive_claim_lease_sec="bad"),
+                reply=SimpleNamespace(base_frequency=0.7),
+            ),
+        )
+
+        decision = asyncio.run(
+            dispatcher.dispatch(
+                self.dispatcher_mod.ProactiveMessageIntent(
+                    chat_id="chat-invalid-lease",
+                    source="wakeup",
+                    reason="invalid claim lease",
+                    guidance="say one line",
+                    metadata={"claim_token": "same"},
+                )
+            )
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.blocked_reason, "claim_unverified")
+        self.assertEqual(
+            next(item for item in decision.stage_ledger if item["stage"] == "proactive.claim")["reason"],
+            "claim_lease_invalid",
+        )
+
+    def test_claim_is_rechecked_before_event_enqueue(self):
+        class _AttentionGate:
+            def __init__(self):
+                self.calls = 0
+
+            async def inject_external_event(self, chat_id, event_data):
+                self.calls += 1
+                return True
+
+        attention_gate = _AttentionGate()
+        states = [
+            SimpleNamespace(
+                energy=1.0,
+                proactive_claim_token="same",
+                proactive_claimed_at=time.time(),
+            ),
+            SimpleNamespace(
+                energy=1.0,
+                proactive_claim_token="same",
+                proactive_claimed_at=time.time(),
+            ),
+            SimpleNamespace(
+                energy=1.0,
+                proactive_claim_token="same",
+                proactive_claimed_at=time.time(),
+            ),
+            SimpleNamespace(
+                energy=1.0,
+                proactive_claim_token="replaced",
+                proactive_claimed_at=time.time(),
+            ),
+        ]
+
+        async def get_state(chat_id):
+            return states.pop(0) if states else states[-1]
+
+        dispatcher = self.dispatcher_mod.ProactiveDispatcher(
+            attention_gate=attention_gate,
+            runtime_coordinator=SimpleNamespace(
+                get_activity_snapshot=lambda chat_id: asyncio.sleep(
+                    0,
+                    result={"latest_activity_ts": time.time(), "wait_targets": [], "executor_pending": 0},
+                )
+            ),
+            state_engine=SimpleNamespace(get_state=get_state),
+            config=_config(),
+        )
+
+        decision = asyncio.run(
+            dispatcher.dispatch(
+                self.dispatcher_mod.ProactiveMessageIntent(
+                    chat_id="chat-claim-race",
+                    source="wakeup",
+                    reason="claim race",
+                    guidance="say one line",
+                    metadata={"claim_token": "same"},
+                )
+            )
+        )
+
+        self.assertFalse(decision.synthetic_event_queued)
+        self.assertEqual(decision.blocked_reason, "claim_stale")
+        self.assertEqual(attention_gate.calls, 0)
+
+    def test_explicit_claimed_requires_claim_id_and_validator(self):
+        class _AttentionGate:
+            async def inject_external_event(self, chat_id, event_data):
+                raise AssertionError("missing claim validator must not dispatch")
+
+        dispatcher = self.dispatcher_mod.ProactiveDispatcher(
+            attention_gate=_AttentionGate(),
+            config=_config(),
+        )
+        decision = asyncio.run(
+            dispatcher.dispatch(
+                self.dispatcher_mod.ProactiveMessageIntent(
+                    chat_id="chat-missing-claim-id",
+                    source="scheduled_scenario",
+                    reason="missing claim id",
+                    guidance="say one line",
+                    metadata={"claim_status": "claimed"},
+                )
+            )
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.blocked_reason, "claim_unverified")
+        self.assertNotIn("claim_validator", dispatcher.list_intents(limit=1)[0]["intent"])
+
+    def test_scheduled_claim_validator_is_rechecked_before_enqueue(self):
+        class _AttentionGate:
+            def __init__(self):
+                self.calls = 0
+
+            async def inject_external_event(self, chat_id, event_data):
+                self.calls += 1
+                return True
+
+        validator_calls = []
+
+        async def validator(claim_id):
+            validator_calls.append(claim_id)
+            return len(validator_calls) == 1
+
+        attention_gate = _AttentionGate()
+        dispatcher = self.dispatcher_mod.ProactiveDispatcher(
+            attention_gate=attention_gate,
+            runtime_coordinator=SimpleNamespace(
+                get_activity_snapshot=lambda chat_id: asyncio.sleep(
+                    0,
+                    result={"latest_activity_ts": time.time(), "wait_targets": [], "executor_pending": 0},
+                )
+            ),
+            state_engine=SimpleNamespace(
+                get_state=lambda chat_id: asyncio.sleep(0, result=SimpleNamespace(energy=1.0)),
+            ),
+            config=_config(),
+        )
+
+        decision = asyncio.run(
+            dispatcher.dispatch(
+                self.dispatcher_mod.ProactiveMessageIntent(
+                    chat_id="chat-scheduled-claim-race",
+                    source="scheduled_scenario",
+                    reason="claim race",
+                    guidance="say one line",
+                    metadata={
+                        "claim_status": "claimed",
+                        "claim_id": "delivery-key",
+                    },
+                    claim_validator=validator,
+                )
+            )
+        )
+
+        self.assertEqual(validator_calls, ["delivery-key", "delivery-key"])
+        self.assertFalse(decision.synthetic_event_queued)
+        self.assertEqual(decision.blocked_reason, "claim_stale")
+        self.assertEqual(attention_gate.calls, 0)
+
     def test_completion_watchdog_settles_stuck_queued_intent(self):
         class _AttentionGate:
             def __init__(self):
@@ -909,6 +1223,7 @@ class ProactiveGapCoverageTests(unittest.TestCase):
         stages = history["decision"]["stage_ledger"]
         self.assertEqual([item["stage"] for item in stages], [
             "proactive.candidate",
+            "proactive.claim",
             "proactive.safety_check",
             "proactive.dispatch",
         ])
