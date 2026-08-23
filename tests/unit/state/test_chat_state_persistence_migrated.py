@@ -301,6 +301,31 @@ class ChatStatePersistenceMigratedTests(unittest.TestCase):
         finally:
             temp_dir.cleanup()
 
+    def test_profile_generation_claim_is_atomic_and_token_scoped(self):
+        temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+
+        async def _run():
+            persistence = _SqliteStatePersistence(Path(temp_dir.name) / "claims.db")
+            first, second = await asyncio.gather(
+                persistence.claim_profile_generation("user-1"),
+                persistence.claim_profile_generation("user-1"),
+            )
+            token = first or second
+            self.assertTrue(token)
+            self.assertNotEqual(bool(first), bool(second))
+            self.assertFalse(await persistence.release_profile_generation("user-1", "stale-token"))
+            self.assertTrue(await persistence.release_profile_generation("user-1", token))
+            self.assertTrue(await persistence.claim_profile_generation("user-1"))
+
+            replacement = await persistence.get_profile_generation_claim("user-1")
+            self.assertTrue(replacement)
+            self.assertEqual(replacement, await persistence.get_profile_generation_claim("user-1"))
+
+        try:
+            asyncio.run(_run())
+        finally:
+            temp_dir.cleanup()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -158,6 +158,19 @@ class UserProfileServiceMigratedTests(unittest.TestCase):
         self.assertFalse(profile.is_dirty)
         self.assertIn("user-1", persistence.saved)
 
+    def test_profile_generation_failure_backoff_is_exponential_and_clearable(self):
+        service = self.mod.UserProfileService(_FakePersistence())
+        profile = self.mod.UserProfile(user_id="user-1", name="Alice")
+
+        first = service.record_profile_generation_failure(profile, "nickname", now=100.0)
+        second = service.record_profile_generation_failure(profile, "nickname", now=100.0)
+
+        self.assertEqual(first["failure_count"], 1)
+        self.assertEqual(second["failure_count"], 2)
+        self.assertTrue(service.profile_generation_backoff_active(profile, "nickname", now=100.0))
+        service.clear_profile_generation_failure(profile, "nickname")
+        self.assertFalse(service.profile_generation_backoff_active(profile, "nickname", now=100.0))
+
 
 if __name__ == "__main__":
     unittest.main()

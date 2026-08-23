@@ -4,6 +4,7 @@ import json
 import time
 from time import monotonic
 from typing import Any, Dict, Optional
+from uuid import uuid4
 
 from .orm_models import ChatState, LastMessageMetadata
 from .sqlite_helpers import connect_aiosqlite, connect_sqlite
@@ -307,6 +308,69 @@ class StateProfilePersistenceMixin:
                 VALUES (?, ?, ?, ?, ?, ?)
             """, (chat_id, sender_id, has_image, json.dumps(image_urls, ensure_ascii=False), False, time.time()))
             await db.commit()
+
+    async def claim_profile_generation(
+        self,
+        user_id: str,
+        *,
+        lease_sec: float = 1800.0,
+        now: float | None = None,
+    ) -> str | None:
+        """Atomically claim one user's profile generation across task instances."""
+        normalized_user_id = str(user_id or "").strip()
+        if not normalized_user_id:
+            return None
+        current = float(time.time() if now is None else now)
+        token = uuid4().hex
+        effective_lease_sec = max(1.0, float(lease_sec or 0.0))
+        claimed_until = current + effective_lease_sec
+        async with connect_aiosqlite(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                INSERT INTO profile_generation_claims (user_id, claim_token, claimed_until)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    claim_token = excluded.claim_token,
+                    claimed_until = excluded.claimed_until
+                WHERE profile_generation_claims.claimed_until <= ?
+                """,
+                (normalized_user_id, token, claimed_until, current),
+            )
+            await db.commit()
+            return token if int(cursor.rowcount or 0) == 1 else None
+
+    async def release_profile_generation(self, user_id: str, claim_token: str) -> bool:
+        normalized_user_id = str(user_id or "").strip()
+        normalized_token = str(claim_token or "").strip()
+        if not normalized_user_id or not normalized_token:
+            return False
+        async with connect_aiosqlite(self.db_path) as db:
+            cursor = await db.execute(
+                "DELETE FROM profile_generation_claims WHERE user_id = ? AND claim_token = ?",
+                (normalized_user_id, normalized_token),
+            )
+            await db.commit()
+            return int(cursor.rowcount or 0) == 1
+
+    async def get_profile_generation_claim(
+        self,
+        user_id: str,
+        *,
+        now: float | None = None,
+    ) -> str | None:
+        """Return the current claim token, or None when no claim exists."""
+        normalized_user_id = str(user_id or "").strip()
+        if not normalized_user_id:
+            return None
+        current = float(time.time() if now is None else now)
+        async with connect_aiosqlite(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT claim_token FROM profile_generation_claims "
+                "WHERE user_id = ? AND claimed_until > ?",
+                (normalized_user_id, current),
+            )
+            row = await cursor.fetchone()
+            return str(row[0]) if row else None
 
     async def list_due_chat_state_ids(
         self,

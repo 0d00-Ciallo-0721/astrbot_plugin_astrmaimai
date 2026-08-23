@@ -1394,6 +1394,199 @@ class ProactiveGapCoverageTests(unittest.TestCase):
 
         asyncio.run(_run())
 
+    def test_nickname_generation_respects_profile_cooldown(self):
+        async def _run():
+            calls = []
+            profile = SimpleNamespace(
+                user_id="user-1",
+                name="Alice",
+                know_times=3,
+                is_known=False,
+                message_count_for_profiling=0,
+                last_persona_gen_time=time.time() - 60,
+                profile_metadata={},
+            )
+            task = self.task_mod.ProactiveTask.__new__(self.task_mod.ProactiveTask)
+            task._profile_semaphore = asyncio.Semaphore(1)
+            task._profiling_user_ids = set()
+            task.state_engine = SimpleNamespace(
+                get_active_states=lambda: [],
+                get_active_profiles=lambda: [profile],
+            )
+            task.config = SimpleNamespace(
+                life=SimpleNamespace(
+                    profiling_msg_threshold=5,
+                    profiling_user_cooldown_sec=21600,
+                )
+            )
+
+            async def _generate_nickname(_profile):
+                calls.append("nickname")
+                return True
+
+            task._generate_nickname = _generate_nickname
+            await task._run_profiling_task()
+            return calls, task._profiling_stats
+
+        calls, status = asyncio.run(_run())
+        self.assertEqual(calls, [])
+        self.assertEqual(status["nickname_cooldown_skipped"], 1)
+
+    def test_profiling_cancellation_releases_shared_claim(self):
+        async def _run():
+            started = asyncio.Event()
+            released = []
+            calls = []
+            profile = SimpleNamespace(
+                user_id="user-1",
+                name="Alice",
+                know_times=0,
+                is_known=True,
+                message_count_for_profiling=5,
+                last_persona_gen_time=0.0,
+                profile_metadata={},
+            )
+
+            class _ProfileService:
+                async def claim_profile_generation(self, user_id, **_kwargs):
+                    return f"token:{user_id}"
+
+                async def release_profile_generation(self, user_id, token):
+                    released.append((user_id, token))
+                    return True
+
+            task = self.task_mod.ProactiveTask.__new__(self.task_mod.ProactiveTask)
+            task._profile_semaphore = asyncio.Semaphore(1)
+            task._profiling_user_ids = set()
+            task.state_engine = SimpleNamespace(
+                user_profile_service=_ProfileService(),
+                get_active_states=lambda: [],
+                get_active_profiles=lambda: [profile],
+            )
+            task.config = SimpleNamespace(
+                life=SimpleNamespace(profiling_msg_threshold=5, profiling_user_cooldown_sec=0)
+            )
+
+            async def _generate_analysis(_profile):
+                calls.append("analysis")
+                started.set()
+                await asyncio.Event().wait()
+
+            task._generate_persona_analysis = _generate_analysis
+            running = asyncio.create_task(task._run_profiling_task())
+            await started.wait()
+            running.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await running
+            return released, task._profiling_user_ids, task._profiling_stats
+
+        released, active_ids, stats = asyncio.run(_run())
+        self.assertEqual(released, [("user-1", "token:user-1")])
+        self.assertEqual(active_ids, set())
+        self.assertEqual(stats["profile_generation_inflight"], 0)
+
+    def test_profile_claim_release_retries_and_reports_pending(self):
+        async def _run():
+            attempts = []
+
+            class _ProfileService:
+                async def release_profile_generation(self, user_id, token):
+                    attempts.append((user_id, token))
+                    return False
+
+            task = self.task_mod.ProactiveTask.__new__(self.task_mod.ProactiveTask)
+            task.state_engine = SimpleNamespace(user_profile_service=_ProfileService())
+            result = await task._release_profile_generation("user-1", "token-1")
+            return result, attempts, task._profiling_stats, task._profile_claim_release_pending_keys
+
+        result, attempts, stats, pending = asyncio.run(_run())
+        self.assertFalse(result)
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(stats["profile_claim_release_failed"], 1)
+        self.assertEqual(len(pending), 1)
+
+    def test_superseded_profile_claim_does_not_remain_pending(self):
+        async def _run():
+            class _ProfileService:
+                async def release_profile_generation(self, _user_id, _token):
+                    return False
+
+                async def get_profile_generation_claim(self, _user_id):
+                    return "new-token"
+
+            task = self.task_mod.ProactiveTask.__new__(self.task_mod.ProactiveTask)
+            task.state_engine = SimpleNamespace(user_profile_service=_ProfileService())
+            result = await task._release_profile_generation("user-1", "old-token")
+            return result, task._profile_claim_release_pending_keys
+
+        result, pending = asyncio.run(_run())
+        self.assertTrue(result)
+        self.assertEqual(pending, set())
+
+    def test_two_proactive_instances_share_atomic_profile_claim(self):
+        async def _run():
+            calls = []
+            started = asyncio.Event()
+            proceed = asyncio.Event()
+            profile = SimpleNamespace(
+                user_id="user-1",
+                name="Alice",
+                know_times=0,
+                is_known=True,
+                message_count_for_profiling=5,
+                last_persona_gen_time=0.0,
+                profile_metadata={},
+            )
+
+            class _SharedProfileService:
+                def __init__(self):
+                    self.claimed = False
+
+                async def claim_profile_generation(self, _user_id, **_kwargs):
+                    if self.claimed:
+                        return None
+                    self.claimed = True
+                    return "shared-token"
+
+                async def release_profile_generation(self, _user_id, _token):
+                    self.claimed = False
+                    return True
+
+            service = _SharedProfileService()
+
+            def _build_task():
+                task = self.task_mod.ProactiveTask.__new__(self.task_mod.ProactiveTask)
+                task._profile_semaphore = asyncio.Semaphore(1)
+                task._profiling_user_ids = set()
+                task.state_engine = SimpleNamespace(
+                    user_profile_service=service,
+                    get_active_states=lambda: [],
+                    get_active_profiles=lambda: [profile],
+                )
+                task.config = SimpleNamespace(
+                    life=SimpleNamespace(profiling_msg_threshold=5, profiling_user_cooldown_sec=0)
+                )
+
+                async def _generate_analysis(_profile):
+                    calls.append("analysis")
+                    started.set()
+                    await proceed.wait()
+                    return True
+
+                task._generate_persona_analysis = _generate_analysis
+                return task
+
+            first, second = _build_task(), _build_task()
+            running = asyncio.gather(first._run_profiling_task(), second._run_profiling_task())
+            await started.wait()
+            await asyncio.sleep(0)
+            self.assertEqual(calls, ["analysis"])
+            proceed.set()
+            await running
+            return calls
+
+        self.assertEqual(asyncio.run(_run()), ["analysis"])
+
     def test_preview_chat_uses_epoch_clock_for_stale_snapshot(self):
         class _Coordinator:
             async def get_activity_snapshot(self, chat_id):

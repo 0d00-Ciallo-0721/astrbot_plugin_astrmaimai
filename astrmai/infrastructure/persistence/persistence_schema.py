@@ -438,6 +438,13 @@ class PersistenceSchemaMixin:
                     )
                 """)
                 db.execute("""
+                    CREATE TABLE IF NOT EXISTS profile_generation_claims (
+                        user_id TEXT PRIMARY KEY,
+                        claim_token TEXT NOT NULL,
+                        claimed_until REAL NOT NULL
+                    )
+                """)
+                db.execute("""
                     CREATE TABLE IF NOT EXISTS expressionpattern (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         situation TEXT,
@@ -565,6 +572,13 @@ class PersistenceSchemaMixin:
                         relationship_points TEXT DEFAULT '[]',
                         speech_style_points TEXT DEFAULT '[]',
                         updated_at REAL
+                    )
+                """)
+                await db.execute("""
+                    CREATE TABLE IF NOT EXISTS profile_generation_claims (
+                        user_id TEXT PRIMARY KEY,
+                        claim_token TEXT NOT NULL,
+                        claimed_until REAL NOT NULL
                     )
                 """)
                 await db.execute("""

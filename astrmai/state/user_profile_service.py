@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from typing import Any, Dict, List
+from uuid import uuid4
 
 from ..infrastructure.persistence.orm_models import UserProfile
 
@@ -34,6 +35,130 @@ class UserProfileService:
         # ponytail: threading.Lock guards dict mutations, held for trivial ops only — safe in asyncio
         self._pool_lock_mutex = threading.Lock()
         self._profiles_dict_lock = asyncio.Lock()
+        self._generation_claim_lock = asyncio.Lock()
+        self._generation_claims: Dict[str, tuple[str, float]] = {}
+
+    async def claim_profile_generation(
+        self,
+        user_id: str,
+        *,
+        lease_sec: float = 1800.0,
+        now: float | None = None,
+    ) -> str | None:
+        """Claim a profile generation atomically when persistence supports it."""
+        normalized_user_id = self._clean_text(user_id)
+        if not normalized_user_id:
+            return None
+        claim = getattr(self.persistence, "claim_profile_generation", None)
+        if callable(claim):
+            result = await claim(normalized_user_id, lease_sec=lease_sec, now=now)
+            if isinstance(result, str):
+                return result
+            if not result:
+                return None
+            return uuid4().hex
+
+        current = float(time.time() if now is None else now)
+        async with self._generation_claim_lock:
+            existing = self._generation_claims.get(normalized_user_id)
+            if existing is not None and existing[1] > current:
+                return None
+            token = uuid4().hex
+            self._generation_claims[normalized_user_id] = (
+                token,
+                current + max(1.0, float(lease_sec or 0.0)),
+            )
+            return token
+
+    async def release_profile_generation(self, user_id: str, claim_token: str) -> bool:
+        normalized_user_id = self._clean_text(user_id)
+        normalized_token = self._clean_text(claim_token)
+        if not normalized_user_id or not normalized_token:
+            return False
+        release = getattr(self.persistence, "release_profile_generation", None)
+        if callable(release):
+            return bool(await release(normalized_user_id, normalized_token))
+        async with self._generation_claim_lock:
+            existing = self._generation_claims.get(normalized_user_id)
+            if existing is None or existing[0] != normalized_token:
+                return False
+            self._generation_claims.pop(normalized_user_id, None)
+            return True
+
+    async def get_profile_generation_claim(
+        self,
+        user_id: str,
+        *,
+        now: float | None = None,
+    ) -> str | None:
+        normalized_user_id = self._clean_text(user_id)
+        if not normalized_user_id:
+            return None
+        getter = getattr(self.persistence, "get_profile_generation_claim", None)
+        if callable(getter):
+            return await getter(normalized_user_id, now=now)
+        current = float(time.time() if now is None else now)
+        async with self._generation_claim_lock:
+            existing = self._generation_claims.get(normalized_user_id)
+            if existing is None or existing[1] <= current:
+                self._generation_claims.pop(normalized_user_id, None)
+                return None
+            return existing[0]
+
+    @classmethod
+    def _generation_failure_keys(cls, kind: str) -> tuple[str, str]:
+        normalized_kind = "nickname" if str(kind or "").strip() == "nickname" else "profile"
+        return (
+            f"{normalized_kind}_generation_failure_count",
+            f"{normalized_kind}_generation_failed_until",
+        )
+
+    @classmethod
+    def profile_generation_backoff_active(
+        cls,
+        profile: UserProfile,
+        kind: str = "profile",
+        *,
+        now: float | None = None,
+    ) -> bool:
+        _, until_key = cls._generation_failure_keys(kind)
+        try:
+            failed_until = float(cls._profile_metadata(profile).get(until_key, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            failed_until = 0.0
+        return failed_until > float(time.time() if now is None else now)
+
+    def record_profile_generation_failure(
+        self,
+        profile: UserProfile,
+        kind: str = "profile",
+        *,
+        now: float | None = None,
+        base_backoff_sec: float = 3600.0,
+        max_backoff_sec: float = 86400.0,
+    ) -> dict[str, float | int]:
+        count_key, until_key = self._generation_failure_keys(kind)
+        meta = self._profile_metadata(profile)
+        try:
+            count = int(meta.get(count_key, 0) or 0) + 1
+        except (TypeError, ValueError):
+            count = 1
+        current = float(time.time() if now is None else now)
+        delay = min(max(1.0, float(max_backoff_sec)), max(1.0, float(base_backoff_sec)) * (2 ** (count - 1)))
+        failed_until = current + delay
+        meta[count_key] = count
+        meta[until_key] = failed_until
+        self._touch_profile(profile, now=current)
+        return {"failure_count": count, "failed_until": failed_until}
+
+    def clear_profile_generation_failure(self, profile: UserProfile, kind: str = "profile") -> None:
+        count_key, until_key = self._generation_failure_keys(kind)
+        meta = self._profile_metadata(profile)
+        changed = count_key in meta or until_key in meta
+        meta.pop(count_key, None)
+        meta.pop(until_key, None)
+        if changed:
+            self._touch_profile(profile)
 
     def invalidate_cache(self, user_id: str = None):
         """ponytail: invalidate cached profile(s) after external modification"""
@@ -573,6 +698,7 @@ class UserProfileService:
         meta = self._profile_metadata(profile)
         meta["last_refresh_source"] = source
         meta["last_refresh_at"] = time.time()
+        self.clear_profile_generation_failure(profile, "profile")
         profile.message_count_for_profiling = 0
         profile.last_persona_gen_time = time.time()
         self._touch_profile(profile)
@@ -596,6 +722,7 @@ class UserProfileService:
         meta = self._profile_metadata(profile)
         meta["nickname_origin"] = "auto"
         meta["last_nickname_gen_time"] = time.time()
+        self.clear_profile_generation_failure(profile, "nickname")
         self._touch_profile(profile)
         return True
 

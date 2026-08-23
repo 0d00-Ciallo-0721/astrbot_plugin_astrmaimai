@@ -47,6 +47,10 @@ class ProactiveTask:
     GLOBAL_MAINTENANCE_INTERVAL_SECONDS = 60.0
     HEARTBEAT_DUE_HORIZON_SECONDS = 2.0
     HEARTBEAT_MAX_BATCH = 32
+    PROFILE_CLAIM_LEASE_SEC = 1800.0
+    PROFILE_FAILURE_BASE_BACKOFF_SEC = 3600.0
+    PROFILE_FAILURE_MAX_BACKOFF_SEC = 86400.0
+    MAX_PENDING_PROFILE_CLAIM_RELEASES = 1024
 
     def __init__(
         self,
@@ -78,6 +82,19 @@ class ProactiveTask:
         self._bg_semaphore = asyncio.Semaphore(2)
         self._profile_semaphore = asyncio.Semaphore(1)
         self._profiling_user_ids: set[str] = set()
+        self._local_profile_claims: set[str] = set()
+        self._profile_claim_release_pending_keys: set[tuple[str, str]] = set()
+        self._profiling_stats: dict[str, int] = {
+            "profile_cooldown_skipped": 0,
+            "profile_duplicate_skipped": 0,
+            "nickname_cooldown_skipped": 0,
+            "profile_generation_failed": 0,
+            "profile_generation_inflight": 0,
+            "profile_generation_requests": 0,
+            "profile_budget_rejected": 0,
+            "profile_claim_release_failed": 0,
+            "profile_claim_release_pending": 0,
+        }
         self._last_profile_run = 0.0
         self._last_diary_date = ""
         self._diary_pending_date = ""
@@ -208,6 +225,8 @@ class ProactiveTask:
         system_prompt: str = "",
         template_envelope=None,
     ) -> str:
+        if task_family == "profile":
+            self._profile_stat_inc("profile_generation_requests")
         return await self.gateway.call_proactive_task(
             prompt=prompt,
             system_prompt=system_prompt,
@@ -216,6 +235,126 @@ class ProactiveTask:
             persona_id=getattr(self.config.persona, "persona_id", "") or "global",
             template_envelope=template_envelope,
         )
+
+    def _profile_stat_inc(self, key: str, amount: int = 1) -> None:
+        stats = getattr(self, "_profiling_stats", None)
+        if not isinstance(stats, dict):
+            stats = {}
+            self._profiling_stats = stats
+        stats[key] = int(stats.get(key, 0) or 0) + int(amount or 0)
+
+    @staticmethod
+    def _profile_metadata(profile) -> dict:
+        metadata = getattr(profile, "profile_metadata", None)
+        if not isinstance(metadata, dict):
+            metadata = {}
+            setattr(profile, "profile_metadata", metadata)
+        return metadata
+
+    @staticmethod
+    def _profile_timestamp(value, default: float = 0.0) -> float:
+        """读取画像时间字段时容忍旧数据或手工编辑产生的脏值。"""
+        try:
+            return float(value or default)
+        except (TypeError, ValueError):
+            return float(default)
+
+    def _profile_backoff_active(self, profile, kind: str, now: float) -> bool:
+        service = getattr(self.state_engine, "user_profile_service", None)
+        checker = getattr(service, "profile_generation_backoff_active", None)
+        if callable(checker):
+            return bool(checker(profile, kind, now=now))
+        key = "nickname_generation_failed_until" if kind == "nickname" else "profile_generation_failed_until"
+        try:
+            return float(self._profile_metadata(profile).get(key, 0.0) or 0.0) > now
+        except (TypeError, ValueError):
+            return False
+
+    async def _record_profile_generation_failure(self, profile, kind: str, exc: BaseException | None = None) -> None:
+        self._profile_stat_inc("profile_generation_failed")
+        if isinstance(exc, (BackgroundTaskQueueFull, BackgroundTaskQueueTimeout)):
+            self._profile_stat_inc("profile_budget_rejected")
+        service = getattr(self.state_engine, "user_profile_service", None)
+        recorder = getattr(service, "record_profile_generation_failure", None)
+        if callable(recorder):
+            recorder(
+                profile,
+                kind,
+                base_backoff_sec=self.PROFILE_FAILURE_BASE_BACKOFF_SEC,
+                max_backoff_sec=self.PROFILE_FAILURE_MAX_BACKOFF_SEC,
+            )
+        else:
+            metadata = self._profile_metadata(profile)
+            count_key = "nickname_generation_failure_count" if kind == "nickname" else "profile_generation_failure_count"
+            until_key = "nickname_generation_failed_until" if kind == "nickname" else "profile_generation_failed_until"
+            count = int(metadata.get(count_key, 0) or 0) + 1
+            metadata[count_key] = count
+            metadata[until_key] = time.time() + min(
+                self.PROFILE_FAILURE_MAX_BACKOFF_SEC,
+                self.PROFILE_FAILURE_BASE_BACKOFF_SEC * (2 ** (count - 1)),
+            )
+            setattr(profile, "is_dirty", True)
+        try:
+            await self._save_user_profile(profile)
+        except Exception as save_exc:
+            logger.warning("[Life] profile failure backoff persistence degraded: %s", save_exc)
+
+    async def _claim_profile_generation(self, user_id: str) -> str | None:
+        service = getattr(self.state_engine, "user_profile_service", None)
+        claim = getattr(service, "claim_profile_generation", None)
+        if callable(claim):
+            return await claim(user_id, lease_sec=self.PROFILE_CLAIM_LEASE_SEC)
+        local_claims = getattr(self, "_local_profile_claims", None)
+        if local_claims is None:
+            local_claims = set()
+            self._local_profile_claims = local_claims
+        if user_id in local_claims:
+            return None
+        local_claims.add(user_id)
+        return user_id
+
+    async def _release_profile_generation(self, user_id: str, claim_token: str | None) -> bool:
+        if not claim_token:
+            return False
+        pending_keys = getattr(self, "_profile_claim_release_pending_keys", None)
+        if not isinstance(pending_keys, set):
+            pending_keys = set()
+            self._profile_claim_release_pending_keys = pending_keys
+        pending_key = (str(user_id), str(claim_token))
+        service = getattr(self.state_engine, "user_profile_service", None)
+        release = getattr(service, "release_profile_generation", None)
+        if callable(release):
+            for attempt in range(3):
+                try:
+                    if await release(user_id, claim_token):
+                        pending_keys.discard(pending_key)
+                        return True
+                    getter = getattr(service, "get_profile_generation_claim", None)
+                    if callable(getter):
+                        current_token = await getter(user_id)
+                        if current_token is None or str(current_token) != str(claim_token):
+                            pending_keys.discard(pending_key)
+                            return True
+                except Exception as exc:
+                    if attempt == 2:
+                        logger.warning("[Life] profile generation claim release degraded for %s: %s", user_id, exc)
+                if attempt < 2:
+                    await asyncio.sleep(0)
+            self._profile_stat_inc("profile_claim_release_failed")
+            if len(pending_keys) >= self.MAX_PENDING_PROFILE_CLAIM_RELEASES:
+                pending_keys.pop()
+            pending_keys.add(pending_key)
+            return False
+        local_claims = getattr(self, "_local_profile_claims", None)
+        if isinstance(local_claims, set):
+            local_claims.discard(user_id)
+        pending_keys.discard(pending_key)
+        return True
+
+    async def _retry_pending_profile_claim_releases(self) -> None:
+        pending_keys = getattr(self, "_profile_claim_release_pending_keys", set())
+        for user_id, claim_token in list(pending_keys):
+            await self._release_profile_generation(user_id, claim_token)
 
     async def start(self):
         if self._is_running:
@@ -355,6 +494,7 @@ class ProactiveTask:
         else:
             coro = awaitable_factory()
         task = asyncio.create_task(coro)
+        task._astrmai_task_name = task_name
         self._background_tasks.add(task)
         task.add_done_callback(self._handle_task_result)
         return task
@@ -365,6 +505,8 @@ class ProactiveTask:
             exc = task.exception()
             if exc:
                 if isinstance(exc, (BackgroundTaskQueueFull, BackgroundTaskQueueTimeout)):
+                    if getattr(task, "_astrmai_task_name", "") == "proactive.profile":
+                        self._profile_stat_inc("profile_budget_rejected")
                     logger.warning(f"[ProactiveTask] background task skipped: {exc}")
                 else:
                     logger.error(f"[Proactive Task Error] {exc}", exc_info=exc)
@@ -430,7 +572,7 @@ class ProactiveTask:
         top_user_id, top_count = counts.most_common(1)[0]
         return top_user_id, display_names.get(top_user_id, ""), int(top_count)
 
-    async def _generate_persona_analysis(self, profile) -> None:
+    async def _generate_persona_analysis(self, profile) -> bool | None:
         recent_summary = ""
         if hasattr(self.state_engine, "user_profile_service"):
             recent_summary = self.state_engine.user_profile_service.build_recent_interaction_summary(profile)
@@ -452,7 +594,7 @@ class ProactiveTask:
         else:
             prompt = self.profile_generator.build_prompt(profile, summary)
             if prompt is None:  # ponytail: skip when no new messages
-                return
+                return None
             result = await self._call_background_lane("profile", str(getattr(profile, "user_id", profile.name)), prompt)
         parsed = self.profile_generator.parse_result(result)
         analysis = parsed["analysis"]
@@ -486,12 +628,13 @@ class ProactiveTask:
             f"[Life] persona profiling completed for {getattr(profile, 'name', '')}: "
             f"tags={len(tags)} memory_points={len(memory_points)}"
         )
+        return True
 
-    async def _generate_nickname(self, profile) -> None:
+    async def _generate_nickname(self, profile) -> bool:
         if not profile or getattr(profile, "is_known", False):
-            return
+            return False
         if hasattr(self.state_engine, "user_profile_service") and not self.state_engine.user_profile_service.can_auto_update_nickname(profile):
-            return
+            return False
         summary = await self._load_persona_summary()
         if self.prompt_registry is not None:
             envelope = self.prompt_registry.render_template(
@@ -511,11 +654,11 @@ class ProactiveTask:
         nickname, reason = self.nickname_generator.parse_result(result)
         nickname = self.nickname_generator.choose(getattr(profile, "name", ""), preferred=nickname)
         if not nickname:
-            return
+            return False
         if hasattr(self.state_engine, "user_profile_service"):
             applied = self.state_engine.user_profile_service.set_auto_nickname(profile, nickname, reason)
             if not applied:
-                return
+                return False
         else:
             profile.nickname = nickname
             profile.nickname_reason = reason
@@ -523,9 +666,11 @@ class ProactiveTask:
             profile.is_dirty = True
         await self._save_user_profile(profile)
         logger.info(f"[Life] nickname generated for {getattr(profile, 'name', '')}: {nickname}")
+        return True
 
     async def _run_profiling_task(self):
         async with self._profile_semaphore:
+            await self._retry_pending_profile_claim_releases()
             for state in self.state_engine.get_active_states():
                 chat_id = str(getattr(state, "chat_id", "") or "")
                 if not chat_id or chat_id.startswith("FriendMessage:"):
@@ -554,28 +699,88 @@ class ProactiveTask:
                 active_user_ids = set()
                 self._profiling_user_ids = active_user_ids
 
+            run_seen_user_ids: set[str] = set()
             for profile in active_profiles:
                 user_id = str(getattr(profile, "user_id", getattr(profile, "name", "")) or "")
-                if not user_id or user_id in active_user_ids:
+                if not user_id:
                     continue
-                last_generated_at = float(getattr(profile, "last_persona_gen_time", 0.0) or 0.0)
+                if user_id in active_user_ids or user_id in run_seen_user_ids:
+                    self._profile_stat_inc("profile_duplicate_skipped")
+                    continue
+                run_seen_user_ids.add(user_id)
+                now = time.time()
+                metadata = self._profile_metadata(profile)
+                last_profile_generated_at = max(
+                    self._profile_timestamp(getattr(profile, "last_persona_gen_time", 0.0)),
+                    self._profile_timestamp(metadata.get("last_nickname_gen_time", 0.0)),
+                )
                 analysis_due = int(getattr(profile, "message_count_for_profiling", 0) or 0) >= threshold
-                if analysis_due and cooldown_sec > 0 and time.time() - last_generated_at < cooldown_sec:
-                    analysis_due = False
-                active_user_ids.add(user_id)
+                if analysis_due:
+                    if cooldown_sec > 0 and now - last_profile_generated_at < cooldown_sec:
+                        analysis_due = False
+                        self._profile_stat_inc("profile_cooldown_skipped")
+                    elif self._profile_backoff_active(profile, "profile", now):
+                        analysis_due = False
+
+                nickname_candidate = (
+                    int(getattr(profile, "know_times", 0) or 0) >= 3
+                    and not getattr(profile, "is_known", False)
+                )
+                if nickname_candidate:
+                    service = getattr(self.state_engine, "user_profile_service", None)
+                    can_update = getattr(service, "can_auto_update_nickname", None)
+                    if callable(can_update) and not can_update(profile):
+                        nickname_candidate = False
+                nickname_due = nickname_candidate
+                if nickname_due:
+                    if cooldown_sec > 0 and now - last_profile_generated_at < cooldown_sec:
+                        nickname_due = False
+                        self._profile_stat_inc("nickname_cooldown_skipped")
+                    elif self._profile_backoff_active(profile, "nickname", now):
+                        nickname_due = False
+
+                if not analysis_due and not nickname_due:
+                    continue
                 try:
-                    if profile.know_times >= 3 and not getattr(profile, "is_known", False):
+                    claim_token = await self._claim_profile_generation(user_id)
+                except Exception as exc:
+                    self._profile_stat_inc("profile_claim_degraded")
+                    logger.warning("[Life] profile generation claim degraded for %s: %s", user_id, exc)
+                    continue
+                if not claim_token:
+                    self._profile_stat_inc("profile_duplicate_skipped")
+                    continue
+                active_user_ids.add(user_id)
+                self._profile_stat_inc("profile_generation_inflight")
+                try:
+                    if nickname_due:
                         try:
-                            await self._generate_nickname(profile)
+                            nickname_ok = await self._generate_nickname(profile)
+                            if nickname_ok is False:
+                                await self._record_profile_generation_failure(profile, "nickname")
+                        except asyncio.CancelledError:
+                            raise
                         except Exception as exc:
+                            await self._record_profile_generation_failure(profile, "nickname", exc)
                             logger.error(f"[Life] nickname task degraded for {getattr(profile, 'name', '')}: {exc}")
                     if analysis_due:
                         try:
-                            await self._generate_persona_analysis(profile)
+                            analysis_ok = await self._generate_persona_analysis(profile)
+                            if analysis_ok is False:
+                                await self._record_profile_generation_failure(profile, "profile")
+                        except asyncio.CancelledError:
+                            raise
                         except Exception as exc:
+                            await self._record_profile_generation_failure(profile, "profile", exc)
                             logger.error(f"[Life] profiling task degraded for {getattr(profile, 'name', '')}: {exc}")
                 finally:
-                    active_user_ids.discard(user_id)
+                    try:
+                        await asyncio.shield(self._release_profile_generation(user_id, claim_token))
+                    except BaseException as exc:
+                        logger.warning("[Life] profile generation claim cleanup degraded for %s: %s", user_id, exc)
+                    finally:
+                        active_user_ids.discard(user_id)
+                        self._profile_stat_inc("profile_generation_inflight", -1)
 
     async def _run_reflection_tasks(self):
         enable_exp_mine = getattr(self.config.evolution, "enable_expression_mining", True) if hasattr(self.config, "evolution") else True
@@ -1011,6 +1216,16 @@ class ProactiveTask:
             "diary_pending_date": self._diary_pending_date,
             "background_tasks": len(self._background_tasks),
             "profiling_active_users": len(getattr(self, "_profiling_user_ids", set())),
+            "profile_cooldown_skipped": int(getattr(self, "_profiling_stats", {}).get("profile_cooldown_skipped", 0) or 0),
+            "profile_duplicate_skipped": int(getattr(self, "_profiling_stats", {}).get("profile_duplicate_skipped", 0) or 0),
+            "nickname_cooldown_skipped": int(getattr(self, "_profiling_stats", {}).get("nickname_cooldown_skipped", 0) or 0),
+            "profile_generation_failed": int(getattr(self, "_profiling_stats", {}).get("profile_generation_failed", 0) or 0),
+            "profile_generation_inflight": int(getattr(self, "_profiling_stats", {}).get("profile_generation_inflight", 0) or 0),
+            "profile_generation_requests": int(getattr(self, "_profiling_stats", {}).get("profile_generation_requests", 0) or 0),
+            "profile_budget_rejected": int(getattr(self, "_profiling_stats", {}).get("profile_budget_rejected", 0) or 0),
+            "profile_claim_degraded": int(getattr(self, "_profiling_stats", {}).get("profile_claim_degraded", 0) or 0),
+            "profile_claim_release_failed": int(getattr(self, "_profiling_stats", {}).get("profile_claim_release_failed", 0) or 0),
+            "profile_claim_release_pending": len(getattr(self, "_profile_claim_release_pending_keys", set()) or set()),
             "dream_scheduler": self.dream_scheduler.describe_status(),
             "heartflow": self.heartflow_manager.describe_status(),
             "heartflow_topic_digest": self.heartflow_topic_digest_service.describe_status(),
