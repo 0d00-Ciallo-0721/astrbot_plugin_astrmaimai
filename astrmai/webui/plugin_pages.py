@@ -363,7 +363,10 @@ class AstrMaiAdminPageApi:
 
     async def proactive_intents(self, request: Any) -> dict[str, Any]:
         query = self._query(request)
-        return await self._admin().proactive_intents(limit=self._int(query.get("limit"), 50))
+        return await self._admin().proactive_intents(
+            limit=self._int(query.get("limit"), 50),
+            cursor=str(query.get("cursor", "") or "") or None,
+        )
 
     async def dream_status(self, request: Any) -> dict[str, Any]:
         return await self._admin().dream_status()

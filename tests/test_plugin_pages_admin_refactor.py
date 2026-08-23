@@ -106,6 +106,25 @@ class PluginPagesAdminRefactorTests(unittest.TestCase):
         self.assertEqual(response.get("status"), "ok")
         self.assertIn("data", response)
 
+    def test_proactive_intents_route_forwards_cursor_to_admin_service(self):
+        from astrmai.webui.plugin_pages import AstrMaiAdminPageApi
+
+        calls = {}
+
+        class _Admin:
+            async def proactive_intents(self, *, limit, cursor):
+                calls.update(limit=limit, cursor=cursor)
+                return {"status": "ok", "items": [], "total": 0}
+
+        api = AstrMaiAdminPageApi(None)
+        api._admin = lambda: _Admin()
+        request = SimpleNamespace(query_params={"limit": "25", "cursor": "123"})
+
+        response = asyncio.run(api.proactive_intents(request))
+
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(calls, {"limit": 25, "cursor": "123"})
+
     def test_plugin_page_handlers_sanitize_path_values(self):
         from pathlib import Path
 
