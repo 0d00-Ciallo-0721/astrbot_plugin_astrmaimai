@@ -61,6 +61,8 @@ class AttentionDecisionRouter:
             tuple[float, str, AttentionTopicIdentity] | float,
         ] = {}
         self._diagnostic_counts: dict[str, int] = {}
+        self._judge_latency_samples_ms: list[float] = []
+        self._judge_requests_active = 0
         self._validation_tasks: set[asyncio.Task] = set()
         self._validation_tasks_by_chat: dict[str, asyncio.Task] = {}
 
@@ -71,12 +73,35 @@ class AttentionDecisionRouter:
     def describe_status(self) -> dict[str, Any]:
         self._prune_ignore_caches()
         self._prune_participation_states()
+        samples = sorted(self._judge_latency_samples_ms)
+
+        def percentile(ratio: float) -> float:
+            if not samples:
+                return 0.0
+            index = min(len(samples) - 1, max(0, int(round((len(samples) - 1) * ratio))))
+            return round(samples[index], 2)
+
+        counts = dict(self._diagnostic_counts)
+        judge_called = int(counts.get("judge_called", 0) or 0)
         return {
             "counts": dict(self._diagnostic_counts),
             "judge_ignore_cache_size": len(self._judge_ignore_cache),
             "ambient_ignore_cache_size": len(self._ambient_ignore_cache),
             "participation_state_count": len(self._participation_states),
             "judge_validation_active": len(self._validation_tasks),
+            "judge_requests_active": self._judge_requests_active,
+            "judge_requests_total": judge_called,
+            "judge_timeout_count": int(counts.get("judge_timeout", 0) or 0),
+            "judge_degraded_count": int(counts.get("judge_degraded", 0) or 0),
+            "judge_success_count": int(counts.get("judge_success", 0) or 0),
+            "judge_latency_ms_p50": percentile(0.50),
+            "judge_latency_ms_p95": percentile(0.95),
+            "judge_latency_ms_p99": percentile(0.99),
+            "judge_latency_sample_size": len(samples),
+            "prefilter_avoided_judge_count": sum(
+                value for key, value in counts.items() if key.startswith("judge_avoided_")
+            ),
+            "shadow_judge_success_count": int(counts.get("judge_validation_success", 0) or 0),
         }
 
     @staticmethod
@@ -366,6 +391,7 @@ class AttentionDecisionRouter:
                 false_filter_candidate,
             )
             self._count(f"judge_validation_action_{action.lower()}")
+            self._count("judge_validation_success")
             self._count(
                 "judge_validation_agreement_true"
                 if agreement
@@ -1128,6 +1154,7 @@ class AttentionDecisionRouter:
             focus_event.set_extra("astrmai_judge_timeout_sec", round(judge_timeout, 3))
             focus_event.set_extra("astrmai_judge_timeout", False)
         if judge_timeout <= 0.0:
+            self._count("judge_budget_exhausted")
             if focus_event is not None and hasattr(focus_event, "set_extra"):
                 focus_event.set_extra("astrmai_judge_outcome", "budget_exhausted")
                 focus_event.set_extra("astrmai_judge_failure_type", "budget_exhausted")
@@ -1153,6 +1180,8 @@ class AttentionDecisionRouter:
             )
         else:
             judge_coroutine = judge_evaluate(chat_id, message, False, "", len(events), False)
+        started_at = time.perf_counter()
+        self._judge_requests_active += 1
         try:
             result = await self._run_judge_with_hard_deadline(
                 judge_coroutine,
@@ -1160,6 +1189,7 @@ class AttentionDecisionRouter:
             )
         except asyncio.TimeoutError:
             self._consecutive_timeouts += 1
+            self._count("judge_timeout")
             if focus_event is not None and hasattr(focus_event, "set_extra"):
                 focus_event.set_extra("astrmai_judge_outcome", "timeout")
                 focus_event.set_extra("astrmai_judge_timeout", True)
@@ -1174,6 +1204,7 @@ class AttentionDecisionRouter:
                 reason="judge_timeout",
             )
         except Exception as exc:
+            self._count("judge_degraded")
             if focus_event is not None and hasattr(focus_event, "set_extra"):
                 focus_event.set_extra("astrmai_judge_outcome", "degraded")
                 focus_event.set_extra("astrmai_judge_failure_type", type(exc).__name__)
@@ -1183,8 +1214,13 @@ class AttentionDecisionRouter:
                 interaction_kind=interaction_kind,
                 reason="judge_degraded",
             )
+        finally:
+            self._judge_requests_active = max(0, self._judge_requests_active - 1)
+            self._judge_latency_samples_ms.append((time.perf_counter() - started_at) * 1000.0)
+            self._judge_latency_samples_ms = self._judge_latency_samples_ms[-256:]
 
         if result is None or not str(getattr(result, "action", "") or "").strip():
+            self._count("judge_empty_response")
             if focus_event is not None and hasattr(focus_event, "set_extra"):
                 focus_event.set_extra("astrmai_judge_outcome", "empty_response")
                 focus_event.set_extra("astrmai_judge_failure_type", "empty_response")
@@ -1195,6 +1231,7 @@ class AttentionDecisionRouter:
             )
         raw_action = str(getattr(result, "action", "PASS") or "PASS").upper()
         self._count(f"judge_action_{raw_action.lower()}")
+        self._count("judge_success")
         if focus_event is not None and hasattr(focus_event, "set_extra"):
             focus_event.set_extra("astrmai_judge_outcome", raw_action.lower())
         if participation_result is not None:

@@ -147,6 +147,9 @@ class AstrMaiAdminPageApi:
     async def runtime_status(self, request: Any) -> dict[str, Any]:
         return await self._admin().runtime_status()
 
+    async def runtime_status_history(self, request: Any) -> dict[str, Any]:
+        return await self._admin().runtime_status_history()
+
     async def runtime_capabilities(self, request: Any) -> dict[str, Any]:
         return await self._admin().runtime_capabilities()
 
@@ -709,6 +712,7 @@ def register_astrmai_admin_pages(context: Any, facade: Any) -> None:
         ("GET", "/heartflow/topic-digests", api.heartflow_topic_digests, "AstrMai Heartflow topic digests"),
         ("GET", "/dashboard", api.dashboard, "AstrMai dashboard"),
         ("GET", "/runtime/status", api.runtime_status, "AstrMai runtime status"),
+        ("GET", "/runtime/status/history", api.runtime_status_history, "AstrMai runtime status history"),
         ("GET", "/runtime/capabilities", api.runtime_capabilities, "AstrMai runtime capabilities"),
         ("GET", "/runtime/models", api.runtime_models, "AstrMai runtime models"),
         ("GET", "/runtime/health", api.runtime_health, "AstrMai runtime health"),

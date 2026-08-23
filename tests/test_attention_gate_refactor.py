@@ -1910,6 +1910,7 @@ class RefactoredAttentionGateTests(unittest.TestCase):
         self.assertEqual(decision.reason, "peer_poke_judge_timeout")
         self.assertEqual(focus.get_extra("astrmai_judge_outcome"), "timeout")
         self.assertTrue(focus.get_extra("astrmai_judge_timeout"))
+        self.assertEqual(router.describe_status()["judge_timeout_count"], 1)
 
     def test_router_keeps_private_chat_responsive_when_judge_times_out(self):
         async def _slow_evaluate(*args, **kwargs):

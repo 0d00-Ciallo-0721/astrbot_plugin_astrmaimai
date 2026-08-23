@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
@@ -166,6 +167,9 @@ class PluginRuntimeContext:
     status: RuntimeStatus = field(default_factory=RuntimeStatus)
     system2_callback: System2Callback | None = None
     host_plugin_ref: Any = None
+    diagnostics_history: list[dict[str, Any]] = field(default_factory=list)
+    diagnostics_sample_interval_sec: float = 60.0
+    _last_diagnostics_sample_at: float = 0.0
 
     def bind_system2_callback(self, callback: System2Callback) -> None:
         self.system2_callback = callback
@@ -394,36 +398,182 @@ class PluginRuntimeContext:
         )
 
     def build_diagnostics(self) -> dict[str, Any]:
+        component_errors: list[dict[str, str]] = []
+
+        def safe_float(value: Any, default: float = 0.0) -> float:
+            try:
+                return float(value or default)
+            except (TypeError, ValueError):
+                return float(default)
+
+        def safe_int(value: Any, default: int = 0) -> int:
+            try:
+                return int(value or default)
+            except (TypeError, ValueError):
+                return int(default)
+
+        def safe_component(name: str, producer, fallback: dict[str, Any]) -> dict[str, Any]:
+            try:
+                value = producer()
+                return value if isinstance(value, dict) else dict(fallback)
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                component_errors.append({"component": name, "error": error})
+                return {
+                    **fallback,
+                    "available": False,
+                    "diagnostics_status": "error",
+                    "error": error,
+                }
+
         describe_vector = getattr(self.memory_engine, "describe_vector_status", None)
-        if callable(describe_vector):
-            vector_status = describe_vector()
-        else:
-            vector_retriever = getattr(self.memory_engine, "vec_retriever", None)
-            vector_status = (
-                vector_retriever.describe_status()
-                if vector_retriever is not None and hasattr(vector_retriever, "describe_status")
+        vector_status = safe_component(
+            "vector_retrieval",
+            describe_vector
+            if callable(describe_vector)
+            else lambda: (
+                self.memory_engine.vec_retriever.describe_status()
+                if getattr(self.memory_engine, "vec_retriever", None) is not None
+                and hasattr(self.memory_engine.vec_retriever, "describe_status")
                 else {"available": False}
-            )
+            ),
+            {"available": False},
+        )
         attention_router = getattr(self.attention_gate, "decision_router", None)
-        attention_status = (
-            attention_router.describe_status()
+        attention_status = safe_component(
+            "attention",
+            attention_router.describe_status
             if attention_router is not None and hasattr(attention_router, "describe_status")
-            else {"available": False}
+            else lambda: {"available": False},
+            {"available": False},
         )
-        try:
-            proactive_status = (
-                self.proactive_task.describe_status()
-                if self.proactive_task is not None and hasattr(self.proactive_task, "describe_status")
-                else {"running": False}
-            )
-        except Exception as exc:
-            proactive_status = {"running": False, "error": str(exc)}
-        reread_status = (
-            self.group_reread_observer.describe_status()
+        proactive_status = safe_component(
+            "proactive",
+            self.proactive_task.describe_status
+            if self.proactive_task is not None and hasattr(self.proactive_task, "describe_status")
+            else lambda: {"running": False},
+            {"running": False},
+        )
+        reread_status = safe_component(
+            "group_reread_observer",
+            self.group_reread_observer.describe_status
             if self.group_reread_observer is not None and hasattr(self.group_reread_observer, "describe_status")
-            else {"active_groups": 0}
+            else lambda: {"active_groups": 0},
+            {"active_groups": 0},
         )
-        return {
+        budget_status = safe_component(
+            "background_task_budget",
+            self.background_task_budget.status
+            if self.background_task_budget is not None and hasattr(self.background_task_budget, "status")
+            else lambda: {"limit": 0, "active": 0, "available_slots": 0},
+            {"limit": 0, "active": 0, "available_slots": 0},
+        )
+        chat_loop_status = safe_component(
+            "chat_loop",
+            self.chat_loop_kernel.describe_status_sync
+            if self.chat_loop_kernel is not None and hasattr(self.chat_loop_kernel, "describe_status_sync")
+            else lambda: {"enabled": False, "tracked_chats": 0},
+            {"enabled": False, "tracked_chats": 0},
+        )
+        planner = self.system2_planner
+        try:
+            raw_traces = getattr(planner, "turn_trace_history", []) or []
+            traces = list(raw_traces)[-300:] if isinstance(raw_traces, (list, tuple)) else []
+        except Exception:
+            traces = []
+        elapsed = []
+        timeout_count = 0
+        budget_exhausted = 0
+        incomplete_timing = 0
+        failed_count = 0
+        skipped_count = 0
+        completed_count = 0
+
+        def trace_flag(value: Any, names: set[str], seen: set[int] | None = None, depth: int = 0) -> bool:
+            if depth > 12:
+                return False
+            if isinstance(value, dict):
+                seen = seen if seen is not None else set()
+                value_id = id(value)
+                if value_id in seen:
+                    return False
+                seen.add(value_id)
+                for key, item in value.items():
+                    normalized_key = str(key or "").strip().lower()
+                    if normalized_key in names and item is True:
+                        return True
+                    if trace_flag(item, names, seen, depth + 1):
+                        return True
+            elif isinstance(value, (list, tuple)):
+                seen = seen if seen is not None else set()
+                value_id = id(value)
+                if value_id in seen:
+                    return False
+                seen.add(value_id)
+                return any(trace_flag(item, names, seen, depth + 1) for item in value)
+            return False
+
+        for trace in traces:
+            if not isinstance(trace, dict):
+                continue
+            try:
+                value = float(trace.get("turn_total_elapsed_ms", trace.get("elapsed_ms", 0.0)) or 0.0)
+            except (TypeError, ValueError):
+                value = 0.0
+            if value > 0:
+                elapsed.append(value)
+            status = str(trace.get("status", "") or "").lower()
+            is_timeout = "timeout" in status or trace_flag(
+                trace, {"timeout", "judge_timeout", "turn_timeout"}
+            )
+            is_budget_exhausted = "budget_exhausted" in status or trace_flag(
+                trace, {"budget_exhausted", "turn_budget_exhausted", "judge_budget_exhausted"}
+            )
+            is_skipped = status.startswith("skipped") or status in {"ignored", "cancelled"}
+            is_failed = status in {"failed", "error", "exception", "degraded"} or trace_flag(
+                trace, {"failed", "error"}
+            )
+            # A trace belongs to exactly one terminal bucket. Keep the most
+            # specific exhaustion/timeout outcome ahead of generic failures.
+            if is_budget_exhausted:
+                budget_exhausted += 1
+            elif is_timeout:
+                timeout_count += 1
+            elif is_failed:
+                failed_count += 1
+            elif is_skipped:
+                skipped_count += 1
+            else:
+                completed_count += 1
+            coverage = trace.get("timing_coverage", {}) or {}
+            if isinstance(coverage, dict) and coverage.get("complete") is False:
+                incomplete_timing += 1
+
+        def percentile(values: list[float], ratio: float) -> float:
+            if not values:
+                return 0.0
+            ordered = sorted(values)
+            index = min(len(ordered) - 1, max(0, int(round((len(ordered) - 1) * ratio))))
+            return round(ordered[index], 2)
+
+        long_turn_status = {
+            "active": safe_int(chat_loop_status.get("active_turn_task_count", 0)),
+            "active_scope": "coordinator_registered_turns",
+            "completed": completed_count,
+            "failed": failed_count,
+            "skipped": skipped_count,
+            "timeout": timeout_count,
+            "budget_exhausted": budget_exhausted,
+            "timing_incomplete": incomplete_timing,
+            "elapsed_ms_p50": percentile(elapsed, 0.50),
+            "elapsed_ms_p95": percentile(elapsed, 0.95),
+            "elapsed_ms_p99": percentile(elapsed, 0.99),
+            "sample_size": len(elapsed),
+        }
+        snapshot = {
+            "snapshot_at": time.time(),
+            "diagnostics_status": "degraded" if component_errors else "ok",
+            "component_errors": component_errors,
             "status": self.status.as_dict(),
             "infrastructure": {
                 "gateway": {
@@ -433,12 +583,7 @@ class PluginRuntimeContext:
                     "api_timeout": self.infrastructure_settings.gateway.api_timeout,
                     "debug_mode": self.infrastructure_settings.gateway.debug_mode,
                 },
-                "background_task_budget": (
-                    self.background_task_budget.status()
-                    if self.background_task_budget is not None
-                    and hasattr(self.background_task_budget, "status")
-                    else {"limit": 0, "active": 0, "available_slots": 0}
-                ),
+                "background_task_budget": budget_status,
                 "features": {
                     "work_mode_enabled": self.infrastructure_settings.features.work_mode_enabled,
                     "private_chat_enabled": self.infrastructure_settings.features.private_chat_enabled,
@@ -469,16 +614,46 @@ class PluginRuntimeContext:
                 "context_compaction": self.context_compaction is not None,
                 "chat_loop_kernel": self.chat_loop_kernel is not None,
             },
-            "chat_loop": self.chat_loop_kernel.describe_status_sync()
-            if self.chat_loop_kernel is not None and hasattr(self.chat_loop_kernel, "describe_status_sync")
-            else {"enabled": False, "tracked_chats": 0},
+            "chat_loop": chat_loop_status,
             "memory": {
                 "vector_retrieval": vector_status,
             },
             "attention": attention_status,
             "proactive": proactive_status,
             "group_reread_observer": reread_status,
+            "long_turn": long_turn_status,
         }
+        history_sample = {
+            "snapshot_at": snapshot["snapshot_at"],
+            "diagnostics_status": snapshot["diagnostics_status"],
+            "component_error_count": len(component_errors),
+            "background_active": safe_int(budget_status.get("active", 0)),
+            "background_queued": safe_int(budget_status.get("queued", 0)),
+            "vector_degraded_ratio": safe_float(vector_status.get("degraded_ratio", 0.0)),
+            "vector_active_queries": safe_int(vector_status.get("active_queries", 0)),
+            "vector_circuit_open": bool(vector_status.get("circuit_open", False)),
+            "attention_judge_active": safe_int(attention_status.get("judge_requests_active", 0)),
+            "attention_judge_timeout_count": safe_int(attention_status.get("judge_timeout_count", 0)),
+            "attention_judge_degraded_count": safe_int(attention_status.get("judge_degraded_count", 0)),
+            "attention_judge_success_count": safe_int(attention_status.get("judge_success_count", 0)),
+            "attention_judge_latency_ms_p95": safe_float(attention_status.get("judge_latency_ms_p95", 0.0)),
+            "attention_prefilter_avoided": safe_int(attention_status.get("prefilter_avoided_judge_count", 0)),
+            "attention_shadow_success": safe_int(attention_status.get("shadow_judge_success_count", 0)),
+            "reread_active_groups": safe_int(reread_status.get("active_groups", 0)),
+            "long_turn_p95_ms": safe_float(long_turn_status.get("elapsed_ms_p95", 0.0)),
+            "long_turn_timeout": safe_int(long_turn_status.get("timeout", 0)),
+            "long_turn_budget_exhausted": safe_int(long_turn_status.get("budget_exhausted", 0)),
+        }
+        sample_interval = max(0.0, safe_float(self.diagnostics_sample_interval_sec, 60.0))
+        if (
+            not self.diagnostics_history
+            or snapshot["snapshot_at"] - self._last_diagnostics_sample_at >= sample_interval
+        ):
+            self.diagnostics_history.append(history_sample)
+            self.diagnostics_history = self.diagnostics_history[-360:]
+            self._last_diagnostics_sample_at = snapshot["snapshot_at"]
+        snapshot["history"] = list(self.diagnostics_history[-60:])
+        return snapshot
 
     def build_capability_overview_sync(self) -> dict[str, Any]:
         from .. import multimodal as multimodal_mod

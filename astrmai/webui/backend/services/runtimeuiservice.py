@@ -8,9 +8,24 @@ class RuntimeUiService:
         self.plugin_api = plugin_api
 
     async def runtime_status(self) -> dict[str, Any]:
+        diagnostics = await self.plugin_api.get_runtime_diagnostics()
+        diagnostics_status = str(diagnostics.get("diagnostics_status", "ok") or "ok")
         return {
-            "status": "ok",
-            "data": await self.plugin_api.get_runtime_diagnostics(),
+            "status": diagnostics_status if diagnostics_status in {"degraded", "error"} else "ok",
+            "data": diagnostics,
+            "runtime_bound": self.plugin_api.has_bound_facade(),
+        }
+
+    async def runtime_status_history(self) -> dict[str, Any]:
+        diagnostics = await self.plugin_api.get_runtime_diagnostics()
+        diagnostics_status = str(diagnostics.get("diagnostics_status", "ok") or "ok")
+        return {
+            "status": diagnostics_status if diagnostics_status in {"degraded", "error"} else "ok",
+            "data": {
+                "snapshot_at": diagnostics.get("snapshot_at", 0.0),
+                "diagnostics_status": diagnostics.get("diagnostics_status", "unknown"),
+                "history": list(diagnostics.get("history", []) or []),
+            },
             "runtime_bound": self.plugin_api.has_bound_facade(),
         }
 

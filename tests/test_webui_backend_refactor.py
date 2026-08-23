@@ -228,6 +228,23 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "boom"):
             asyncio.run(service.runtime_status())
 
+    def test_runtime_ui_service_exposes_runtime_status_history(self):
+        adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
+        service_mod = importlib.import_module("astrmai.webui.backend.services.runtimeuiservice")
+
+        class _Facade:
+            def get_runtime_diagnostics(self):
+                return {
+                    "snapshot_at": 12.0,
+                    "diagnostics_status": "degraded",
+                    "history": [{"background_active": 1}],
+                }
+
+        service = service_mod.RuntimeUiService(adapter_mod.PluginApiAdapter(facade=_Facade()))
+        result = asyncio.run(service.runtime_status_history())
+        self.assertEqual(result["data"]["history"], [{"background_active": 1}])
+        self.assertEqual(result["data"]["diagnostics_status"], "degraded")
+
     def test_server_mounts_aggregated_api_router(self):
         from pathlib import Path
 

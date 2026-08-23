@@ -904,17 +904,29 @@ async function renderDashboardOverview() {
         ${detailsJson("查看模型与健康诊断", { models, health: healthData })}
       `)}
     </div>
-    ${section("运行时压力与社交动作", "查看当前排队、检索、主动会话和复读动作的运行快照。", `
+    ${section("运行时压力与社交动作", "查看当前排队、检索、注意力、长回合和复读动作的运行快照。", `
       <div class="grid compact-grid">
         ${metric("后台活动", runtimeStatus?.infrastructure?.background_task_budget?.active ?? 0)}
         ${metric("后台排队", runtimeStatus?.infrastructure?.background_task_budget?.queued ?? 0)}
         ${metric("向量降级比例", `${((runtimeStatus?.memory?.vector_retrieval?.degraded_ratio ?? 0) * 100).toFixed(1)}%`)}
+        ${metric("Judge 活跃请求", runtimeStatus?.attention?.judge_requests_active ?? 0)}
+        ${metric("Judge 超时", runtimeStatus?.attention?.judge_timeout_count ?? 0)}
+        ${metric("Judge P95", `${runtimeStatus?.attention?.judge_latency_ms_p95 ?? 0} ms`)}
+        ${metric("长回合 P95", `${runtimeStatus?.long_turn?.elapsed_ms_p95 ?? 0} ms`)}
         ${metric("复读活跃群", runtimeStatus?.group_reread_observer?.active_groups ?? 0)}
       </div>
       ${detailsJson("后台预算", runtimeStatus?.infrastructure?.background_task_budget || {})}
       ${detailsJson("向量检索状态", runtimeStatus?.memory?.vector_retrieval || {})}
       ${detailsJson("主动会话状态", runtimeStatus?.proactive || {})}
+      ${detailsJson("Attention 状态", runtimeStatus?.attention || {})}
+      ${detailsJson("长回合聚合", runtimeStatus?.long_turn || {})}
+      ${detailsJson("最近诊断趋势样本", runtimeStatus?.history || [])}
       ${detailsJson("复读动作状态", runtimeStatus?.group_reread_observer || {})}
+      ${detailsJson("诊断接口状态", {
+        diagnostics_status: runtimeStatus?.diagnostics_status || "unknown",
+        snapshot_at: runtimeStatus?.snapshot_at || 0,
+        component_errors: runtimeStatus?.component_errors || [],
+      })}
     `)}
     ${section("统一观测", "默认只显示统计摘要，异常详情按需展开。", `
       <div class="grid">

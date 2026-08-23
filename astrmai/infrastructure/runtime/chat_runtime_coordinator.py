@@ -67,6 +67,7 @@ class ChatRuntimeCoordinator:
         self._concurrency_metrics: Dict[str, int] = {}
         self._generation_sequence = 0
         self._shutdown = False
+        self._active_turn_tasks: set[asyncio.Task] = set()
 
     async def _get_state(self, chat_id: str) -> ChatRuntimeState:
         async with self._lock:
@@ -173,6 +174,8 @@ class ChatRuntimeCoordinator:
             next_generation = self._generation_sequence
             state.turn_generations[normalized_thread_id] = next_generation
             stale_task = state.active_turn_tasks.pop(normalized_thread_id, None)
+            if stale_task is not None:
+                self._active_turn_tasks.discard(stale_task)
             self._increment_metric_locked("generation_advanced")
             if stale_task is not None and not stale_task.done():
                 self._increment_metric_locked("stale_turn_cancelled")
@@ -200,6 +203,9 @@ class ChatRuntimeCoordinator:
                 return False
             previous_task = state.active_turn_tasks.get(thread_id)
             state.active_turn_tasks[thread_id] = task
+            if previous_task is not None:
+                self._active_turn_tasks.discard(previous_task)
+            self._active_turn_tasks.add(task)
         if previous_task is not None and previous_task is not task and not previous_task.done():
             previous_task.cancel()
         return True
@@ -215,6 +221,10 @@ class ChatRuntimeCoordinator:
             state = self._states.get(chat_id)
             if state is not None and state.active_turn_tasks.get(thread_id) is task:
                 state.active_turn_tasks.pop(thread_id, None)
+                self._active_turn_tasks.discard(task)
+
+    def active_turn_task_count_sync(self) -> int:
+        return sum(1 for task in self._active_turn_tasks if not task.done())
 
     async def current_generation(self, chat_id: str, thread_id: str) -> int:
         normalized_chat_id, normalized_thread_id = self._normalize_thread_key(chat_id, thread_id)
@@ -476,6 +486,7 @@ class ChatRuntimeCoordinator:
                 if task is not current_task and not task.done()
             ]
             self._states.clear()
+            self._active_turn_tasks.clear()
         for task in tasks:
             task.cancel()
         if tasks:

@@ -130,6 +130,9 @@ class AdminUiService:
     async def runtime_status(self) -> dict[str, Any]:
         return await self._runtime.runtime_status()
 
+    async def runtime_status_history(self) -> dict[str, Any]:
+        return await self._runtime.runtime_status_history()
+
     @staticmethod
     def _parse_filter_values(value: Any) -> set[str]:
         if value is None:

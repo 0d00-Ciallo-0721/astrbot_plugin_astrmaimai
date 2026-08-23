@@ -91,6 +91,27 @@ class ChatRuntimeCoordinatorRefactorTests(unittest.TestCase):
         self.assertFalse(is_current)
         self.assertEqual(coordinator._states, {})
 
+    def test_active_turn_task_count_tracks_register_and_unregister(self):
+        coordinator_mod = importlib.import_module(
+            "astrmai.infrastructure.runtime.chat_runtime_coordinator"
+        )
+        coordinator = coordinator_mod.ChatRuntimeCoordinator()
+
+        async def _run():
+            generation = await coordinator.advance_generation("chat-1", "thread-1")
+            turn = SimpleNamespace(chat_id="chat-1", thread_id="thread-1", generation=generation)
+            task = asyncio.create_task(asyncio.sleep(60))
+            self.assertTrue(await coordinator.register_turn_task(turn, task))
+            active = coordinator.active_turn_task_count_sync()
+            await coordinator.unregister_turn_task(turn, task)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            return active, coordinator.active_turn_task_count_sync()
+
+        active, remaining = asyncio.run(_run())
+        self.assertEqual(active, 1)
+        self.assertEqual(remaining, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

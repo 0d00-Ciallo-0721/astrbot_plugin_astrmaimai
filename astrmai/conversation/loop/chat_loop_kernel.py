@@ -343,9 +343,17 @@ class ChatLoopKernel:
         return deepcopy(self._last_due_selection_report or {})
 
     def describe_status_sync(self) -> dict[str, Any]:
+        active_turn_task_count = 0
+        coordinator = self.runtime_coordinator
+        if coordinator is not None and hasattr(coordinator, "active_turn_task_count_sync"):
+            try:
+                active_turn_task_count = int(coordinator.active_turn_task_count_sync() or 0)
+            except Exception:
+                active_turn_task_count = 0
         return {
             "enabled": True,
             "tracked_chats": self._state_store.count_sync(),
+            "active_turn_task_count": active_turn_task_count,
             "message_handler_bound": self._message_handler is not None,
             "heartbeat_handler_bound": self._heartbeat_handler is not None,
             "decision_mode": "single_primary_action",

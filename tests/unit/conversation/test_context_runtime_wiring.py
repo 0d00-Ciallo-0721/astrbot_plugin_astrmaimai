@@ -311,6 +311,107 @@ class ContextRuntimeWiringTests(unittest.TestCase):
         self.assertTrue(diagnostics["components"]["chat_loop_kernel"])
         self.assertEqual(diagnostics["chat_loop"]["tracked_chats"], 2)
 
+    def test_runtime_diagnostics_isolates_component_failures_and_aggregates_long_turns(self):
+        runtime_context_mod = importlib.import_module("astrmai.app.runtime_context")
+
+        class _Broken:
+            def describe_vector_status(self):
+                raise RuntimeError("component unavailable")
+
+            def describe_status(self):
+                raise RuntimeError("component unavailable")
+
+            def describe_status_sync(self):
+                raise RuntimeError("component unavailable")
+
+        runtime = runtime_context_mod.PluginRuntimeContext(
+            host_context=SimpleNamespace(),
+            raw_config={},
+            config=SimpleNamespace(),
+            runtime_coordinator=SimpleNamespace(),
+            host_bridge=SimpleNamespace(),
+        )
+        runtime.core.memory_engine = _Broken()
+        runtime.interaction.attention_gate = SimpleNamespace(decision_router=_Broken())
+        runtime.background_task_budget = _Broken()
+        runtime.interaction.group_reread_observer = _Broken()
+        runtime.chat_loop_kernel = _Broken()
+        runtime.cognition.system2_planner = SimpleNamespace(
+            turn_trace_history=[
+                {"turn_total_elapsed_ms": 100.0, "timing_coverage": {"complete": True}},
+                {"turn_total_elapsed_ms": 900.0, "status": "timeout", "timing_coverage": {"complete": False}},
+            ]
+        )
+
+        diagnostics = runtime.build_diagnostics()
+
+        self.assertEqual(diagnostics["diagnostics_status"], "degraded")
+        self.assertGreaterEqual(len(diagnostics["component_errors"]), 3)
+        self.assertEqual(diagnostics["memory"]["vector_retrieval"]["diagnostics_status"], "error")
+        self.assertEqual(diagnostics["long_turn"]["timeout"], 1)
+        self.assertEqual(diagnostics["long_turn"]["elapsed_ms_p95"], 900.0)
+        for _ in range(365):
+            diagnostics = runtime.build_diagnostics()
+        self.assertLessEqual(len(diagnostics["history"]), 60)
+        self.assertLessEqual(len(runtime.diagnostics_history), 360)
+
+    def test_runtime_diagnostics_long_turn_terminal_buckets_are_mutually_exclusive(self):
+        runtime_context_mod = importlib.import_module("astrmai.app.runtime_context")
+        runtime = runtime_context_mod.PluginRuntimeContext(
+            host_context=SimpleNamespace(),
+            raw_config={},
+            config=SimpleNamespace(),
+            runtime_coordinator=SimpleNamespace(),
+            host_bridge=SimpleNamespace(),
+        )
+        runtime.cognition.system2_planner = SimpleNamespace(
+            turn_trace_history=[
+                {"status": "skipped_timeout", "decision_observation": {"judge_timeout": True}},
+                {"status": "failed", "turn_budget_exhausted": True},
+                {"status": "failed"},
+                {"status": "skipped"},
+                {"status": "completed"},
+            ]
+        )
+
+        long_turn = runtime.build_diagnostics()["long_turn"]
+
+        self.assertEqual(long_turn["budget_exhausted"], 1)
+        self.assertEqual(long_turn["timeout"], 1)
+        self.assertEqual(long_turn["failed"], 1)
+        self.assertEqual(long_turn["skipped"], 1)
+        self.assertEqual(long_turn["completed"], 1)
+        terminal_total = sum(
+            long_turn[key] for key in ("completed", "failed", "skipped", "timeout", "budget_exhausted")
+        )
+        self.assertEqual(terminal_total, 5)
+
+    def test_runtime_diagnostics_tolerates_malformed_and_cyclic_traces(self):
+        runtime_context_mod = importlib.import_module("astrmai.app.runtime_context")
+        runtime = runtime_context_mod.PluginRuntimeContext(
+            host_context=SimpleNamespace(),
+            raw_config={},
+            config=SimpleNamespace(),
+            runtime_coordinator=SimpleNamespace(),
+            host_bridge=SimpleNamespace(),
+        )
+        cyclic_trace = {"status": "completed", "nested": {"timeout": 30}}
+        cyclic_trace["self"] = cyclic_trace
+        runtime.cognition.system2_planner = SimpleNamespace(
+            turn_trace_history=[cyclic_trace, {"status": "completed", "timeout": 30}]
+        )
+
+        diagnostics = runtime.build_diagnostics()
+
+        self.assertEqual(diagnostics["long_turn"]["timeout"], 0)
+        self.assertEqual(diagnostics["long_turn"]["completed"], 2)
+        self.assertEqual(diagnostics["long_turn"]["active_scope"], "coordinator_registered_turns")
+
+        runtime.cognition.system2_planner.turn_trace_history = 42
+        diagnostics = runtime.build_diagnostics()
+        self.assertEqual(diagnostics["long_turn"]["completed"], 0)
+        self.assertEqual(diagnostics["long_turn"]["timeout"], 0)
+
     def test_bootstrap_uses_new_compaction_defaults_when_config_values_are_absent(self):
         defaults_mod = importlib.import_module("astrmai.shared.constants.defaults")
         bootstrap_mod = importlib.import_module("astrmai.app.bootstrap")
