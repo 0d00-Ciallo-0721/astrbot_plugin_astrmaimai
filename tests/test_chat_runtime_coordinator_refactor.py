@@ -22,6 +22,57 @@ class ChatRuntimeCoordinatorRefactorTests(unittest.TestCase):
         self.assertIs(first, second)
         self.assertIsNot(first, other)
 
+    def test_sys2_lock_is_rejected_after_shutdown(self):
+        coordinator_mod = importlib.import_module(
+            "astrmai.infrastructure.runtime.chat_runtime_coordinator"
+        )
+        coordinator = coordinator_mod.ChatRuntimeCoordinator()
+
+        async def _run():
+            await coordinator.shutdown()
+            return await coordinator.get_sys2_lock("chat-1", "thread-1")
+
+        self.assertIsNone(asyncio.run(_run()))
+
+    def test_active_thread_locks_are_not_evicted_at_capacity(self):
+        coordinator_mod = importlib.import_module(
+            "astrmai.infrastructure.runtime.chat_runtime_coordinator"
+        )
+        coordinator = coordinator_mod.ChatRuntimeCoordinator()
+        coordinator.MAX_THREAD_GENERATIONS_PER_CHAT = 2
+
+        async def _run():
+            first = await coordinator.get_sys2_lock("chat-1", "thread-1")
+            second = await coordinator.get_sys2_lock("chat-1", "thread-2")
+            await first.acquire()
+            await second.acquire()
+            third = await coordinator.get_sys2_lock("chat-1", "thread-3")
+            first_again = await coordinator.get_sys2_lock("chat-1", "thread-1")
+            first.release()
+            second.release()
+            return first, first_again, third
+
+        first, first_again, third = asyncio.run(_run())
+        self.assertIs(first, first_again)
+        self.assertIsNot(first, third)
+
+    def test_clear_runtime_state_keeps_state_until_active_lock_is_released(self):
+        coordinator_mod = importlib.import_module(
+            "astrmai.infrastructure.runtime.chat_runtime_coordinator"
+        )
+        coordinator = coordinator_mod.ChatRuntimeCoordinator()
+
+        async def _run():
+            lock = await coordinator.get_sys2_lock("chat-1")
+            await lock.acquire()
+            self.assertTrue(await coordinator.clear_runtime_state("chat-1"))
+            retained = await coordinator.get_sys2_lock("chat-1")
+            lock.release()
+            return lock, retained
+
+        lock, retained = asyncio.run(_run())
+        self.assertIs(lock, retained)
+
     def test_wait_targets_are_de_duplicated(self):
         coordinator_mod = importlib.import_module(
             "astrmai.infrastructure.runtime.chat_runtime_coordinator"

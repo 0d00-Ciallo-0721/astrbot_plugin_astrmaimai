@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import sys
 
 from astrbot.api import logger
 
@@ -30,12 +31,15 @@ class System2Runner:
     async def get_sys2_lock(self, chat_id: str, thread_id: str = ""):
         getter = self.runtime.runtime_coordinator.get_sys2_lock
         try:
+            inspect.signature(getter).bind(chat_id, thread_id=thread_id)
+        except (TypeError, ValueError):
+            lock = await getter(chat_id)
+            self._last_lock_scope = "chat"
+            return lock
+        else:
             lock = await getter(chat_id, thread_id=thread_id)
             self._last_lock_scope = "thread" if thread_id else "chat_fallback"
             return lock
-        except TypeError:
-            self._last_lock_scope = "chat"
-            return await getter(chat_id)
 
     def _prepare_queue_events(self, main_event, events_to_process: list | None) -> list:
         return events_to_process.copy() if isinstance(events_to_process, list) and events_to_process else [main_event]
@@ -136,20 +140,48 @@ class System2Runner:
     async def _acquire_lock_bounded(lock, timeout_sec: float) -> str:
         acquire = getattr(lock, "acquire", None)
         if callable(acquire):
-            await asyncio.wait_for(acquire(), timeout=max(0.1, timeout_sec))
+            result = acquire()
+            if inspect.isawaitable(result):
+                result = await asyncio.wait_for(result, timeout=max(0.1, timeout_sec))
+            # The compatibility contract is deliberately strict: only an
+            # explicit True means that the caller owns the lock.  In
+            # particular, None must not be guessed as successful acquisition.
+            if result is not True:
+                raise asyncio.TimeoutError("system2 lock acquire did not return True")
             return "acquire"
         enter = getattr(lock, "__aenter__", None)
-        if callable(enter):
-            await asyncio.wait_for(enter(), timeout=max(0.1, timeout_sec))
+        exit_method = getattr(lock, "__aexit__", None)
+        if callable(enter) and callable(exit_method):
+            try:
+                result = enter()
+                if inspect.isawaitable(result):
+                    await asyncio.wait_for(result, timeout=max(0.1, timeout_sec))
+            except BaseException as exc:
+                # A legacy __aenter__ may acquire before its final await.  It
+                # is not safe to assume that a cancelled/timeout enter left
+                # the lock untouched, so make a best-effort compensating exit.
+                try:
+                    cleanup = exit_method(type(exc), exc, exc.__traceback__)
+                    if inspect.isawaitable(cleanup):
+                        await cleanup
+                except BaseException as cleanup_exc:
+                    logger.warning(
+                        "[AstrMai] system2 context lock cleanup failed "
+                        f"after {type(exc).__name__}: {type(cleanup_exc).__name__}"
+                    )
+                raise
             return "context"
         raise TypeError("system2 lock must provide acquire() or async context manager")
 
     @staticmethod
-    async def _release_lock(lock, acquire_mode: str) -> None:
+    async def _release_lock(lock, acquire_mode: str, exc_info=None) -> None:
         if acquire_mode == "context":
             exit_method = getattr(lock, "__aexit__", None)
             if callable(exit_method):
-                await exit_method(None, None, None)
+                exc_type, exc_value, traceback = exc_info or (None, None, None)
+                result = exit_method(exc_type, exc_value, traceback)
+                if inspect.isawaitable(result):
+                    await result
             return
         locked = getattr(lock, "locked", None)
         release = getattr(lock, "release", None)
@@ -209,33 +241,70 @@ class System2Runner:
     async def run(self, main_event, events_to_process: list | None = None):
         chat_id = main_event.unified_msg_origin
         thread_id = self._turn_thread_id(main_event)
-        lock = await self.get_sys2_lock(chat_id, thread_id)
-        lock_scope = str(getattr(self, "_last_lock_scope", "thread" if thread_id else "chat_fallback"))
         queue_events = self._prepare_queue_events(main_event, events_to_process)
         debug_trace(main_event, "system2.enter", chat_id=chat_id, queue_size=len(queue_events))
         logger.debug(f"[{chat_id}] System 2 request queued and waiting for execution slot.")
 
         lock_stage = begin_stage(
             main_event,
-            "system2.chat_lock_wait",
+            "system2.chat_lock_resolve",
             critical_path=True,
             metadata={
                 "chat_id": str(chat_id or ""),
                 "thread_id": self._turn_thread_id(main_event),
-                "lock_scope": lock_scope,
                 "queue_size": len(queue_events),
             },
         )
+        lock = None
         acquired_mode = ""
+        lock_exc_info = None
         try:
             timeout_sec = self._lock_wait_timeout(main_event)
             if timeout_sec <= 0.0:
+                raise System2QueueTimeout("system2.chat_lock_resolve")
+            lock_deadline = asyncio.get_running_loop().time() + timeout_sec
+            try:
+                lock = await asyncio.wait_for(
+                    self.get_sys2_lock(chat_id, thread_id),
+                    timeout=max(0.1, timeout_sec),
+                )
+            except asyncio.TimeoutError as exc:
+                raise System2QueueTimeout("system2.chat_lock_resolve") from exc
+            if lock is None:
+                raise System2QueueTimeout("system2.chat_lock_resolve")
+            finish_stage(main_event, lock_stage, metadata={"timeout_sec": timeout_sec})
+            lock_stage = begin_stage(
+                main_event,
+                "system2.chat_lock_wait",
+                critical_path=True,
+                metadata={
+                    "chat_id": str(chat_id or ""),
+                    "thread_id": self._turn_thread_id(main_event),
+                    "lock_scope": str(
+                        getattr(
+                            self,
+                            "_last_lock_scope",
+                            "thread" if thread_id else "chat_fallback",
+                        )
+                    ),
+                    "queue_size": len(queue_events),
+                },
+            )
+            remaining_timeout_sec = lock_deadline - asyncio.get_running_loop().time()
+            if remaining_timeout_sec <= 0.0:
                 raise System2QueueTimeout("system2.chat_lock_wait")
             try:
-                acquired_mode = await self._acquire_lock_bounded(lock, timeout_sec)
+                acquired_mode = await self._acquire_lock_bounded(
+                    lock,
+                    remaining_timeout_sec,
+                )
             except asyncio.TimeoutError as exc:
                 raise System2QueueTimeout("system2.chat_lock_wait") from exc
-            finish_stage(main_event, lock_stage, metadata={"timeout_sec": timeout_sec})
+            finish_stage(
+                main_event,
+                lock_stage,
+                metadata={"timeout_sec": remaining_timeout_sec},
+            )
             lock_stage = ""
             self._reset_runtime_reply_extras(main_event)
             await self._prepare_system2_runtime(main_event, chat_id)
@@ -243,6 +312,7 @@ class System2Runner:
             await self._finalize_followups(chat_id, main_event, reply_sent)
             return reply_sent
         except System2QueueTimeout as exc:
+            lock_exc_info = (type(exc), exc, exc.__traceback__)
             if lock_stage:
                 finish_stage(main_event, lock_stage, status="timeout", reason="queue_timeout")
             timeout_stage = str(main_event.get_extra("astrmai_queue_timeout_stage", "") or exc.stage)
@@ -254,14 +324,25 @@ class System2Runner:
             await self._record_pre_planner_timeout(main_event, timeout_stage)
             return False
         except asyncio.CancelledError:
+            lock_exc_info = sys.exc_info()
             finish_stage(main_event, lock_stage, status="cancelled", reason="acquire_cancelled")
             raise
         except Exception as exc:
+            lock_exc_info = (type(exc), exc, exc.__traceback__)
             finish_stage(main_event, lock_stage, status="error", reason=type(exc).__name__)
             raise
         finally:
             if acquired_mode:
-                await self._release_lock(lock, acquired_mode)
+                try:
+                    await self._release_lock(lock, acquired_mode, lock_exc_info)
+                except BaseException as release_exc:
+                    if lock_exc_info:
+                        logger.warning(
+                            "[AstrMai] system2 lock release failed while preserving "
+                            f"{lock_exc_info[0].__name__}: {type(release_exc).__name__}"
+                        )
+                    else:
+                        raise
             logger.debug(f"[AstrMai] System2 execution finished safely for {chat_id}.")
             debug_trace(
                 main_event,

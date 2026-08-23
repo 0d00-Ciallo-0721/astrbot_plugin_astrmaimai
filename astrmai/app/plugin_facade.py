@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import threading
 import time
 
@@ -810,9 +811,10 @@ class PluginFacade(RuntimeFacadeProtocol):
     async def _get_sys2_lock(self, chat_id: str, thread_id: str = ""):
         getter = self.runtime.runtime_coordinator.get_sys2_lock
         try:
-            return await getter(chat_id, thread_id=thread_id)
-        except TypeError:
+            inspect.signature(getter).bind(chat_id, thread_id=thread_id)
+        except (TypeError, ValueError):
             return await getter(chat_id)
+        return await getter(chat_id, thread_id=thread_id)
 
     async def _system2_entry(self, main_event, events_to_process: list | None = None):
         runner = self.runtime.system2_runner

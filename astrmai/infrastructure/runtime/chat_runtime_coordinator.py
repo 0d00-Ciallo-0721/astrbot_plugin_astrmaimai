@@ -77,14 +77,41 @@ class ChatRuntimeCoordinator:
                 self._states[chat_id] = ChatRuntimeState()
             return self._states[chat_id]
 
-    async def get_sys2_lock(self, chat_id: str, thread_id: str = "") -> asyncio.Lock:
-        state = await self._get_state(chat_id)
+    @staticmethod
+    def _state_has_locked_locks(state: ChatRuntimeState) -> bool:
+        locks = [state.sys2_lock, state.executor_lock]
+        locks.extend(state.sys2_thread_locks.values())
+        locks.extend(state.executor_thread_locks.values())
+        return any(callable(getattr(lock, "locked", None)) and lock.locked() for lock in locks)
+
+    async def get_sys2_lock(
+        self, chat_id: str, thread_id: str = ""
+    ) -> Optional[asyncio.Lock]:
+        normalized_chat_id = str(chat_id or "").strip()
         normalized_thread_id = str(thread_id or "").strip()
-        if not normalized_thread_id:
-            return state.sys2_lock
         async with self._lock:
-            if normalized_thread_id not in state.sys2_thread_locks and len(state.sys2_thread_locks) >= self.MAX_THREAD_GENERATIONS_PER_CHAT:
-                state.sys2_thread_locks.pop(next(iter(state.sys2_thread_locks)), None)
+            if self._shutdown:
+                return None
+            state = self._states.setdefault(normalized_chat_id, ChatRuntimeState())
+            if not normalized_thread_id:
+                return state.sys2_lock
+            if (
+                normalized_thread_id not in state.sys2_thread_locks
+                and len(state.sys2_thread_locks) >= self.MAX_THREAD_GENERATIONS_PER_CHAT
+            ):
+                # The cap is a soft memory bound. Never evict an occupied lock;
+                # if every cached generation is active, temporarily grow the
+                # cache rather than breaking per-thread serialization.
+                evict_key = next(
+                        (
+                            key
+                            for key, lock in state.sys2_thread_locks.items()
+                            if key not in state.active_turn_tasks and not lock.locked()
+                    ),
+                    None,
+                )
+                if evict_key is not None:
+                    state.sys2_thread_locks.pop(evict_key, None)
             return state.sys2_thread_locks.setdefault(normalized_thread_id, asyncio.Lock())
 
     async def try_acquire_executor(
@@ -102,8 +129,20 @@ class ChatRuntimeCoordinator:
             state.executor_pending += 1
             normalized_thread_id = str(thread_id or "").strip()
             if normalized_thread_id:
-                if normalized_thread_id not in state.executor_thread_locks and len(state.executor_thread_locks) >= self.MAX_THREAD_GENERATIONS_PER_CHAT:
-                    state.executor_thread_locks.pop(next(iter(state.executor_thread_locks)), None)
+                if (
+                    normalized_thread_id not in state.executor_thread_locks
+                    and len(state.executor_thread_locks) >= self.MAX_THREAD_GENERATIONS_PER_CHAT
+                ):
+                    evict_key = next(
+                        (
+                            key
+                            for key, lock in state.executor_thread_locks.items()
+                            if key not in state.active_turn_tasks and not lock.locked()
+                        ),
+                        None,
+                    )
+                    if evict_key is not None:
+                        state.executor_thread_locks.pop(evict_key, None)
                 executor_lock = state.executor_thread_locks.setdefault(
                     normalized_thread_id,
                     asyncio.Lock(),
@@ -464,13 +503,21 @@ class ChatRuntimeCoordinator:
 
     async def clear_runtime_state(self, chat_id: str) -> bool:
         tasks: list[asyncio.Task] = []
+        current_task = asyncio.current_task()
         async with self._lock:
-            state = self._states.pop(chat_id, None)
+            state = self._states.get(chat_id)
             if state is not None:
-                tasks = list(state.active_turn_tasks.values())
+                tasks = [task for task in state.active_turn_tasks.values() if task is not current_task]
         for task in tasks:
             if not task.done():
                 task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        async with self._lock:
+            current_state = self._states.get(chat_id)
+            if current_state is state and state is not None:
+                if not state.active_turn_tasks and not self._state_has_locked_locks(state):
+                    self._states.pop(chat_id, None)
         return state is not None
 
     async def shutdown(self, *, timeout_sec: float = 1.0) -> int:
@@ -518,7 +565,12 @@ class ChatRuntimeCoordinator:
         async with self._lock:
             stale_ids = [
                 chat_id for chat_id, state in self._states.items()
-                if now - state.latest_activity_ts > max_idle_sec
+                if (
+                    now - state.latest_activity_ts > max_idle_sec
+                    and not state.active_turn_tasks
+                    and not state.executor_pending
+                    and not self._state_has_locked_locks(state)
+                )
             ]
             for chat_id in stale_ids:
                 del self._states[chat_id]

@@ -120,6 +120,204 @@ class _FakeEvent:
 
 
 class RefactoredSystem2RunnerTests(unittest.TestCase):
+    def test_lock_acquire_false_is_rejected_without_release(self):
+        runner_mod = importlib.import_module("astrmai.conversation.execution.system2_runner")
+
+        class _FalseLock:
+            def __init__(self):
+                self.released = 0
+
+            def acquire(self):
+                return False
+
+            def release(self):
+                self.released += 1
+
+            def locked(self):
+                return True
+
+        lock = _FalseLock()
+
+        async def _run():
+            with self.assertRaises(asyncio.TimeoutError):
+                await runner_mod.System2Runner._acquire_lock_bounded(lock, 1.0)
+            return lock.released
+
+        self.assertEqual(asyncio.run(_run()), 0)
+
+    def test_lock_acquire_none_is_rejected_by_explicit_protocol(self):
+        runner_mod = importlib.import_module("astrmai.conversation.execution.system2_runner")
+
+        class _NoneLock:
+            def acquire(self):
+                return None
+
+        async def _run():
+            with self.assertRaises(asyncio.TimeoutError):
+                await runner_mod.System2Runner._acquire_lock_bounded(_NoneLock(), 1.0)
+
+        asyncio.run(_run())
+
+    def test_context_enter_cancellation_runs_compensating_exit(self):
+        runner_mod = importlib.import_module("astrmai.conversation.execution.system2_runner")
+
+        class _LeakyContext:
+            def __init__(self):
+                self.entered = asyncio.Event()
+                self.cleaned = False
+
+            async def __aenter__(self):
+                self.entered.set()
+                await asyncio.Event().wait()
+
+            async def __aexit__(self, exc_type, exc_value, traceback):
+                self.cleaned = exc_type is asyncio.CancelledError
+
+        lock = _LeakyContext()
+
+        async def _run():
+            task = asyncio.create_task(
+                runner_mod.System2Runner._acquire_lock_bounded(lock, 1.0)
+            )
+            await lock.entered.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(_run())
+        self.assertTrue(lock.cleaned)
+
+    def test_sync_acquire_and_context_protocol_require_exit(self):
+        runner_mod = importlib.import_module("astrmai.conversation.execution.system2_runner")
+
+        class _SyncLock:
+            def acquire(self):
+                return True
+
+            def release(self):
+                pass
+
+            def locked(self):
+                return True
+
+        self.assertEqual(
+            asyncio.run(runner_mod.System2Runner._acquire_lock_bounded(_SyncLock(), 1.0)),
+            "acquire",
+        )
+
+        class _IncompleteContext:
+            async def __aenter__(self):
+                return self
+
+        async def _run():
+            with self.assertRaises(TypeError):
+                await runner_mod.System2Runner._acquire_lock_bounded(_IncompleteContext(), 1.0)
+
+        asyncio.run(_run())
+
+    def test_context_release_receives_body_exception(self):
+        runner_mod = importlib.import_module("astrmai.conversation.execution.system2_runner")
+
+        class _ContextLock:
+            def __init__(self):
+                self.exc_info = None
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc_value, traceback):
+                self.exc_info = (exc_type, exc_value, traceback)
+
+        lock = _ContextLock()
+        error = ValueError("planner failed")
+        asyncio.run(runner_mod.System2Runner._release_lock(lock, "context", (type(error), error, None)))
+        self.assertIs(lock.exc_info[0], ValueError)
+        self.assertIs(lock.exc_info[1], error)
+
+    def test_lock_getter_internal_type_error_is_not_retried(self):
+        runner_mod = importlib.import_module("astrmai.conversation.execution.system2_runner")
+        calls = []
+
+        async def getter(chat_id, *, thread_id=""):
+            calls.append((chat_id, thread_id))
+            raise TypeError("internal getter failure")
+
+        runner = runner_mod.System2Runner(
+            SimpleNamespace(runtime_coordinator=SimpleNamespace(get_sys2_lock=getter))
+        )
+
+        async def _run():
+            with self.assertRaisesRegex(TypeError, "internal getter failure"):
+                await runner.get_sys2_lock("chat-1", "thread-1")
+
+        asyncio.run(_run())
+        self.assertEqual(calls, [("chat-1", "thread-1")])
+
+    def test_context_release_error_does_not_replace_planner_error(self):
+        runner_mod = importlib.import_module("astrmai.conversation.execution.system2_runner")
+
+        class _ContextLock:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc_value, traceback):
+                raise RuntimeError("release failed")
+
+        class _Planner:
+            async def plan_and_execute(self, event, queue_events):
+                raise ValueError("planner failed")
+
+        runtime = SimpleNamespace(
+            runtime_coordinator=SimpleNamespace(
+                get_sys2_lock=lambda chat_id: asyncio.sleep(0, result=_ContextLock())
+            ),
+            state_engine=_FakeStateEngine(),
+            lane_manager=_FakeLaneManager(),
+            system2_planner=_Planner(),
+            config=SimpleNamespace(attention=SimpleNamespace(thread_same_speaker_followup_sec=8)),
+        )
+
+        async def _run():
+            with self.assertRaisesRegex(ValueError, "planner failed"):
+                await runner_mod.System2Runner(runtime).run(_FakeEvent())
+
+        asyncio.run(_run())
+
+    def test_stage_timeout_is_passed_to_context_exit(self):
+        runner_mod = importlib.import_module("astrmai.conversation.execution.system2_runner")
+
+        class _ContextLock:
+            def __init__(self):
+                self.exc_info = None
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc_value, traceback):
+                self.exc_info = (exc_type, exc_value, traceback)
+
+        class _BlockingState:
+            async def consume_energy(self, chat_id):
+                await asyncio.Event().wait()
+
+        lock = _ContextLock()
+        runtime = SimpleNamespace(
+            runtime_coordinator=SimpleNamespace(
+                get_sys2_lock=lambda chat_id: asyncio.sleep(0, result=lock)
+            ),
+            state_engine=_BlockingState(),
+            lane_manager=_FakeLaneManager(),
+            system2_planner=_FakePlanner(),
+            config=SimpleNamespace(
+                timing=SimpleNamespace(energy_prepare_timeout_sec=0.01),
+                attention=SimpleNamespace(thread_same_speaker_followup_sec=8),
+            ),
+        )
+
+        self.assertFalse(asyncio.run(runner_mod.System2Runner(runtime).run(_FakeEvent())))
+        self.assertIs(lock.exc_info[0], runner_mod.System2QueueTimeout)
+        self.assertEqual(lock.exc_info[1].stage, "system2.energy_prepare")
+
     def test_runner_preserves_cancellation_while_waiting_for_chat_lock(self):
         runner_mod = importlib.import_module("astrmai.conversation.execution.system2_runner")
 
@@ -155,6 +353,60 @@ class RefactoredSystem2RunnerTests(unittest.TestCase):
         asyncio.run(_run())
         stages = event.get_extra("astrmai_stage_ledger", [])
         self.assertEqual(stages[-1]["status"], "cancelled")
+
+    def test_lock_getter_wait_is_bounded_and_recorded(self):
+        runner_mod = importlib.import_module("astrmai.conversation.execution.system2_runner")
+
+        async def hanging_getter(chat_id, *, thread_id=""):
+            await asyncio.Event().wait()
+
+        runtime = SimpleNamespace(
+            runtime_coordinator=SimpleNamespace(get_sys2_lock=hanging_getter),
+            config=SimpleNamespace(
+                timing=SimpleNamespace(sys2_lock_wait_timeout_sec=0.01)
+            ),
+        )
+        event = _FakeEvent()
+
+        self.assertFalse(asyncio.run(runner_mod.System2Runner(runtime).run(event)))
+        self.assertEqual(event.get_extra("astrmai_execution_status"), "queue_timeout")
+        self.assertEqual(
+            event.get_extra("astrmai_queue_timeout_stage"),
+            "system2.chat_lock_resolve",
+        )
+        stages = event.get_extra("astrmai_stage_ledger", [])
+        self.assertEqual(stages[-1]["stage"], "system2.chat_lock_resolve")
+        self.assertEqual(stages[-1]["status"], "timeout")
+
+    def test_shutdown_coordinator_rejects_system2_before_planner(self):
+        runner_mod = importlib.import_module("astrmai.conversation.execution.system2_runner")
+        coordinator_mod = importlib.import_module(
+            "astrmai.infrastructure.runtime.chat_runtime_coordinator"
+        )
+
+        class _Planner(_FakePlanner):
+            pass
+
+        coordinator = coordinator_mod.ChatRuntimeCoordinator()
+        planner = _Planner()
+        runtime = SimpleNamespace(
+            runtime_coordinator=coordinator,
+            state_engine=_FakeStateEngine(),
+            lane_manager=_FakeLaneManager(),
+            system2_planner=planner,
+            config=SimpleNamespace(
+                timing=SimpleNamespace(sys2_lock_wait_timeout_sec=0.1),
+                attention=SimpleNamespace(thread_same_speaker_followup_sec=8),
+            ),
+        )
+        event = _FakeEvent()
+
+        async def _run():
+            await coordinator.shutdown()
+            return await runner_mod.System2Runner(runtime).run(event)
+
+        self.assertFalse(asyncio.run(_run()))
+        self.assertEqual(planner.calls, [])
 
     def test_runner_times_out_while_waiting_for_chat_lock(self):
         runner_mod = importlib.import_module("astrmai.conversation.execution.system2_runner")
@@ -225,6 +477,8 @@ class RefactoredSystem2RunnerTests(unittest.TestCase):
         self.assertEqual(runtime.chat_loop_kernel.cooldowns[0][1:], ("followup", "followup_dispatch"))
         self.assertEqual(runtime.group_reply_wait_manager.events, [event])
         stages = event.get_extra("astrmai_stage_ledger", [])
+        self.assertEqual(stages[-4]["stage"], "system2.chat_lock_resolve")
+        self.assertEqual(stages[-4]["status"], "success")
         self.assertEqual(stages[-3]["stage"], "system2.chat_lock_wait")
         self.assertEqual(stages[-3]["status"], "success")
         self.assertEqual(stages[-3]["metadata"]["thread_id"], "thread-a")
