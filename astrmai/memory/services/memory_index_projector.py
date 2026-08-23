@@ -18,6 +18,50 @@ class MemoryIndexProjector:
         self._pending_projection_scheduled: dict[str, bool] = {}
         self._retry_task: asyncio.Task | None = None
         self._retry_stop = asyncio.Event()
+        self._projection_lock = getattr(engine, "_projection_lock", None) or asyncio.Lock()
+        self._ack_projection_outbox = bool(getattr(engine, "_ack_projection_outbox", True))
+        self._candidate_outbox_candidates: set[str] = {
+            str(item)
+            for item in (getattr(engine, "_candidate_outbox_candidates", set()) or set())
+            if item
+        }
+        self._candidate_outbox_watermarks: dict[str, int] = {
+            str(key): int(value or 0)
+            for key, value in (getattr(engine, "_candidate_outbox_watermarks", {}) or {}).items()
+        }
+        self._candidate_outbox_ids: set[str] = set()
+        self._candidate_outbox_confirmations: dict[str, int] = {}
+
+    def _get_projection_lock(self) -> asyncio.Lock:
+        lock = getattr(self, "_projection_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._projection_lock = lock
+        return lock
+
+    def _projection_rebuild_active(self) -> bool:
+        return bool(getattr(self.engine, "_projection_rebuild_active", False))
+
+    async def _defer_projection_ids(self, memory_ids: list[str], reason: str) -> None:
+        for memory_id in memory_ids:
+            if memory_id:
+                await self._mark_pending_persisted(str(memory_id), reason)
+
+    async def _acquire_projection_lock(self, *, timeout_sec: float | None = None) -> bool:
+        timeout = max(
+            0.05,
+            float(
+                timeout_sec
+                if timeout_sec is not None
+                else self._config_value("projection_lock_timeout_sec", 1.0)
+                or 1.0
+            ),
+        )
+        try:
+            await asyncio.wait_for(self._get_projection_lock().acquire(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
 
     def _config_value(self, name: str, default):
         config = getattr(self.engine, "config", None)
@@ -44,13 +88,44 @@ class MemoryIndexProjector:
         self._pending_projection_scheduled[memory_id] = scheduled
         return scheduled
 
-    async def _clear_pending_persisted(self, memory_id: str) -> None:
+    async def _clear_pending_persisted(self, memory_id: str, expected_revision: int = 0) -> None:
         self._clear_pending(memory_id)
         self._pending_projection_scheduled.pop(memory_id, None)
+        if not self._ack_projection_outbox:
+            normalized_id = str(memory_id or "")
+            if normalized_id in self._candidate_outbox_candidates:
+                self._candidate_outbox_ids.add(normalized_id)
+                self._candidate_outbox_confirmations[normalized_id] = self._candidate_outbox_watermarks.get(
+                    normalized_id, 0
+                )
+            return
         store = getattr(self.engine, "v2_store", None)
+        conditional = getattr(store, "complete_projection_retry_if_unchanged", None)
+        if callable(conditional):
+            await conditional(memory_id, int(expected_revision or 0))
+            return
         complete = getattr(store, "complete_projection_retry", None)
         if callable(complete):
             await complete(memory_id)
+
+    def candidate_outbox_ids(self) -> set[str]:
+        return {item for item in self._candidate_outbox_ids if item}
+
+    def candidate_outbox_confirmations(self) -> dict[str, int]:
+        return dict(self._candidate_outbox_confirmations)
+
+    async def confirm_projection_outbox(self, memory_ids) -> None:
+        store = getattr(self.engine, "v2_store", None)
+        complete = getattr(store, "complete_projection_retry", None)
+        conditional = getattr(store, "complete_projection_retry_if_unchanged", None)
+        if isinstance(memory_ids, dict) and callable(conditional):
+            for memory_id, watermark in memory_ids.items():
+                await conditional(str(memory_id), int(watermark))
+            return
+        if not callable(complete):
+            return
+        for memory_id in set(memory_ids or []):
+            await complete(str(memory_id))
 
     def _mark_pending(self, memory_id: str, reason: str) -> None:
         if not memory_id:
@@ -72,8 +147,31 @@ class MemoryIndexProjector:
         return getattr(self.engine, "db_path", None)
 
     async def project(self, memory_id: str, request: MemoryWriteRequest | None = None) -> bool:
+        if self._projection_rebuild_active():
+            await self._mark_pending_persisted(memory_id, "projection_rebuild_in_progress")
+            return False
+        if not await self._acquire_projection_lock():
+            await self._mark_pending_persisted(memory_id, "projection_lock_timeout")
+            return False
+        if self._projection_rebuild_active():
+            self._get_projection_lock().release()
+            await self._mark_pending_persisted(memory_id, "projection_rebuild_in_progress")
+            return False
+        try:
+            return await self._project_locked(memory_id, request)
+        finally:
+            self._get_projection_lock().release()
+
+    async def _project_locked(self, memory_id: str, request: MemoryWriteRequest | None = None) -> bool:
         if not memory_id:
             return False
+        expected_revision = 0
+        revision_reader = getattr(getattr(self.engine, "v2_store", None), "projection_retry_revision", None)
+        if callable(revision_reader):
+            try:
+                expected_revision = int(await revision_reader(memory_id) or 0)
+            except Exception:
+                expected_revision = 0
         if not getattr(self.engine, "retriever", None):
             scheduled = await self._mark_pending_persisted(memory_id, "retriever_not_ready")
             logger.info(
@@ -85,8 +183,12 @@ class MemoryIndexProjector:
             if request is None:
                 candidate = await self.engine.v2_store.get_by_id(memory_id, allow_stale=False)
                 if not candidate:
-                    await self.delete_projection(memory_id)
-                    await self._clear_pending_persisted(memory_id)
+                    cleanup_result = await self._cleanup_deleted_locked(
+                        [memory_id],
+                        return_result=True,
+                    )
+                    if cleanup_result.get("failed"):
+                        return False
                     return True
                 request = MemoryWriteRequest(
                     source=candidate.source,
@@ -102,7 +204,13 @@ class MemoryIndexProjector:
                     dedup_key=str(candidate.metadata.get("dedup_key") or ""),
                     visibility=candidate.visibility,
                 )
-            await self.delete_projection(memory_id)
+            cleanup_result = await self._cleanup_deleted_locked(
+                [memory_id],
+                settle_outbox=False,
+                return_result=True,
+            )
+            if cleanup_result.get("failed"):
+                return False
             metadata = self.engine._build_memory_metadata(
                 session_id=request.session_id,
                 persona_id=request.persona_id or None,
@@ -116,7 +224,7 @@ class MemoryIndexProjector:
             )
             metadata.update(dict(request.metadata or {}))
             await self.engine.retriever.add_memory(request.content, metadata)
-            await self._clear_pending_persisted(memory_id)
+            await self._clear_pending_persisted(memory_id, expected_revision)
             return True
         except Exception as exc:
             reason = f"projection_error:{type(exc).__name__}"
@@ -202,20 +310,60 @@ class MemoryIndexProjector:
         return await self.cleanup_deleted([memory_id])
 
     async def cleanup_deleted(self, memory_ids: list[str]) -> int:
-        if not memory_ids or not hasattr(self.engine, "_execute_documents_write"):
+        normalized_ids = [str(memory_id or "") for memory_id in memory_ids or []]
+        if self._projection_rebuild_active():
+            await self._defer_projection_ids(normalized_ids, "projection_rebuild_in_progress")
             return 0
+        if not await self._acquire_projection_lock():
+            await self._defer_projection_ids(normalized_ids, "projection_lock_timeout")
+            return 0
+        if self._projection_rebuild_active():
+            self._get_projection_lock().release()
+            await self._defer_projection_ids(normalized_ids, "projection_rebuild_in_progress")
+            return 0
+        try:
+            return await self._cleanup_deleted_locked(memory_ids)
+        finally:
+            self._get_projection_lock().release()
+
+    async def _cleanup_deleted_locked(
+        self,
+        memory_ids: list[str],
+        *,
+        settle_outbox: bool = True,
+        return_result: bool = False,
+    ) -> int | dict[str, object]:
+        if not memory_ids or not hasattr(self.engine, "_execute_documents_write"):
+            return {"deleted": 0, "failed": bool(memory_ids)} if return_result else 0
         deleted = 0
+        failed_ids: list[str] = []
         faiss_db = getattr(self.engine, "faiss_db", None)
         faiss_delete = getattr(faiss_db, "delete", None) if faiss_db is not None else None
         vector_retriever = getattr(self.engine, "vec_retriever", None)
         coordinated_delete = getattr(vector_retriever, "delete_document", None)
         for memory_id in memory_ids:
             try:
+                expected_revision = 0
+                revision_reader = getattr(getattr(self.engine, "v2_store", None), "projection_retry_revision", None)
+                if callable(revision_reader):
+                    try:
+                        expected_revision = int(await revision_reader(memory_id) or 0)
+                    except Exception:
+                        expected_revision = 0
                 rows = await self.engine._run_documents_query(
                     "SELECT id, doc_id FROM documents WHERE json_extract(metadata, '$.canonical_id') = ?",
                     (memory_id,),
                     db_path=self._documents_db_path(),
                 )
+                if not rows:
+                    orphan_fts_result = await self._cleanup_orphan_fts_rows()
+                    if orphan_fts_result is None or orphan_fts_result:
+                        await self._mark_pending_persisted(memory_id, "fts_delete_failed")
+                        failed_ids.append(memory_id)
+                        continue
+                    if settle_outbox:
+                        await self._clear_pending_persisted(memory_id, expected_revision)
+                    continue
                 int_ids = [row[0] for row in rows if row]
                 doc_keys = [str(row[1]) for row in rows if row and len(row) > 1 and row[1]]
                 # OPT-05/ML-04: 必须走 FaissVecDB.delete 才会同步删除 embedding——
@@ -223,7 +371,16 @@ class MemoryIndexProjector:
                 # 已删条目挤占且索引文件只增不减。顺序关键：faiss.delete 内部按
                 # doc_id 反查 int id，必须先于任何 documents 行删除执行。
                 vector_delete_supported = callable(coordinated_delete) or callable(faiss_delete)
+                if not vector_delete_supported and int_ids:
+                    await self._mark_pending_persisted(memory_id, "vector_delete_unavailable")
+                    logger.warning(
+                        f"[MemoryIndexProjector] retained document rows because vector delete is unavailable "
+                        f"memory_id={memory_id}"
+                    )
+                    failed_ids.append(memory_id)
+                    continue
                 vector_delete_failed = False
+                successful_rows: list[tuple[int, str]] = []
                 if callable(coordinated_delete):
                     for doc_key in doc_keys:
                         try:
@@ -232,6 +389,9 @@ class MemoryIndexProjector:
                                 raise RuntimeError(
                                     f"vector document not found during cleanup: {doc_key}"
                                 )
+                            row = next((item for item in rows if str(item[1]) == doc_key), None)
+                            if row:
+                                successful_rows.append((int(row[0]), doc_key))
                         except Exception:
                             vector_delete_failed = True
                             logger.debug(
@@ -242,27 +402,49 @@ class MemoryIndexProjector:
                     for doc_key in doc_keys:
                         try:
                             await faiss_delete(doc_key)
+                            row = next((item for item in rows if str(item[1]) == doc_key), None)
+                            if row:
+                                successful_rows.append((int(row[0]), doc_key))
                         except Exception:
                             vector_delete_failed = True
                             logger.debug(
                                 f"[MemoryIndexProjector] faiss delete degraded doc_id={doc_key}",
                                 exc_info=True,
                             )
-                if vector_delete_supported and vector_delete_failed:
+                if vector_delete_supported and vector_delete_failed and not successful_rows:
                     await self._mark_pending_persisted(memory_id, "vector_delete_failed")
                     logger.warning(
                         f"[MemoryIndexProjector] retained document rows after vector delete failure "
                         f"memory_id={memory_id} repair_scheduled={str(self.retry_scheduled(memory_id)).lower()}"
                     )
+                    failed_ids.append(memory_id)
                     continue
-                removed_rows = await self.engine._execute_documents_write(
-                    "DELETE FROM documents WHERE json_extract(metadata, '$.canonical_id') = ?",
-                    (memory_id,),
-                    db_path=self._documents_db_path(),
-                )
-                deleted += removed_rows
-                await self._delete_fts_rows(int_ids)
-                await self._clear_pending_persisted(memory_id)
+                if len(successful_rows) == len(rows):
+                    removed_rows = await self.engine._execute_documents_write(
+                        "DELETE FROM documents WHERE json_extract(metadata, '$.canonical_id') = ?",
+                        (memory_id,),
+                        db_path=self._documents_db_path(),
+                    )
+                    deleted += max(int(removed_rows or 0), len(successful_rows))
+                    fts_failed_ids = await self._delete_fts_rows(
+                        [doc_id for doc_id, _ in successful_rows]
+                    ) or []
+                else:
+                    fts_failed_ids = []
+                    for doc_id, doc_key in successful_rows:
+                        removed_rows = await self.engine._execute_documents_write(
+                            "DELETE FROM documents WHERE id = ?",
+                            (doc_id,),
+                            db_path=self._documents_db_path(),
+                        )
+                        deleted += max(int(removed_rows or 0), 1)
+                        fts_failed_ids.extend(await self._delete_fts_rows([doc_id]) or [])
+                if vector_delete_failed or fts_failed_ids:
+                    reason = "vector_delete_failed" if vector_delete_failed else "fts_delete_failed"
+                    await self._mark_pending_persisted(memory_id, reason)
+                    failed_ids.append(memory_id)
+                elif settle_outbox:
+                    await self._clear_pending_persisted(memory_id, expected_revision)
             except Exception as exc:
                 reason = f"cleanup_error:{type(exc).__name__}"
                 try:
@@ -273,39 +455,111 @@ class MemoryIndexProjector:
                     f"[MemoryIndexProjector] cleanup degraded for {memory_id}: {exc} "
                     f"repair_scheduled={str(scheduled).lower()}"
                 )
+                failed_ids.append(memory_id)
+        if return_result:
+            return {"deleted": deleted, "failed": bool(failed_ids), "failed_ids": failed_ids}
         return deleted
 
+    async def _cleanup_orphan_fts_rows(self) -> list[int] | None:
+        """Remove FTS rows whose integer document IDs no longer exist."""
+        if not hasattr(self.engine, "_run_documents_query"):
+            return []
+        try:
+            rows = await self.engine._run_documents_query(
+                """
+                SELECT f.doc_id
+                FROM memories_fts AS f
+                LEFT JOIN documents AS d ON d.id = f.doc_id
+                WHERE d.id IS NULL
+                """,
+                db_path=self._documents_db_path(),
+            )
+            orphan_ids = [int(row[0]) for row in rows if row and row[0] is not None]
+            return await self._delete_fts_rows(orphan_ids) or []
+        except Exception as exc:
+            logger.warning(f"[MemoryIndexProjector] orphan FTS cleanup degraded: {exc}")
+            return None
+
     async def rebuild_all(self) -> int:
-        if not await self.engine._ensure_faiss_initialized():
-            return 0
-        await self._clear_projected_documents()
-        count = 0
-        for candidate in await self.engine.v2_store.list_projectable():
-            await self.project(candidate.id)
-            count += 1
-        return count
+        if not await self._acquire_projection_lock(
+            timeout_sec=self._config_value("projection_rebuild_lock_timeout_sec", 60.0)
+        ):
+            raise asyncio.TimeoutError("projection rebuild lock timeout")
+        try:
+            if not await self.engine._ensure_faiss_initialized():
+                return 0
+            await self._clear_projected_documents()
+            count = 0
+            for candidate in await self.engine.v2_store.list_projectable():
+                await self._project_locked(candidate.id)
+                count += 1
+            return count
+        finally:
+            self._get_projection_lock().release()
 
     async def rebuild_session(self, session_id: str) -> int:
-        if not await self.engine._ensure_faiss_initialized():
-            return 0
-        await self._clear_projected_documents(session_id=session_id)
-        count = 0
-        for candidate in await self.engine.v2_store.list_projectable(session_id=session_id):
-            await self.project(candidate.id)
-            count += 1
-        return count
+        if not await self._acquire_projection_lock(
+            timeout_sec=self._config_value("projection_rebuild_lock_timeout_sec", 60.0)
+        ):
+            raise asyncio.TimeoutError("projection rebuild lock timeout")
+        try:
+            if not await self.engine._ensure_faiss_initialized():
+                return 0
+            await self._clear_projected_documents(session_id=session_id)
+            count = 0
+            for candidate in await self.engine.v2_store.list_projectable(session_id=session_id):
+                await self._project_locked(candidate.id)
+                count += 1
+            return count
+        finally:
+            self._get_projection_lock().release()
 
     async def check_consistency(self) -> dict:
         persisted_pending: dict[str, str] = {}
-        snapshot = getattr(self.engine.v2_store, "projection_retry_snapshot", None)
+        snapshot = getattr(self.engine.v2_store, "projection_retry_snapshot_with_revisions", None)
         if callable(snapshot):
             try:
-                persisted_pending = await snapshot()
+                structured_pending = await snapshot()
+                persisted_pending = {
+                    str(memory_id): str((value or {}).get("reason", "unknown"))
+                    for memory_id, value in (structured_pending or {}).items()
+                }
+                persisted_revisions = {
+                    str(memory_id): int((value or {}).get("revision", 0))
+                    for memory_id, value in (structured_pending or {}).items()
+                }
             except Exception as exc:
                 logger.warning(f"[MemoryIndexProjector] projection outbox snapshot degraded: {exc}")
+                persisted_revisions = {}
+        else:
+            snapshot = getattr(self.engine.v2_store, "projection_retry_snapshot", None)
+            persisted_revisions = {}
+            if callable(snapshot):
+                try:
+                    persisted_pending = await snapshot()
+                except Exception as exc:
+                    logger.warning(f"[MemoryIndexProjector] projection outbox snapshot degraded: {exc}")
         pending_ids = set(self._pending_projection_ids) | set(persisted_pending)
+        deferred_projection_ids: set[str] = set()
+        ignored_pending: set[str] = set()
+        if self._candidate_outbox_confirmations:
+            ignored_pending = {
+                memory_id
+                for memory_id, watermark in self._candidate_outbox_confirmations.items()
+                if memory_id in persisted_pending
+                and memory_id in persisted_revisions
+                and int(persisted_revisions[memory_id]) == int(watermark)
+            }
+        pending_ids -= ignored_pending
+        if not self._ack_projection_outbox:
+            deferred_projection_ids = set(pending_ids)
         pending_reasons = dict(persisted_pending)
         pending_reasons.update(self._pending_projection_reasons)
+        pending_reasons = {
+            memory_id: reason
+            for memory_id, reason in pending_reasons.items()
+            if memory_id in pending_ids
+        }
         report = {
             "missing_projection_ids": [],
             "orphan_projection_ids": [],
@@ -315,9 +569,13 @@ class MemoryIndexProjector:
             "canonical_projectable_count": 0,
             "pending_projection_count": len(pending_ids),
             "pending_projection_reasons": pending_reasons,
+            "deferred_projection_ids": sorted(deferred_projection_ids),
             "faiss_index_count": None,
             "faiss_index_count_observed": False,
             "faiss_index_count_delta_vs_projection": None,
+            "faiss_id_set_observed": False,
+            "faiss_ids_missing_from_documents": [],
+            "document_ids_missing_from_faiss": [],
         }
         try:
             projectable = await self.engine.v2_store.list_projectable()
@@ -325,6 +583,12 @@ class MemoryIndexProjector:
             report["canonical_projectable_count"] = len(projectable_ids)
             projection_rows = await self._projection_rows()
             report["projection_count"] = len(projection_rows)
+            document_ids = {int(doc_id) for doc_id, _ in projection_rows}
+            faiss_ids = self._faiss_id_set()
+            if faiss_ids is not None:
+                report["faiss_id_set_observed"] = True
+                report["faiss_ids_missing_from_documents"] = sorted(faiss_ids - document_ids)
+                report["document_ids_missing_from_faiss"] = sorted(document_ids - faiss_ids)
             faiss_db = getattr(self.engine, "faiss_db", None)
             if faiss_db is None:
                 vector_retriever = getattr(self.engine, "vec_retriever", None)
@@ -342,8 +606,12 @@ class MemoryIndexProjector:
             for doc_id, canonical_id in projection_rows:
                 by_canonical.setdefault(canonical_id, []).append(doc_id)
             projected_ids = set(by_canonical)
-            report["missing_projection_ids"] = sorted(projectable_ids - projected_ids)
-            if pending_ids:
+            report["missing_projection_ids"] = sorted(
+                (projectable_ids - projected_ids) - deferred_projection_ids
+                if not self._ack_projection_outbox
+                else projectable_ids - projected_ids
+            )
+            if pending_ids and self._ack_projection_outbox:
                 report["missing_projection_ids"] = sorted(
                     set(report["missing_projection_ids"]) | (pending_ids & projectable_ids)
                 )
@@ -364,12 +632,16 @@ class MemoryIndexProjector:
         report = report or await self.check_consistency()
         repaired = {
             "rebuilt_missing": 0,
+            "rebuilt_index": 0,
             "deleted_orphan": 0,
             "deleted_inactive": 0,
             "deduplicated": 0,
             "remaining_pending": len(self._pending_projection_ids),
             "remaining_pending_reasons": dict(self._pending_projection_reasons),
         }
+        if report.get("faiss_ids_missing_from_documents") or report.get("document_ids_missing_from_faiss"):
+            repaired["rebuilt_index"] = await self.rebuild_all()
+            report = await self.check_consistency()
         for memory_id in report.get("missing_projection_ids", []) or []:
             if await self.project(str(memory_id)):
                 repaired["rebuilt_missing"] += 1
@@ -434,7 +706,11 @@ class MemoryIndexProjector:
                 "DELETE FROM documents WHERE json_extract(metadata, '$.canonical_id') IS NOT NULL",
                 db_path=self._documents_db_path(),
             )
-        await self._delete_fts_rows(int_ids)
+        fts_failed_ids = await self._delete_fts_rows(int_ids)
+        if fts_failed_ids:
+            raise RuntimeError(
+                f"FTS cleanup failed for document IDs: {', '.join(str(item) for item in fts_failed_ids)}"
+            )
         return len(rows)
 
     async def _projection_rows(self) -> list[tuple[int, str]]:
@@ -462,24 +738,49 @@ class MemoryIndexProjector:
                 continue
         return result
 
+    def _faiss_id_set(self) -> set[int] | None:
+        faiss_db = getattr(self.engine, "faiss_db", None)
+        if faiss_db is None:
+            faiss_db = getattr(getattr(self.engine, "vec_retriever", None), "faiss_db", None)
+        index = getattr(getattr(faiss_db, "embedding_storage", None), "index", None)
+        id_map = getattr(index, "id_map", None)
+        if id_map is None:
+            return None
+        try:
+            return {int(value) for value in id_map.tolist()}
+        except (AttributeError, TypeError, ValueError):
+            pass
+        try:
+            return {int(value) for value in id_map}
+        except (TypeError, ValueError):
+            pass
+        try:
+            import faiss
+
+            values = faiss.vector_to_array(id_map)
+            return {int(value) for value in values.tolist()}
+        except (ImportError, AttributeError, RuntimeError, TypeError, ValueError):
+            return None
+
     async def projection_count(self) -> int:
         return len(await self._projection_rows())
 
-    async def _delete_fts_rows(self, doc_ids: list[int]) -> int:
+    async def _delete_fts_rows(self, doc_ids: list[int]) -> list[int]:
         ids = [item for item in doc_ids if item is not None]
         if not ids or not hasattr(self.engine, "_execute_documents_write"):
-            return 0
-        deleted = 0
+            return []
+        failed_ids: list[int] = []
         for doc_id in ids:
             try:
-                deleted += await self.engine._execute_documents_write(
+                await self.engine._execute_documents_write(
                     "DELETE FROM memories_fts WHERE doc_id = ?",
                     (doc_id,),
                     db_path=self._documents_db_path(),
                 )
             except Exception as exc:
+                failed_ids.append(int(doc_id))
                 logger.warning(f"[MemoryIndexProjector] fts cleanup degraded for {doc_id}: {exc}")
-        return deleted
+        return failed_ids
 
 
 __all__ = ["MemoryIndexProjector"]

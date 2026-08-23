@@ -305,12 +305,32 @@ class MemoryV2Store:
                     memory_id TEXT PRIMARY KEY,
                     status TEXT NOT NULL DEFAULT 'pending',
                     attempts INTEGER NOT NULL DEFAULT 0,
+                    revision INTEGER NOT NULL DEFAULT 0,
                     next_retry_at REAL NOT NULL DEFAULT 0,
                     last_error TEXT NOT NULL DEFAULT '',
                     created_at REAL NOT NULL DEFAULT 0,
                     updated_at REAL NOT NULL DEFAULT 0
                 )
                 """
+            )
+            outbox_columns_cursor = await db.execute("PRAGMA table_info(memory_projection_outbox)")
+            outbox_columns = {str(row[1]) for row in await outbox_columns_cursor.fetchall()}
+            if "revision" not in outbox_columns:
+                await db.execute(
+                    "ALTER TABLE memory_projection_outbox ADD COLUMN revision INTEGER NOT NULL DEFAULT 0"
+                )
+            await db.execute(
+                "INSERT OR IGNORE INTO memory_v2_meta(key, value) VALUES ('projection_outbox_revision', '0')"
+            )
+            max_revision_cursor = await db.execute(
+                "SELECT COALESCE(MAX(revision), 0) FROM memory_projection_outbox"
+            )
+            max_revision_row = await max_revision_cursor.fetchone()
+            max_revision = int(max_revision_row[0] or 0) if max_revision_row else 0
+            await db.execute(
+                "UPDATE memory_v2_meta SET value = CAST(MAX(CAST(value AS INTEGER), ?) AS TEXT) "
+                "WHERE key = 'projection_outbox_revision'",
+                (max_revision,),
             )
             await db.execute(
                 """
@@ -336,33 +356,63 @@ class MemoryV2Store:
             return False
         now = self._now()
         async with connect_aiosqlite(self.db_path) as db:
-            cursor = await db.execute(
-                "SELECT attempts, created_at FROM memory_projection_outbox WHERE memory_id = ? LIMIT 1",
-                (clean_id,),
-            )
-            row = await cursor.fetchone()
-            attempts = int(row[0] or 0) + 1 if row else 1
-            created_at = float(row[1] or now) if row else now
-            delay = min(
-                max(float(max_delay_sec or 900.0), 1.0),
-                max(float(base_delay_sec or 30.0), 1.0) * (2 ** max(attempts - 1, 0)),
-            )
-            await db.execute(
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await db.execute(
+                    "SELECT attempts, created_at, revision FROM memory_projection_outbox WHERE memory_id = ? LIMIT 1",
+                    (clean_id,),
+                )
+                row = await cursor.fetchone()
+                attempts = int(row[0] or 0) + 1 if row else 1
+                created_at = float(row[1] or now) if row else now
+                revision_cursor = await db.execute(
+                    "SELECT CAST(value AS INTEGER) FROM memory_v2_meta "
+                    "WHERE key = 'projection_outbox_revision' LIMIT 1"
+                )
+                revision_row = await revision_cursor.fetchone()
+                revision = (int(revision_row[0] or 0) if revision_row else 0) + 1
+                await db.execute(
+                    "UPDATE memory_v2_meta SET value = ? WHERE key = 'projection_outbox_revision'",
+                    (str(revision),),
+                )
+                delay = min(
+                    max(float(max_delay_sec or 900.0), 1.0),
+                    max(float(base_delay_sec or 30.0), 1.0) * (2 ** max(attempts - 1, 0)),
+                )
+                await db.execute(
                 """
                 INSERT INTO memory_projection_outbox(
-                    memory_id, status, attempts, next_retry_at, last_error, created_at, updated_at
-                ) VALUES (?, 'pending', ?, ?, ?, ?, ?)
+                    memory_id, status, attempts, revision, next_retry_at, last_error, created_at, updated_at
+                ) VALUES (?, 'pending', ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(memory_id) DO UPDATE SET
                     status = 'pending',
                     attempts = excluded.attempts,
+                    revision = excluded.revision,
                     next_retry_at = excluded.next_retry_at,
                     last_error = excluded.last_error,
                     updated_at = excluded.updated_at
                 """,
-                (clean_id, attempts, now + delay, str(reason or "unknown")[:500], created_at, now),
-            )
-            await db.commit()
+                (clean_id, attempts, revision, now + delay, str(reason or "unknown")[:500], created_at, now),
+                )
+                await db.commit()
+            except Exception:
+                await db.execute("ROLL" + "BACK")
+                raise
         return True
+
+    async def projection_retry_revision(self, memory_id: str) -> int:
+        await self.initialize()
+        clean_id = str(memory_id or "").strip()
+        if not clean_id:
+            return 0
+        async with connect_aiosqlite(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT revision FROM memory_projection_outbox "
+                "WHERE memory_id = ? AND status = 'pending' LIMIT 1",
+                (clean_id,),
+            )
+            row = await cursor.fetchone()
+        return int(row[0] or 0) if row else 0
 
     async def complete_projection_retry(self, memory_id: str) -> None:
         await self.initialize()
@@ -372,6 +422,33 @@ class MemoryV2Store:
         async with connect_aiosqlite(self.db_path) as db:
             await db.execute("DELETE FROM memory_projection_outbox WHERE memory_id = ?", (clean_id,))
             await db.commit()
+
+    async def complete_projection_retry_if_unchanged(self, memory_id: str, revision: int) -> bool:
+        await self.initialize()
+        clean_id = str(memory_id or "").strip()
+        if not clean_id:
+            return False
+        async with connect_aiosqlite(self.db_path) as db:
+            cursor = await db.execute(
+                "DELETE FROM memory_projection_outbox WHERE memory_id = ? AND revision = ?",
+                (clean_id, int(revision)),
+            )
+            await db.commit()
+            return bool(getattr(cursor, "rowcount", 0) == 1)
+
+    async def projection_retry_watermarks(self, *, limit: int = 1000) -> dict[str, int]:
+        await self.initialize()
+        async with connect_aiosqlite(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT memory_id, revision FROM memory_projection_outbox WHERE status = 'pending' ORDER BY revision ASC LIMIT ?",
+                (max(1, int(limit or 1000)),),
+            )
+            rows = await cursor.fetchall()
+        return {
+            str(row[0]): int(row[1] or 0)
+            for row in rows
+            if row and str(row[0] or '').strip()
+        }
 
     async def list_due_projection_retries(self, *, limit: int = 25) -> list[dict[str, Any]]:
         await self.initialize()
@@ -431,6 +508,25 @@ class MemoryV2Store:
             rows = await cursor.fetchall()
         return {
             str(row[0]): str(row[1] or "unknown")
+            for row in rows
+            if row and str(row[0] or "").strip()
+        }
+
+    async def projection_retry_snapshot_with_revisions(self, *, limit: int | None = None) -> dict[str, dict[str, object]]:
+        await self.initialize()
+        async with connect_aiosqlite(self.db_path) as db:
+            query = (
+                "SELECT memory_id, last_error, revision FROM memory_projection_outbox "
+                "WHERE status = 'pending' ORDER BY revision ASC"
+            )
+            params: tuple[int, ...] = ()
+            if limit is not None:
+                query += " LIMIT ?"
+                params = (max(1, int(limit or 1)),)
+            cursor = await db.execute(query, params)
+            rows = await cursor.fetchall()
+        return {
+            str(row[0]): {"reason": str(row[1] or "unknown"), "revision": int(row[2] or 0)}
             for row in rows
             if row and str(row[0] or "").strip()
         }

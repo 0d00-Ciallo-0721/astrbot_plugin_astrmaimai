@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import math
 import time
+import threading
 from collections import deque
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -64,6 +65,7 @@ class BackgroundTaskBudget:
     _timeout_duration_samples_by_kind: dict[str, list[float]] = field(init=False, default_factory=dict, repr=False)
     _late_duration_samples_by_kind: dict[str, list[float]] = field(init=False, default_factory=dict, repr=False)
     _last_error_by_kind: dict[str, str] = field(init=False, default_factory=dict, repr=False)
+    _resume_lock: threading.Lock = field(init=False, default_factory=threading.Lock, repr=False)
     _active_by_scope: dict[str, int] = field(init=False, default_factory=dict, repr=False)
     _rejected_by_scope: dict[str, int] = field(init=False, default_factory=dict, repr=False)
     _timed_out_by_scope: dict[str, int] = field(init=False, default_factory=dict, repr=False)
@@ -359,6 +361,21 @@ class BackgroundTaskBudget:
             return False
         self._accepting = True
         return True
+
+    def can_resume(self) -> bool:
+        return not (
+            self._active > 0
+            or any(lease.active for lease in self._active_leases.values())
+            or any(not task.done() for task in self._deferred_tasks)
+            or any(not waiter.done() for waiter in self._waiters)
+        )
+
+    def resume_if_idle(self) -> bool:
+        with self._resume_lock:
+            if not self.can_resume():
+                return False
+            self._accepting = True
+            return True
 
     async def _acquire(self, task_name: str, scope_key: str = "") -> None:
         if self._active < self.limit and not self._waiters:

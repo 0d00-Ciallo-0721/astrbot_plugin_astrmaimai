@@ -522,6 +522,82 @@ class MemoryGapCoverageTests(unittest.TestCase):
         self.assertLess(elapsed, 0.1)
         self.assertEqual(observation["vector"]["status"], "rebuilding")
 
+    def test_memory_engine_rebuild_barrier_skips_ready_legacy_retriever(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        gateway = SimpleNamespace(
+            config=SimpleNamespace(
+                provider=SimpleNamespace(embedding_models=["embedding"]),
+                memory=SimpleNamespace(recall_top_k=5),
+            )
+        )
+        engine = memory_engine_mod.MemoryEngine(
+            SimpleNamespace(),
+            gateway,
+            embedding_models=["embedding"],
+            config=gateway.config,
+        )
+        calls = []
+
+        class _LegacyRetriever:
+            async def search(self, *args, **kwargs):
+                calls.append((args, kwargs))
+                return ["legacy-result"]
+
+        engine.retriever = _LegacyRetriever()
+        engine._is_ready = True
+        engine._vector_state = "rebuilding"
+        engine._projection_rebuild_active = True
+        observation = {}
+
+        result = asyncio.run(engine.search_memories("query", top_k=3, observation=observation))
+
+        self.assertEqual(result, [])
+        self.assertEqual(calls, [])
+        self.assertEqual(engine._vector_state, "rebuilding")
+        self.assertEqual(observation["vector"]["status"], "rebuilding")
+        self.assertEqual(observation["fallback_source"], "canonical_fts")
+
+    def test_retrieve_trace_records_canonical_fts_fallback_during_rebuild(self):
+        contracts = self.contracts
+
+        class _Store:
+            async def search(self, *args, **kwargs):
+                return [_candidate(contracts, "mem-canon", score=0.9)]
+
+        calls = []
+
+        class _Engine:
+            config = SimpleNamespace(
+                timing=SimpleNamespace(
+                    memory_retrieval_timeout_sec=0.5,
+                    memory_fts_timeout_sec=0.5,
+                )
+            )
+
+            async def search_memories(self, *args, observation=None, **kwargs):
+                calls.append((args, kwargs))
+                observation.update(
+                    {
+                        "vector": {"status": "rebuilding"},
+                        "fallback_source": "canonical_fts",
+                        "fused_result_count": 0,
+                    }
+                )
+                return []
+
+        service = self.retrieval_mod.MemoryRetrievalService(_Store(), engine=_Engine())
+        query = self.contracts.MemoryQuery(query="canonical", session_id="chat-1", top_k=1)
+
+        result = asyncio.run(service.retrieve(query))
+
+        self.assertEqual([item.id for item in result], ["mem-canon"])
+        self.assertEqual(len(calls), 1)
+        trace = query.metadata["_trace"]
+        self.assertEqual(trace["vector_fallback"]["source"], "canonical_fts")
+        self.assertEqual(trace["vector_fallback"]["vector_status"], "rebuilding")
+        self.assertEqual(trace["retrieval_branches"]["hybrid"]["status"], "fallback")
+        self.assertEqual(trace["retrieval_branches"]["hybrid"]["reason"], "rebuilding")
+
     def test_memory_engine_failed_candidate_bootstrap_closes_candidate_stack(self):
         memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
         config = SimpleNamespace(

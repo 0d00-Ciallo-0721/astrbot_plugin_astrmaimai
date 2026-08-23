@@ -2029,6 +2029,22 @@
         "maximum": 200,
         "hint": "限制单轮后台修复规模，避免抢占正常聊天资源。"
       },
+      "projection_lock_timeout_sec": {
+        "description": "在线记忆投影锁最长等待（秒）",
+        "type": "float",
+        "default": 1.0,
+        "minimum": 0.1,
+        "maximum": 30,
+        "hint": "在线投影等待索引写入锁超过该时间后进入待处理队列，不阻塞消息写入。"
+      },
+      "projection_rebuild_lock_timeout_sec": {
+        "description": "记忆索引重建等待存量投影最长时间（秒）",
+        "type": "float",
+        "default": 60.0,
+        "minimum": 1,
+        "maximum": 3600,
+        "hint": "重建会等待已经开始的慢投影完成；重建期间的新投影会进入待处理队列。"
+      },
       "private_wait_timeout_sec": {
         "description": "私聊等待下一句时间（秒）",
         "type": "int",

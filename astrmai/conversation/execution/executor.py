@@ -258,6 +258,9 @@ class ConcurrentExecutor:
         if result.sent:
             event.set_extra("astrmai_execution_status", "reread_dispatched")
             return True
+        if result.status in {"cooldown", "duplicate", "stale", "shutdown"}:
+            event.set_extra("astrmai_execution_status", f"skipped_reread_{result.status}")
+            return True
         raise RuntimeError(f"reread_dispatch_{result.status}:{result.detail}")
 
     @staticmethod

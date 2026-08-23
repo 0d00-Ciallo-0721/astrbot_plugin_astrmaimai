@@ -390,6 +390,7 @@ class PluginRuntimeContext:
             self.proactive_task,
             self.group_social_feedback_observer,
             self.group_reread_observer,
+            self.reread_action_dispatcher,
         )
 
     def build_diagnostics(self) -> dict[str, Any]:

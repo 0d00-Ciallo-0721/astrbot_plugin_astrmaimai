@@ -839,6 +839,14 @@ class MemoryRetrievalService:
         vector_status = str(
             (latest_hybrid_observation.get("vector") or {}).get("status") or ""
         )
+        if vector_status == "rebuilding":
+            branch_trace["hybrid"].update(
+                {
+                    "status": "fallback",
+                    "reason": "rebuilding",
+                }
+            )
+            self._mark_degraded(query, "hybrid_rebuilding")
         if vector_status in {
             "timeout",
             "query_queue_timeout",
@@ -846,6 +854,7 @@ class MemoryRetrievalService:
             "circuit_open",
             "unavailable",
             "initialization_failed",
+            "rebuilding",
         }:
             if canonical_results:
                 fallback_source = "canonical_fts"
@@ -920,7 +929,12 @@ class MemoryRetrievalService:
                 dict(observation)
             )
             return []
-        observation.setdefault("status", "success")
+        vector_status = str((observation.get("vector") or {}).get("status") or "")
+        if vector_status == "rebuilding":
+            observation["status"] = "fallback"
+            observation["reason"] = "rebuilding"
+        else:
+            observation.setdefault("status", "success")
         observation["raw_result_count"] = len(results or [])
         self._trace_bucket(query).setdefault("hybrid_observations", []).append(
             dict(observation)

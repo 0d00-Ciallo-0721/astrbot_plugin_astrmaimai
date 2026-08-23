@@ -97,6 +97,8 @@ class MemoryEngine:
         self.index_projector = None
 
         self._faiss_lock = asyncio.Lock()
+        self._projection_lock = asyncio.Lock()
+        self._projection_rebuild_active = False
         self._is_ready = False
         self._vector_state = "uninitialized"
         self._vector_bootstrap_task: asyncio.Task | None = None
@@ -306,6 +308,17 @@ class MemoryEngine:
         persona_id: str = None,
         observation: dict | None = None,
     ):
+        if self._projection_rebuild_active or self._vector_state == "rebuilding":
+            if observation is not None:
+                observation.clear()
+                observation.update(
+                    {
+                        "vector": {"status": "rebuilding"},
+                        "fallback_source": "canonical_fts",
+                        "fused_result_count": 0,
+                    }
+                )
+            return []
         if not await self._ensure_faiss_initialized():
             if observation is not None:
                 observation.clear()
@@ -628,6 +641,7 @@ class MemoryEngine:
         try:
             await self._build_and_publish_vector_index(lifecycle)
         finally:
+            self._projection_rebuild_active = False
             if not lifecycle.published:
                 await self._close_vector_stack(lifecycle.retriever, lifecycle.faiss_db)
                 if lifecycle.discard_index and lifecycle.index_path is not None:
@@ -670,47 +684,76 @@ class MemoryEngine:
                 else self._load_published_vector_index(unique_models)
             )
             rebuild_required = self._force_index_rebuild or not migration_applied or published_index_path is None
+            projection_retry_snapshot = getattr(self.v2_store, "projection_retry_snapshot_with_revisions", None)
+            candidate_outbox_candidates = set()
+            candidate_outbox_watermarks = {}
+            if callable(projection_retry_snapshot):
+                try:
+                    snapshot = await projection_retry_snapshot() or {}
+                    candidate_outbox_candidates = set(snapshot.keys())
+                    candidate_outbox_watermarks = {
+                        str(key): int((value or {}).get("revision", 0))
+                        for key, value in snapshot.items()
+                    }
+                except Exception as exc:
+                    logger.warning(f"[AstrMai] projection outbox snapshot degraded during rebuild: {exc}")
             candidate_index_path = (
                 self._new_vector_index_path(generation)
                 if rebuild_required
                 else published_index_path
             )
-            lifecycle.index_path = candidate_index_path
-            lifecycle.discard_index = rebuild_required
-            candidate_db = await asyncio.to_thread(
-                FaissVecDB,
-                doc_store_path=str(self.data_path / "docs.db"),
-                index_store_path=str(candidate_index_path),
-                embedding_provider=provider_instance,
-            )
-            lifecycle.faiss_db = candidate_db
-            await candidate_db.initialize()
-            candidate_retriever = VectorRetriever(candidate_db, self.config)
-            lifecycle.retriever = candidate_retriever
-            candidate_hybrid = HybridRetriever(
-                self.bm25_retriever,
-                candidate_retriever,
-                config=self.config,
-            )
-
             async def _candidate_ready() -> bool:
                 return True
 
-            candidate_engine = SimpleNamespace(
-                config=self.config,
-                v2_store=self.v2_store,
-                db_path=self.db_path,
-                faiss_db=candidate_db,
-                vec_retriever=candidate_retriever,
-                retriever=candidate_hybrid,
-                background_task_budget=getattr(self, "background_task_budget", None),
-                _ensure_faiss_initialized=_candidate_ready,
-                _run_documents_query=self._run_documents_query,
-                _execute_documents_write=self._execute_documents_write,
-                _build_memory_metadata=self._build_memory_metadata,
+            async def _make_candidate(index_path):
+                candidate_db = None
+                candidate_retriever = None
+                try:
+                    candidate_db = await asyncio.to_thread(
+                        FaissVecDB,
+                        doc_store_path=str(self.data_path / "docs.db"),
+                        index_store_path=str(index_path),
+                        embedding_provider=provider_instance,
+                    )
+                    await candidate_db.initialize()
+                    candidate_retriever = VectorRetriever(candidate_db, self.config)
+                    candidate_hybrid = HybridRetriever(
+                        self.bm25_retriever,
+                        candidate_retriever,
+                        config=self.config,
+                    )
+                    candidate_engine = SimpleNamespace(
+                        config=self.config,
+                        v2_store=self.v2_store,
+                        db_path=self.db_path,
+                        faiss_db=candidate_db,
+                        vec_retriever=candidate_retriever,
+                        retriever=candidate_hybrid,
+                        background_task_budget=getattr(self, "background_task_budget", None),
+                        _projection_lock=self._projection_lock,
+                        _ack_projection_outbox=False,
+                        _candidate_outbox_candidates=candidate_outbox_candidates,
+                        _candidate_outbox_watermarks=candidate_outbox_watermarks,
+                        _ensure_faiss_initialized=_candidate_ready,
+                        _run_documents_query=self._run_documents_query,
+                        _execute_documents_write=self._execute_documents_write,
+                        _build_memory_metadata=self._build_memory_metadata,
+                    )
+                    candidate_projector = MemoryIndexProjector(candidate_engine)
+                    candidate_retriever._projection_count_provider = candidate_projector.projection_count
+                    return candidate_db, candidate_retriever, candidate_hybrid, candidate_projector
+                except Exception:
+                    await self._close_vector_stack(candidate_retriever, candidate_db)
+                    raise
+
+            lifecycle.index_path = candidate_index_path
+            lifecycle.discard_index = rebuild_required
+            candidate_db, candidate_retriever, candidate_hybrid, candidate_projector = await _make_candidate(
+                candidate_index_path
             )
-            candidate_projector = MemoryIndexProjector(candidate_engine)
-            candidate_retriever._projection_count_provider = candidate_projector.projection_count
+            lifecycle.faiss_db = candidate_db
+            lifecycle.retriever = candidate_retriever
+            self._projection_rebuild_active = True
             self._vector_state = "rebuilding"
             if rebuild_required:
                 rebuilt = await candidate_projector.rebuild_all()
@@ -729,18 +772,38 @@ class MemoryEngine:
                     "orphan_projection_ids",
                     "inactive_projection_ids",
                     "duplicate_projection_ids",
+                    "faiss_ids_missing_from_documents",
+                    "document_ids_missing_from_faiss",
                 )
             )
             index_count_mismatch = bool(
                 report.get("faiss_index_count_observed")
                 and int(report.get("faiss_index_count_delta_vs_projection") or 0) != 0
             )
-            if index_count_mismatch and not rebuild_required:
+            exact_id_mismatch = bool(
+                report.get("faiss_ids_missing_from_documents")
+                or report.get("document_ids_missing_from_faiss")
+            )
+            if (index_count_mismatch or exact_id_mismatch) and not rebuild_required:
+                if index_count_mismatch or exact_id_mismatch:
+                    await self._close_vector_stack(candidate_retriever, candidate_db)
+                    candidate_index_path = self._new_vector_index_path(generation)
+                    lifecycle.index_path = candidate_index_path
+                    lifecycle.discard_index = True
+                    rebuild_required = True
+                    candidate_db, candidate_retriever, candidate_hybrid, candidate_projector = await _make_candidate(
+                        candidate_index_path
+                    )
+                    lifecycle.faiss_db = candidate_db
+                    lifecycle.retriever = candidate_retriever
                 rebuilt = await candidate_projector.rebuild_all()
                 await self.v2_store.record_migration(
                     "2_index_rebuild",
                     status="applied",
-                    detail=f"rebuilt={rebuilt},reason=index_count_mismatch",
+                    detail=(
+                        f"rebuilt={rebuilt},reason="
+                        f"{'id_set_mismatch' if exact_id_mismatch else 'index_count_mismatch'}"
+                    ),
                 )
                 report = await candidate_projector.check_consistency()
                 if report.get("error"):
@@ -752,6 +815,8 @@ class MemoryEngine:
                         "orphan_projection_ids",
                         "inactive_projection_ids",
                         "duplicate_projection_ids",
+                        "faiss_ids_missing_from_documents",
+                        "document_ids_missing_from_faiss",
                     )
                 )
             if needs_repair:
@@ -759,54 +824,86 @@ class MemoryEngine:
                 report = await candidate_projector.check_consistency()
                 if report.get("error"):
                     raise RuntimeError(f"vector consistency scan failed: {report['error']}")
-            unresolved = {
-                key: list(report.get(key) or [])
-                for key in (
-                    "missing_projection_ids",
-                    "orphan_projection_ids",
-                    "inactive_projection_ids",
-                    "duplicate_projection_ids",
-                )
-                if report.get(key)
-            }
-            if unresolved:
-                raise RuntimeError(f"vector index consistency repair incomplete: {unresolved}")
-            if (
-                report.get("faiss_index_count_observed")
-                and int(report.get("faiss_index_count_delta_vs_projection") or 0) != 0
-            ):
-                raise RuntimeError(
-                    "vector index count does not match canonical projections: "
-                    f"delta={report.get('faiss_index_count_delta_vs_projection')}"
-                )
-            await candidate_retriever.refresh_storage_metrics(force=True)
-            if generation != self._vector_generation:
-                return
+            cutover_timeout = max(
+                0.05,
+                self._timing_value("projection_lock_timeout_sec", 1.0),
+            )
+            try:
+                await asyncio.wait_for(self._projection_lock.acquire(), timeout=cutover_timeout)
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError("vector index cutover lock timeout") from exc
+            try:
+                # Recheck while the cutover barrier is held. Online projectors see
+                # _projection_rebuild_active and enqueue instead of mutating docs.db.
+                report = await candidate_projector.check_consistency()
+                if report.get("error"):
+                    raise RuntimeError(f"vector consistency scan failed: {report['error']}")
+                unresolved = {
+                    key: list(report.get(key) or [])
+                    for key in (
+                        "missing_projection_ids",
+                        "orphan_projection_ids",
+                        "inactive_projection_ids",
+                        "duplicate_projection_ids",
+                        "faiss_ids_missing_from_documents",
+                        "document_ids_missing_from_faiss",
+                    )
+                    if report.get(key)
+                }
+                if unresolved:
+                    raise RuntimeError(f"vector index consistency repair incomplete: {unresolved}")
+                if (
+                    report.get("faiss_index_count_observed")
+                    and int(report.get("faiss_index_count_delta_vs_projection") or 0) != 0
+                ):
+                    raise RuntimeError(
+                        "vector index count does not match canonical projections: "
+                        f"delta={report.get('faiss_index_count_delta_vs_projection')}"
+                    )
+                await candidate_retriever.refresh_storage_metrics(force=True)
+                if generation != self._vector_generation:
+                    return
 
-            previous_retriever = self.vec_retriever
-            previous_faiss_db = self.faiss_db
-            if rebuild_required:
-                self._publish_vector_index_manifest(candidate_index_path, unique_models)
-            self.faiss_db = candidate_db
-            self.vec_retriever = candidate_retriever
-            self.retriever = candidate_hybrid
-            self._vector_index_path = str(candidate_index_path)
-            self._vector_consistency_report = dict(report or {})
-            self._force_index_rebuild = False
-            self._index_consistency_repaired = True
-            self._init_failures = 0
-            self._next_retry_time = 0.0
-            self._is_ready = True
-            self._vector_state = "ready"
-            self._vector_bootstrap_completed_at = time.time()
-            lifecycle.published = True
-            lifecycle.discard_index = False
-            if previous_retriever is not candidate_retriever or previous_faiss_db is not candidate_db:
-                await self._close_vector_stack(previous_retriever, previous_faiss_db)
-            self._cleanup_stale_vector_indexes(candidate_index_path, keep_history=1)
-            logger.info("[AstrMai] hybrid memory engine ready (BM25 + FaissVecDB).")
+                previous_retriever = self.vec_retriever
+                previous_faiss_db = self.faiss_db
+                if rebuild_required:
+                    self._publish_vector_index_manifest(candidate_index_path, unique_models)
+                self.faiss_db = candidate_db
+                self.vec_retriever = candidate_retriever
+                self.retriever = candidate_hybrid
+                self._vector_index_path = str(candidate_index_path)
+                self._vector_consistency_report = dict(report or {})
+                self._force_index_rebuild = False
+                self._index_consistency_repaired = True
+                self._init_failures = 0
+                self._next_retry_time = 0.0
+                self._is_ready = True
+                self._vector_state = "ready"
+                self._vector_bootstrap_completed_at = time.time()
+                lifecycle.published = True
+                lifecycle.discard_index = False
+                if previous_retriever is not candidate_retriever or previous_faiss_db is not candidate_db:
+                    await self._close_vector_stack(previous_retriever, previous_faiss_db)
+                active_projector = getattr(self, "index_projector", None)
+                confirm = getattr(active_projector, "confirm_projection_outbox", None)
+                if callable(confirm):
+                    pending_ids = getattr(
+                        candidate_projector,
+                        "candidate_outbox_confirmations",
+                        getattr(candidate_projector, "candidate_outbox_ids", lambda: set()),
+                    )()
+                    try:
+                        await confirm(pending_ids)
+                    except Exception as exc:
+                        logger.warning(f"[AstrMai] projection outbox confirmation deferred: {exc}")
+                self._cleanup_stale_vector_indexes(candidate_index_path, keep_history=1)
+                logger.info("[AstrMai] hybrid memory engine ready (BM25 + FaissVecDB).")
+            finally:
+                self._projection_lock.release()
 
     async def _ensure_faiss_initialized(self):
+        if self._projection_rebuild_active or self._vector_state == "rebuilding":
+            return False
         if self._is_ready:
             self._vector_state = "ready"
             return True

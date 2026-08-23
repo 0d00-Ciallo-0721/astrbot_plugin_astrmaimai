@@ -104,11 +104,29 @@ class PluginLifecycleManager:
         if late_cleanup is not None and not late_cleanup.done():
             logger.warning("[AstrMai] runtime reinitialize deferred: late shutdown cleanup is running")
             return False
+        reread_dispatcher = getattr(self.runtime, "reread_action_dispatcher", None)
+        resume_reread = getattr(reread_dispatcher, "resume", None)
         budget = getattr(self.runtime, "background_task_budget", None)
+        can_resume_budget = getattr(budget, "can_resume", None)
         resume_budget = getattr(budget, "resume", None)
-        if callable(resume_budget):
-            if resume_budget() is False:
+        resume_budget_if_idle = getattr(budget, "resume_if_idle", None)
+        if callable(can_resume_budget):
+            if can_resume_budget() is False:
                 logger.warning("[AstrMai] runtime reinitialize deferred: background work is still draining")
+                return False
+            if callable(resume_reread) and resume_reread() is False:
+                logger.warning("[AstrMai] runtime reinitialize deferred: reread dispatcher still has pending work")
+                return False
+            budget_resume = resume_budget_if_idle if callable(resume_budget_if_idle) else resume_budget
+            if callable(budget_resume) and budget_resume() is False:
+                logger.warning("[AstrMai] runtime reinitialize deferred: background work is still draining")
+                return False
+        else:
+            if callable(resume_budget) and resume_budget() is False:
+                logger.warning("[AstrMai] runtime reinitialize deferred: background work is still draining")
+                return False
+            if callable(resume_reread) and resume_reread() is False:
+                logger.warning("[AstrMai] runtime reinitialize deferred: reread dispatcher still has pending work")
                 return False
         event_bus = getattr(self.runtime, "event_bus", None)
         reset_abort = getattr(event_bus, "reset_abort", None)
@@ -470,10 +488,51 @@ class PluginLifecycleManager:
         except Exception as exc:
             logger.warning(f"[AstrMai] forced shutdown cleanup degraded name={name}: {exc}")
 
-    def _force_shutdown_tail(self) -> None:
+    async def _force_shutdown_tail_async(self) -> None:
+        reread_dispatcher = getattr(self.runtime, "reread_action_dispatcher", None)
+        force_shutdown_reread = getattr(reread_dispatcher, "force_shutdown", None)
+        if callable(force_shutdown_reread):
+            try:
+                completed = await force_shutdown_reread()
+                status = getattr(reread_dispatcher, "describe_status", lambda: {})()
+                if completed is False or status.get("pending_dispatch_shutdown"):
+                    self._shutdown_pending_drain = True
+
+                    async def _late_reread_cleanup() -> None:
+                        try:
+                            await reread_dispatcher.shutdown()
+                            self._force_shutdown_tail(wait_dispatcher=False)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            self.runtime.mark_degraded("shutdown.reread_late_cleanup", str(exc))
+                            logger.warning(f"[AstrMai] late reread cleanup degraded: {exc}")
+                        finally:
+                            self._shutdown_pending_drain = False
+                            self._reset_runtime_status_flags()
+                            elapsed_ms = (time.monotonic() - self._shutdown_started_monotonic) * 1000
+                            self.runtime.status.shutdown_completed_at = time.time()
+                            self.runtime.status.last_shutdown_elapsed_ms = round(elapsed_ms, 3)
+                            self.runtime.set_boot_phase("shutdown.complete")
+                            self._termination_complete = True
+
+                    task = asyncio.create_task(_late_reread_cleanup(), name="astrmai:shutdown:reread-late")
+                    self._late_shutdown_cleanup_task = task
+                    self._isolated_shutdown_tasks.add(task)
+                    task.add_done_callback(self._consume_isolated_shutdown_task)
+                    return
+            except Exception as exc:
+                logger.warning(f"[AstrMai] forced reread dispatcher shutdown degraded: {exc}")
+        self._force_shutdown_tail(wait_dispatcher=False)
+
+    def _force_shutdown_tail(self, *, wait_dispatcher: bool = True) -> None:
         """Release critical tail resources after a bounded sequence is isolated."""
         started = time.monotonic()
         errors: list[str] = []
+        reread_dispatcher = getattr(self.runtime, "reread_action_dispatcher", None)
+        force_shutdown_reread = getattr(reread_dispatcher, "force_shutdown", None)
+        if wait_dispatcher and callable(force_shutdown_reread):
+            self._schedule_forced_shutdown_cleanup("reread_dispatcher", force_shutdown_reread)
         try:
             self.stop_visual_services()
         except Exception as exc:
@@ -648,7 +707,7 @@ class PluginLifecycleManager:
                     timeout_sec=max(0.0, deadline - time.monotonic()),
                 )
                 if not shutdown_completed:
-                    self._force_shutdown_tail()
+                    await self._force_shutdown_tail_async()
             finally:
                 coordinator = getattr(self.runtime, "runtime_coordinator", None)
                 if coordinator and hasattr(coordinator, "_states"):
@@ -692,6 +751,14 @@ class PluginLifecycleManager:
                 begin_drain()
             except Exception as exc:
                 logger.warning(f"[AstrMai] background budget drain admission degraded: {exc}")
+
+        reread_dispatcher = getattr(self.runtime, "reread_action_dispatcher", None)
+        shutdown_reread = getattr(reread_dispatcher, "shutdown", None)
+        if callable(shutdown_reread):
+            try:
+                await shutdown_reread()
+            except Exception as exc:
+                logger.warning(f"[AstrMai] Reread dispatcher shutdown degraded: {exc}")
         drain_budget = getattr(budget, "drain", None)
         drain_report: dict[str, object] = {}
         try:

@@ -2403,9 +2403,13 @@ class MemoryV2ServiceTests(unittest.TestCase):
                 self.projected = []
                 self.cleaned = []
                 self.retriever = type("_Retriever", (), {"add_memory": self._add_memory})()
+                self.vec_retriever = type("_VectorRetriever", (), {"delete_document": self._delete_document})()
 
             async def _add_memory(self, content, metadata):
                 self.projected.append((content, metadata))
+
+            async def _delete_document(self, doc_key):
+                return True
 
             async def _ensure_faiss_initialized(self):
                 return True
@@ -2416,6 +2420,12 @@ class MemoryV2ServiceTests(unittest.TestCase):
             async def _run_documents_query(self, query, params=(), *, db_path=None):
                 if "SELECT id, metadata" in query:
                     return list(self.rows)
+                if "SELECT id, doc_id" in query:
+                    return [
+                        (row[0], f"doc-{row[0]}")
+                        for row in self.rows
+                        if row[1] and (not params or params[0] in row[1])
+                    ]
                 if "SELECT id FROM documents" in query:
                     return [(row[0],) for row in self.rows if row[1] and (not params or params[0] in row[1])]
                 return []

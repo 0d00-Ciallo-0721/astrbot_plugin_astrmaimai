@@ -5,6 +5,7 @@ import collections
 import hashlib
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -28,6 +29,8 @@ class _GroupRereadState:
     records: list[_RereadRecord] = field(default_factory=list)
     last_activity_at: float = 0.0
     cooldown_until: float = 0.0
+    inflight_token: str = ""
+    inflight_trigger_kind: str = ""
 
 
 class GroupRereadObserver:
@@ -55,13 +58,15 @@ class GroupRereadObserver:
         return max(5.0, float(getattr(self._conversation_config(), "group_reread_window_sec", 60.0) or 60.0))
 
     def _cooldown_seconds(self) -> float:
-        return max(0.0, float(getattr(self._conversation_config(), "group_reread_cooldown_sec", 45.0) or 45.0))
+        value = getattr(self._conversation_config(), "group_reread_cooldown_sec", 45.0)
+        return max(0.0, float(45.0 if value is None else value))
 
     def _max_groups(self) -> int:
         return max(16, int(getattr(self._conversation_config(), "group_reread_max_groups", 256) or 256))
 
     def _state_ttl_seconds(self) -> float:
-        return max(30.0, float(getattr(self._conversation_config(), "group_reread_state_ttl_sec", 600.0) or 600.0))
+        value = getattr(self._conversation_config(), "group_reread_state_ttl_sec", 600.0)
+        return max(30.0, float(600.0 if value is None else value))
 
     @staticmethod
     def normalize_text(value: str) -> str:
@@ -111,10 +116,18 @@ class GroupRereadObserver:
         ttl_cutoff = now - self._state_ttl_seconds()
         for chat_id in list(self._states):
             state = self._states[chat_id]
-            if state.last_activity_at < ttl_cutoff:
+            protected = bool(state.inflight_token or state.cooldown_until > now)
+            if state.last_activity_at < ttl_cutoff and not protected:
                 self._states.pop(chat_id, None)
         while len(self._states) > self._max_groups():
-            self._states.popitem(last=False)
+            evicted = False
+            for chat_id, state in list(self._states.items()):
+                if not state.inflight_token and state.cooldown_until <= now:
+                    self._states.pop(chat_id, None)
+                    evicted = True
+                    break
+            if not evicted:
+                break
 
     def _get_state_locked(self, chat_id: str, now: float) -> _GroupRereadState:
         state = self._states.get(chat_id)
@@ -125,6 +138,18 @@ class GroupRereadObserver:
             self._states.move_to_end(chat_id)
         state.last_activity_at = now
         return state
+
+    def _admit_state_locked(self, chat_id: str, now: float) -> bool:
+        normalized = str(chat_id or "")
+        if normalized in self._states or len(self._states) < self._max_groups():
+            return True
+        for candidate_id, state in list(self._states.items()):
+            if not state.inflight_token and state.cooldown_until <= now:
+                self._states.pop(candidate_id, None)
+                self._stats["state_evicted"] += 1
+                return True
+        self._stats["state_capacity_blocked"] += 1
+        return False
 
     async def record_outbound_text_seed(
         self,
@@ -137,10 +162,12 @@ class GroupRereadObserver:
         normalized = self.normalize_text(text)
         if not self._enabled() or not chat_id or not normalized or not bot_id:
             return
-        now = time.time()
+        now = time.monotonic()
         record = _RereadRecord(bot_id, str(event_id or ""), normalized, self.fingerprint(normalized), now)
         async with self._lock:
             self._prune_locked(now)
+            if not self._admit_state_locked(chat_id, now):
+                return
             state = self._get_state_locked(chat_id, now)
             state.records = [record]
             self._stats["outbound_seed"] += 1
@@ -157,12 +184,19 @@ class GroupRereadObserver:
         if not chat_id or not sender_id or not text:
             self._stats["skipped_missing_identity"] += 1
             return None
-        now = time.time()
+        now = time.monotonic()
         record = _RereadRecord(sender_id, self._event_id(event), text, self.fingerprint(text), now)
         async with self._lock:
             self._prune_locked(now)
+            if not self._admit_state_locked(chat_id, now):
+                self._stats["observed_capacity_blocked"] += 1
+                return None
             state = self._get_state_locked(chat_id, now)
             state.records = [item for item in state.records if now - item.observed_at <= self._window_seconds()]
+            if now < state.cooldown_until:
+                state.records = []
+                self._stats["observed_cooldown_blocked"] += 1
+                return None
             tail = state.records[-1] if state.records else None
             if tail is None or tail.fingerprint != record.fingerprint or sender_id in {item.sender_id for item in state.records}:
                 state.records = [record]
@@ -192,32 +226,61 @@ class GroupRereadObserver:
             explanation=explanation,
         )
 
-    async def claim_dispatch(self, chat_id: str) -> bool:
-        """Atomically claim the shared cooldown for either passive or active reread."""
-        if not self._enabled() or not chat_id:
-            return False
-        now = time.time()
+    async def claim_dispatch(self, chat_id: str, *, trigger_kind: str = "group_reread_passive") -> str | None:
+        """Atomically reserve a dispatch lease; cooldown starts only on commit."""
+        if not chat_id or (trigger_kind == "group_reread_passive" and not self._enabled()):
+            self._stats[f"blocked:{trigger_kind}:disabled"] += 1
+            return None
+        now = time.monotonic()
         async with self._lock:
             self._prune_locked(now)
+            if not self._admit_state_locked(str(chat_id), now):
+                self._stats[f"blocked:{trigger_kind}:capacity"] += 1
+                return None
             state = self._get_state_locked(str(chat_id), now)
+            if state.inflight_token:
+                self._stats[f"blocked:{trigger_kind}:inflight"] += 1
+                return None
             if now < state.cooldown_until:
-                self._stats["cooldown_blocked"] += 1
-                return False
-            state.cooldown_until = now + self._cooldown_seconds()
-            self._stats["dispatch_claimed"] += 1
-            return True
+                self._stats[f"blocked:{trigger_kind}:cooldown"] += 1
+                return None
+            token = uuid.uuid4().hex
+            state.inflight_token = token
+            state.inflight_trigger_kind = str(trigger_kind or "unknown")
+            self._stats[f"claimed:{trigger_kind}"] += 1
+            return token
 
-    async def release_dispatch(self, chat_id: str) -> bool:
-        """Release a cooldown reservation when no visible message was sent."""
+    async def release_dispatch(self, chat_id: str, token: str | None = None) -> bool:
+        """Release only the matching in-flight lease; never clear a newer lease."""
         if not chat_id:
             return False
-        now = time.time()
         async with self._lock:
             state = self._states.get(str(chat_id))
-            if state is None or state.cooldown_until <= now:
+            if state is None or not state.inflight_token:
                 return False
-            state.cooldown_until = 0.0
-            self._stats["dispatch_released"] += 1
+            if token and state.inflight_token != str(token):
+                self._stats["release_stale"] += 1
+                return False
+            trigger_kind = state.inflight_trigger_kind or "unknown"
+            state.inflight_token = ""
+            state.inflight_trigger_kind = ""
+            self._stats[f"released:{trigger_kind}"] += 1
+            return True
+
+    async def commit_dispatch(self, chat_id: str, token: str, *, trigger_kind: str = "") -> bool:
+        if not chat_id or not token:
+            return False
+        now = time.monotonic()
+        async with self._lock:
+            state = self._states.get(str(chat_id))
+            if state is None or state.inflight_token != str(token):
+                self._stats["commit_stale"] += 1
+                return False
+            kind = str(trigger_kind or state.inflight_trigger_kind or "unknown")
+            state.inflight_token = ""
+            state.inflight_trigger_kind = ""
+            state.cooldown_until = now + self._cooldown_seconds()
+            self._stats[f"sent:{kind}"] += 1
             return True
 
     async def clear_chat(self, chat_id: str) -> bool:
@@ -225,7 +288,12 @@ class GroupRereadObserver:
             return self._states.pop(str(chat_id or ""), None) is not None
 
     def describe_status(self) -> dict[str, Any]:
-        return {"active_groups": len(self._states), "stats": dict(self._stats)}
+        return {
+            "active_groups": len(self._states),
+            "inflight_groups": sum(bool(state.inflight_token) for state in self._states.values()),
+            "cooldown_groups": sum(state.cooldown_until > time.monotonic() for state in self._states.values()),
+            "stats": dict(self._stats),
+        }
 
 
 __all__ = ["GroupRereadObserver"]
