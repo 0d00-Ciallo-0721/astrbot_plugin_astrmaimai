@@ -10,6 +10,7 @@ from typing import Any, Awaitable, Callable
 
 from astrbot.api import logger
 
+from .history_store import ProactiveHistoryStore
 from .rhythm import evaluate_proactive_rhythm
 
 
@@ -75,12 +76,15 @@ class ProactiveDispatcher:
         runtime_coordinator: Any = None,
         state_engine: Any = None,
         config: Any = None,
+        history_db_path: Any = None,
     ) -> None:
         self.attention_gate = attention_gate
         self.runtime_coordinator = runtime_coordinator
         self.state_engine = state_engine
         self.config = config
         self._history: list[dict[str, Any]] = []
+        self._history_store = ProactiveHistoryStore(history_db_path)
+        self._history = self._load_persistent_history()
         self._cooldowns: dict[str, float] = {}
         self._callbacks: dict[str, CompletionCallback] = {}
         self._completion_watchdogs: dict[str, asyncio.Task] = {}
@@ -92,6 +96,22 @@ class ProactiveDispatcher:
         self._terminal_order: deque[str] = deque()
         self._shutting_down = False
         self._dispatch_lock = asyncio.Lock()
+
+    def _load_persistent_history(self) -> list[dict[str, Any]]:
+        if self._history_store.db_path is None:
+            return []
+        try:
+            page = self._history_store.page(limit=self.HISTORY_LIMIT)
+            return list(reversed(page.get("items", []) or []))
+        except Exception as exc:
+            logger.warning(f"[ProactiveDispatcher] history load degraded: {type(exc).__name__}")
+            return []
+
+    @staticmethod
+    def _without_history_id(record: dict[str, Any]) -> dict[str, Any]:
+        payload = dict(record)
+        payload.pop("_history_id", None)
+        return payload
 
     def _completion_timeout_seconds(self, intent: ProactiveMessageIntent) -> float:
         metadata_value = intent.metadata.get("completion_timeout_sec", None)
@@ -545,7 +565,15 @@ class ProactiveDispatcher:
         }
 
     def _remember(self, intent: ProactiveMessageIntent, decision: ProactiveDispatchDecision) -> None:
-        self._history = [*self._history, self._intent_record(intent, decision)][-self.HISTORY_LIMIT :]
+        record = self._intent_record(intent, decision)
+        try:
+            history_id = self._history_store.append(record)
+        except Exception as exc:
+            history_id = None
+            logger.warning(f"[ProactiveDispatcher] history append degraded: {type(exc).__name__}")
+        if history_id:
+            record["_history_id"] = history_id
+        self._history = [*self._history, record][-self.HISTORY_LIMIT :]
 
     async def _sync_history_for_dispatch(self, intent_id: str, decision: ProactiveDispatchDecision) -> None:
         for item in reversed(self._history):
@@ -556,16 +584,54 @@ class ProactiveDispatcher:
             item["blocked_reason"] = decision.blocked_reason
             item["reply_sent"] = decision.reply_sent
             item["stage_ledger"] = [dict(entry) for entry in decision.stage_ledger]
+            try:
+                self._history_store.update(
+                    int(item.get("_history_id", 0) or 0),
+                    self._without_history_id(item),
+                )
+            except Exception as exc:
+                logger.warning(f"[ProactiveDispatcher] history update degraded: {type(exc).__name__}")
             return
 
     def list_intents(self, *, limit: int = 50) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit or 50), self.HISTORY_LIMIT))
-        return list(self._history)[-limit:][::-1]
+        return [self._without_history_id(item) for item in list(self._history)[-limit:][::-1]]
+
+    def list_intents_page(self, *, limit: int = 50, cursor: str | None = None) -> dict[str, Any]:
+        if self._history_store.db_path is not None:
+            try:
+                page = self._history_store.page(limit=limit, cursor=cursor)
+                page["items"] = [self._without_history_id(item) for item in page.get("items", [])]
+                return page
+            except Exception as exc:
+                logger.warning(f"[ProactiveDispatcher] history page degraded: {type(exc).__name__}")
+        safe_limit = max(1, min(int(limit or 50), self.HISTORY_LIMIT))
+        ordered = list(reversed(self._history))
+        if cursor:
+            try:
+                before_id = int(str(cursor))
+                ordered = [item for item in ordered if int(item.get("_history_id", 0) or 0) < before_id]
+            except (TypeError, ValueError):
+                pass
+        items = ordered[:safe_limit]
+        next_cursor = None
+        if len(ordered) > safe_limit and items:
+            next_cursor = str(items[-1].get("_history_id", "")) or None
+        return {
+            "items": [self._without_history_id(item) for item in items],
+            "total": len(self._history),
+            "next_cursor": next_cursor,
+            "has_more": bool(next_cursor),
+        }
 
     def describe_status(self) -> dict[str, Any]:
         return {
             "available": bool(self.attention_gate and hasattr(self.attention_gate, "inject_external_event")),
             "history_size": len(self._history),
+            "history_persistent": self._history_store.db_path is not None,
+            "history_total": (
+                self._history_store.count() if self._history_store.db_path is not None else len(self._history)
+            ),
             "cooldown_chats": len(self._cooldowns),
             "completion_watchdogs": len(self._completion_watchdogs),
             "settlement_pending": sum(

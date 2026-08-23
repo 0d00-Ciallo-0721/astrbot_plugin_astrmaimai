@@ -27,14 +27,17 @@ class ChatRuntimeService:
         data = task.describe_status() if task and hasattr(task, "describe_status") else {"running": False}
         return {"status": "ok", "data": data, "runtime_bound": task is not None}
 
-    async def proactive_intents(self, limit: int = 50) -> dict[str, Any]:
+    async def proactive_intents(self, limit: int = 50, cursor: str | None = None) -> dict[str, Any]:
         task = self._api.get_proactive_task()
         dispatcher = getattr(task, "proactive_dispatcher", None) if task else None
         if not dispatcher or not hasattr(dispatcher, "list_intents"):
             return {"status": "ok", "items": [], "total": 0, "runtime_bound": task is not None}
-        safe_limit = max(1, min(int(limit or 50), 200))
-        items = dispatcher.list_intents(limit=safe_limit)
-        return {"status": "ok", "items": items, "total": len(items), "runtime_bound": True}
+        safe_limit = max(1, min(int(limit or 50), 500))
+        if hasattr(dispatcher, "list_intents_page"):
+            page = dispatcher.list_intents_page(limit=safe_limit, cursor=cursor)
+            return {"status": "ok", **dict(page or {}), "runtime_bound": True}
+        items = dispatcher.list_intents(limit=min(safe_limit, 200))
+        return {"status": "ok", "items": items, "total": len(items), "next_cursor": None, "has_more": False, "runtime_bound": True}
 
     async def dream_status(self) -> dict[str, Any]:
         task = self._api.get_proactive_task()

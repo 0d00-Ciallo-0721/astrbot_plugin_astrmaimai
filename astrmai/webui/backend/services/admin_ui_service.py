@@ -1031,17 +1031,20 @@ class AdminUiService:
         data["scheduler_pending_signals"] = self._scheduler_pending_signal_slice(data.get("pending_signals", {}))
         return {"status": "ok", "data": data, "runtime_bound": True}
 
-    async def proactive_intents(self, limit: int = 50) -> dict[str, Any]:
+    async def proactive_intents(self, limit: int = 50, cursor: str | None = None) -> dict[str, Any]:
         task = self.plugin_api.get_proactive_task()
         dispatcher = getattr(task, "proactive_dispatcher", None) if task else None
         if not dispatcher or not hasattr(dispatcher, "list_intents"):
             return {"status": "ok", "items": [], "total": 0, "runtime_bound": task is not None}
         try:
-            safe_limit = max(1, min(int(limit or 50), 200))
+            safe_limit = max(1, min(int(limit or 50), 500))
         except (TypeError, ValueError):
             safe_limit = 50
-        items = dispatcher.list_intents(limit=safe_limit)
-        return {"status": "ok", "items": items, "total": len(items), "runtime_bound": True}
+        if hasattr(dispatcher, "list_intents_page"):
+            page = dispatcher.list_intents_page(limit=safe_limit, cursor=cursor)
+            return {"status": "ok", **dict(page or {}), "runtime_bound": True}
+        items = dispatcher.list_intents(limit=min(safe_limit, 200))
+        return {"status": "ok", "items": items, "total": len(items), "next_cursor": None, "has_more": False, "runtime_bound": True}
 
     async def dream_status(self) -> dict[str, Any]:
         task = self.plugin_api.get_proactive_task()

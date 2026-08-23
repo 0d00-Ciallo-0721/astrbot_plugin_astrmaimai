@@ -772,6 +772,7 @@ class ScheduledScenarioService:
             "generation_last_error": dict(self._generation_last_error),
             "cached_schedule_dates": sorted(self._schedule_cache)[-7:],
             "weather_cached": self.weather._cached is not None,
+            "claim_persistence_mode": "sqlite" if self.delivery_store.db_path else "memory_process_local",
             "memory_claim_count": len(self.delivery_store._memory_claims),
             "memory_claim_limit": self.delivery_store.MEMORY_CLAIM_LIMIT,
             "memory_claim_capacity_rejected": self.delivery_store._memory_claim_capacity_rejected,

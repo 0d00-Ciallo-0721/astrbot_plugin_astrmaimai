@@ -140,6 +140,10 @@ def test_architecture_trace_contract_links_full_chain_without_raw_reply_text():
     event.set_extra("astrmai_judge_validation_action", "PASS")
     event.set_extra("astrmai_judge_validation_agreement", False)
     event.set_extra("astrmai_judge_validation_false_filter_candidate", True)
+    event.set_extra(
+        "astrmai_proactive_stage_ledger",
+        [{"stage": f"proactive.stage.{index}", "status": "success"} for index in range(80)],
+    )
 
     contract = build_architecture_trace_contract(
         event=event,
@@ -177,6 +181,8 @@ def test_architecture_trace_contract_links_full_chain_without_raw_reply_text():
     assert contract["judge_decision"]["validation_false_filter_candidate"] is True
     assert contract["timing_coverage"]["unattributed_ms"] == 7.5
     assert contract["stage_ledger"][0]["stage"] == "attention.dispatch"
+    assert len(contract["proactive_observation"]["stage_ledger"]) == 80
+    assert contract["proactive_observation"]["stage_ledger"][0]["stage"] == "proactive.stage.0"
     assert contract["reply_plan"]["planned_char_count"] == len("绝密草稿文本")
     assert contract["reply_commit"]["commit_id"] == committed.commit_id
     assert contract["memory_actor_filter"]["actor_whitelist"] == ["actor-1", "bot-1"]

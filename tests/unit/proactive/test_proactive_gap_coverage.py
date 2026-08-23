@@ -4,6 +4,7 @@ import sys
 import tempfile
 import time
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -42,6 +43,42 @@ class ProactiveGapCoverageTests(unittest.TestCase):
             self.temp_dir.cleanup()
         except Exception:
             pass
+
+    def test_dispatch_history_persists_and_supports_cursor_pages(self):
+        db_path = Path(self.temp_dir.name) / "proactive-history.db"
+        dispatcher = self.dispatcher_mod.ProactiveDispatcher(history_db_path=db_path)
+        for index in range(3):
+            intent = self.dispatcher_mod.ProactiveMessageIntent(
+                chat_id=f"chat-{index}",
+                source="wakeup",
+                reason="test",
+                guidance="one line",
+                intent_id=f"intent-{index}",
+            )
+            decision = self.dispatcher_mod.ProactiveDispatchDecision(
+                intent_id=intent.intent_id,
+                chat_id=intent.chat_id,
+                source=intent.source,
+                timestamp=float(index + 1),
+                status="blocked",
+            )
+            dispatcher._remember(intent, decision)
+
+        first_page = dispatcher.list_intents_page(limit=2)
+        self.assertEqual(first_page["total"], 3)
+        self.assertEqual(len(first_page["items"]), 2)
+        self.assertTrue(first_page["has_more"])
+        self.assertTrue(first_page["next_cursor"])
+        second_page = dispatcher.list_intents_page(limit=2, cursor=first_page["next_cursor"])
+        self.assertEqual(len(second_page["items"]), 1)
+        self.assertFalse(second_page["has_more"])
+
+        reloaded = self.dispatcher_mod.ProactiveDispatcher(history_db_path=db_path)
+        self.assertEqual([item["intent"]["intent_id"] for item in reloaded.list_intents()], [
+            "intent-2",
+            "intent-1",
+            "intent-0",
+        ])
 
     def test_dispatcher_blocks_second_intent_during_completion_cooldown(self):
         class _AttentionGate:

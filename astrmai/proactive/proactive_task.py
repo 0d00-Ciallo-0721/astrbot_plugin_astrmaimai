@@ -136,6 +136,7 @@ class ProactiveTask:
             runtime_coordinator=runtime_coordinator,
             state_engine=state_engine,
             config=self.config,
+            history_db_path=getattr(persistence, "db_path", None),
         )
         self.scheduled_scenario_service = ScheduledScenarioService(
             state_engine=state_engine,

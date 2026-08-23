@@ -234,6 +234,13 @@ _MIGRATIONS: list[tuple[int, str]] = [
     (91, "CREATE INDEX IF NOT EXISTS ix_relationship_event_ledger_chat_created ON relationship_event_ledger(chat_id, created_at)"),
     (92, "CREATE INDEX IF NOT EXISTS ix_relationship_event_ledger_turn_id ON relationship_event_ledger(turn_id)"),
     (93, "ALTER TABLE proactive_scenario_delivery ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''"),
+    (94, """CREATE TABLE IF NOT EXISTS proactive_dispatch_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        intent_id TEXT NOT NULL,
+        created_at REAL NOT NULL DEFAULT 0,
+        payload_json TEXT NOT NULL DEFAULT '{}'
+    )"""),
+    (95, "CREATE INDEX IF NOT EXISTS ix_proactive_dispatch_history_created ON proactive_dispatch_history(created_at DESC, id DESC)"),
 ]
 
 

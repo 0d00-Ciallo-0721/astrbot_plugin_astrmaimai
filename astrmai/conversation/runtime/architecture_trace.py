@@ -307,7 +307,7 @@ def build_architecture_trace_contract(
             "cancel_reason": proactive.cancel_reason,
             "stage_ledger": [
                 dict(item)
-                for item in list(_extra(event, "astrmai_proactive_stage_ledger", ()) or ())[-16:]
+                for item in list(_extra(event, "astrmai_proactive_stage_ledger", ()) or ())
                 if isinstance(item, Mapping)
             ],
         },
