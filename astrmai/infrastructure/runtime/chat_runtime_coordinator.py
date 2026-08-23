@@ -283,19 +283,20 @@ class ChatRuntimeCoordinator:
             claim.committed_at = time.time()
             self._increment_metric_locked("send_committed")
 
-    async def mark_send_failed(self, chat_id: str, send_key: str, error: str = "") -> None:
+    async def mark_send_failed(self, chat_id: str, send_key: str, error: str = "") -> bool:
         normalized_chat_id = str(chat_id or "").strip()
         normalized_send_key = str(send_key or "").strip()
         if not normalized_send_key:
-            return
+            return False
         async with self._lock:
             if self._shutdown:
-                return
+                return False
             state = self._states.setdefault(normalized_chat_id, ChatRuntimeState())
             claim = state.send_claims.setdefault(normalized_send_key, SendClaimState())
             claim.status = "failed"
             claim.error = str(error or "")[:300]
             self._increment_metric_locked("send_failed")
+            return True
 
     async def get_send_claim(self, chat_id: str, send_key: str) -> Optional[dict]:
         normalized_chat_id = str(chat_id or "").strip()

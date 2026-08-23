@@ -84,6 +84,16 @@ class ChatRuntimeGenerationTests(unittest.TestCase):
         self.assertEqual(retried["status"], "claimed")
         self.assertEqual(retried["error"], "")
 
+    def test_mark_send_failed_reports_shutdown_rejection(self):
+        coordinator = ChatRuntimeCoordinator()
+
+        async def _run():
+            await coordinator.claim_send("chat-1", "send-key")
+            await coordinator.shutdown()
+            return await coordinator.mark_send_failed("chat-1", "send-key", "cancelled")
+
+        self.assertFalse(asyncio.run(_run()))
+
     def test_latest_committed_outbound_can_exclude_current_send(self):
         coordinator = ChatRuntimeCoordinator()
 

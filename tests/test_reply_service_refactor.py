@@ -571,6 +571,44 @@ class RefactoredReplyServiceTests(unittest.TestCase):
         self.assertEqual(len(coordinator.commits), 1)
         self.assertIn("failed:transport failed", coordinator.commits[0][2])
 
+    def test_send_exception_records_unconfirmed_claim_failure_during_shutdown(self):
+        from astrmai.conversation.contracts.turn_identity import TurnIdentity
+
+        state_engine = FakeStateEngine()
+        coordinator = _ClaimingRuntimeCoordinator()
+
+        async def _raise_send(*_args, **_kwargs):
+            raise RuntimeError("transport failed")
+
+        async def _mark_unconfirmed(*_args, **_kwargs):
+            return False
+
+        state_engine.gateway.context.send_message = _raise_send
+        coordinator.mark_send_failed = _mark_unconfirmed
+        engine = self.reply_mod.ReplyService(
+            state_engine=state_engine,
+            mood_manager=SimpleNamespace(),
+            runtime_coordinator=coordinator,
+        )
+        event = FakeEvent("user-1", "Alice", "question")
+        event.set_extra(
+            "astrmai_turn_identity",
+            TurnIdentity(
+                mode="group",
+                chat_id=event.unified_msg_origin,
+                thread_id=event.unified_msg_origin,
+                generation=1,
+            ),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "transport failed"):
+            asyncio.run(engine.handle_reply(event, "answer", event.unified_msg_origin))
+
+        traces = event.get_extra("astrmai_conversation_concurrency_trace", [])
+        failed = [item for item in traces if item.get("action") == "send_claim"]
+        self.assertTrue(failed)
+        self.assertEqual(failed[-1]["claim_status"], "failed_unconfirmed")
+
     def test_reply_below_segment_limit_splits_complete_sentences(self):
         service = self._service(max_len=80)
 

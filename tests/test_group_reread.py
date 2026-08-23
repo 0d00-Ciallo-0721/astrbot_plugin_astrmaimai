@@ -289,6 +289,233 @@ class GroupRereadTests(unittest.TestCase):
         self.assertTrue(second.sent)
         self.assertEqual(len(coordinator.failures), 1)
 
+    def test_observer_claim_failure_rolls_back_send_claim(self):
+        contract_mod = importlib.import_module("astrmai.conversation.contracts.reread")
+        request = contract_mod.RereadActionRequest(
+            chat_id="default:GroupMessage:group-1",
+            text="早",
+            fingerprint="observer-failure",
+            trigger_kind="group_reread_active",
+            source_event_ids=("m-observer-failure",),
+        )
+
+        class _FailingObserver:
+            async def claim_dispatch(self, _chat_id, **_kwargs):
+                raise RuntimeError("observer unavailable")
+
+        coordinator = _Coordinator()
+        dispatcher = self.dispatcher_mod.RereadActionDispatcher(
+            context=_Context(),
+            runtime_coordinator=coordinator,
+            reread_observer=_FailingObserver(),
+        )
+
+        result = asyncio.run(dispatcher.dispatch(_Event("早", sender_id="u1", message_id="m-observer-failure"), request))
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(coordinator.claims, set())
+        self.assertEqual(len(coordinator.failures), 1)
+
+    def test_failed_mark_falls_back_to_release_send_claim(self):
+        contract_mod = importlib.import_module("astrmai.conversation.contracts.reread")
+        request = contract_mod.RereadActionRequest(
+            chat_id="default:GroupMessage:group-1",
+            text="早",
+            fingerprint="mark-failure",
+            trigger_kind="group_reread_active",
+            source_event_ids=("m-mark-failure",),
+        )
+
+        class _FailingMarkCoordinator(_Coordinator):
+            def __init__(self):
+                super().__init__()
+                self.releases = []
+
+            async def mark_send_failed(self, *_args):
+                raise RuntimeError("coordinator unavailable")
+
+            async def release_send_claim(self, chat_id, send_key):
+                self.releases.append((chat_id, send_key))
+                self.claims.discard(send_key)
+
+        class _RejectingObserver:
+            async def claim_dispatch(self, _chat_id, **_kwargs):
+                return None
+
+        coordinator = _FailingMarkCoordinator()
+        dispatcher = self.dispatcher_mod.RereadActionDispatcher(
+            context=_Context(),
+            runtime_coordinator=coordinator,
+            reread_observer=_RejectingObserver(),
+        )
+
+        result = asyncio.run(dispatcher.dispatch(_Event("早", sender_id="u1", message_id="m-mark-failure"), request))
+
+        self.assertEqual(result.status, "cooldown")
+        self.assertEqual(coordinator.claims, set())
+        self.assertEqual(len(coordinator.releases), 1)
+
+    def test_missing_claim_rollback_interface_does_not_escape_dispatch(self):
+        contract_mod = importlib.import_module("astrmai.conversation.contracts.reread")
+        request = contract_mod.RereadActionRequest(
+            chat_id="default:GroupMessage:group-1",
+            text="早",
+            fingerprint="missing-rollback",
+            trigger_kind="group_reread_active",
+            source_event_ids=("m-missing-rollback",),
+        )
+
+        class _ClaimOnlyCoordinator:
+            async def claim_send(self, _chat_id, _send_key):
+                return True
+
+        class _FailingContext:
+            async def send_message(self, _origin, _chain):
+                raise RuntimeError("send failed")
+
+        dispatcher = self.dispatcher_mod.RereadActionDispatcher(
+            context=_FailingContext(),
+            runtime_coordinator=_ClaimOnlyCoordinator(),
+        )
+
+        result = asyncio.run(dispatcher.dispatch(_Event("早", sender_id="u1", message_id="m-missing-rollback"), request))
+
+        self.assertEqual(result.status, "failed")
+
+    def test_shutdown_coordinator_claim_is_released_after_stale_dispatch(self):
+        contract_mod = importlib.import_module("astrmai.conversation.contracts.reread")
+        request = contract_mod.RereadActionRequest(
+            chat_id="default:GroupMessage:group-1",
+            text="早",
+            fingerprint="shutdown-claim",
+            trigger_kind="group_reread_active",
+            source_event_ids=("m-shutdown-claim",),
+        )
+
+        class _ShutdownCoordinator:
+            def __init__(self):
+                self.claims = set()
+                self.shutdown = False
+                self.releases = []
+
+            async def claim_send(self, _chat_id, send_key):
+                self.claims.add(send_key)
+                self.shutdown = True
+                return True
+
+            async def is_current_turn(self, _turn):
+                return False
+
+            async def mark_send_failed(self, _chat_id, _send_key, _reason):
+                return False
+
+            async def get_send_claim(self, _chat_id, send_key):
+                if send_key in self.claims:
+                    return {"status": "claimed"}
+                return None
+
+            async def release_send_claim(self, *, chat_id, send_key):
+                self.releases.append((chat_id, send_key))
+                self.claims.discard(send_key)
+
+        coordinator = _ShutdownCoordinator()
+        dispatcher = self.dispatcher_mod.RereadActionDispatcher(
+            context=_Context(),
+            runtime_coordinator=coordinator,
+        )
+        event = _Event("早", sender_id="u1", message_id="m-shutdown-claim")
+        event.set_extra("astrmai_turn_identity", object())
+
+        result = asyncio.run(dispatcher.dispatch(event, request))
+
+        self.assertEqual(result.status, "stale")
+        self.assertEqual(coordinator.claims, set())
+        self.assertEqual(len(coordinator.releases), 1)
+
+    def test_release_still_claimed_is_reported_as_degraded(self):
+        contract_mod = importlib.import_module("astrmai.conversation.contracts.reread")
+        request = contract_mod.RereadActionRequest(
+            chat_id="default:GroupMessage:group-1",
+            text="早",
+            fingerprint="silent-release",
+            trigger_kind="group_reread_active",
+            source_event_ids=("m-silent-release",),
+        )
+
+        class _SilentReleaseCoordinator:
+            def __init__(self):
+                self.claims = set()
+
+            async def claim_send(self, _chat_id, send_key):
+                self.claims.add(send_key)
+                return True
+
+            async def is_current_turn(self, _turn):
+                return False
+
+            async def mark_send_failed(self, _chat_id, _send_key, _reason):
+                return False
+
+            async def get_send_claim(self, _chat_id, send_key):
+                if send_key in self.claims:
+                    return {"status": "claimed"}
+                return None
+
+            async def release_send_claim(self, _chat_id, _send_key):
+                return False
+
+        coordinator = _SilentReleaseCoordinator()
+        dispatcher = self.dispatcher_mod.RereadActionDispatcher(
+            context=_Context(),
+            runtime_coordinator=coordinator,
+        )
+        event = _Event("早", sender_id="u1", message_id="m-silent-release")
+        event.set_extra("astrmai_turn_identity", object())
+
+        result = asyncio.run(dispatcher.dispatch(event, request))
+
+        self.assertEqual(result.status, "stale")
+        self.assertEqual(dispatcher.describe_status()["claim_rollback_degraded"], 1)
+
+    def test_real_coordinator_shutdown_stale_dispatch_can_reclaim_after_reopen(self):
+        from astrmai.infrastructure.runtime.chat_runtime_coordinator import ChatRuntimeCoordinator
+
+        contract_mod = importlib.import_module("astrmai.conversation.contracts.reread")
+        request = contract_mod.RereadActionRequest(
+            chat_id="default:GroupMessage:group-1",
+            text="早",
+            fingerprint="real-shutdown",
+            trigger_kind="group_reread_active",
+            source_event_ids=("m-real-shutdown",),
+        )
+
+        class _ShutdownAfterClaimCoordinator(ChatRuntimeCoordinator):
+            async def claim_send(self, chat_id, send_key):
+                claimed = await super().claim_send(chat_id, send_key)
+                if claimed:
+                    await self.shutdown()
+                return claimed
+
+        coordinator = _ShutdownAfterClaimCoordinator()
+        dispatcher = self.dispatcher_mod.RereadActionDispatcher(
+            context=_Context(),
+            runtime_coordinator=coordinator,
+        )
+        event = _Event("早", sender_id="u1", message_id="m-real-shutdown")
+        event.set_extra("astrmai_turn_identity", object())
+
+        async def _run():
+            result = await dispatcher.dispatch(event, request)
+            send_key = dispatcher._send_key(request)
+            await coordinator.reopen()
+            reclaimable = await coordinator.claim_send(request.chat_id, send_key)
+            return result, reclaimable
+
+        result, reclaimable = asyncio.run(_run())
+
+        self.assertEqual(result.status, "stale")
+        self.assertTrue(reclaimable)
+
     def test_dispatch_lease_token_cannot_release_newer_claim(self):
         self.config.conversation.group_reread_cooldown_sec = 60
         observer = self.observer_mod.GroupRereadObserver(config=self.config)

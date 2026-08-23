@@ -33,10 +33,21 @@ class RereadActionDispatcher:
         self._pending_dispatch_shutdown = False
         self._retry_cleanup_tasks: set[asyncio.Task] = set()
         self._settlement_retry_stats = {"retry_pending": 0, "retry_exhausted": 0, "retry_rejected": 0}
+        self._claim_rollback_degraded = 0
         self._shutting_down = False
 
     def refresh_config(self, config) -> None:
         self.config = config
+
+    def _note_claim_rollback_degraded(self, chat_id: str, send_key: str, reason: str) -> None:
+        self._claim_rollback_degraded += 1
+        send_key_hash = hashlib.sha256(str(send_key or "").encode("utf-8")).hexdigest()[:16]
+        logger.warning(
+            "[RereadAction] claim_rollback_degraded chat=%s key_hash=%s reason=%s",
+            chat_id,
+            send_key_hash,
+            reason,
+        )
 
     async def _release_observer_claim(self, chat_id: str, token: str | None = None, *, strict: bool = False) -> None:
         observer = self.reread_observer
@@ -79,6 +90,74 @@ class RereadActionDispatcher:
         if supports_trigger:
             return await observer.claim_dispatch(chat_id, trigger_kind=trigger_kind)
         return await observer.claim_dispatch(chat_id)
+
+    async def _rollback_send_claim(self, chat_id: str, send_key: str, reason: str) -> None:
+        """Best-effort rollback for a claim that will not produce a message."""
+        coordinator = self.runtime_coordinator
+        if coordinator is None:
+            return
+        mark_failed = getattr(coordinator, "mark_send_failed", None)
+        if callable(mark_failed):
+            try:
+                marked = await mark_failed(chat_id, send_key, reason)
+                get_claim = getattr(coordinator, "get_send_claim", None)
+                if callable(get_claim):
+                    claim = await get_claim(chat_id, send_key)
+                    if claim is None or claim.get("status") != "claimed":
+                        return
+                elif marked is True:
+                    return
+            except BaseException:
+                logger.warning(
+                    "[RereadAction] send claim failure mark degraded chat=%s key=%s",
+                    chat_id,
+                    send_key,
+                    exc_info=True,
+                )
+        release_claim = getattr(coordinator, "release_send_claim", None)
+        if not callable(release_claim):
+            self._note_claim_rollback_degraded(chat_id, send_key, "release_interface_missing")
+            return
+        try:
+            try:
+                parameters = inspect.signature(release_claim).parameters
+            except (TypeError, ValueError):
+                parameters = {}
+            positional = [
+                item for item in parameters.values()
+                if item.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+            ]
+            if len(positional) >= 2 or any(
+                item.kind is inspect.Parameter.VAR_POSITIONAL for item in parameters.values()
+            ):
+                await release_claim(chat_id, send_key)
+            else:
+                keyword_parameters = [
+                    item for item in parameters.values()
+                    if item.kind is inspect.Parameter.KEYWORD_ONLY
+                ]
+                if len(keyword_parameters) >= 2:
+                    await release_claim(
+                        **{
+                            keyword_parameters[0].name: chat_id,
+                            keyword_parameters[1].name: send_key,
+                        }
+                    )
+                else:
+                    await release_claim(chat_id, send_key)
+            get_claim = getattr(coordinator, "get_send_claim", None)
+            if callable(get_claim):
+                claim = await get_claim(chat_id, send_key)
+                if claim is not None and claim.get("status") == "claimed":
+                    self._note_claim_rollback_degraded(chat_id, send_key, "release_still_claimed")
+        except BaseException:
+            self._note_claim_rollback_degraded(chat_id, send_key, "release_exception")
+            logger.warning(
+                "[RereadAction] send claim release degraded chat=%s key=%s",
+                chat_id,
+                send_key,
+                exc_info=True,
+            )
 
     async def _commit_observer(self, chat_id: str, token: str | None, trigger_kind: str) -> bool:
         observer = self.reread_observer
@@ -296,6 +375,7 @@ class RereadActionDispatcher:
             "retry_exhausted": self._settlement_retry_stats["retry_exhausted"],
             "retry_rejected": self._settlement_retry_stats["retry_rejected"],
             "release_exhausted": self._settlement_retry_stats.get("release_exhausted", 0),
+            "claim_rollback_degraded": self._claim_rollback_degraded,
             "pending_dispatch_shutdown": self._pending_dispatch_shutdown,
         }
 
@@ -324,24 +404,26 @@ class RereadActionDispatcher:
             return RereadDispatchResult("failed", detail="context_unavailable")
         coordinator = self.runtime_coordinator
         send_key = self._send_key(request)
-        if coordinator is not None and hasattr(coordinator, "claim_send"):
-            if not await coordinator.claim_send(request.chat_id, send_key):
-                return RereadDispatchResult("duplicate", detail="send_claim_exists")
+        claim_owned = False
         observer_token = None
-        if self.reread_observer is not None and hasattr(self.reread_observer, "claim_dispatch"):
-            observer_token = await self._claim_observer(request.chat_id, request.trigger_kind)
-            if not observer_token:
-                if hasattr(coordinator, "mark_send_failed"):
-                    await coordinator.mark_send_failed(request.chat_id, send_key, "reread_cooldown")
-                return RereadDispatchResult("cooldown", detail="group_reread_cooldown")
         send_completed = False
         outbound_ids: tuple[str, ...] = ()
         try:
+            if coordinator is not None and hasattr(coordinator, "claim_send"):
+                if not await coordinator.claim_send(request.chat_id, send_key):
+                    return RereadDispatchResult("duplicate", detail="send_claim_exists")
+                claim_owned = True
+            if self.reread_observer is not None and hasattr(self.reread_observer, "claim_dispatch"):
+                observer_token = await self._claim_observer(request.chat_id, request.trigger_kind)
+                if not observer_token:
+                    if claim_owned:
+                        await self._rollback_send_claim(request.chat_id, send_key, "reread_cooldown")
+                    return RereadDispatchResult("cooldown", detail="group_reread_cooldown")
             turn = event.get_extra("astrmai_turn_identity", None) if hasattr(event, "get_extra") else None
             if turn is not None and coordinator is not None and hasattr(coordinator, "is_current_turn"):
                 if not await coordinator.is_current_turn(turn):
-                    if hasattr(coordinator, "mark_send_failed"):
-                        await coordinator.mark_send_failed(request.chat_id, send_key, "stale_turn")
+                    if claim_owned:
+                        await self._rollback_send_claim(request.chat_id, send_key, "stale_turn")
                     await self._release_observer_claim(request.chat_id, observer_token)
                     return RereadDispatchResult("stale", detail="stale_turn")
             chain = MessageChain()
@@ -373,8 +455,8 @@ class RereadActionDispatcher:
             return RereadDispatchResult("sent", outbound_ids, detail=detail)
         except asyncio.CancelledError:
             if not send_completed:
-                if coordinator is not None and hasattr(coordinator, "mark_send_failed"):
-                    await coordinator.mark_send_failed(request.chat_id, send_key, "cancelled")
+                if claim_owned:
+                    await self._rollback_send_claim(request.chat_id, send_key, "cancelled")
                 await self._release_observer_claim(request.chat_id, observer_token)
                 raise
             settlement_ok = False
@@ -408,8 +490,8 @@ class RereadActionDispatcher:
                     request, send_key, outbound_ids, observer_token, coordinator
                 )
                 return RereadDispatchResult("sent", outbound_ids, detail="settlement_degraded")
-            if coordinator is not None and hasattr(coordinator, "mark_send_failed"):
-                await coordinator.mark_send_failed(request.chat_id, send_key, str(exc))
+            if claim_owned:
+                await self._rollback_send_claim(request.chat_id, send_key, str(exc))
             await self._release_observer_claim(request.chat_id, observer_token)
             logger.warning("[RereadAction] send failed: %s", exc)
             return RereadDispatchResult("failed", detail=str(exc))

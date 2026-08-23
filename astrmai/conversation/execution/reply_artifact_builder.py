@@ -632,8 +632,15 @@ class ReplyArtifactMixin:
             ):
                 try:
                     failure_reason = str(exc) or "send_exception"
-                    await runtime_coordinator.mark_send_failed(chat_id, send_key, failure_reason)
-                    debug_trace(event, "reply.send_failed", chat_id=chat_id, reason=failure_reason)
+                    marked = await runtime_coordinator.mark_send_failed(chat_id, send_key, failure_reason)
+                    claim_status = "failed" if marked is not False else "failed_unconfirmed"
+                    debug_trace(
+                        event,
+                        "reply.send_failed",
+                        chat_id=chat_id,
+                        reason=failure_reason,
+                        claim_status=claim_status,
+                    )
                     record_conversation_concurrency_trace(
                         event,
                         "send_claim",
@@ -641,7 +648,7 @@ class ReplyArtifactMixin:
                         chat_id=chat_id,
                         thread_id=getattr(turn, "thread_id", "") if turn is not None else "",
                         generation=getattr(turn, "generation", "") if turn is not None else "",
-                        claim_status="failed",
+                        claim_status=claim_status,
                         send_key_hash=_hash_send_key(send_key),
                     )
                 except Exception:
@@ -676,8 +683,15 @@ class ReplyArtifactMixin:
                         send_key_hash=_hash_send_key(send_key),
                     )
                 elif hasattr(runtime_coordinator, "mark_send_failed"):
-                    await runtime_coordinator.mark_send_failed(chat_id, send_key, "not_sent")
-                    debug_trace(event, "reply.send_failed", chat_id=chat_id, reason="not_sent")
+                    marked = await runtime_coordinator.mark_send_failed(chat_id, send_key, "not_sent")
+                    claim_status = "failed" if marked is not False else "failed_unconfirmed"
+                    debug_trace(
+                        event,
+                        "reply.send_failed",
+                        chat_id=chat_id,
+                        reason="not_sent",
+                        claim_status=claim_status,
+                    )
                     record_conversation_concurrency_trace(
                         event,
                         "send_claim",
@@ -685,7 +699,7 @@ class ReplyArtifactMixin:
                         chat_id=chat_id,
                         thread_id=getattr(turn, "thread_id", "") if turn is not None else "",
                         generation=getattr(turn, "generation", "") if turn is not None else "",
-                        claim_status="failed",
+                        claim_status=claim_status,
                         send_key_hash=_hash_send_key(send_key),
                     )
             except Exception:
