@@ -1,6 +1,7 @@
 const API_PREFIX = "admin";
 const ADMIN_BUILD_VERSION = "2026.07.28-r7";
 const SCHEDULER_POLL_INTERVAL_MS = 45000;
+const GATEWAY_HEALTH_POLL_INTERVAL_MS = 10000;
 const DASHBOARD_CACHE_TTL_MS = 180000;
 const DATA_CACHE_TTL_MS = 180000;
 const REVIEW_PAGE_SIZE = 25;
@@ -52,6 +53,7 @@ const state = {
   schedulerChatLoop: null,
   schedulerChatId: "",
   schedulerPollTimer: null,
+  gatewayHealthPollTimer: null,
   personaRegenerationPollTimer: null,
   lastApiErrorToastAt: 0,
   lastApiErrorKey: "",
@@ -436,6 +438,64 @@ function statusChip(text, kind = "") {
   return `<span class="chip ${kind}">${escapeHtml(text)}</span>`;
 }
 
+function gatewayHealthKind(status) {
+  if (status === "cooldown") return "danger";
+  if (status === "half_open") return "warn";
+  if (status === "healthy") return "ok";
+  return "muted";
+}
+
+function gatewayHealthLabel(status) {
+  const labels = { healthy: "healthy", cooldown: "cooldown", half_open: "half-open" };
+  return labels[status] || status || "unknown";
+}
+
+function renderGatewayHealth(modelHealth, providerHealth) {
+  const modelEntries = Object.entries(modelHealth || {}).sort(([left], [right]) => left.localeCompare(right));
+  const providerEntries = Object.entries(providerHealth || {}).sort(([left], [right]) => left.localeCompare(right));
+  const modelRows = modelEntries.map(([key, item]) => `
+    <tr>
+      <td>${escapeHtml(item.pool_name || key.split(":", 1)[0] || "-")}</td>
+      <td>${escapeHtml(item.model_id || key.split(":").slice(1).join(":") || key)}</td>
+      <td>${statusChip(gatewayHealthLabel(item.status), gatewayHealthKind(item.status))}</td>
+      <td>${escapeHtml(item.consecutive_5xx ?? 0)}</td>
+      <td>${escapeHtml(item.skipped_requests ?? 0)}</td>
+      <td>${item.cooldown_remaining_sec > 0 ? `${Number(item.cooldown_remaining_sec).toFixed(1)}s` : "—"}</td>
+      <td>${escapeHtml(item.last_error_type || "—")}</td>
+    </tr>
+  `);
+  const providerRows = providerEntries.map(([providerId, item]) => {
+    const status = Number(item.cooldown_pool_count || 0) > 0 || item.provider_cooldown?.status === "cooldown"
+      ? "cooldown"
+      : Number(item.half_open_pool_count || 0) > 0 || item.provider_cooldown?.status === "half_open" ? "half_open" : "healthy";
+    return `
+      <tr>
+        <td>${escapeHtml(providerId)}</td>
+        <td>${statusChip(gatewayHealthLabel(status), gatewayHealthKind(status))}</td>
+        <td>${escapeHtml(item.pool_count ?? 0)}</td>
+        <td>${escapeHtml(item.cooldown_pool_count ?? 0)}</td>
+        <td>${escapeHtml(item.half_open_pool_count ?? 0)}</td>
+        <td>${escapeHtml(item.consecutive_5xx ?? 0)}</td>
+        <td>${escapeHtml(item.skipped_requests ?? 0)}</td>
+      </tr>
+    `;
+  });
+  return `
+    <div class="stack">
+      ${section("Pool / Model", "健康状态按 pool_model 隔离；仅在网关实际观察到模型时出现。", table(
+        ["Pool", "Model", "状态", "连续 5xx", "跳过请求", "冷却剩余", "最近错误"],
+        modelRows,
+        "当前没有模型健康事件；已配置模型默认视为 healthy。",
+      ))}
+      ${section("Provider 聚合", "只读跨池汇总，不合并或改变各池熔断决策。", table(
+        ["Provider", "聚合状态", "池数", "Cooldown 池", "Half-open 池", "最大连续 5xx", "跳过请求"],
+        providerRows,
+        "当前没有 provider 健康事件。",
+      ))}
+    </div>
+  `;
+}
+
 function progressBar(value, label = "") {
   const width = clampPercent(value);
   return `
@@ -818,10 +878,14 @@ async function loadDashboard() {
   }
   if (state.dashboardTab === "overview") {
     stopSchedulerPolling();
-    return renderDashboardOverview();
+    stopGatewayHealthPolling();
+    const result = await renderDashboardOverview();
+    startGatewayHealthPolling();
+    return result;
   }
   if (state.dashboardTab === "heartflow") {
     stopSchedulerPolling();
+    stopGatewayHealthPolling();
     return renderDashboardHeartflow();
   }
   if (state.dashboardTab === "cognition") {
@@ -830,6 +894,7 @@ async function loadDashboard() {
     return;
   }
   stopSchedulerPolling();
+  stopGatewayHealthPolling();
   return renderDashboardTools();
 }
 
@@ -896,12 +961,13 @@ async function renderDashboardOverview() {
         </div>
         ${detailsJson("查看完整能力矩阵", { components, feature_flags: featureFlags, capabilities })}
       `)}
-      ${section("模型健康", "当前模型池与降级组件摘要。", `
+      ${section("模型健康", "运行期网关健康状态；pool_model 明细与 provider 聚合分开展示。", `
         <div class="grid compact-grid">
           ${metric("降级组件", healthData.degraded_count ?? 0)}
           ${metric("运行阶段", healthData.boot_phase || "unknown")}
         </div>
-        ${detailsJson("查看模型与健康诊断", { models, health: healthData })}
+        <div data-gateway-health>${renderGatewayHealth(runtimeStatus?.gateway_model_health, runtimeStatus?.gateway_provider_health)}</div>
+        ${detailsJson("查看完整模型与健康诊断", { models, health: healthData, gateway_model_health: runtimeStatus?.gateway_model_health || {}, gateway_provider_health: runtimeStatus?.gateway_provider_health || {} })}
       `)}
     </div>
     ${section("运行时压力与社交动作", "查看当前排队、检索、注意力、长回合和复读动作的运行快照。", `
@@ -939,6 +1005,41 @@ async function renderDashboardOverview() {
       ${detailsJson(`查看最近异常（${asItems(obs.recent_errors).length}）`, asItems(obs.recent_errors))}
     `)}
   `);
+}
+
+function shouldPollGatewayHealth() {
+  return state.current === "dashboard" && state.dashboardTab === "overview";
+}
+
+function stopGatewayHealthPolling() {
+  if (state.gatewayHealthPollTimer) {
+    clearInterval(state.gatewayHealthPollTimer);
+    state.gatewayHealthPollTimer = null;
+  }
+}
+
+function startGatewayHealthPolling() {
+  stopGatewayHealthPolling();
+  if (!shouldPollGatewayHealth()) return;
+  state.gatewayHealthPollTimer = setInterval(async () => {
+    if (!shouldPollGatewayHealth()) {
+      stopGatewayHealthPolling();
+      return;
+    }
+    const target = $("[data-gateway-health]");
+    if (!target || state._gatewayHealthPollingInFlight) return;
+    state._gatewayHealthPollingInFlight = true;
+    try {
+      const runtimeStatus = await api.get("/runtime/status");
+      if (runtimeStatus && ("gateway_model_health" in runtimeStatus || "gateway_provider_health" in runtimeStatus)) {
+        target.innerHTML = renderGatewayHealth(runtimeStatus.gateway_model_health, runtimeStatus.gateway_provider_health);
+      }
+    } catch (error) {
+      console.warn("[AstrMai-Admin] gateway health refresh degraded:", error);
+    } finally {
+      state._gatewayHealthPollingInFlight = false;
+    }
+  }, GATEWAY_HEALTH_POLL_INTERVAL_MS);
 }
 
 async function renderDashboardHeartflow() {
@@ -2679,6 +2780,7 @@ async function loadCurrent() {
   };
   if (state.current !== "dashboard") {
     stopSchedulerPolling();
+    stopGatewayHealthPolling();
   }
   if (state.current !== "personaSlices") {
     stopPersonaRegenerationPolling();

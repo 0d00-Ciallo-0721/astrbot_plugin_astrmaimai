@@ -35,6 +35,15 @@ class SessionContext:
     pending_vision_images: dict[str, dict[str, Any]] = field(default_factory=dict)
     pending_vision_mentions: dict[str, dict[str, Any]] = field(default_factory=dict)
     vision_pair_signal: asyncio.Event = field(default_factory=asyncio.Event)
+    # Worker identity is tied to the live SessionContext.  A cancelled worker
+    # must never revive a replaced/cleared chat session.
+    worker_generation: int = 0
+    worker_token: int = 0
+    worker_task: Any = None
+    closed: bool = False
+    overflow_count: int = 0
+    dropped_event_count: int = 0
+    oldest_pending_at: float = 0.0
 
 
 @dataclass

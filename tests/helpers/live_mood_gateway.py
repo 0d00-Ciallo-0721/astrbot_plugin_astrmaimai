@@ -6,40 +6,7 @@ import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
 
-
-HOST_CMD_CONFIG = Path(r"Z:\ai_robot\aibot\AstrBot-4.12.1\data\cmd_config.json")
-PLUGIN_CONFIG = Path(
-    r"Z:\ai_robot\aibot\AstrBot-4.12.1\data\config\astrmai_plugin_refactored_final_config.json"
-)
-
-
-def _load_json(path: Path) -> dict:
-    text = path.read_text(encoding="utf-8-sig")
-    return json.loads(text)
-
-
-def _load_runtime_config() -> tuple[dict, dict]:
-    return _load_json(HOST_CMD_CONFIG), _load_json(PLUGIN_CONFIG)
-
-
-def _resolve_openai_source(host_config: dict) -> tuple[str, str]:
-    provider_sources = host_config.get("provider_sources", []) or []
-    for source in provider_sources:
-        if str(source.get("provider", "")).strip().lower() == "openai":
-            api_base = str(source.get("api_base", "") or "").strip().rstrip("/")
-            keys = source.get("key", []) or []
-            api_key = str(keys[0] if keys else "").strip()
-            if api_base and api_key:
-                return api_base, api_key
-    raise RuntimeError("no usable openai provider source found in cmd_config.json")
-
-
-def _resolve_task_models(plugin_config: dict) -> list[str]:
-    provider = plugin_config.get("provider", {}) or {}
-    task_models = list(provider.get("task_models", []) or [])
-    if not task_models:
-        raise RuntimeError("astrmai task_models is empty")
-    return task_models
+from tests.helpers.live_test_config import load_live_llm_config
 
 
 class LiveMoodGateway:
@@ -99,12 +66,12 @@ class LiveMoodGateway:
 
 
 def build_live_mood_gateway():
-    host_config, plugin_config = _load_runtime_config()
-    api_base, api_key = _resolve_openai_source(host_config)
-    task_models = _resolve_task_models(plugin_config)
+    config = load_live_llm_config()
+    plugin_config = json.loads(config.plugin_config_path.read_text(encoding="utf-8-sig"))
+    task_models = list(config.task_models)
     return LiveMoodGateway(
-        api_base=api_base,
-        api_key=api_key,
+        api_base=config.api_base,
+        api_key=config.api_key,
         task_models=task_models,
         plugin_config=plugin_config,
     )

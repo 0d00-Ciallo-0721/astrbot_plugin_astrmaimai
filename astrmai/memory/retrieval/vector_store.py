@@ -121,7 +121,7 @@ class VectorRetriever:
             if stage == "embedding":
                 timeout = min(
                     timeout,
-                    max(0.1, self._timing_value("embedding_timeout_sec", 15.0)),
+                    max(0.1, self._timing_value("embedding_timeout_sec", 30.0)),
                 )
             return await asyncio.wait_for(
                 awaitable,
@@ -532,7 +532,7 @@ class VectorRetriever:
 
         embedding = await asyncio.wait_for(
             self.faiss_db.embedding_provider.get_embedding(content),
-            timeout=max(0.1, self._timing_value("embedding_timeout_sec", 15.0)),
+            timeout=max(0.1, self._timing_value("embedding_timeout_sec", 30.0)),
         )
         vector = np.asarray(embedding, dtype=np.float32)
         expected_dimension = int(

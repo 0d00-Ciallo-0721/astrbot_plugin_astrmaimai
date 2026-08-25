@@ -30,12 +30,17 @@ from tests.helpers.scheduler_webui_fixture import (
     ensure_fixture_files,
 )
 from tests.helpers.state_bar_audit import write_state_bar_audit_artifacts
+from tests.helpers.live_test_config import (
+    DEFAULT_HOST_CMD_CONFIG,
+    DEFAULT_PLUGIN_CONFIG,
+    load_live_llm_config,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_OUTPUT_DIR = ROOT / "artifacts" / "release_validation"
-HOST_CMD_CONFIG = Path(r"Z:\ai_robot\aibot\AstrBot-4.12.1\data\cmd_config.json")
-PLUGIN_CONFIG = Path(r"Z:\ai_robot\aibot\AstrBot-4.12.1\data\config\astrmai_plugin_refactored_final_config.json")
+HOST_CMD_CONFIG = DEFAULT_HOST_CMD_CONFIG
+PLUGIN_CONFIG = DEFAULT_PLUGIN_CONFIG
 
 STATIC_COMPILE_TARGETS = (
     ROOT / "main.py",
@@ -262,6 +267,8 @@ class ProviderProbeClient:
             headers={
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {self.api_key}",
+                "Accept-Encoding": "identity",
+                "User-Agent": "AstrMai-Live-Probe/1.0",
                 **(headers or {}),
             },
             method="POST",
@@ -315,7 +322,7 @@ class ProviderProbeClient:
     def vision_completion(self, model_id: str) -> dict[str, Any]:
         pixel_png = (
             "data:image/png;base64,"
-            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9P6i8AAAAASUVORK5CYII="
+            "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAAZSURBVDhPY/hPIRg1YNQAEBg1YBgY8P8/AF14/C6vXdhWAAAAAElFTkSuQmCC"
         )
         started = time.time()
         payload = {
@@ -414,35 +421,15 @@ def _categorize_text_probe(probe: dict[str, Any]) -> str:
 
 
 def load_live_provider_context() -> dict[str, Any]:
-    host_config = _load_json(HOST_CMD_CONFIG)
-    plugin_config = _load_json(PLUGIN_CONFIG)
-    provider_sources = host_config.get("provider_sources", []) or []
-    openai_source = next(
-        (
-            source
-            for source in provider_sources
-            if str(source.get("provider", "")).strip().lower() == "openai" and source.get("enable", True)
-        ),
-        None,
-    )
-    if not openai_source:
-        raise RuntimeError("no enabled openai provider source found in AstrBot cmd_config.json")
-    api_base = str(openai_source.get("api_base", "") or "").strip().rstrip("/")
-    keys = list(openai_source.get("key", []) or [])
-    api_key = str(keys[0] if keys else "").strip()
-    if not api_base or not api_key:
-        raise RuntimeError("openai provider source is missing api_base or key")
-    model_entries = {
-        str(item.get("id", "")).strip(): dict(item)
-        for item in host_config.get("provider", []) or []
-        if str(item.get("provider_source_id", "")).strip() == "openai" and item.get("enable", True)
-    }
+    config = load_live_llm_config()
+    host_config = _load_json(config.host_config_path)
+    plugin_config = _load_json(config.plugin_config_path)
     return {
         "host_config": host_config,
         "plugin_config": plugin_config,
-        "api_base": api_base,
-        "api_key": api_key,
-        "model_entries": model_entries,
+        "api_base": config.api_base,
+        "api_key": config.api_key,
+        "model_entries": config.model_entries,
     }
 
 

@@ -138,6 +138,15 @@
         "default": 300.0,
         "description": "人格初始化反复失败时的最长等待秒数",
         "hint": "重试间隔会逐步增加，但不会超过这个数值，避免持续请求故障模型。"
+      },
+      "startup_timeout_sec": {
+        "title": "人格启动最长等待时间",
+        "type": "float",
+        "default": 900.0,
+        "minimum": 0,
+        "maximum": 86400,
+        "description": "人格核心初始化的整体最长等待时间",
+        "hint": "超时后继续保持未接收消息状态，并等待下一次重载恢复；填 0 表示不设置整体上限。"
       }
     }
   },
@@ -761,6 +770,12 @@
         "type": "int",
         "default": 20,
         "hint": "用于保留最近一段群聊窗口，帮助机器人判断当前该接哪条消息。"
+      },
+      "accumulation_pool_max_events": {
+        "description": "每群注意力积累池硬上限",
+        "type": "int",
+        "default": 100,
+        "hint": "模型处理较慢时限制单群积压，超出后按消息优先级丢弃并记录诊断。"
       },
       "focus_thread_enabled": {
         "description": "启用主线程识别",
@@ -1944,7 +1959,7 @@
       "embedding_timeout_sec": {
         "description": "向量生成超时（秒）",
         "type": "float",
-        "default": 15.0,
+        "default": 30.0,
         "minimum": 1,
         "maximum": 600,
         "hint": "向量模型单次生成向量的等待时间，仅影响向量检索。"
@@ -2354,6 +2369,24 @@
         "type": "int",
         "default": 1800,
         "hint": "某个模型出现配额、账单周期或权限失败后，后续请求会暂时跳过它；不会永久修改模型配置。"
+      },
+      "server_error_model_cooldown_sec": {
+        "description": "模型连续服务端错误后的运行期冷却时间（秒）",
+        "type": "int",
+        "default": 300,
+        "hint": "同一模型在短时间内连续返回服务端错误后暂时跳过，冷却结束只允许一次探测请求。"
+      },
+      "server_error_failure_threshold": {
+        "description": "进入服务端错误冷却前的连续失败次数",
+        "type": "int",
+        "default": 2,
+        "hint": "建议保持为 2，避免一次瞬态提供商错误就把模型标记为不健康。"
+      },
+      "server_error_window_sec": {
+        "description": "统计连续服务端错误的时间窗口（秒）",
+        "type": "int",
+        "default": 60,
+        "hint": "超过该时间窗口的服务端错误不会继续累加为连续故障。"
       }
     }
   }

@@ -104,13 +104,18 @@ class GatewayTaskMixin:
                     last_error = exc.error_message
                     last_kind = exc.last_failure_kind
                     last_model_id = exc.model_id or model_id
-                    self._open_model_cooldown("vision", model_id, f"{exc.error_message} {exc.raw_completion}")
+                    self._open_model_cooldown(
+                        "vision",
+                        model_id,
+                        f"{exc.error_message} {exc.raw_completion}",
+                        error=exc,
+                    )
                     logger.warning(f"[Gateway] vision model {model_id} failed, trying next: {exc.error_message}")
                 except Exception as exc:
                     last_error = str(exc)
                     last_kind = self._classify_failure_kind(last_error).value
                     last_model_id = model_id
-                    self._open_model_cooldown("vision", model_id, last_error)
+                    self._open_model_cooldown("vision", model_id, last_error, error=exc)
                     logger.warning(f"[Gateway] vision model {model_id} failed, trying next: {exc}")
             raise LLMCascadeFailureException(
                 f"vision model pool exhausted: {last_error}; skipped_cooldown_models={skipped_cooldown_models}; cooldown_overridden={cooldown_overridden}",
@@ -181,13 +186,18 @@ class GatewayTaskMixin:
                 last_error = exc.error_message
                 last_kind = exc.last_failure_kind
                 last_model_id = exc.model_id or model_id
-                self._open_model_cooldown("vision", model_id, f"{exc.error_message} {exc.raw_completion}")
+                self._open_model_cooldown(
+                    "vision",
+                    model_id,
+                    f"{exc.error_message} {exc.raw_completion}",
+                    error=exc,
+                )
                 logger.warning(f"[Gateway] vision model {model_id} failed, trying next: {exc.error_message}")
             except Exception as exc:
                 last_error = str(exc)
                 last_kind = self._classify_failure_kind(last_error).value
                 last_model_id = model_id
-                self._open_model_cooldown("vision", model_id, last_error)
+                self._open_model_cooldown("vision", model_id, last_error, error=exc)
                 logger.warning(f"[Gateway] vision model {model_id} failed, trying next: {exc}")
         raise LLMCascadeFailureException(
             f"vision model pool exhausted: {last_error}; skipped_cooldown_models={skipped_cooldown_models}; cooldown_overridden={cooldown_overridden}",

@@ -27,6 +27,16 @@ _GATEWAY_SLOT_OWNERS: ContextVar[frozenset[tuple[int, int]]] = ContextVar(
 
 
 class GatewayCallMixin:
+    @staticmethod
+    def _mark_turn_budget_exhausted(event: Any, *, provider_request_started: bool, provider_request_count: int) -> None:
+        if event is None or not hasattr(event, "set_extra"):
+            return
+        event.set_extra("astrmai_execution_status", "turn_budget_exhausted")
+        event.set_extra("astrmai_turn_budget_exhausted", True)
+        event.set_extra("astrmai_provider_request_started", provider_request_started)
+        event.set_extra("astrmai_provider_request_count", provider_request_count)
+        event.set_extra("astrmai_cascade_not_started", not provider_request_started)
+
     @asynccontextmanager
     async def _model_cascade_scope(self):
         """Keep cascade structure without retaining a provider concurrency slot."""
@@ -456,12 +466,17 @@ class GatewayCallMixin:
             )
             backoff_factor = self._backoff_factor()
             attempted_models: List[str] = []
+            cascade_budget_exhausted = False
+            provider_request_started = False
+            provider_request_count = 0
             last_result = self._build_failure_result(
                 error_kind=FailureKind.UNKNOWN,
                 error_message="model queue not started",
             )
 
             for model_id in attempt_queue:
+                if cascade_budget_exhausted:
+                    break
                 attempted_models.append(model_id)
                 report_pool = pool_name if model_id in primary_models else "fallback"
                 for attempt in range(max_retries + 1):
@@ -469,11 +484,16 @@ class GatewayCallMixin:
                     raw_completion_text = ""
                     try:
                         effective_timeout = clamp_timeout_to_turn_budget(
-                            None,
+                            event,
                             timeout_limit,
                             reserve_for_reply=reserve_for_reply,
                         )
                         if effective_timeout <= 0.0:
+                            self._mark_turn_budget_exhausted(
+                                event,
+                                provider_request_started=provider_request_started,
+                                provider_request_count=provider_request_count,
+                            )
                             raise asyncio.TimeoutError("turn_deadline_exhausted")
                         llm_kwargs = self._build_request_kwargs(
                             model_id=model_id,
@@ -495,6 +515,11 @@ class GatewayCallMixin:
                                 model_id=model_id,
                                 attempt=attempt,
                             ):
+                                provider_request_started = True
+                                provider_request_count += 1
+                                if event is not None and hasattr(event, "set_extra"):
+                                    event.set_extra("astrmai_provider_request_started", True)
+                                    event.set_extra("astrmai_provider_request_count", provider_request_count)
                                 response = await asyncio.wait_for(
                                     self.context.llm_generate(
                                         chat_provider_id=model_id,
@@ -540,6 +565,8 @@ class GatewayCallMixin:
                             model_id=model_id,
                             raw_completion="",
                         )
+                        if last_result.error_kind == FailureKind.TURN_BUDGET_EXHAUSTED:
+                            cascade_budget_exhausted = True
                         is_fatal = False  # ponytail: asyncio timeout → retry, not fatal
                         record_llm_attempt(
                             None,
@@ -556,11 +583,16 @@ class GatewayCallMixin:
                         if attempt < max_retries:
                             backoff = (backoff_factor + retry_penalty) ** attempt
                             remaining = clamp_timeout_to_turn_budget(
-                                None,
+                                event,
                                 backoff,
                                 reserve_for_reply=reserve_for_reply,
                             )
                             if remaining <= 0.0:
+                                self._mark_turn_budget_exhausted(
+                                    event,
+                                    provider_request_started=provider_request_started,
+                                    provider_request_count=provider_request_count,
+                                )
                                 break
                             await self._wait_retry_backoff(
                                 remaining,
@@ -579,6 +611,8 @@ class GatewayCallMixin:
                             raw_completion="",
                         )
                         is_fatal = self._is_fatal_failure(last_error, error=exc)
+                        if last_result.error_kind == FailureKind.TURN_BUDGET_EXHAUSTED:
+                            cascade_budget_exhausted = True
                         record_llm_attempt(
                             None,
                             ledger_call_id,
@@ -590,9 +624,9 @@ class GatewayCallMixin:
                             retry_index=attempt,
                         )
                         self.router.report_failure(report_pool, model_id, is_fatal=is_fatal)
-                        self._open_model_cooldown(report_pool, model_id, last_error)
-                        if is_fatal:
-                            logger.exception(f"[Gateway] fatal model failure {model_id}")
+                        cooldown_meta = self._open_model_cooldown(report_pool, model_id, last_error, error=exc)
+                        if is_fatal or cooldown_meta.get("status") == "cooldown":
+                            logger.warning(f"[Gateway] model {model_id} retry stopped: {last_error}")
                             break
                         logger.warning(
                             f"[Gateway] model {model_id} failed ({attempt + 1}/{max_retries + 1}): {last_error}"
@@ -600,11 +634,16 @@ class GatewayCallMixin:
                         if attempt < max_retries:
                             backoff = (backoff_factor + retry_penalty) ** attempt
                             remaining = clamp_timeout_to_turn_budget(
-                                None,
+                                event,
                                 backoff,
                                 reserve_for_reply=reserve_for_reply,
                             )
                             if remaining <= 0.0:
+                                self._mark_turn_budget_exhausted(
+                                    event,
+                                    provider_request_started=provider_request_started,
+                                    provider_request_count=provider_request_count,
+                                )
                                 break
                             await self._wait_retry_backoff(
                                 remaining,
@@ -613,6 +652,10 @@ class GatewayCallMixin:
                                 model_id=model_id,
                                 attempt=attempt,
                             )
+
+                        if cascade_budget_exhausted:
+                            break
+
                         continue
 
                     raw_completion_text = ""  # ponytail: init before try to avoid NameError in nested except
@@ -643,6 +686,7 @@ class GatewayCallMixin:
                                 if not is_valid:
                                     raise ValueError(validation_error or "invalid_result")
                             self.router.report_success(report_pool, model_id)
+                            self._record_model_success(report_pool, model_id)
                             economy_payload = await self._record_success_artifacts(
                                 report_pool=report_pool,
                                 model_id=model_id,
@@ -691,6 +735,7 @@ class GatewayCallMixin:
                             raise ValueError(failure_kind)
 
                         self.router.report_success(report_pool, model_id)
+                        self._record_model_success(report_pool, model_id)
                         economy_payload = await self._record_success_artifacts(
                             report_pool=report_pool,
                             model_id=model_id,
@@ -747,9 +792,14 @@ class GatewayCallMixin:
                             retry_index=attempt,
                         )
                         self.router.report_failure(report_pool, model_id, is_fatal=is_fatal)
-                        self._open_model_cooldown(report_pool, model_id, f"{last_error} {raw_completion_text}")
-                        if is_fatal:
-                            logger.exception(f"[Gateway] fatal model failure {model_id}")
+                        cooldown_meta = self._open_model_cooldown(
+                            report_pool,
+                            model_id,
+                            f"{last_error} {raw_completion_text}",
+                            error=exc,
+                        )
+                        if is_fatal or cooldown_meta.get("status") == "cooldown":
+                            logger.warning(f"[Gateway] model {model_id} retry stopped: {last_error}")
                             break
                         logger.warning(
                             f"[Gateway] model {model_id} failed ({attempt + 1}/{max_retries + 1}): {last_error}"

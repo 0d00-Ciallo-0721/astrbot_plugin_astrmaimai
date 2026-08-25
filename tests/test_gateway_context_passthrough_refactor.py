@@ -2,10 +2,13 @@ import asyncio
 import importlib
 import sys
 import tempfile
+import time
 import unittest
+from time import monotonic
 from types import SimpleNamespace
 
 from tests.helpers.astrbot_stubs import install_astrbot_stubs
+from astrmai.infrastructure.runtime.turn_call_ledger import configure_turn_budget, turn_telemetry_scope
 
 
 class _FakeConversation:
@@ -1175,6 +1178,418 @@ class GatewayContextPassthroughRefactorTests(unittest.TestCase):
 
         self.assertTrue(gateway._is_model_cooldown("dialog", "code2/model-b"))
         self.assertFalse(gateway._is_model_cooldown("dialog", "code3/model-b"))
+
+    def test_server_error_cooldown_requires_threshold_and_filters_model(self):
+        fake_context = _FakeContext()
+        config = SimpleNamespace(
+            infra=SimpleNamespace(
+                max_concurrent_llm_calls=2,
+                llm_retries=0,
+                backoff_factor=1.5,
+                api_timeout=10,
+                rate_limit_model_cooldown_sec=120,
+                quota_model_cooldown_sec=1800,
+                server_error_model_cooldown_sec=300,
+                server_error_failure_threshold=2,
+                server_error_window_sec=60,
+            ),
+            provider=SimpleNamespace(fallback_models=[]),
+        )
+        gateway = self.gateway_mod.GlobalModelGateway(fake_context, config)
+
+        self.assertEqual(gateway._classify_cooldown_reason("HTTP 500"), "server_error")
+        gateway._open_model_cooldown("task", "model-a", "HTTP 500")
+        self.assertFalse(gateway._is_model_cooldown("task", "model-a"))
+        gateway._open_model_cooldown("task", "model-a", "HTTP 503")
+
+        queue, skipped, _ = gateway._filter_cooldown_attempt_queue(
+            "task", ["model-a", "model-b"], ["model-a", "model-b"], allow_override=False
+        )
+        self.assertEqual(queue, ["model-b"])
+        self.assertEqual(skipped[0]["cooldown_reason"], "server_error")
+
+        queue, skipped, overridden = gateway._filter_cooldown_attempt_queue(
+            "task", ["model-a"], ["model-a"]
+        )
+        self.assertEqual(queue, [])
+        self.assertFalse(overridden)
+
+    def test_server_error_statuses_are_retryable_but_auth_and_not_found_are_fatal(self):
+        gateway = self.gateway_mod.GlobalModelGateway(
+            _FakeContext(),
+            SimpleNamespace(
+                infra=SimpleNamespace(max_concurrent_llm_calls=2, llm_retries=0, backoff_factor=1.5, api_timeout=10),
+                provider=SimpleNamespace(fallback_models=[]),
+            ),
+        )
+        for status in ("500", "502", "503", "504"):
+            self.assertFalse(gateway._is_fatal_failure(f"HTTP {status}"), status)
+        self.assertTrue(gateway._is_fatal_failure("HTTP 403"))
+        self.assertTrue(gateway._is_fatal_failure("404 model not found"))
+
+    def test_structured_http_401_is_fatal_and_not_server_cooldown(self):
+        gateway = self.gateway_mod.GlobalModelGateway(
+            _FakeContext(),
+            SimpleNamespace(
+                infra=SimpleNamespace(max_concurrent_llm_calls=2, llm_retries=2, backoff_factor=1.5, api_timeout=10),
+                provider=SimpleNamespace(fallback_models=[]),
+            ),
+        )
+        error = SimpleNamespace(status_code=401)
+        self.assertTrue(gateway._is_fatal_failure("provider rejected request", error=error))
+        self.assertEqual(gateway._classify_cooldown_reason("provider rejected request", error=error), "provider_permission_denied")
+        self.assertEqual(
+            gateway._classify_cooldown_reason("upstream unavailable", error=SimpleNamespace(status_code=503)),
+            "server_error",
+        )
+        self.assertNotEqual(gateway._classify_cooldown_reason("model output mentions 500 users", error=SimpleNamespace(status_code=401)), "server_error")
+
+    def test_gateway_structured_401_does_not_retry_same_model(self):
+        class _HttpError(RuntimeError):
+            status_code = 401
+
+        class _AuthFailureContext(_FakeContext):
+            async def llm_generate(self, **kwargs):
+                self.calls.append(kwargs)
+                raise _HttpError("provider rejected request")
+
+        context = _AuthFailureContext()
+        gateway = self.gateway_mod.GlobalModelGateway(
+            context,
+            SimpleNamespace(
+                infra=SimpleNamespace(max_concurrent_llm_calls=2, llm_retries=2, backoff_factor=1.5, api_timeout=10),
+                provider=SimpleNamespace(fallback_models=[]),
+            ),
+        )
+
+        async def _run():
+            with self.assertRaises(Exception):
+                await gateway._elastic_call_result(
+                    pool_name="task",
+                    prompt="auth",
+                    system_prompt="",
+                    models=["primary-model"],
+                    use_fallback=False,
+                )
+
+        asyncio.run(_run())
+        self.assertEqual(len(context.calls), 1)
+
+    def test_gateway_stops_current_model_retries_at_5xx_threshold(self):
+        class _HttpError(RuntimeError):
+            status_code = 503
+
+        class _ServerFailureContext(_FakeContext):
+            async def llm_generate(self, **kwargs):
+                self.calls.append(kwargs)
+                raise _HttpError("provider temporarily unavailable")
+
+        context = _ServerFailureContext()
+        gateway = self.gateway_mod.GlobalModelGateway(
+            context,
+            SimpleNamespace(
+                infra=SimpleNamespace(
+                    max_concurrent_llm_calls=2,
+                    llm_retries=2,
+                    backoff_factor=1.0,
+                    api_timeout=10,
+                    server_error_model_cooldown_sec=300,
+                    server_error_failure_threshold=2,
+                    server_error_window_sec=60,
+                ),
+                provider=SimpleNamespace(fallback_models=[]),
+            ),
+        )
+
+        async def _run():
+            with self.assertRaises(Exception):
+                await gateway._elastic_call_result(
+                    pool_name="task",
+                    prompt="server error",
+                    system_prompt="",
+                    models=["primary-model"],
+                    use_fallback=False,
+                )
+
+        asyncio.run(_run())
+        self.assertEqual(len(context.calls), 2)
+        self.assertEqual(gateway._model_health[("task", "primary-model")]["status"], "cooldown")
+
+    def test_server_error_cooldown_allows_one_half_open_probe_and_recovers(self):
+        fake_context = _FakeContext()
+        config = SimpleNamespace(
+            infra=SimpleNamespace(
+                max_concurrent_llm_calls=2,
+                llm_retries=0,
+                backoff_factor=1.5,
+                api_timeout=10,
+                server_error_model_cooldown_sec=300,
+                server_error_failure_threshold=2,
+                server_error_window_sec=60,
+            ),
+            provider=SimpleNamespace(fallback_models=[]),
+        )
+        gateway = self.gateway_mod.GlobalModelGateway(fake_context, config)
+        gateway._open_model_cooldown("task", "model-a", "HTTP 500")
+        gateway._open_model_cooldown("task", "model-a", "HTTP 500")
+        health = gateway._model_health[("task", "model-a")]
+        health["cooldown_until"] = monotonic() - 1
+
+        queue, skipped, _ = gateway._filter_cooldown_attempt_queue(
+            "task", ["model-a"], ["model-a"], allow_override=False
+        )
+        self.assertEqual(queue, ["model-a"])
+        self.assertEqual(skipped, [])
+        self.assertTrue(health["half_open_probe"])
+
+        gateway._record_model_success("task", "model-a")
+        self.assertEqual(health["status"], "healthy")
+        self.assertEqual(health["consecutive_5xx"], 0)
+
+    def test_model_health_snapshot_exposes_cooldown_and_skip_diagnostics(self):
+        gateway = self.gateway_mod.GlobalModelGateway(
+            _FakeContext(),
+            SimpleNamespace(
+                infra=SimpleNamespace(
+                    max_concurrent_llm_calls=2,
+                    llm_retries=0,
+                    backoff_factor=1.5,
+                    api_timeout=10,
+                    server_error_model_cooldown_sec=300,
+                    server_error_failure_threshold=1,
+                    server_error_window_sec=60,
+                ),
+                provider=SimpleNamespace(fallback_models=[]),
+            ),
+        )
+        gateway._open_model_cooldown("task", "model-a", "HTTP 503")
+        gateway._filter_cooldown_attempt_queue("task", ["model-a"], ["model-a"], allow_override=False)
+        item = gateway.describe_model_health()["task:model-a"]
+        self.assertEqual(item["status"], "cooldown")
+        self.assertEqual(item["last_error_type"], "server_error")
+        self.assertEqual(item["health_scope"], "pool_model")
+        self.assertEqual(item["skipped_requests"], 1)
+        self.assertGreater(item["cooldown_remaining_sec"], 0.0)
+
+    def test_model_health_snapshot_is_side_effect_free_and_includes_model_cooldowns(self):
+        gateway = self.gateway_mod.GlobalModelGateway(
+            _FakeContext(),
+            SimpleNamespace(
+                infra=SimpleNamespace(
+                    max_concurrent_llm_calls=2,
+                    llm_retries=0,
+                    backoff_factor=1.5,
+                    api_timeout=10,
+                    rate_limit_model_cooldown_sec=120,
+                    quota_model_cooldown_sec=1800,
+                ),
+                provider=SimpleNamespace(fallback_models=[]),
+            ),
+        )
+        gateway._open_model_cooldown("task", "provider/model-a", "Error code: 429 rate limit")
+        cooldown_before = {key: dict(value) for key, value in gateway._model_cooldowns.items()}
+
+        snapshot = gateway.describe_model_health()
+
+        self.assertEqual(gateway._model_cooldowns, cooldown_before)
+        item = snapshot["task:provider/model-a"]
+        self.assertEqual(item["status"], "cooldown")
+        self.assertEqual(item["cooldown_source"], "model_cooldown")
+        self.assertTrue(item["read_only"])
+
+    def test_expired_health_snapshot_reports_half_open_without_mutating_live_state(self):
+        gateway = self.gateway_mod.GlobalModelGateway(
+            _FakeContext(),
+            SimpleNamespace(
+                infra=SimpleNamespace(
+                    max_concurrent_llm_calls=2,
+                    llm_retries=0,
+                    backoff_factor=1.5,
+                    api_timeout=10,
+                    server_error_model_cooldown_sec=300,
+                    server_error_failure_threshold=1,
+                    server_error_window_sec=60,
+                ),
+                provider=SimpleNamespace(fallback_models=[]),
+            ),
+        )
+        gateway._open_model_cooldown("task", "model-a", "HTTP 503")
+        health_before = dict(gateway._model_health[("task", "model-a")])
+        gateway._model_health[("task", "model-a")]["cooldown_until"] = monotonic() - 1
+
+        snapshot = gateway.describe_model_health()
+
+        self.assertEqual(snapshot["task:model-a"]["status"], "half_open")
+        self.assertTrue(snapshot["task:model-a"]["pending_transition"])
+        self.assertEqual(gateway._model_health[("task", "model-a")]["status"], health_before["status"])
+        self.assertFalse(gateway._model_health[("task", "model-a")].get("pending_transition", False))
+
+    def test_expired_model_and_provider_cooldowns_report_pending_transition(self):
+        gateway = self.gateway_mod.GlobalModelGateway(
+            _FakeContext(),
+            SimpleNamespace(
+                infra=SimpleNamespace(
+                    max_concurrent_llm_calls=2,
+                    llm_retries=0,
+                    backoff_factor=1.5,
+                    api_timeout=10,
+                    rate_limit_model_cooldown_sec=120,
+                    quota_model_cooldown_sec=1800,
+                ),
+                provider=SimpleNamespace(fallback_models=[]),
+            ),
+        )
+        gateway._open_model_cooldown("task", "provider/model-a", "Error code: 429 rate limit")
+        for cooldown in gateway._model_cooldowns.values():
+            cooldown["until"] = monotonic() - 1
+
+        model = gateway.describe_model_health()["task:provider/model-a"]
+        provider = gateway.describe_provider_health()["provider"]["provider_cooldown"]
+
+        self.assertEqual(model["status"], "half_open")
+        self.assertTrue(model["pending_transition"])
+        self.assertEqual(provider["status"], "half_open")
+        self.assertTrue(provider["pending_transition"])
+
+    def test_provider_health_aggregates_pools_without_merging_circuits(self):
+        gateway = self.gateway_mod.GlobalModelGateway(
+            _FakeContext(),
+            SimpleNamespace(
+                infra=SimpleNamespace(
+                    max_concurrent_llm_calls=2,
+                    llm_retries=0,
+                    backoff_factor=1.5,
+                    api_timeout=10,
+                    server_error_model_cooldown_sec=300,
+                    server_error_failure_threshold=1,
+                    server_error_window_sec=60,
+                ),
+                provider=SimpleNamespace(fallback_models=[]),
+            ),
+        )
+        gateway._open_model_cooldown("task", "provider/model-a", "HTTP 503")
+        gateway._open_model_cooldown("vision", "provider/model-a", "HTTP 503")
+        aggregate = gateway.describe_provider_health()["provider"]
+        self.assertEqual(aggregate["health_scope"], "provider_aggregate")
+        self.assertTrue(aggregate["read_only"])
+        self.assertEqual(set(aggregate["pools"]), {"task", "vision"})
+        self.assertEqual(aggregate["cooldown_pool_count"], 2)
+        self.assertTrue(gateway._is_model_cooldown("task", "provider/model-a"))
+        self.assertTrue(gateway._is_model_cooldown("vision", "provider/model-a"))
+
+    def test_plugin_facade_runtime_diagnostics_includes_gateway_health(self):
+        facade_mod = importlib.import_module("astrmai.app.plugin_facade")
+        gateway = self.gateway_mod.GlobalModelGateway(
+            _FakeContext(),
+            SimpleNamespace(
+                infra=SimpleNamespace(
+                    max_concurrent_llm_calls=2,
+                    llm_retries=0,
+                    backoff_factor=1.5,
+                    api_timeout=10,
+                    server_error_model_cooldown_sec=300,
+                    server_error_failure_threshold=1,
+                    server_error_window_sec=60,
+                ),
+                provider=SimpleNamespace(
+                    task_models=["model-a"],
+                    agent_models=[],
+                    embedding_models=[],
+                    fallback_models=[],
+                ),
+            ),
+        )
+        gateway._open_model_cooldown("task", "model-a", "HTTP 503")
+        runtime = SimpleNamespace(
+            gateway=gateway,
+            config=gateway.config,
+            build_diagnostics=lambda: {"status": {"lifecycle_started": True}},
+        )
+        facade = object.__new__(facade_mod.PluginFacade)
+        facade.runtime = runtime
+        facade.get_capability_overview_sync = lambda: {}
+
+        diagnostics = facade.get_runtime_diagnostics()
+
+        self.assertIn("task:model-a", diagnostics["gateway_model_health"])
+        self.assertEqual(diagnostics["gateway_model_health"]["task:model-a"]["status"], "cooldown")
+        self.assertIn("gateway_provider_health", diagnostics)
+
+    def test_turn_budget_exhaustion_skips_provider_and_fallback(self):
+        fake_context = _FakeContext()
+        config = SimpleNamespace(
+            infra=SimpleNamespace(
+                max_concurrent_llm_calls=2,
+                llm_retries=2,
+                backoff_factor=1.5,
+                api_timeout=45,
+            ),
+            provider=SimpleNamespace(fallback_models=["fallback-model"]),
+        )
+        gateway = self.gateway_mod.GlobalModelGateway(fake_context, config)
+        event = _TraceEvent()
+        event.set_extra("astrmai_turn_created_at", time.time() - 60.0)
+
+        async def _run():
+            with turn_telemetry_scope(event):
+                configure_turn_budget(event, total_budget_sec=30.0, main_reply_reserve_sec=0.0)
+                event.get_extra("astrmai_turn_telemetry").deadline_monotonic = time.monotonic() - 1.0
+                with self.assertRaises(Exception):
+                    await gateway._elastic_call_result(
+                        pool_name="task",
+                        prompt="budget",
+                        system_prompt="",
+                        models=["primary-model"],
+                        use_fallback=True,
+                        event=event,
+                    )
+
+        asyncio.run(_run())
+        self.assertEqual(fake_context.calls, [])
+        self.assertTrue(event.get_extra("astrmai_turn_budget_exhausted"))
+        self.assertTrue(event.get_extra("astrmai_cascade_not_started"))
+
+    def test_turn_budget_after_first_provider_request_is_not_cascade_not_started(self):
+        event = _TraceEvent()
+
+        class _FailThenBudgetContext(_FakeContext):
+            async def llm_generate(self, **kwargs):
+                self.calls.append(kwargs)
+                if len(self.calls) == 1:
+                    event.get_extra("astrmai_turn_telemetry").deadline_monotonic = time.monotonic() - 1.0
+                    raise RuntimeError("temporary provider failure")
+                return _FakeResponse("unexpected")
+
+        fake_context = _FailThenBudgetContext()
+        config = SimpleNamespace(
+            infra=SimpleNamespace(
+                max_concurrent_llm_calls=2,
+                llm_retries=1,
+                backoff_factor=1.5,
+                api_timeout=10,
+            ),
+            provider=SimpleNamespace(fallback_models=["fallback-model"]),
+        )
+        gateway = self.gateway_mod.GlobalModelGateway(fake_context, config)
+
+        async def _run():
+            with turn_telemetry_scope(event):
+                configure_turn_budget(event, total_budget_sec=30.0, main_reply_reserve_sec=0.0)
+                with self.assertRaises(Exception):
+                    await gateway._elastic_call_result(
+                        pool_name="task",
+                        prompt="budget",
+                        system_prompt="",
+                        models=["primary-model"],
+                        use_fallback=True,
+                        event=event,
+                    )
+
+        asyncio.run(_run())
+        self.assertEqual(len(fake_context.calls), 1)
+        self.assertTrue(event.get_extra("astrmai_provider_request_started"))
+        self.assertEqual(event.get_extra("astrmai_provider_request_count"), 1)
+        self.assertFalse(event.get_extra("astrmai_cascade_not_started"))
 
     def test_get_agent_models_filters_runtime_cooldown_for_executor_entrypoint(self):
         fake_context = _FakeContext()

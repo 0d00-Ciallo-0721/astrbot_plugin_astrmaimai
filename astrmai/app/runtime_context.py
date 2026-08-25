@@ -87,6 +87,8 @@ class RuntimeStatus:
     persona_persisted: bool = False
     persona_self_lore_ready: bool = False
     persona_last_error: str = ""
+    startup_blocked_reason: str = ""
+    startup_retry_at: float = 0.0
     foreign_commands_loaded: bool = False
     proactive_started: bool = False
     visual_started: bool = False
@@ -125,6 +127,8 @@ class RuntimeStatus:
             "persona_persisted": self.persona_persisted,
             "persona_self_lore_ready": self.persona_self_lore_ready,
             "persona_last_error": self.persona_last_error,
+            "startup_blocked_reason": self.startup_blocked_reason,
+            "startup_retry_at": self.startup_retry_at,
             "foreign_commands_loaded": self.foreign_commands_loaded,
             "proactive_started": self.proactive_started,
             "visual_started": self.visual_started,
@@ -447,6 +451,15 @@ class PluginRuntimeContext:
             else lambda: {"available": False},
             {"available": False},
         )
+        attention_gate_status = safe_component(
+            "attention_gate",
+            self.attention_gate.describe_status
+            if self.attention_gate is not None and hasattr(self.attention_gate, "describe_status")
+            else lambda: {"available": False},
+            {"available": False},
+        )
+        if isinstance(attention_gate_status, dict):
+            attention_status = {**attention_status, **attention_gate_status}
         proactive_status = safe_component(
             "proactive",
             self.proactive_task.describe_status

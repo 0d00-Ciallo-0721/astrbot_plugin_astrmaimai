@@ -185,6 +185,148 @@ class PluginLifecycleShutdownRegressionTests(unittest.TestCase):
 
         asyncio.run(_run())
 
+    def test_persona_startup_timeout_marks_not_ready_without_opening_ingress(self):
+        async def _run():
+            from astrmai.app.lifecycle import PluginLifecycleManager
+            from astrmai.app.runtime_context import RuntimeStatus
+
+            status = RuntimeStatus()
+
+            class _Summarizer:
+                REQUIRED_SHARDS = ()
+                pending_tasks = {}
+
+                @staticmethod
+                def _cache_key(persona_id, _session_id):
+                    return persona_id
+
+                async def ensure_core_ready(self, *_args, **_kwargs):
+                    raise RuntimeError("provider unavailable")
+
+            runtime = SimpleNamespace(
+                background_tasks=set(),
+                lifecycle=SimpleNamespace(manager=None),
+                status=status,
+                config=SimpleNamespace(
+                    persona=SimpleNamespace(
+                        retry_interval_sec=0.005,
+                        retry_max_interval_sec=0.005,
+                        startup_timeout_sec=0.02,
+                    )
+                ),
+                context_engine=SimpleNamespace(resolve_active_persona=lambda: ("persona", "raw prompt")),
+                persona_summarizer=_Summarizer(),
+                set_boot_phase=status.set_phase,
+                mark_degraded=status.mark_degraded,
+            )
+            manager = PluginLifecycleManager(runtime)
+            manager._persona_retry_bounds = lambda: (0.005, 0.005)
+
+            ready = await manager._initialize_persona_core_until_ready()
+            return ready, status
+
+        ready, status = asyncio.run(_run())
+        self.assertFalse(ready)
+        self.assertFalse(status.accepting_events)
+        self.assertEqual(status.persona_state, "core_failed")
+        self.assertEqual(status.startup_blocked_reason, "persona_startup_timeout")
+        self.assertEqual(status.boot_phase, "lifecycle.persona_timeout")
+
+    def test_persona_single_hanging_call_is_hard_timed_out(self):
+        async def _run():
+            from astrmai.app.lifecycle import PluginLifecycleManager
+            from astrmai.app.runtime_context import RuntimeStatus
+
+            status = RuntimeStatus()
+            cancelled = []
+
+            class _Summarizer:
+                REQUIRED_SHARDS = ()
+                pending_tasks = {}
+
+                @staticmethod
+                def _cache_key(persona_id, _session_id):
+                    return persona_id
+
+                async def ensure_core_ready(self, *_args, **_kwargs):
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        cancelled.append(True)
+                        raise
+
+            runtime = SimpleNamespace(
+                background_tasks=set(),
+                lifecycle=SimpleNamespace(manager=None),
+                status=status,
+                config=SimpleNamespace(
+                    persona=SimpleNamespace(
+                        retry_interval_sec=0.01,
+                        retry_max_interval_sec=0.01,
+                        startup_timeout_sec=0.02,
+                    )
+                ),
+                context_engine=SimpleNamespace(resolve_active_persona=lambda: ("persona", "raw prompt")),
+                persona_summarizer=_Summarizer(),
+                set_boot_phase=status.set_phase,
+                mark_degraded=status.mark_degraded,
+            )
+            manager = PluginLifecycleManager(runtime)
+            manager._persona_retry_bounds = lambda: (0.01, 0.01)
+            started = asyncio.get_running_loop().time()
+            ready = await manager._initialize_persona_core_until_ready()
+            elapsed = asyncio.get_running_loop().time() - started
+            return ready, elapsed, cancelled, status
+
+        ready, elapsed, cancelled, status = asyncio.run(_run())
+        self.assertFalse(ready)
+        self.assertLess(elapsed, 0.2)
+        self.assertTrue(cancelled)
+        self.assertEqual(status.startup_blocked_reason, "persona_startup_timeout")
+        self.assertFalse(status.accepting_events)
+
+    def test_persona_retry_stops_when_shutdown_is_requested(self):
+        async def _run():
+            from astrmai.app.lifecycle import PluginLifecycleManager
+            from astrmai.app.runtime_context import RuntimeStatus
+
+            attempts = []
+            status = RuntimeStatus()
+
+            class _Summarizer:
+                REQUIRED_SHARDS = ()
+                pending_tasks = {}
+
+                @staticmethod
+                def _cache_key(persona_id, _session_id):
+                    return persona_id
+
+                async def ensure_core_ready(self, *_args, **_kwargs):
+                    attempts.append(True)
+                    raise RuntimeError("provider unavailable")
+
+            runtime = SimpleNamespace(
+                background_tasks=set(),
+                lifecycle=SimpleNamespace(manager=None),
+                status=status,
+                config=SimpleNamespace(persona=SimpleNamespace(retry_interval_sec=0.01, retry_max_interval_sec=0.01, startup_timeout_sec=0)),
+                context_engine=SimpleNamespace(resolve_active_persona=lambda: ("persona", "raw prompt")),
+                persona_summarizer=_Summarizer(),
+                set_boot_phase=status.set_phase,
+                mark_degraded=status.mark_degraded,
+            )
+            manager = PluginLifecycleManager(runtime)
+            manager._persona_retry_bounds = lambda: (0.01, 0.01)
+            task = asyncio.create_task(manager._initialize_persona_core_until_ready())
+            await asyncio.sleep(0.015)
+            manager._shutdown_requested = True
+            result = await asyncio.wait_for(task, timeout=0.2)
+            return result, len(attempts)
+
+        result, attempts = asyncio.run(_run())
+        self.assertFalse(result)
+        self.assertEqual(attempts, 1)
+
     def test_budget_drain_starts_after_producers_stop_and_before_memory_close(self):
         async def _run():
             from astrmai.app.lifecycle import PluginLifecycleManager

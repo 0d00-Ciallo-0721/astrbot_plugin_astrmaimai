@@ -48,6 +48,7 @@ class FailureKind(str, Enum):
     BAD_PAYLOAD = "bad_payload"
     JSON_DECODE_ERROR = "json_decode_error"
     TIMEOUT = "timeout"
+    TURN_BUDGET_EXHAUSTED = "turn_budget_exhausted"
     CASCADE_FAILURE = "cascade_failure"
     UNKNOWN = "unknown"
 

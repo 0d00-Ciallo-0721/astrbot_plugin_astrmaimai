@@ -15,10 +15,10 @@ class EmbeddingClient:
         self.embedding_models = embedding_models or []
         timing = getattr(config, "timing", None)
         try:
-            configured_timeout = getattr(timing, "embedding_timeout_sec", 15.0) or 15.0
+            configured_timeout = getattr(timing, "embedding_timeout_sec", 30.0) or 30.0
             self._timeout_sec = max(0.1, float(configured_timeout))
         except (TypeError, ValueError):
-            self._timeout_sec = 15.0
+            self._timeout_sec = 30.0
         # 🟢 引入独立的轮询指针状态
         self._cursor = 0
 

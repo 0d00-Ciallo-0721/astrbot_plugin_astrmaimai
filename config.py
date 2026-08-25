@@ -106,6 +106,12 @@ class PersonaConfig(BaseModel):
     component_max_retries: int = Field(default=3, ge=1, le=10, description="每个人格生成步骤单轮最多重试次数")
     retry_interval_sec: float = Field(default=15.0, ge=1.0, description="人格初始化失败后的首次重试间隔")
     retry_max_interval_sec: float = Field(default=300.0, ge=1.0, description="人格初始化连续失败时的最大重试间隔")
+    startup_timeout_sec: float = Field(
+        default=900.0,
+        ge=0.0,
+        le=86400.0,
+        description="人格核心初始化的整体最长等待时间；0 表示仅按重试策略运行",
+    )
 
 
 class AgentConfig(BaseModel):
@@ -135,6 +141,12 @@ class AttentionConfig(BaseModel):
     # 已随 schema 一并删除——UI 不再展示无效承诺
     judge_timeout: float = Field(default=20.0, ge=0.1, description="System1 Judge attention gate timeout in seconds")
     bg_pool_size: int = Field(default=20, ge=1)
+    accumulation_pool_max_events: int = Field(
+        default=100,
+        ge=1,
+        le=10000,
+        description="每个群聊注意力积累池的硬上限，超出后按优先级丢弃消息并记录诊断",
+    )
     focus_thread_enabled: bool = Field(default=True, description="启用 Focus Thread 算法，在窗口内选择主线程作为本轮回复目标")
     focus_thread_core_max_messages: int = Field(default=4, description="Focus Thread 核心消息的最大条数")
     focus_thread_related_max_messages: int = Field(default=3, description="Focus Thread 相关补充消息的最大条数")
@@ -571,6 +583,9 @@ class InfraConfig(BaseModel):
     )
     rate_limit_model_cooldown_sec: int = Field(default=120, ge=0, description="模型触发 429/rate limit 后的运行期冷却时间（秒）")
     quota_model_cooldown_sec: int = Field(default=1800, ge=0, description="模型触发 403/配额/权限失败后的运行期冷却时间（秒）")
+    server_error_model_cooldown_sec: int = Field(default=300, ge=0, description="模型连续 5xx 失败后的运行期冷却时间（秒）")
+    server_error_failure_threshold: int = Field(default=2, ge=1, le=10, description="进入 5xx 模型冷却前的连续失败次数")
+    server_error_window_sec: int = Field(default=60, ge=1, le=3600, description="统计连续 5xx 失败的时间窗口（秒）")
 
 
 class VisionConfig(BaseModel):
@@ -751,7 +766,7 @@ class TimingConfig(BaseModel):
     memory_rerank_timeout_sec: float = Field(default=20.0, ge=0.5, le=60.0)
     memory_compress_timeout_sec: float = Field(default=20.0, ge=0.5, le=60.0)
     compaction_timeout_sec: float = Field(default=60.0, ge=1.0, le=1200.0)
-    embedding_timeout_sec: float = Field(default=15.0, ge=1.0, le=600.0)
+    embedding_timeout_sec: float = Field(default=30.0, ge=1.0, le=600.0)
     faiss_timeout_sec: float = Field(default=20.0, ge=0.5, le=60.0)
     faiss_bootstrap_timeout_sec: float = Field(default=1800.0, ge=30.0, le=7200.0)
     faiss_query_concurrency: int = Field(default=2, ge=1, le=8, description="向量检索同时执行的最大查询数")

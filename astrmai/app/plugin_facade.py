@@ -545,6 +545,11 @@ class PluginFacade(RuntimeFacadeProtocol):
             "embedding_pool": list(getattr(self.runtime.config.provider, "embedding_models", []) or []),
             "fallback_pool": list(getattr(self.runtime.config.provider, "fallback_models", []) or []),
         }
+        gateway = getattr(self.runtime, "gateway", None)
+        if gateway is not None and hasattr(gateway, "describe_model_health"):
+            diagnostics["gateway_model_health"] = gateway.describe_model_health()
+        if gateway is not None and hasattr(gateway, "describe_provider_health"):
+            diagnostics["gateway_provider_health"] = gateway.describe_provider_health()
         diagnostics["capabilities"] = self.get_capability_overview_sync()
         return diagnostics
 

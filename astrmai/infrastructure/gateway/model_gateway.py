@@ -1,4 +1,5 @@
 import asyncio
+from time import monotonic
 from typing import Any, List, Optional
 
 from astrbot.api import logger
@@ -34,6 +35,7 @@ class GlobalModelGateway(
         self.benchmark_sample_store = None
         self.lane_manager: Optional[LaneManager] = None
         self._model_cooldowns: dict[tuple[str, str], dict[str, Any]] = {}
+        self._model_health: dict[tuple[str, str], dict[str, Any]] = {}
         self._last_agent_model_selection: dict[str, Any] = {}
         self._global_semaphore = asyncio.Semaphore(max(1, int(self.settings.max_concurrent_llm_calls)))
         self._background_semaphore = self._build_background_semaphore()
@@ -90,6 +92,158 @@ class GlobalModelGateway(
 
     def get_context_economy_stats(self) -> dict:
         return self.context_economy.snapshot_metrics()
+
+    def _diagnostic_health_records(self, now: float) -> dict[tuple[str, str], dict[str, Any]]:
+        """Build health records without advancing or pruning gateway state."""
+        records: dict[tuple[str, str], dict[str, Any]] = {
+            key: dict(meta)
+            for key, meta in getattr(self, "_model_health", {}).items()
+        }
+        for (pool_name, model_id), cooldown in getattr(self, "_model_cooldowns", {}).items():
+            if pool_name == "__provider__":
+                continue
+            key = (str(pool_name), str(model_id))
+            item = records.setdefault(
+                key,
+                {
+                    "provider_id": self._provider_id(model_id),
+                    "consecutive_5xx": 0,
+                    "last_5xx_at": 0.0,
+                    "status": "healthy",
+                    "half_open_probe": False,
+                    "last_error_type": "",
+                    "skipped_requests": 0,
+                },
+            )
+            until = float(cooldown.get("until", 0.0) or 0.0)
+            current_until = float(item.get("cooldown_until", 0.0) or 0.0)
+            if until >= current_until:
+                item.update(
+                    {
+                        "status": "cooldown" if until > now else "half_open",
+                        "cooldown_until": until,
+                        "cooldown_reason": cooldown.get("reason", ""),
+                        "duration_sec": cooldown.get("duration_sec", 0),
+                        "last_error_type": item.get("last_error_type") or cooldown.get("reason", ""),
+                    }
+                )
+                if until and until <= now:
+                    item["pending_transition"] = True
+            item["cooldown_source"] = "model_cooldown" if not item.get("cooldown_source") else "mixed"
+        for (pool_name, model_id), item in records.items():
+            cooldown_until = float(item.get("cooldown_until", 0.0) or 0.0)
+            if item.get("status") in {"cooldown", "half_open"} and cooldown_until and cooldown_until <= now:
+                item["status"] = "half_open"
+                item["half_open_probe"] = False
+                item["pending_transition"] = True
+            item.setdefault("provider_id", self._provider_id(model_id))
+            item["pool_name"] = pool_name
+            item["model_id"] = model_id
+        return records
+
+    def describe_model_health(self) -> dict[str, dict[str, Any]]:
+        """Return a side-effect-free snapshot of all observed model cooldowns."""
+        now = monotonic()
+        snapshot: dict[str, dict[str, Any]] = {}
+        for (pool_name, model_id), meta in self._diagnostic_health_records(now).items():
+            item = dict(meta)
+            item["health_scope"] = "pool_model"
+            item["read_only"] = True
+            item["cooldown_remaining_sec"] = max(
+                0.0,
+                float(item.get("cooldown_until", 0.0) or 0.0) - now,
+            )
+            snapshot[f"{pool_name}:{model_id}"] = item
+        return snapshot
+
+    def describe_provider_health(self) -> dict[str, dict[str, Any]]:
+        """Aggregate pool-local health without changing pool-local circuit decisions."""
+        now = monotonic()
+        aggregate: dict[str, dict[str, Any]] = {}
+        for (pool_name, model_id), meta in self._diagnostic_health_records(now).items():
+            provider_id = str(meta.get("provider_id") or self._provider_id(model_id) or model_id)
+            item = aggregate.setdefault(
+                provider_id,
+                {
+                    "health_scope": "provider_aggregate",
+                    "read_only": True,
+                    "provider_id": provider_id,
+                    "pools": {},
+                    "pool_count": 0,
+                    "model_count": 0,
+                    "cooldown_pool_count": 0,
+                    "half_open_pool_count": 0,
+                    "consecutive_5xx": 0,
+                    "skipped_requests": 0,
+                    "provider_cooldown": None,
+                },
+            )
+            state = dict(meta)
+            state["pool_name"] = pool_name
+            pool_state = item["pools"].setdefault(
+                pool_name,
+                {"status": "healthy", "model_count": 0, "models": {}},
+            )
+            pool_state["models"][model_id] = state
+            pool_state["model_count"] = len(pool_state["models"])
+            item["model_count"] += 1
+            statuses = [str(model.get("status", "healthy")) for model in pool_state["models"].values()]
+            pool_state["status"] = "cooldown" if "cooldown" in statuses else "half_open" if "half_open" in statuses else "healthy"
+            pool_state["consecutive_5xx"] = max(
+                int(model.get("consecutive_5xx", 0) or 0) for model in pool_state["models"].values()
+            )
+            pool_state["skipped_requests"] = sum(
+                int(model.get("skipped_requests", 0) or 0) for model in pool_state["models"].values()
+            )
+            pool_state["provider_id"] = provider_id
+            pool_state["pool_name"] = pool_name
+            pool_state["cooldown_until"] = max(
+                float(model.get("cooldown_until", 0.0) or 0.0) for model in pool_state["models"].values()
+            )
+            pool_state["last_error_type"] = state.get("last_error_type", "")
+            item["pool_count"] = len(item["pools"])
+            item["cooldown_pool_count"] = sum(
+                1 for pool_state in item["pools"].values() if pool_state.get("status") == "cooldown"
+            )
+            item["half_open_pool_count"] = sum(
+                1 for pool_state in item["pools"].values() if pool_state.get("status") == "half_open"
+            )
+            item["consecutive_5xx"] = max(
+                int(pool_state.get("consecutive_5xx", 0) or 0) for pool_state in item["pools"].values()
+            )
+            item["skipped_requests"] = sum(
+                int(pool_state.get("skipped_requests", 0) or 0) for pool_state in item["pools"].values()
+            )
+        for (scope, provider_id), cooldown in getattr(self, "_model_cooldowns", {}).items():
+            if scope != "__provider__":
+                continue
+            provider_id = str(provider_id or "")
+            if not provider_id:
+                continue
+            item = aggregate.setdefault(
+                provider_id,
+                {
+                    "health_scope": "provider_aggregate",
+                    "read_only": True,
+                    "provider_id": provider_id,
+                    "pools": {},
+                    "pool_count": 0,
+                    "model_count": 0,
+                    "cooldown_pool_count": 0,
+                    "half_open_pool_count": 0,
+                    "consecutive_5xx": 0,
+                    "skipped_requests": 0,
+                    "provider_cooldown": None,
+                },
+            )
+            until = float(cooldown.get("until", 0.0) or 0.0)
+            provider_state = dict(cooldown)
+            provider_state["status"] = "cooldown" if until > now else "half_open"
+            provider_state["cooldown_remaining_sec"] = max(0.0, until - now)
+            provider_state["pending_transition"] = bool(until and until <= now)
+            provider_state["read_only"] = True
+            item["provider_cooldown"] = provider_state
+        return aggregate
 
     def _fallback_models(self) -> List[str]:
         return list(self.settings.fallback_models)

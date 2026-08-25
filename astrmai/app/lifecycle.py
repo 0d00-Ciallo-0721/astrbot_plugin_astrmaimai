@@ -93,7 +93,13 @@ class PluginLifecycleManager:
         self.runtime.status.is_running = False
         self.runtime.status.lifecycle_started = False
         self.runtime.status.persona_state = "pending"
+        self.runtime.status.startup_blocked_reason = ""
+        self.runtime.status.startup_retry_at = 0.0
         self.runtime.set_boot_phase("lifecycle.starting")
+        attention_gate = getattr(self.runtime, "attention_gate", None)
+        reset_attention = getattr(attention_gate, "reset_runtime_state", None)
+        if callable(reset_attention):
+            reset_attention()
         self._startup_task = self.track_task(self._complete_startup())
 
     async def _prepare_reinitialize(self) -> bool:
@@ -181,6 +187,13 @@ class PluginLifecycleManager:
         maximum = max(initial, float(getattr(persona_config, "retry_max_interval_sec", 300.0) or 300.0))
         return initial, maximum
 
+    def _persona_startup_timeout(self) -> float:
+        persona_config = getattr(self.runtime.config, "persona", None)
+        try:
+            return max(0.0, float(getattr(persona_config, "startup_timeout_sec", 900.0) or 0.0))
+        except (TypeError, ValueError):
+            return 900.0
+
     async def _restore_dialogue_snapshot(self) -> None:
         # G4/PL-09: 重载后恢复群对话热/温区（TTL 与 schema 版本双重约束在 store 内部）
         store = getattr(self.runtime, "dialogue_store", None)
@@ -210,8 +223,8 @@ class PluginLifecycleManager:
             return
         logger.info("[AstrMai] boot phase: memory initialization completed")
 
-        await self._initialize_persona_core_until_ready()
-        if self._shutdown_requested:
+        persona_ready = await self._initialize_persona_core_until_ready()
+        if self._shutdown_requested or not persona_ready:
             return
         logger.info("[AstrMai] boot phase: persona core ready and persisted")
 
@@ -237,7 +250,7 @@ class PluginLifecycleManager:
         self.runtime.set_boot_phase("runtime.running")
         logger.info("[AstrMai] boot complete — runtime running")
 
-    async def _initialize_persona_core_until_ready(self) -> None:
+    async def _initialize_persona_core_until_ready(self) -> bool:
         summarizer = getattr(self.runtime, "persona_summarizer", None)
         context_engine = getattr(self.runtime, "context_engine", None)
         if summarizer is None or context_engine is None:
@@ -246,19 +259,36 @@ class PluginLifecycleManager:
         cache_key = summarizer._cache_key(persona_id, "global")
         self.runtime.status.persona_cache_key = cache_key
         initial_delay, max_delay = self._persona_retry_bounds()
+        startup_timeout = self._persona_startup_timeout()
+        startup_started = time.monotonic()
         delay = initial_delay
         while not self._shutdown_requested:
+            if startup_timeout > 0 and time.monotonic() - startup_started >= startup_timeout:
+                self.runtime.status.persona_state = "core_failed"
+                self.runtime.status.persona_persisted = False
+                self.runtime.status.startup_blocked_reason = "persona_startup_timeout"
+                self.runtime.status.startup_retry_at = 0.0
+                self.runtime.set_boot_phase("lifecycle.persona_timeout")
+                self.runtime.mark_degraded("persona.core", "startup_timeout")
+                return False
             self.runtime.status.persona_state = "core_initializing"
             self.runtime.status.persona_last_error = ""
             self.runtime.set_boot_phase("lifecycle.persona_core")
             try:
-                payload = await summarizer.ensure_core_ready(
+                ensure_core_ready = summarizer.ensure_core_ready(
                     raw_prompt,
                     persona_id=persona_id,
                     session_id="global",
                 )
+                if startup_timeout > 0:
+                    remaining = max(0.001, startup_timeout - (time.monotonic() - startup_started))
+                    payload = await asyncio.wait_for(ensure_core_ready, timeout=remaining)
+                else:
+                    payload = await ensure_core_ready
                 self.runtime.status.persona_state = "core_ready"
                 self.runtime.status.persona_persisted = True
+                self.runtime.status.startup_blocked_reason = ""
+                self.runtime.status.startup_retry_at = 0.0
                 self.runtime.status.persona_self_lore_ready = bool(payload.get("self_lore_ready", False))
                 shards = payload.get("shard_status", {})
                 self.runtime.status.persona_completed_shards = sum(
@@ -271,19 +301,32 @@ class PluginLifecycleManager:
                     self.track_task(self._monitor_persona_enrichment(cache_key, enrichment_task))
                 elif payload.get("is_full_ready", False):
                     self.runtime.status.persona_state = "full_ready"
-                return
+                return True
             except asyncio.CancelledError:
                 raise
+            except asyncio.TimeoutError:
+                self.runtime.status.persona_state = "core_failed"
+                self.runtime.status.persona_persisted = False
+                self.runtime.status.persona_last_error = "persona startup timed out"
+                self.runtime.status.startup_blocked_reason = "persona_startup_timeout"
+                self.runtime.status.startup_retry_at = 0.0
+                self.runtime.set_boot_phase("lifecycle.persona_timeout")
+                self.runtime.mark_degraded("persona.core", "startup_timeout")
+                return False
             except Exception as exc:
                 self.runtime.status.persona_state = "core_failed"
                 self.runtime.status.persona_persisted = False
                 self.runtime.status.persona_last_error = str(exc)
+                self.runtime.status.startup_blocked_reason = "persona_core_unavailable"
+                self.runtime.status.startup_retry_at = time.time() + delay
+                self.runtime.set_boot_phase("lifecycle.persona_timeout")
                 self.runtime.mark_degraded("persona.core", str(exc))
                 logger.warning(
                     f"[AstrMai] persona core initialization failed; retrying in {delay:.1f}s: {exc}"
                 )
                 await asyncio.sleep(delay)
                 delay = min(max_delay, delay * 2)
+        return False
 
     async def _monitor_persona_enrichment(self, cache_key: str, task: asyncio.Task[Any]) -> None:
         self.runtime.status.persona_state = "enriching"
@@ -453,6 +496,10 @@ class PluginLifecycleManager:
         self._shutdown_requested = True
         self.runtime.status.accepting_events = False
         self.runtime.status.is_running = False
+        attention_gate = getattr(self.runtime, "attention_gate", None)
+        request_attention_shutdown = getattr(attention_gate, "request_shutdown", None)
+        if callable(request_attention_shutdown):
+            request_attention_shutdown()
         self.runtime.status.shutdown_generation = int(
             getattr(self.runtime.status, "shutdown_generation", 0) or 0
         ) + 1
@@ -752,6 +799,14 @@ class PluginLifecycleManager:
             except Exception as exc:
                 logger.warning(f"[AstrMai] background budget drain admission degraded: {exc}")
 
+        attention_gate = getattr(self.runtime, "attention_gate", None)
+        shutdown_attention = getattr(attention_gate, "shutdown_workers", None)
+        if callable(shutdown_attention):
+            try:
+                await shutdown_attention()
+            except Exception as exc:
+                logger.warning(f"[AstrMai] Attention worker shutdown degraded: {exc}")
+
         reread_dispatcher = getattr(self.runtime, "reread_action_dispatcher", None)
         shutdown_reread = getattr(reread_dispatcher, "shutdown", None)
         if callable(shutdown_reread):
@@ -968,6 +1023,8 @@ class PluginLifecycleManager:
         self.runtime.status.persona_persisted = False
         self.runtime.status.persona_self_lore_ready = False
         self.runtime.status.persona_last_error = ""
+        self.runtime.status.startup_blocked_reason = ""
+        self.runtime.status.startup_retry_at = 0.0
         self.runtime.status.proactive_started = False
         self.runtime.status.visual_started = False
         self.runtime.status.cron_guard_started = False

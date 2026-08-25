@@ -10,3 +10,5 @@ backup_before_v2_*/
 .reasonix/
 .tmp_entry_fix/
 .tmp_smoke/
+tests/manual/llm_live.secrets.json
+tests/manual/*secrets*.local.json

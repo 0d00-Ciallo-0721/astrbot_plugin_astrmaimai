@@ -269,6 +269,49 @@ class GatewayVisionRefactorTests(unittest.TestCase):
         self.assertIn("vision-a", str(caught.exception))
         self.assertEqual([call["chat_provider_id"] for call in context.calls], ["vision-b"])
 
+    def test_call_vision_task_propagates_structured_http_status_to_cooldown(self):
+        class _Http503(RuntimeError):
+            status_code = 503
+
+        class _FailingVisionContext(_VisionContext):
+            async def llm_generate(self, **kwargs):
+                self.calls.append(kwargs)
+                raise _Http503("upstream unavailable")
+
+        context = _FailingVisionContext([])
+        gateway = self.gateway_mod.GlobalModelGateway(
+            context,
+            SimpleNamespace(
+                infra=SimpleNamespace(
+                    max_concurrent_llm_calls=2,
+                    llm_retries=0,
+                    backoff_factor=1.5,
+                    api_timeout=10,
+                    server_error_model_cooldown_sec=300,
+                    server_error_failure_threshold=1,
+                    server_error_window_sec=60,
+                ),
+                provider=SimpleNamespace(
+                    fallback_models=[],
+                    task_models=[],
+                    agent_models=[],
+                    vision_models=["vision-a"],
+                ),
+            ),
+        )
+
+        with self.assertRaises(Exception):
+            asyncio.run(
+                gateway.call_vision_task(
+                    image_data="image.png",
+                    prompt="Analyze",
+                    system_prompt="Return JSON",
+                )
+            )
+
+        self.assertEqual(len(context.calls), 1)
+        self.assertEqual(gateway._model_health[("vision", "vision-a")]["status"], "cooldown")
+
     def test_judge_and_mood_tasks_use_task_pool_and_workload_families(self):
         task_mod = importlib.import_module("astrmai.infrastructure.gateway.gateway_tasks")
         context_mod = importlib.import_module("astrmai.infrastructure.context_economy")

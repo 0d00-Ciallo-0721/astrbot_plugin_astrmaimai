@@ -1328,7 +1328,12 @@ class GatewayLaneMixin:
                     retry_index=attempt,
                 )
                 self.router.report_failure(report_pool, model_id, is_fatal=is_fatal)
-                cooldown_meta = self._open_model_cooldown(report_pool, model_id, f"{last_error} {last_raw_completion}")
+                cooldown_meta = self._open_model_cooldown(
+                    report_pool,
+                    model_id,
+                    f"{last_error} {last_raw_completion}",
+                    error=exc,
+                )
                 append_trace_stage(
                     event,
                     "gateway_tool_call_failure",

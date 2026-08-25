@@ -23,6 +23,9 @@ class GatewaySettings:
     semaphore_wait_timeout_sec: float = 30.0
     rate_limit_model_cooldown_sec: int = 120
     quota_model_cooldown_sec: int = 1800
+    server_error_model_cooldown_sec: int = 300
+    server_error_failure_threshold: int = 2
+    server_error_window_sec: int = 60
     debug_mode: bool = False
     task_models: tuple[str, ...] = ()
     agent_models: tuple[str, ...] = ()
@@ -101,6 +104,9 @@ def build_infrastructure_settings(config: Any) -> InfrastructureSettings:
             ),
             rate_limit_model_cooldown_sec=int(_num(getattr(infra, "rate_limit_model_cooldown_sec", None), 120)),
             quota_model_cooldown_sec=int(_num(getattr(infra, "quota_model_cooldown_sec", None), 1800)),
+            server_error_model_cooldown_sec=int(_num(getattr(infra, "server_error_model_cooldown_sec", None), 300)),
+            server_error_failure_threshold=_min_int(getattr(infra, "server_error_failure_threshold", None), 2, 1),
+            server_error_window_sec=_min_int(getattr(infra, "server_error_window_sec", None), 60, 1),
             debug_mode=bool(getattr(global_settings, "debug_mode", False)),
             task_models=_tupleize(getattr(provider, "task_models", ())),
             agent_models=_tupleize(getattr(provider, "agent_models", ())),

@@ -1190,6 +1190,322 @@ class RefactoredAttentionGateTests(unittest.TestCase):
         self.assertNotIn("group-1", self.gate.focus_pools)
         self.assertNotIn("group-1", self.gate.decision_router._participation_states)
 
+    def test_accumulation_pool_has_hard_limit_and_preserves_direct_wakeup(self):
+        self.gate.config.attention.accumulation_pool_max_events = 2
+        session = self.gate_mod.SessionContext()
+        self.gate.focus_pools["group-1"] = session
+        ordinary_one = _FakeEvent("u1", "Alice", "ordinary-1")
+        ordinary_two = _FakeEvent("u1", "Alice", "ordinary-2")
+        priority = _FakeEvent("u1", "Alice", "reply-now", extras={"astrmai_reply_wakeup": True})
+
+        self.gate._append_accumulation_event(session, ordinary_one)
+        self.gate._append_accumulation_event(session, ordinary_two)
+        accepted = self.gate._append_accumulation_event(session, priority)
+
+        self.assertTrue(accepted)
+        self.assertEqual(len(session.accumulation_pool), 2)
+        self.assertIn(priority, session.accumulation_pool)
+        self.assertEqual(session.overflow_count, 1)
+        self.assertEqual(session.dropped_event_count, 1)
+        self.assertTrue(ordinary_one.get_extra("astrmai_attention_accumulation_dropped", False))
+        status = self.gate.describe_status()
+        self.assertEqual(status["pool_length"], 2)
+        self.assertEqual(status["pool_limit"], 2)
+        self.assertEqual(status["dropped_event_count"], 1)
+
+    def test_cancelled_worker_resets_state_but_does_not_revive_cleared_session(self):
+        async def _run():
+            session = self.gate_mod.SessionContext()
+            session.is_evaluating = True
+            session.accumulation_pool = [_FakeEvent("u1", "Alice", "pending")]
+            self.gate.focus_pools["group-1"] = session
+
+            async def pending_worker():
+                await asyncio.Event().wait()
+
+            task = asyncio.create_task(pending_worker())
+            task._worker_context = SimpleNamespace(
+                chat_id="group-1",
+                session=session,
+                self_id="bot-1",
+                generation=session.worker_generation,
+                token=1,
+            )
+            session.worker_task = task
+            session.worker_token = 1
+            self.gate._session_tasks.add(task)
+            task.add_done_callback(self.gate._handle_session_worker_result)
+            await asyncio.sleep(0)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await asyncio.sleep(0.01)
+            recovery = list(self.gate._background_tasks)
+            if recovery:
+                await asyncio.gather(*recovery, return_exceptions=True)
+            replacement = self.gate_mod.SessionContext()
+            self.gate.focus_pools["group-1"] = replacement
+            session.closed = True
+            session.worker_generation += 1
+            await self.gate._cancel_session_workers("group-1", session=session)
+            return session, replacement
+
+        session, replacement = asyncio.run(_run())
+        self.assertFalse(replacement.is_evaluating)
+        self.assertFalse(session.worker_task)
+
+    def test_shutdown_workers_blocks_recovery_until_runtime_reset(self):
+        async def _run():
+            session = self.gate_mod.SessionContext()
+            session.is_evaluating = True
+            session.accumulation_pool = [_FakeEvent("u1", "Alice", "pending")]
+            self.gate.focus_pools["group-1"] = session
+
+            async def pending_worker():
+                await asyncio.Event().wait()
+
+            task = asyncio.create_task(pending_worker())
+            task._worker_context = SimpleNamespace(
+                chat_id="group-1",
+                session=session,
+                self_id="bot-1",
+                generation=session.worker_generation,
+                token=1,
+            )
+            session.worker_task = task
+            self.gate._session_tasks.add(task)
+            task.add_done_callback(self.gate._handle_session_worker_result)
+            await asyncio.sleep(0)
+            cancelled = await self.gate.shutdown_workers()
+            return cancelled, session, self.gate.describe_status()
+
+        cancelled, session, status = asyncio.run(_run())
+        self.assertEqual(cancelled, 1)
+        self.assertTrue(status["workers_shutdown"])
+        self.assertFalse(session.is_evaluating)
+        self.assertEqual(session.accumulation_pool, [])
+
+    def test_inflight_event_is_rejected_after_shutdown_wins_race(self):
+        async def _run():
+            async def shutdown_during_preprocessing(event):
+                await self.gate.shutdown_workers()
+
+            self.gate._append_dialogue_segment = shutdown_during_preprocessing
+            event = _FakeEvent("u1", "Alice", "late event")
+            result = await self.gate.process_event(event)
+            session = self.gate.focus_pools.get(event.unified_msg_origin)
+            return result, session, event
+
+        result, session, event = asyncio.run(_run())
+        self.assertEqual(result, "DROPPED_SHUTDOWN")
+        self.assertTrue(event.get_extra("astrmai_attention_dropped_during_shutdown", False))
+        self.assertTrue(session is None or not session.accumulation_pool)
+
+    def test_stale_worker_callback_cannot_modify_replacement_worker(self):
+        async def _run():
+            session = self.gate_mod.SessionContext()
+            self.gate.focus_pools["group-1"] = session
+
+            async def completed_worker():
+                return None
+
+            old_task = asyncio.create_task(completed_worker())
+            new_task = asyncio.create_task(asyncio.Event().wait())
+            await asyncio.sleep(0)
+            old_task._worker_context = SimpleNamespace(
+                chat_id="group-1",
+                session=session,
+                self_id="bot-1",
+                generation=0,
+                token=1,
+            )
+            session.worker_generation = 1
+            session.worker_token = 2
+            session.worker_task = new_task
+            session.is_evaluating = True
+            self.gate._session_tasks.add(old_task)
+            self.gate._handle_session_worker_result(old_task)
+            await asyncio.sleep(0)
+            new_task.cancel()
+            await asyncio.gather(new_task, return_exceptions=True)
+            return session
+
+        session = asyncio.run(_run())
+        self.assertTrue(session.is_evaluating)
+        self.assertEqual(session.worker_generation, 1)
+        self.assertEqual(session.worker_token, 2)
+        self.assertGreaterEqual(self.gate.describe_status()["worker_invariant_violation"], 1)
+
+    def test_delayed_recovery_cannot_reclaim_new_worker_token(self):
+        async def _run():
+            session = self.gate_mod.SessionContext()
+            self.gate.focus_pools["group-1"] = session
+            session.worker_generation = 3
+            session.worker_token = 8
+            session.is_evaluating = True
+            session.accumulation_pool = [_FakeEvent("u1", "Alice", "pending")]
+            replacement_task = asyncio.create_task(asyncio.Event().wait())
+            session.worker_task = replacement_task
+            context = SimpleNamespace(
+                chat_id="group-1",
+                session=session,
+                self_id="bot-1",
+                generation=3,
+                token=7,
+            )
+            await self.gate._recover_failed_session_worker(context)
+            replacement_task.cancel()
+            await asyncio.gather(replacement_task, return_exceptions=True)
+            return session
+
+        session = asyncio.run(_run())
+        self.assertTrue(session.is_evaluating)
+        self.assertEqual(session.worker_token, 8)
+
+    def test_single_cpu_pressure_simulation_bounds_eight_chat_pools(self):
+        async def _run():
+            self.gate.config.attention.accumulation_pool_max_events = 100
+            sessions = {
+                f"group-{index}": self.gate_mod.SessionContext()
+                for index in range(8)
+            }
+            self.gate.focus_pools.update(sessions)
+            heartbeat_delays = []
+            stop_heartbeat = asyncio.Event()
+
+            async def heartbeat():
+                while not stop_heartbeat.is_set():
+                    started = time.monotonic()
+                    await asyncio.sleep(0.001)
+                    heartbeat_delays.append(time.monotonic() - started)
+
+            async def simulated_worker(session):
+                session.is_evaluating = True
+                while session.accumulation_pool:
+                    async with session.lock:
+                        batch = list(session.accumulation_pool[:4])
+                        del session.accumulation_pool[:4]
+                        if not session.accumulation_pool:
+                            session.oldest_pending_at = 0.0
+                    await asyncio.sleep(0.002)  # simulated 30–45s Provider tail, accelerated
+                session.is_evaluating = False
+
+            heartbeat_task = asyncio.create_task(heartbeat())
+            workers = []
+            for chat_id, session in sessions.items():
+                async def producer(target=session, target_chat=chat_id):
+                    for index in range(180):
+                        async with target.lock:
+                            self.gate._append_accumulation_event(
+                                target,
+                                _FakeEvent("user", target_chat, f"message-{index}"),
+                            )
+                        await asyncio.sleep(0)
+                await producer()
+                workers.append(asyncio.create_task(simulated_worker(session)))
+            await asyncio.gather(*workers)
+            stop_heartbeat.set()
+            await heartbeat_task
+            status = self.gate.describe_status()
+            return status, heartbeat_delays
+
+        status, heartbeat_delays = asyncio.run(_run())
+        self.assertLessEqual(status["pool_length"], 8 * 100)
+        self.assertGreater(status["overflow_count"], 0)
+        self.assertEqual(status["worker_count"], 0)
+        self.assertFalse(status["is_evaluating"])
+        self.assertLess(max(heartbeat_delays or [0.0]), 0.05)
+
+    def test_concurrent_process_event_pressure_shutdown_reload_resume(self):
+        async def _run():
+            self.gate.config.attention.accumulation_pool_max_events = 100
+            self.gate._compute_debounce_delay = lambda *args, **kwargs: 0.0
+            provider_slots = asyncio.Semaphore(3)
+            provider_calls = 0
+
+            async def simulated_system2(_event, _events):
+                nonlocal provider_calls
+                async with provider_slots:
+                    provider_calls += 1
+                    await asyncio.sleep(0.01)
+
+            self.gate.sys2_process = simulated_system2
+
+            async def simulated_worker(
+                chat_id,
+                session,
+                self_id,
+                *,
+                is_private=False,
+                is_strong_wakeup=False,
+                worker_event=None,
+            ):
+                del self_id, is_private, is_strong_wakeup, worker_event
+                while True:
+                    async with session.lock:
+                        batch = list(session.accumulation_pool[:8])
+                        del session.accumulation_pool[:8]
+                        if not session.accumulation_pool:
+                            session.oldest_pending_at = 0.0
+                    if not batch:
+                        session.is_evaluating = False
+                        return
+                    await self.gate.sys2_process(batch[-1], batch)
+
+            self.gate._debounce_and_judge = simulated_worker
+            heartbeat_delays = []
+            stop_heartbeat = asyncio.Event()
+
+            async def heartbeat():
+                while not stop_heartbeat.is_set():
+                    started = time.monotonic()
+                    await asyncio.sleep(0.002)
+                    heartbeat_delays.append(time.monotonic() - started)
+
+            async def producer(group_index):
+                for message_index in range(36):
+                    event = _FakeEvent(
+                        f"user-{group_index}",
+                        f"Group {group_index}",
+                        f"pressure-{group_index}-{message_index}",
+                    )
+                    event.unified_msg_origin = f"default:GroupMessage:group-{group_index}"
+                    await self.gate.process_event(event)
+                    await asyncio.sleep(0)
+
+            heartbeat_task = asyncio.create_task(heartbeat())
+            producers = [asyncio.create_task(producer(index)) for index in range(8)]
+            await asyncio.sleep(0.01)
+            cancelled_chat = "default:GroupMessage:group-0"
+            cancelled = [
+                task
+                for task in list(self.gate._session_tasks)
+                if str(getattr(getattr(task, "_worker_context", None), "chat_id", "")) == cancelled_chat
+            ]
+            for task in cancelled:
+                task.cancel()
+            await asyncio.gather(*producers)
+            await asyncio.sleep(0.2)
+            before_shutdown = self.gate.describe_status()
+            self.assertLessEqual(before_shutdown["pool_length"], 8 * 100)
+
+            await self.gate.shutdown_workers()
+            drained = self.gate.describe_status()
+            self.gate.reset_runtime_state()
+            resume_event = _FakeEvent("resume-user", "Resume", "resume after reload")
+            resume_event.unified_msg_origin = "default:GroupMessage:group-0"
+            resume_result = await self.gate.process_event(resume_event)
+            await asyncio.sleep(0.05)
+            stop_heartbeat.set()
+            await heartbeat_task
+            return before_shutdown, drained, resume_result, provider_calls, heartbeat_delays
+
+        before_shutdown, drained, resume_result, provider_calls, heartbeat_delays = asyncio.run(_run())
+        self.assertGreater(provider_calls, 0)
+        self.assertEqual(drained["pool_length"], 0)
+        self.assertFalse(drained["is_evaluating"])
+        self.assertEqual(resume_result, "BUFFERED")
+        self.assertLess(max(heartbeat_delays or [0.0]), 0.1)
+
     def test_session_worker_cancel_does_not_cancel_replacement_session(self):
         async def _run():
             old_session = self.gate_mod.SessionContext()
@@ -3229,6 +3545,8 @@ class RefactoredAttentionGateTests(unittest.TestCase):
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
             spawned = list(getattr(self.gate, "_session_tasks", set()) or [])
+            failed_session.closed = True
+            failed_session.worker_generation += 1
             for spawned_task in spawned:
                 spawned_task.cancel()
             if spawned:

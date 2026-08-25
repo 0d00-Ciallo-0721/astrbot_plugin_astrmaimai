@@ -158,6 +158,11 @@ class AttentionGate:
         self._last_focus_pool_prune: float = 0.0
         self._background_tasks: set[asyncio.Task] = set()
         self._session_tasks: set[asyncio.Task] = set()
+        self._workers_shutdown = False
+        self._shutdown_generation = 0
+        self._overflow_count = 0
+        self._dropped_event_count = 0
+        self._worker_invariant_violation_count = 0
         self._background_task_semaphore = asyncio.Semaphore(self.BACKGROUND_TASK_MAX_CONCURRENCY)
         # Platform IDs persist until FIFO eviction; content fallbacks use a short TTL.
         self._global_message_cache = collections.OrderedDict()
@@ -173,6 +178,169 @@ class AttentionGate:
             refresh_continuity = getattr(self.conversation_continuity, "refresh_config", None)
             if callable(refresh_continuity):
                 refresh_continuity(config)
+
+    def _accumulation_pool_limit(self) -> int:
+        attention_cfg = getattr(self.config, "attention", None)
+        try:
+            return max(1, int(getattr(attention_cfg, "accumulation_pool_max_events", 100) or 100))
+        except (TypeError, ValueError):
+            return 100
+
+    @staticmethod
+    def _event_is_priority_for_accumulation(event: Any) -> bool:
+        if event is None:
+            return False
+        keys = (
+            "astrmai_group_direct_wakeup",
+            "astrmai_at_bot_wakeup",
+            "astrmai_reply_wakeup",
+            "astrmai_is_command",
+            "heartflow_is_command",
+        )
+        return any(bool(event.get_extra(key, False)) for key in keys if hasattr(event, "get_extra"))
+
+    @staticmethod
+    def _event_diagnostic_id(event: Any) -> str:
+        message_obj = getattr(event, "message_obj", None)
+        message_id = str(getattr(message_obj, "message_id", "") or "")
+        if not message_id:
+            message_id = "|".join(
+                (
+                    str(getattr(event, "unified_msg_origin", "") or ""),
+                    str(getattr(event, "timestamp", "") or ""),
+                    str(getattr(event, "message_str", "") or ""),
+                )
+            )
+        return hashlib.sha256(message_id.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+    def _append_accumulation_event(self, session: SessionContext, event: Any) -> bool:
+        """Append with a bounded per-chat pool, retaining priority events when possible."""
+        limit = self._accumulation_pool_limit()
+        if len(session.accumulation_pool) < limit:
+            session.accumulation_pool.append(event)
+            if session.oldest_pending_at <= 0:
+                session.oldest_pending_at = time.time()
+            return True
+
+        session.overflow_count += 1
+        self._overflow_count += 1
+        incoming_priority = self._event_is_priority_for_accumulation(event)
+        removable_index = next(
+            (
+                index
+                for index, queued in enumerate(session.accumulation_pool)
+                if not self._event_is_priority_for_accumulation(queued)
+            ),
+            None,
+        )
+        if incoming_priority and removable_index is not None:
+            dropped = session.accumulation_pool.pop(removable_index)
+            session.accumulation_pool.append(event)
+        elif incoming_priority and removable_index is None:
+            dropped = session.accumulation_pool.pop(0)
+            session.accumulation_pool.append(event)
+        else:
+            dropped = event
+        session.dropped_event_count += 1
+        self._dropped_event_count += 1
+        try:
+            dropped.set_extra("astrmai_attention_accumulation_dropped", True)
+            dropped.set_extra(
+                "astrmai_attention_accumulation_dropped_event_hash",
+                self._event_diagnostic_id(dropped),
+            )
+        except Exception:
+            pass
+        return dropped is not event
+
+    def _prepend_accumulation_events(
+        self,
+        session: SessionContext,
+        events: list[Any],
+        *,
+        oldest_pending_at: float = 0.0,
+    ) -> None:
+        if not events:
+            return
+        existing = list(session.accumulation_pool)
+        session.accumulation_pool.clear()
+        for event in events:
+            self._append_accumulation_event(session, event)
+        for event in existing:
+            self._append_accumulation_event(session, event)
+        if oldest_pending_at > 0:
+            session.oldest_pending_at = min(
+                value for value in (session.oldest_pending_at, oldest_pending_at) if value > 0
+            )
+
+    def describe_status(self) -> dict[str, Any]:
+        now = time.time()
+        pool_lengths = [len(session.accumulation_pool) for session in self.focus_pools.values()]
+        oldest = [
+            float(session.oldest_pending_at or 0.0)
+            for session in self.focus_pools.values()
+            if session.accumulation_pool and session.oldest_pending_at > 0
+        ]
+        active_workers = sum(
+            1
+            for task in self._session_tasks
+            if task is not None and not task.done()
+        )
+        evaluating = sum(1 for session in self.focus_pools.values() if session.is_evaluating)
+        violations = 0
+        for session in self.focus_pools.values():
+            if session.is_evaluating and (
+                session.worker_task is None or session.worker_task.done()
+            ):
+                violations += 1
+        worker_invariant_violation = max(
+            self._worker_invariant_violation_count,
+            violations,
+        )
+        return {
+            "pool_length": sum(pool_lengths),
+            "pool_limit": self._accumulation_pool_limit(),
+            "oldest_pending_age_ms": round(max(0.0, now - min(oldest)) * 1000, 3) if oldest else 0.0,
+            "overflow_count": self._overflow_count,
+            "dropped_event_count": self._dropped_event_count,
+            "metrics_scope": "attention_gate_instance",
+            "worker_count": active_workers,
+            "is_evaluating": evaluating > 0,
+            "worker_invariant_violation": worker_invariant_violation,
+            "shutdown_generation": self._shutdown_generation,
+            "workers_shutdown": self._workers_shutdown,
+            "session_count": len(self.focus_pools),
+        }
+
+    def request_shutdown(self) -> None:
+        if not self._workers_shutdown:
+            self._workers_shutdown = True
+            self._shutdown_generation += 1
+
+    def reset_runtime_state(self) -> None:
+        self._workers_shutdown = False
+        self._shutdown_generation += 1
+        for session in self.focus_pools.values():
+            session.closed = False
+            session.worker_generation += 1
+            session.worker_task = None
+            session.is_evaluating = False
+
+    async def shutdown_workers(self) -> int:
+        self.request_shutdown()
+        async with self._pool_lock:
+            sessions = list(self.focus_pools.values())
+            for session in sessions:
+                async with session.lock:
+                    session.closed = True
+                    session.worker_generation += 1
+                    session.accumulation_pool.clear()
+                    session.oldest_pending_at = 0.0
+                    session.is_evaluating = False
+        cancelled = await self._cancel_session_workers()
+        self._deferred_messages.clear()
+        self._proactive_dispatching.clear()
+        return cancelled
 
     def _prepare_group_attention_topic(
         self,
@@ -268,6 +436,9 @@ class AttentionGate:
         removed_session = None
         async with self._pool_lock:
             removed_session = self.focus_pools.pop(chat_id, None)
+            if removed_session is not None:
+                removed_session.closed = True
+                removed_session.worker_generation += 1
             removed = removed_session is not None or removed
             removed = self._proactive_dispatching.pop(chat_id, None) is not None or removed
             removed = self._deferred_messages.pop(chat_id, None) is not None or removed
@@ -326,8 +497,9 @@ class AttentionGate:
         for session in sessions:
             async with session.lock:
                 session.is_evaluating = False
-                if chat_id is not None:
-                    session.accumulation_pool.clear()
+                session.worker_task = None
+                session.accumulation_pool.clear()
+                session.oldest_pending_at = 0.0
         return len(tasks)
 
     async def _extract_image_base64(self, image_component):
@@ -372,6 +544,7 @@ class AttentionGate:
                 session.repeat_count = 0
                 session.last_active_user_time = 0.0
                 session.last_window_open_ts = 0.0
+                session.closed = False
                 self.focus_pools[chat_id] = session
             session.last_active_time = time.time()
             return session
@@ -762,7 +935,21 @@ class AttentionGate:
         is_private: bool = False,
         is_strong_wakeup: bool = False,
         event: Any = None,
+        generation: int | None = None,
     ):
+        current_session = self.focus_pools.get(str(chat_id))
+        if (
+            self._workers_shutdown
+            or session.closed
+            or current_session is not session
+            or (generation is not None and generation != session.worker_generation)
+        ):
+            return None
+        existing = session.worker_task
+        if existing is not None and not existing.done():
+            return existing
+        session.worker_token += 1
+        worker_token = session.worker_token
         task = asyncio.create_task(
             self._debounce_and_judge(
                 chat_id,
@@ -773,7 +960,15 @@ class AttentionGate:
                 worker_event=event,
             )
         )
-        task._worker_context = SimpleNamespace(chat_id=chat_id, session=session, self_id=self_id, event=event)
+        task._worker_context = SimpleNamespace(
+            chat_id=chat_id,
+            session=session,
+            self_id=self_id,
+            event=event,
+            generation=session.worker_generation,
+            token=worker_token,
+        )
+        session.worker_task = task
         self._session_tasks.add(task)
         attach_background_task_trace(
             task,
@@ -786,14 +981,44 @@ class AttentionGate:
 
     def _handle_session_worker_result(self, task: asyncio.Task):
         self._session_tasks.discard(task)
+        worker_context = getattr(task, "_worker_context", None)
+        session = getattr(worker_context, "session", None)
+        raw_generation = getattr(worker_context, "generation", None)
+        raw_token = getattr(worker_context, "token", None)
+        identity_valid = bool(
+            session is not None
+            and session.worker_task is task
+            and (raw_generation is None or int(raw_generation) == session.worker_generation)
+            and (raw_token is None or int(raw_token) == session.worker_token)
+        )
+        # A few legacy tests construct a task context by hand.  Preserve their
+        # recovery semantics, while real workers always use the strict triple.
+        legacy_context = bool(
+            session is not None
+            and session.worker_task is None
+            and raw_generation is None
+            and raw_token is None
+        )
+        current_worker = identity_valid or legacy_context
+        if session is not None and raw_token is not None and not identity_valid:
+            self._worker_invariant_violation_count += 1
+        if identity_valid:
+            session.worker_task = None
+        if session is not None and session.closed:
+            session.is_evaluating = False
         if task.cancelled():
+            if session is not None and current_worker and not session.closed:
+                session.is_evaluating = False
+            if current_worker and worker_context is not None and raw_token is not None:
+                recovery = asyncio.create_task(self._recover_failed_session_worker(worker_context))
+                self._background_tasks.add(recovery)
+                recovery.add_done_callback(self._handle_background_task_result)
             return
         try:
             task.result()
         except Exception as exc:
             logger.error(f"[Attention Worker Error] {exc}", exc_info=exc)
-            worker_context = getattr(task, "_worker_context", None)
-            if worker_context is not None:
+            if current_worker and worker_context is not None:
                 recovery = asyncio.create_task(self._recover_failed_session_worker(worker_context))
                 self._background_tasks.add(recovery)
                 attach_background_task_trace(
@@ -810,16 +1035,48 @@ class AttentionGate:
         self_id = str(getattr(worker_context, "self_id", "") or "")
         if not chat_id or session is None:
             return
+        raw_generation = getattr(worker_context, "generation", None)
+        generation = session.worker_generation if raw_generation is None else int(raw_generation)
+        raw_token = getattr(worker_context, "token", None)
+        token = session.worker_token if raw_token is None else int(raw_token)
+        if (
+            self._workers_shutdown
+            or session.closed
+            or self.focus_pools.get(chat_id) is not session
+            or generation != session.worker_generation
+            or (raw_token is not None and token != session.worker_token)
+            or (
+                session.worker_task is not None
+                and not session.worker_task.done()
+                and (raw_token is None or token != session.worker_token)
+            )
+        ):
+            return
         async with session.lock:
+            if (
+                self._workers_shutdown
+                or session.closed
+                or self.focus_pools.get(chat_id) is not session
+                or generation != session.worker_generation
+                or (raw_token is not None and token != session.worker_token)
+                or (
+                    session.worker_task is not None
+                    and not session.worker_task.done()
+                    and session.worker_task is not asyncio.current_task()
+                )
+            ):
+                return
             has_pending = bool(session.accumulation_pool)
             session.is_evaluating = False
-        if has_pending:
-            self._spawn_session_worker(
-                chat_id,
-                session,
-                self_id,
-                event=getattr(worker_context, "event", None),
-            )
+            if has_pending:
+                session.is_evaluating = True
+                self._spawn_session_worker(
+                    chat_id,
+                    session,
+                    self_id,
+                    event=getattr(worker_context, "event", None),
+                    generation=generation,
+                )
 
     def _handle_background_task_result(self, task: asyncio.Task):
         self._background_tasks.discard(task)
@@ -2131,23 +2388,32 @@ class AttentionGate:
             await self._append_dialogue_segment(event)
 
         async with session.lock:
-            session.accumulation_pool.append(event)
+            if (
+                self._workers_shutdown
+                or session.closed
+                or self.focus_pools.get(chat_id) is not session
+            ):
+                event.set_extra("astrmai_attention_dropped_during_shutdown", True)
+                return "DROPPED_SHUTDOWN"
+            self._append_accumulation_event(session, event)
             session.last_active_time = time.time()
             if bool(event.get_extra("astrmai_release_vision_pair_waiter", False)):
                 session.vision_pair_signal.set()
                 event.set_extra("astrmai_release_vision_pair_waiter", False)
             should_schedule = not session.is_evaluating
             session.is_evaluating = True
-
-        if should_schedule:
-            self._spawn_session_worker(
-                chat_id,
-                session,
-                self_id,
-                is_private=is_private,
-                is_strong_wakeup=is_strong_wakeup,
-                event=event,
-            )
+            if should_schedule:
+                spawned = self._spawn_session_worker(
+                    chat_id,
+                    session,
+                    self_id,
+                    is_private=is_private,
+                    is_strong_wakeup=is_strong_wakeup,
+                    event=event,
+                    generation=session.worker_generation,
+                )
+                if spawned is None:
+                    session.is_evaluating = False
         return "BUFFERED"
 
     @staticmethod
@@ -2299,8 +2565,10 @@ class AttentionGate:
             )
             try:
                 async with session.lock:
+                    batch_oldest_pending_at = session.oldest_pending_at
                     batch_events = list(session.accumulation_pool)
                     session.accumulation_pool.clear()
+                    session.oldest_pending_at = 0.0
             finally:
                 finish_stage(wait_event, lock_stage)
 
@@ -2333,7 +2601,11 @@ class AttentionGate:
                         vision_outcome = await self.private_turn_coordinator.prepare_batch(batch_events, chat_id)
                     async with session.lock:
                         if session.accumulation_pool:
-                            session.accumulation_pool = batch_events + list(session.accumulation_pool)
+                            self._prepend_accumulation_events(
+                                session,
+                                batch_events,
+                                oldest_pending_at=batch_oldest_pending_at,
+                            )
                             current_is_strong_wakeup = False
                             continue
                     session.vision_burst_deadline = 0.0
