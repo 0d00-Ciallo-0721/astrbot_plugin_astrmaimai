@@ -104,6 +104,9 @@ class PluginLifecycleManager:
         self._startup_task = self.track_task(self._complete_startup())
 
     async def _prepare_reinitialize(self) -> bool:
+        if getattr(self, "_shutdown_dependency_close_errors", None):
+            logger.warning("[AstrMai] runtime reinitialize deferred: dependency close failed")
+            return False
         if getattr(self, "_shutdown_pending_drain", False):
             logger.warning("[AstrMai] runtime reinitialize deferred: shutdown cleanup is pending")
             return False
@@ -501,6 +504,11 @@ class PluginLifecycleManager:
         request_attention_shutdown = getattr(attention_gate, "request_shutdown", None)
         if callable(request_attention_shutdown):
             request_attention_shutdown()
+        proactive_task = getattr(self.runtime, "proactive_task", None)
+        scheduled_scenarios = getattr(proactive_task, "scheduled_scenario_service", None)
+        request_scenario_shutdown = getattr(scheduled_scenarios, "request_shutdown", None)
+        if callable(request_scenario_shutdown):
+            request_scenario_shutdown()
         self.runtime.status.shutdown_generation = int(
             getattr(self.runtime.status, "shutdown_generation", 0) or 0
         ) + 1
@@ -519,6 +527,20 @@ class PluginLifecycleManager:
 
     def _consume_isolated_shutdown_task(self, task: asyncio.Task[Any]) -> None:
         self._isolated_shutdown_tasks.discard(task)
+        late_cleanup = getattr(self, "_late_shutdown_cleanup_task", None)
+        if (
+            task.cancelled()
+            and task is late_cleanup
+            and int(getattr(self.runtime.status, "shutdown_late_cleanup_task_count", 0) or 0)
+        ):
+            self._shutdown_pending_drain = True
+            self._termination_complete = False
+            self.runtime.status.shutdown_late_cleanup_task_count = 0
+            self.runtime.status.shutdown_final_status = "degraded"
+            self.runtime.status.shutdown_pending_drain = True
+            self.runtime.status.shutdown_forced_termination_risk = True
+            self.runtime.set_boot_phase("shutdown.degraded")
+            self.runtime.mark_degraded("shutdown.cleanup_cancelled", "late_cleanup_cancelled")
         try:
             task.exception()
         except (asyncio.CancelledError, Exception):
@@ -601,7 +623,8 @@ class PluginLifecycleManager:
                 begin_drain()
             except Exception as exc:
                 errors.append(f"budget.begin_drain:{exc}")
-        pending_budget = self._background_budget_pending(budget)
+        pending_report = self._shutdown_pending_report(budget)
+        pending_budget = int(pending_report.get("remaining", 0) or 0)
         if pending_budget:
             self._shutdown_pending_drain = True
             self._schedule_late_shutdown_cleanup(budget)
@@ -613,6 +636,8 @@ class PluginLifecycleManager:
                 "elapsed_ms": elapsed_ms,
                 "errors": errors,
                 "remaining": pending_budget,
+                "remaining_by_kind": dict(pending_report.get("remaining_by_kind", {}) or {}),
+                "owner_task_names": list(pending_report.get("owner_task_names", []) or []),
             }
             logger.warning(
                 "[AstrMai] forced shutdown tail deferred while background work remains: "
@@ -653,7 +678,56 @@ class PluginLifecycleManager:
             int(status.get("active", 0) or 0),
             int(status.get("queued", 0) or 0),
             int(status.get("deferred_tasks", 0) or 0),
+            int(status.get("physical_owner_count", 0) or 0),
         )
+
+    def _shutdown_pending_report(self, budget: Any, *, include_late_task: bool = False) -> dict[str, Any]:
+        status_fn = getattr(budget, "status", None)
+        budget_status = status_fn() if callable(status_fn) else {}
+        if not isinstance(budget_status, dict):
+            budget_status = {}
+        remaining_by_kind: dict[str, int] = {}
+        for field in ("active_by_kind", "queued_by_kind", "deferred_by_kind"):
+            for name, count in dict(budget_status.get(field, {}) or {}).items():
+                if int(count or 0) > 0:
+                    remaining_by_kind[str(name)] = max(
+                        remaining_by_kind.get(str(name), 0), int(count or 0)
+                    )
+        attention = getattr(self.runtime, "attention_gate", None)
+        attention_status = {}
+        describe_attention = getattr(attention, "describe_status", None)
+        if callable(describe_attention):
+            try:
+                attention_status = describe_attention() or {}
+            except Exception:
+                attention_status = {}
+        worker_count = int(attention_status.get("worker_count", 0) or 0)
+        if worker_count:
+            remaining_by_kind["attention.worker"] = worker_count
+        remaining = max(
+            int(budget_status.get("active", 0) or 0),
+            int(budget_status.get("queued", 0) or 0),
+            int(budget_status.get("deferred", budget_status.get("deferred_tasks", 0)) or 0),
+            int(budget_status.get("physical", budget_status.get("physical_owner_count", 0)) or 0),
+            worker_count,
+        )
+        if include_late_task and int(getattr(self.runtime.status, "shutdown_late_cleanup_task_count", 0) or 0):
+            remaining = max(remaining, 1)
+            remaining_by_kind["shutdown.late_cleanup"] = 1
+        return {
+            "remaining": remaining,
+            "remaining_by_kind": remaining_by_kind,
+            "active": int(budget_status.get("active", 0) or 0),
+            "queued": int(budget_status.get("queued", 0) or 0),
+            "deferred": int(budget_status.get("deferred", budget_status.get("deferred_tasks", 0)) or 0),
+            "physical": int(budget_status.get("physical", budget_status.get("physical_owner_count", 0)) or 0),
+            "worker_count": worker_count,
+            "owner_task_names": list(budget_status.get("owner_task_names", []) or []),
+            "oldest_owner_age_ms": float(budget_status.get("oldest_owner_age_ms", 0.0) or 0.0),
+            "active_by_kind": dict(budget_status.get("active_by_kind", {}) or {}),
+            "queued_by_kind": dict(budget_status.get("queued_by_kind", {}) or {}),
+            "deferred_by_kind": dict(budget_status.get("deferred_by_kind", {}) or {}),
+        }
 
     async def _run_bounded_shutdown_stage(
         self,
@@ -729,6 +803,7 @@ class PluginLifecycleManager:
             self.runtime.status.shutdown_pending_drain = False
             self.runtime.status.shutdown_forced_termination_risk = False
             self.runtime.status.shutdown_late_cleanup_deadline = 0.0
+            self.runtime.status.shutdown_late_cleanup_task_count = 0
             deadline = started + self._shutdown_timing("hot_reload_shutdown_budget_sec", 5.0)
 
             try:
@@ -775,12 +850,48 @@ class PluginLifecycleManager:
                         deadline=deadline,
                     )
                 self._reset_runtime_status_flags()
-                if self._shutdown_pending_drain:
+                final_budget = getattr(self.runtime, "background_task_budget", None)
+                final_pending = self._shutdown_pending_report(
+                    final_budget,
+                    include_late_task=True,
+                )
+                dependency_errors = list(getattr(self, "_shutdown_dependency_close_errors", []) or [])
+                if dependency_errors:
+                    self.runtime.set_boot_phase("shutdown.degraded")
+                    self.runtime.status.shutdown_pending_drain = False
+                    self.runtime.status.shutdown_final_status = "degraded"
+                    self.runtime.status.shutdown_forced_termination_risk = True
+                    self.runtime.status.shutdown_stage_stats["dependency_close"] = {
+                        "status": "degraded",
+                        "errors": dependency_errors,
+                    }
+                    self._termination_complete = False
+                    logger.warning(
+                        "[AstrMai] shutdown degraded: dependency close failed "
+                        f"errors={dependency_errors}"
+                    )
+                elif self._shutdown_pending_drain or final_pending.get("remaining"):
+                    if final_pending.get("remaining"):
+                        self.runtime.status.shutdown_stage_stats["final_quiescence"] = {
+                            "status": "pending",
+                            "remaining": int(final_pending.get("remaining", 0) or 0),
+                            "remaining_by_kind": dict(final_pending.get("remaining_by_kind", {}) or {}),
+                            "active_by_kind": dict(final_pending.get("active_by_kind", {}) or {}),
+                            "queued_by_kind": dict(final_pending.get("queued_by_kind", {}) or {}),
+                            "deferred_by_kind": dict(final_pending.get("deferred_by_kind", {}) or {}),
+                            "physical_owner_count": int(final_pending.get("physical", 0) or 0),
+                            "worker_count": int(final_pending.get("worker_count", 0) or 0),
+                        }
                     self.runtime.set_boot_phase("shutdown.pending_drain")
                     self.runtime.status.shutdown_pending_drain = True
-                    self.runtime.status.shutdown_final_status = "pending_drain"
+                    if self.runtime.status.shutdown_final_status == "running":
+                        self.runtime.status.shutdown_final_status = "pending_drain"
                     self._termination_complete = False
-                    logger.warning("[AstrMai] shutdown pending physical background work drain")
+                    logger.warning(
+                        "[AstrMai] shutdown pending quiescence drain: "
+                        f"remaining={final_pending.get('remaining', 0)} "
+                        f"by_kind={final_pending.get('remaining_by_kind', {})}"
+                    )
                 else:
                     elapsed_ms = (time.monotonic() - started) * 1000
                     self.runtime.status.shutdown_completed_at = time.time()
@@ -803,6 +914,7 @@ class PluginLifecycleManager:
                     )
 
     async def _terminate_impl(self) -> None:
+        self._shutdown_dependency_close_errors = []
         budget = getattr(self.runtime, "background_task_budget", None)
         begin_drain = getattr(budget, "begin_drain", None)
         if callable(begin_drain):
@@ -828,6 +940,26 @@ class PluginLifecycleManager:
                 logger.warning(f"[AstrMai] Reread dispatcher shutdown degraded: {exc}")
         drain_budget = getattr(budget, "drain", None)
         drain_report: dict[str, object] = {}
+
+        # Fence all producer loops before stopping memory/projector workers;
+        # their durable outbox remains available for the next bootstrap.
+        try:
+            await self.stop_proactive_services()
+        except Exception as exc:
+            logger.warning(f"[AstrMai] Proactive shutdown degraded: {exc}")
+
+        try:
+            await self.stop_expression_governance_services()
+        except Exception as exc:
+            logger.warning(f"[AstrMai] Expression governance shutdown degraded: {exc}")
+
+        try:
+            evolution = getattr(self.runtime, "evolution", None)
+            if evolution is not None and hasattr(evolution, "stop_background_tasks"):
+                await evolution.stop_background_tasks()
+        except Exception as exc:
+            logger.warning(f"[AstrMai] Evolution background shutdown degraded: {exc}")
+
         try:
             stop_memory = getattr(self.runtime.memory_engine, "stop_background_producers", None)
             if not callable(stop_memory):
@@ -847,23 +979,6 @@ class PluginLifecycleManager:
                 await pcm._persist_pending_sessions()
         except Exception as exc:
             logger.warning(f"[AstrMai] PrivateChat persist shutdown degraded: {exc}")
-
-        try:
-            await self.stop_proactive_services()
-        except Exception as exc:
-            logger.warning(f"[AstrMai] Proactive shutdown degraded: {exc}")
-
-        try:
-            await self.stop_expression_governance_services()
-        except Exception as exc:
-            logger.warning(f"[AstrMai] Expression governance shutdown degraded: {exc}")
-
-        try:
-            evolution = getattr(self.runtime, "evolution", None)
-            if evolution is not None and hasattr(evolution, "stop_background_tasks"):
-                await evolution.stop_background_tasks()
-        except Exception as exc:
-            logger.warning(f"[AstrMai] Evolution background shutdown degraded: {exc}")
 
         try:
             persona_summarizer = getattr(self.runtime, "persona_summarizer", None)
@@ -920,14 +1035,34 @@ class PluginLifecycleManager:
             except Exception as exc:
                 logger.warning(f"[AstrMai] deferred background drain degraded: {exc}")
 
+        pending_report = self._shutdown_pending_report(budget)
         if drain_report.get("remaining", 0):
+            pending_report["remaining"] = max(
+                int(pending_report.get("remaining", 0) or 0),
+                int(drain_report.get("remaining", 0) or 0),
+            )
+            for field in ("active_by_kind", "queued_by_kind", "deferred_by_kind"):
+                pending_report[field] = {
+                    **dict(pending_report.get(field, {}) or {}),
+                    **dict(drain_report.get(field, {}) or {}),
+                }
+            pending_report["owner_task_names"] = sorted(
+                set(pending_report.get("owner_task_names", []) or [])
+                | set(drain_report.get("owner_task_names", []) or [])
+            )
+        self.runtime.status.shutdown_stage_stats["budget_drain"] = {
+            "status": "pending_drain" if pending_report["remaining"] else "completed",
+            **pending_report,
+        }
+        if pending_report["remaining"]:
             self._shutdown_pending_drain = True
             self._schedule_late_shutdown_cleanup(budget)
             self.runtime.status.shutdown_pending_drain = True
             self.runtime.status.shutdown_final_status = "pending_drain"
             logger.warning(
                 "[AstrMai] keeping dependent resources open until background drain completes: "
-                f"remaining={drain_report.get('remaining', 0)}"
+                f"remaining={pending_report.get('remaining', 0)} "
+                f"by_kind={pending_report.get('remaining_by_kind', {})}"
             )
             return
 
@@ -940,6 +1075,8 @@ class PluginLifecycleManager:
             if callable(close_memory_resources):
                 await close_memory_resources()
         except Exception as exc:
+            self._shutdown_dependency_close_errors.append(f"memory:{exc}")
+            self.runtime.mark_degraded("shutdown.dependency_close", f"memory:{exc}")
             logger.warning(f"[AstrMai] Memory resource shutdown degraded: {exc}")
 
         # 停止 EventBus workers
@@ -948,6 +1085,8 @@ class PluginLifecycleManager:
             try:
                 await event_bus.stop()
             except Exception as exc:
+                self._shutdown_dependency_close_errors.append(f"event_bus:{exc}")
+                self.runtime.mark_degraded("shutdown.dependency_close", f"event_bus:{exc}")
                 logger.warning(f"[AstrMai] EventBus shutdown degraded: {exc}")
 
         # 释放 DB 连接池
@@ -956,12 +1095,26 @@ class PluginLifecycleManager:
             try:
                 persistence.dispose()
             except Exception as exc:
+                self._shutdown_dependency_close_errors.append(f"persistence:{exc}")
+                self.runtime.mark_degraded("shutdown.dependency_close", f"persistence:{exc}")
                 logger.warning(f"[AstrMai] Persistence dispose degraded: {exc}")
+
+        if self._shutdown_dependency_close_errors:
+            self.runtime.status.shutdown_stage_stats["dependency_close"] = {
+                "status": "degraded",
+                "errors": list(self._shutdown_dependency_close_errors),
+            }
+            self.runtime.status.shutdown_final_status = "degraded"
+            self.runtime.status.shutdown_pending_drain = False
+            self.runtime.status.shutdown_forced_termination_risk = True
+            self.runtime.set_boot_phase("shutdown.degraded")
+            self._termination_complete = False
 
     def _schedule_late_shutdown_cleanup(self, budget: Any) -> None:
         if not budget or not hasattr(budget, "wait_until_idle"):
             self.runtime.status.shutdown_final_status = "degraded"
             self.runtime.status.shutdown_forced_termination_risk = True
+            self.runtime.status.shutdown_late_cleanup_task_count = 0
             self.runtime.set_boot_phase("shutdown.degraded")
             self.runtime.mark_degraded("shutdown.late_cleanup", "budget_idle_waiter_unavailable")
             logger.warning("[AstrMai] late shutdown cleanup unavailable: budget has no idle waiter")
@@ -974,38 +1127,33 @@ class PluginLifecycleManager:
         late_started = time.monotonic()
         self._late_shutdown_cleanup_deadline_monotonic = late_started + late_budget
         self.runtime.status.shutdown_late_cleanup_deadline = time.time() + late_budget
+        self.runtime.status.shutdown_late_cleanup_task_count = 1
 
-        async def _cleanup() -> None:
-            try:
-                report = await budget.wait_until_idle(timeout_sec=late_budget)
-            except Exception as exc:
-                self.runtime.mark_degraded("shutdown.late_cleanup", str(exc))
-                report = {"remaining": self._background_budget_pending(budget)}
-            remaining = max(
-                int(report.get("remaining", 0) or 0),
-                self._background_budget_pending(budget),
+        async def _mark_cleanup_cancelled() -> None:
+            pending = self._shutdown_pending_report(budget)
+            self._shutdown_pending_drain = True
+            self._termination_complete = False
+            self.runtime.status.shutdown_late_cleanup_task_count = 0
+            self.runtime.status.shutdown_final_status = "degraded"
+            self.runtime.status.shutdown_pending_drain = True
+            self.runtime.status.shutdown_forced_termination_risk = True
+            self.runtime.status.shutdown_stage_stats["late_cleanup"] = {
+                "status": "cancelled",
+                "elapsed_ms": round((time.monotonic() - late_started) * 1000, 3),
+                "remaining": int(pending.get("remaining", 0) or 0),
+                "remaining_by_kind": dict(pending.get("remaining_by_kind", {}) or {}),
+                "owner_task_names": list(pending.get("owner_task_names", []) or []),
+                "forced_termination_risk": True,
+            }
+            self.runtime.set_boot_phase("shutdown.degraded")
+            self.runtime.mark_degraded("shutdown.cleanup_cancelled", "late_cleanup_cancelled")
+            logger.warning(
+                "[AstrMai] late shutdown cleanup cancelled; dependencies remain open: "
+                f"remaining={pending.get('remaining', 0)}"
             )
-            if remaining:
-                self.runtime.status.shutdown_stage_stats["late_cleanup"] = {
-                    "status": "degraded",
-                    "elapsed_ms": round((time.monotonic() - late_started) * 1000, 3),
-                    "remaining": remaining,
-                    "deadline": self.runtime.status.shutdown_late_cleanup_deadline,
-                    "forced_termination_risk": True,
-                }
-                self.runtime.status.shutdown_final_status = "degraded"
-                self.runtime.status.shutdown_pending_drain = True
-                self.runtime.status.shutdown_forced_termination_risk = True
-                self.runtime.set_boot_phase("shutdown.degraded")
-                self.runtime.mark_degraded(
-                    "shutdown.late_cleanup",
-                    f"physical_background_work_remaining={remaining}",
-                )
-                logger.warning(
-                    "[AstrMai] late shutdown drain deadline reached; dependencies remain open: "
-                    f"remaining={remaining} budget_sec={late_budget:.1f}"
-                )
-                return
+
+        async def _close_dependencies() -> None:
+            close_errors: list[str] = []
             try:
                 close_memory_resources = getattr(
                     self.runtime.memory_engine,
@@ -1015,6 +1163,8 @@ class PluginLifecycleManager:
                 if callable(close_memory_resources):
                     await close_memory_resources()
             except Exception as exc:
+                close_errors.append(f"memory:{exc}")
+                self.runtime.mark_degraded("shutdown.dependency_close", f"memory:{exc}")
                 logger.warning(f"[AstrMai] late Memory resource shutdown degraded: {exc}")
             try:
                 event_bus = getattr(self.runtime, "event_bus", None)
@@ -1022,6 +1172,8 @@ class PluginLifecycleManager:
                 if callable(stop_event_bus):
                     await stop_event_bus()
             except Exception as exc:
+                close_errors.append(f"event_bus:{exc}")
+                self.runtime.mark_degraded("shutdown.dependency_close", f"event_bus:{exc}")
                 logger.warning(f"[AstrMai] late EventBus shutdown degraded: {exc}")
             try:
                 persistence = getattr(self.runtime, "persistence", None)
@@ -1029,14 +1181,37 @@ class PluginLifecycleManager:
                 if callable(dispose):
                     dispose()
             except Exception as exc:
+                close_errors.append(f"persistence:{exc}")
+                self.runtime.mark_degraded("shutdown.dependency_close", f"persistence:{exc}")
                 logger.warning(f"[AstrMai] late Persistence dispose degraded: {exc}")
-            finally:
+            if close_errors:
+                self._shutdown_dependency_close_errors = close_errors
+                self._shutdown_pending_drain = False
+                self._termination_complete = False
+                self.runtime.status.shutdown_pending_drain = False
+                self.runtime.status.shutdown_final_status = "degraded"
+                self.runtime.status.shutdown_forced_termination_risk = True
+                self.runtime.status.shutdown_late_cleanup_task_count = 0
+                self.runtime.status.shutdown_stage_stats["dependency_close"] = {
+                    "status": "degraded",
+                    "errors": list(close_errors),
+                }
+                self.runtime.set_boot_phase("shutdown.degraded")
+                return
+            else:
                 self._shutdown_pending_drain = False
                 self._reset_runtime_status_flags()
                 self.runtime.status.shutdown_pending_drain = False
                 self.runtime.status.shutdown_final_status = "complete"
                 self.runtime.status.shutdown_forced_termination_risk = False
                 self.runtime.status.shutdown_late_cleanup_deadline = 0.0
+                self.runtime.status.shutdown_late_cleanup_task_count = 0
+                self.runtime.status.shutdown_stage_stats["late_cleanup"] = {
+                    **dict(self.runtime.status.shutdown_stage_stats.get("late_cleanup", {}) or {}),
+                    "status": "completed",
+                    "remaining": 0,
+                    "physical_owner_count": 0,
+                }
                 elapsed_ms = (time.monotonic() - self._shutdown_started_monotonic) * 1000
                 self.runtime.status.shutdown_completed_at = time.time()
                 self.runtime.status.last_shutdown_elapsed_ms = round(elapsed_ms, 3)
@@ -1044,9 +1219,96 @@ class PluginLifecycleManager:
                 self._termination_complete = True
                 logger.info(f"[AstrMai] deferred shutdown cleanup complete elapsed_ms={elapsed_ms:.1f}")
 
+        async def _wait_for_quiescence(timeout_sec: float | None) -> dict[str, Any]:
+            deadline = None if timeout_sec is None else time.monotonic() + max(0.0, timeout_sec)
+            while True:
+                if deadline is None:
+                    slice_timeout = 0.5
+                else:
+                    slice_timeout = min(0.5, max(0.0, deadline - time.monotonic()))
+                await budget.wait_until_idle(timeout_sec=slice_timeout)
+                pending = self._shutdown_pending_report(budget)
+                if not pending["remaining"]:
+                    return pending
+                if deadline is not None and time.monotonic() >= deadline:
+                    return pending
+                await asyncio.sleep(0.05)
+
+        async def _watch_late_shutdown_cleanup() -> None:
+            try:
+                pending = await _wait_for_quiescence(None)
+            except asyncio.CancelledError:
+                await _mark_cleanup_cancelled()
+                raise
+            if pending.get("remaining"):
+                self.runtime.mark_degraded(
+                    "shutdown.late_cleanup",
+                    f"physical_background_work_remaining={pending.get('remaining', 0)}",
+                )
+                return
+            await _close_dependencies()
+
+        async def _cleanup() -> None:
+            try:
+                pending = await _wait_for_quiescence(late_budget)
+            except asyncio.CancelledError:
+                await _mark_cleanup_cancelled()
+                raise
+            except Exception as exc:
+                self.runtime.mark_degraded("shutdown.late_cleanup", str(exc))
+                pending = self._shutdown_pending_report(budget)
+            if pending.get("remaining"):
+                self.runtime.status.shutdown_stage_stats["late_cleanup"] = {
+                    "status": "degraded",
+                    "elapsed_ms": round((time.monotonic() - late_started) * 1000, 3),
+                    "remaining": int(pending.get("remaining", 0) or 0),
+                    "remaining_by_kind": dict(pending.get("remaining_by_kind", {}) or {}),
+                    "active_by_kind": dict(pending.get("active_by_kind", {}) or {}),
+                    "queued_by_kind": dict(pending.get("queued_by_kind", {}) or {}),
+                    "deferred_by_kind": dict(pending.get("deferred_by_kind", {}) or {}),
+                    "physical_owner_count": int(pending.get("physical", 0) or 0),
+                    "owner_task_names": list(pending.get("owner_task_names", []) or []),
+                    "oldest_owner_age_ms": float(pending.get("oldest_owner_age_ms", 0.0) or 0.0),
+                    "deadline": self.runtime.status.shutdown_late_cleanup_deadline,
+                    "forced_termination_risk": True,
+                }
+                self.runtime.status.shutdown_final_status = "degraded"
+                self.runtime.status.shutdown_pending_drain = True
+                self.runtime.status.shutdown_forced_termination_risk = True
+                self.runtime.set_boot_phase("shutdown.degraded")
+                self.runtime.mark_degraded(
+                    "shutdown.late_cleanup",
+                    f"physical_background_work_remaining={pending.get('remaining', 0)}",
+                )
+                logger.warning(
+                    "[AstrMai] late shutdown drain deadline reached; dependencies remain open: "
+                    f"remaining={pending.get('remaining', 0)} "
+                    f"by_kind={pending.get('remaining_by_kind', {})} budget_sec={late_budget:.1f}"
+                )
+                try:
+                    watcher = asyncio.create_task(
+                        _watch_late_shutdown_cleanup(),
+                        name="astrmai:shutdown:late-cleanup-watcher",
+                    )
+                except RuntimeError as exc:
+                    await _mark_cleanup_cancelled()
+                    logger.warning(f"[AstrMai] late shutdown watcher scheduling degraded: {exc}")
+                    return
+                self._late_shutdown_cleanup_task = watcher
+                self._isolated_shutdown_tasks.add(watcher)
+                watcher.add_done_callback(self._consume_isolated_shutdown_task)
+                return
+            await _close_dependencies()
+
         try:
             task = asyncio.create_task(_cleanup(), name="astrmai:shutdown:late-cleanup")
         except RuntimeError as exc:
+            self.runtime.status.shutdown_late_cleanup_task_count = 0
+            self.runtime.status.shutdown_final_status = "degraded"
+            self.runtime.status.shutdown_pending_drain = True
+            self.runtime.status.shutdown_forced_termination_risk = True
+            self.runtime.set_boot_phase("shutdown.degraded")
+            self.runtime.mark_degraded("shutdown.cleanup_cancelled", "late_cleanup_schedule_failed")
             logger.warning(f"[AstrMai] late shutdown cleanup scheduling degraded: {exc}")
             return
         self._late_shutdown_cleanup_task = task

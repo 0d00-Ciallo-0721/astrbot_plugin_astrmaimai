@@ -793,7 +793,7 @@ class FaissAwareCleanupTests(unittest.TestCase):
         deleted = asyncio.run(projector.cleanup_deleted(["mem-1"]))
 
         self.assertEqual(deleted, 0)
-        self.assertEqual(projector.pending_reason("mem-1"), "cleanup_error:RuntimeError")
+        self.assertEqual(projector.pending_reason("mem-1"), "documents_delete_failed")
 
 
 class MaintenanceScheduleTests(unittest.TestCase):

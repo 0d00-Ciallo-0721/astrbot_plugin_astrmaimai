@@ -119,8 +119,9 @@ class BackgroundTaskBudgetTests(unittest.TestCase):
 
             tasks = [asyncio.create_task(budget.run(lambda index=index: work(index))) for index in range(4)]
             await asyncio.sleep(0)
+            status = budget.status()
             self.assertEqual(
-                budget.status(),
+                {key: status[key] for key in ("limit", "max_queue", "wait_timeout_sec", "active", "available_slots", "queued", "peak_queued", "rejected", "timed_out")},
                 {
                     "limit": 2,
                     "max_queue": 64,
@@ -136,8 +137,9 @@ class BackgroundTaskBudgetTests(unittest.TestCase):
             release.set()
             self.assertEqual(await asyncio.gather(*tasks), [0, 1, 2, 3])
             self.assertEqual(peak, 2)
+            status = budget.status()
             self.assertEqual(
-                budget.status(),
+                {key: status[key] for key in ("limit", "max_queue", "wait_timeout_sec", "active", "available_slots", "queued", "peak_queued", "rejected", "timed_out")},
                 {
                     "limit": 2,
                     "max_queue": 64,
@@ -415,8 +417,9 @@ class BackgroundTaskBudgetTests(unittest.TestCase):
             runtime.rebuild_infrastructure_settings()
 
         self.assertEqual(budget.status()["limit"], 3)
+        budget_status = runtime.build_diagnostics()["infrastructure"]["background_task_budget"]
         self.assertEqual(
-            runtime.build_diagnostics()["infrastructure"]["background_task_budget"],
+            {key: budget_status[key] for key in ("limit", "max_queue", "wait_timeout_sec", "active", "available_slots", "queued", "peak_queued", "rejected", "timed_out")},
             {
                 "limit": 3,
                 "max_queue": 64,
@@ -699,6 +702,38 @@ class BackgroundTaskBudgetTests(unittest.TestCase):
                 await asyncio.sleep(0.01)
             self.assertEqual(budget.status()["active"], 0)
             self.assertTrue(budget.resume())
+
+        asyncio.run(run())
+
+    def test_status_exposes_physical_owner_by_kind_and_age(self):
+        async def run():
+            budget = BackgroundTaskBudget(1, execution_timeout_sec=0.01)
+            entered = threading.Event()
+            release = threading.Event()
+
+            def blocking_work():
+                entered.set()
+                while not release.is_set():
+                    threading.Event().wait(0.005)
+
+            async def work():
+                await asyncio.to_thread(blocking_work)
+
+            with self.assertRaises(BackgroundTaskExecutionTimeout):
+                await budget.run(
+                    work,
+                    task_name="memory_projection",
+                    defer_release_on_timeout=True,
+                )
+            self.assertTrue(entered.wait(0.5))
+            status = budget.status()
+            self.assertEqual(status["active_by_kind"], {"memory_projection": 1})
+            self.assertEqual(status["deferred_by_kind"], {"memory_projection": 1})
+            self.assertEqual(status["physical_owner_count"], 1)
+            self.assertGreaterEqual(status["oldest_owner_age_ms"], 0.0)
+            self.assertTrue(status["owner_task_names"])
+            release.set()
+            await budget.wait_until_idle(1.0)
 
         asyncio.run(run())
 

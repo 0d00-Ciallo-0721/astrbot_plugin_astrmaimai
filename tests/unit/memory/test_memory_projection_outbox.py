@@ -228,6 +228,104 @@ class MemoryProjectionOutboxTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_projection_diagnostics_keep_all_pending_rows_and_capabilities(self):
+        async def run():
+            db_path = self._db_path("outbox-large-diagnostics.db")
+            store = self.store_mod.MemoryV2Store(db_path, data_path=self.temp_dir.name)
+            await store.initialize()
+            import aiosqlite
+
+            rows = [
+                (
+                    f"mem-{index}",
+                    "pending",
+                    1,
+                    index + 1,
+                    0.0,
+                    "retriever_not_ready",
+                    time.time() - 10,
+                    time.time() - 1,
+                )
+                for index in range(1001)
+            ]
+            async with aiosqlite.connect(db_path) as db:
+                await db.executemany(
+                    """
+                    INSERT INTO memory_projection_outbox(
+                        memory_id, status, attempts, revision, next_retry_at, last_error, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    rows,
+                )
+                await db.commit()
+
+            diagnostics = await store.projection_retry_diagnostics()
+            self.assertEqual(diagnostics["pending_projection_count"], 1001)
+            self.assertEqual(diagnostics["pending_by_reason"], {"retriever_not_ready": 1001})
+            snapshot = await store.projection_retry_snapshot_with_revisions()
+            self.assertEqual(len(snapshot), 1001)
+
+            engine = SimpleNamespace(
+                v2_store=store,
+                retriever=object(),
+                _is_ready=True,
+                _vector_state="ready",
+                faiss_db=SimpleNamespace(delete=lambda *_args: None),
+                _execute_documents_write=lambda *_args, **_kwargs: None,
+            )
+            projector = self.projector_mod.MemoryIndexProjector(engine)
+            await projector._refresh_outbox_diagnostics()
+            status = projector.describe_status()
+            self.assertEqual(status["pending_projection_count"], 1001)
+            self.assertTrue(status["retriever_ready"])
+            self.assertTrue(status["vector_delete_supported"])
+            self.assertTrue(status["fts_delete_supported"])
+            self.assertTrue(status["repair_required"])
+
+        from types import SimpleNamespace
+
+        asyncio.run(run())
+
+    def test_permanently_unavailable_vector_delete_enters_repair_required(self):
+        async def run():
+            db_path = self._db_path("outbox-vector-unavailable.db")
+            store = self.store_mod.MemoryV2Store(db_path, data_path=self.temp_dir.name)
+
+            class _Engine:
+                v2_store = store
+                retriever = None
+                faiss_db = None
+                config = SimpleNamespace(
+                    timing=SimpleNamespace(
+                        projection_retry_max_attempts=1,
+                        projection_retry_base_delay_sec=1,
+                        projection_retry_max_delay_sec=1,
+                    )
+                )
+
+                async def _run_documents_query(self, *_args, **_kwargs):
+                    return [(1, "doc-1")]
+
+                async def _execute_documents_write(self, *_args, **_kwargs):
+                    return 0
+
+            projector = self.projector_mod.MemoryIndexProjector(_Engine())
+            self.assertEqual(await projector.cleanup_deleted(["mem-unavailable"]), 0)
+            self.assertEqual(await projector.cleanup_deleted(["mem-unavailable"]), 0)
+            await projector._refresh_outbox_diagnostics()
+            status = projector.describe_status()
+            self.assertTrue(status["repair_required"])
+            self.assertEqual(status["dead_letter_count"], 1)
+            self.assertFalse(status["vector_delete_supported"])
+            self.assertEqual(
+                status["dead_letter_count_by_reason"],
+                {"vector_delete_unavailable": 1},
+            )
+
+        from types import SimpleNamespace
+
+        asyncio.run(run())
+
 
 if __name__ == "__main__":
     unittest.main()

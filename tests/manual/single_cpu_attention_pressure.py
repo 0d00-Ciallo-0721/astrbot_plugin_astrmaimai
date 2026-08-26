@@ -7,6 +7,7 @@ import math
 import random
 import statistics
 import sys
+import tempfile
 import time
 from collections import defaultdict
 from collections import Counter
@@ -51,6 +52,8 @@ class PressureOptions:
     gateway_wait_timeout_sec: float = 30.0
     attention_drain_timeout_sec: float = 15.0
     physical_drain_timeout_sec: float = 15.0
+    late_physical_drain_budget_sec: float = 30.0
+    shutdown_physical_owner_duration_sec: float = 0.0
     sample_interval_sec: float = 1.0
     heartbeat_interval_sec: float = 0.05
     heartbeat_p95_limit_ms: float = 250.0
@@ -73,6 +76,10 @@ class PressureOptions:
             raise ValueError("provider_delay_max_sec must be >= provider_delay_min_sec")
         if self.reply_every < 1:
             raise ValueError("reply_every must be at least 1")
+        if self.shutdown_physical_owner_duration_sec < 0:
+            raise ValueError("shutdown_physical_owner_duration_sec cannot be negative")
+        if self.late_physical_drain_budget_sec < 0:
+            raise ValueError("late_physical_drain_budget_sec cannot be negative")
 
 
 class _Conversation:
@@ -363,7 +370,8 @@ def _build_config(options: PressureOptions) -> Any:
             enable_token_estimator=False,
         ),
         timing=SimpleNamespace(
-            hot_reload_shutdown_budget_sec=max(5.0, options.physical_drain_timeout_sec),
+            hot_reload_shutdown_budget_sec=5.0,
+            shutdown_late_physical_drain_budget_sec=options.late_physical_drain_budget_sec,
             shutdown_snapshot_timeout_sec=0.2,
             shutdown_cancel_grace_sec=1.0,
         ),
@@ -507,6 +515,80 @@ async def _wait_for_attention_drain(gate: AttentionGate, timeout_sec: float) -> 
     return False
 
 
+async def _run_memory_projection_probe() -> dict[str, Any]:
+    """Exercise the persisted projection outbox while the pressure run is active."""
+    from astrmai.memory.services.memory_index_projector import MemoryIndexProjector
+    from astrmai.memory.services.v2_store import MemoryV2Store
+    from astrmai.memory.contracts.memory_query import MemoryWriteRequest
+
+    class _Retriever:
+        def __init__(self) -> None:
+            self.ready = False
+            self.added: list[tuple[str, dict[str, Any]]] = []
+
+        async def add_memory(self, content: str, metadata: dict[str, Any]) -> int:
+            self.added.append((content, metadata))
+            return len(self.added)
+
+        def describe_status(self) -> dict[str, Any]:
+            return {"ready": self.ready, "vector_state": "ready" if self.ready else "initializing"}
+
+    class _Engine:
+        def __init__(self, store: MemoryV2Store, retriever: _Retriever) -> None:
+            self.v2_store = store
+            self.retriever = retriever
+            self.config = SimpleNamespace()
+            self._is_ready = False
+            self._vector_state = "initializing"
+
+        def _build_memory_metadata(self, **kwargs: Any) -> dict[str, Any]:
+            return dict(kwargs)
+
+        async def _run_documents_query(self, *_args: Any, **_kwargs: Any) -> list[Any]:
+            return []
+
+        async def _execute_documents_write(self, *_args: Any, **_kwargs: Any) -> int:
+            return 0
+
+    with tempfile.TemporaryDirectory(prefix="astrmai-pressure-memory-") as temp_dir:
+        store = MemoryV2Store(str(Path(temp_dir) / "memory.db"), data_path=Path(temp_dir))
+        retriever = _Retriever()
+        engine = _Engine(store, retriever)
+        projector = MemoryIndexProjector(engine)
+        written = await store.upsert(
+            MemoryWriteRequest(
+                source="single_cpu_pressure",
+                kind="memory",
+                session_id="pressure-memory",
+                content="projection pending during pressure",
+                dedup_key="pressure:projection",
+            )
+        )
+        pending_before = not await projector.project(written.memory_id)
+        pending_snapshot = await store.projection_retry_snapshot()
+        retriever.ready = True
+        engine._is_ready = True
+        engine._vector_state = "ready"
+        if pending_snapshot:
+            import aiosqlite
+
+            async with aiosqlite.connect(store.db_path) as db:
+                await db.execute(
+                    "UPDATE memory_projection_outbox SET next_retry_at = ? WHERE memory_id = ?",
+                    (time.time() - 1, written.memory_id),
+                )
+                await db.commit()
+        retry_result = await projector.retry_due(limit=20)
+        diagnostics = await store.projection_retry_diagnostics()
+        return {
+            "pending_before_retriever_ready": pending_before,
+            "retry_result": retry_result,
+            "pending_projection_count": int(diagnostics.get("pending_projection_count", 0) or 0),
+            "retriever_recovered": bool(retriever.ready and retriever.added),
+            "outbox_empty_after_recovery": not bool(await store.projection_retry_snapshot()),
+        }
+
+
 async def run_pressure(options: PressureOptions) -> dict[str, Any]:
     options.validate()
     rng = random.Random(options.random_seed)
@@ -588,6 +670,7 @@ async def run_pressure(options: PressureOptions) -> dict[str, Any]:
 
     stop = asyncio.Event()
     heartbeat_ms: list[float] = []
+    cpu_percent_samples: list[float] = []
     samples: list[dict[str, Any]] = []
     peak_pool_by_chat: defaultdict[str, int] = defaultdict(int)
     ingress_results: defaultdict[str, int] = defaultdict(int)
@@ -595,6 +678,7 @@ async def run_pressure(options: PressureOptions) -> dict[str, Any]:
     produced_events: list[_PressureEvent] = []
     produced = 0
     started_at = time.monotonic()
+    memory_probe = await _run_memory_projection_probe()
 
     async def heartbeat() -> None:
         deadline = time.monotonic() + options.heartbeat_interval_sec
@@ -606,6 +690,7 @@ async def run_pressure(options: PressureOptions) -> dict[str, Any]:
 
     async def sampler() -> None:
         while not stop.is_set():
+            cpu_percent_samples.append(round(float(process.cpu_percent(interval=None)), 3))
             snapshot = _runtime_snapshot(gate, budget, gateway, lane_manager, provider)
             snapshot["elapsed_sec"] = round(time.monotonic() - started_at, 3)
             for chat_id, session_status in snapshot["sessions"].items():
@@ -659,8 +744,46 @@ async def run_pressure(options: PressureOptions) -> dict[str, Any]:
         )
         before_shutdown = _runtime_snapshot(gate, budget, gateway, lane_manager, provider)
         before_shutdown_event_timeouts = _queue_timeout_counts(produced_events)
+        physical_owner_timeouts = 0
+        physical_owner_before_shutdown = 0
+        if options.shutdown_physical_owner_duration_sec > 0:
+            from astrmai.infrastructure.runtime.background_task_budget import (
+                BackgroundTaskExecutionTimeout,
+            )
+
+            async def physical_owner(index: int) -> None:
+                await asyncio.to_thread(
+                    time.sleep,
+                    options.shutdown_physical_owner_duration_sec,
+                )
+
+            owner_results = await asyncio.gather(
+                *(
+                    budget.run(
+                        lambda index=index: physical_owner(index),
+                        task_name=f"pressure.physical_owner.{index}",
+                        execution_timeout_sec=0.1,
+                        defer_release_on_timeout=True,
+                    )
+                    for index in range(2)
+                ),
+                return_exceptions=True,
+            )
+            physical_owner_timeouts = sum(
+                isinstance(result, BackgroundTaskExecutionTimeout)
+                for result in owner_results
+            )
+            physical_owner_before_shutdown = int(
+                budget.status().get("physical_owner_count", 0) or 0
+            )
         await lifecycle.terminate()
         idle_report = await budget.wait_until_idle(options.physical_drain_timeout_sec)
+        late_cleanup = getattr(lifecycle, "_late_shutdown_cleanup_task", None)
+        if late_cleanup is not None and not late_cleanup.done():
+            await asyncio.wait_for(
+                asyncio.shield(late_cleanup),
+                timeout=max(0.1, options.physical_drain_timeout_sec),
+            )
         after_shutdown = _runtime_snapshot(gate, budget, gateway, lane_manager, provider)
         after_shutdown_event_timeouts = _queue_timeout_counts(produced_events)
 
@@ -706,6 +829,13 @@ async def run_pressure(options: PressureOptions) -> dict[str, Any]:
             50.0,
             float(heartbeat_early["p99_ms"]) * 1.5,
         )
+        cpu_summary = {
+            "samples": len(cpu_percent_samples),
+            "p50": _percentile(cpu_percent_samples, 50),
+            "p95": _percentile(cpu_percent_samples, 95),
+            "p99": _percentile(cpu_percent_samples, 99),
+            "max": round(max(cpu_percent_samples), 3) if cpu_percent_samples else 0.0,
+        }
         final_window_timeout_growth = _final_window_timeout_growth(samples)
         peak_budget_active = max(
             (
@@ -721,6 +851,12 @@ async def run_pressure(options: PressureOptions) -> dict[str, Any]:
             ),
             default=0,
         )
+        completed_budget_work = sum(
+            int(value or 0)
+            for value in dict(
+                final_snapshot["background_budget"].get("completed_by_kind", {}) or {}
+            ).values()
+        )
         acceptance = {
             "cpu_affinity_applied": bool(
                 selected_cpu is not None and process.cpu_affinity() == [selected_cpu]
@@ -735,6 +871,13 @@ async def run_pressure(options: PressureOptions) -> dict[str, Any]:
             and int(final_snapshot["background_budget"].get("deferred_tasks", 0) or 0) == 0,
             "physical_tasks_zero": max(final_snapshot["physical_tasks"].values(), default=0) == 0
             and int(final_idle_report.get("remaining", 0) or 0) == 0,
+            "shutdown_physical_owners_exercised": (
+                options.shutdown_physical_owner_duration_sec <= 0
+                or (
+                    physical_owner_timeouts == 2
+                    and physical_owner_before_shutdown == 2
+                )
+            ),
             "queue_timeouts_stable_after_shutdown": (
                 post_shutdown_timeout_growth == 0
                 and post_shutdown_event_timeout_growth == 0
@@ -750,7 +893,13 @@ async def run_pressure(options: PressureOptions) -> dict[str, Any]:
             "reload_reaches_provider_success": reload_provider_completed,
             "slow_provider_concurrency_exercised": provider.started >= 2
             and provider.peak_active >= min(2, options.background_concurrency),
-            "background_budget_exercised": peak_budget_active > 0,
+            "background_budget_exercised": peak_budget_active > 0 or completed_budget_work > 0,
+            "memory_projection_recovered": (
+                bool(memory_probe["pending_before_retriever_ready"])
+                and bool(memory_probe["retriever_recovered"])
+                and bool(memory_probe["outbox_empty_after_recovery"])
+                and int(memory_probe["pending_projection_count"] or 0) == 0
+            ),
             "lifecycle_shutdown_completed": runtime.status.boot_phase == "shutdown.complete"
             and reload_runtime.status.boot_phase == "shutdown.complete",
             "no_producer_errors": not producer_errors,
@@ -767,6 +916,7 @@ async def run_pressure(options: PressureOptions) -> dict[str, Any]:
                 "GlobalModelGateway",
                 "LaneManager",
                 "PluginLifecycleManager.terminate",
+                "MemoryIndexProjector.retry_due",
             ],
             "simulated_components": ["Provider HTTP transport"],
             "options": asdict(options),
@@ -805,6 +955,7 @@ async def run_pressure(options: PressureOptions) -> dict[str, Any]:
             "heartbeat": heartbeat,
             "heartbeat_early": heartbeat_early,
             "heartbeat_late": heartbeat_late,
+            "cpu_percent": cpu_summary,
             "queue_timeout": {
                 "background_budget": {
                     "at_input_stop": stopped_timed_out,
@@ -824,6 +975,12 @@ async def run_pressure(options: PressureOptions) -> dict[str, Any]:
             "background_budget_peak": {
                 "active": peak_budget_active,
                 "queued": peak_budget_queued,
+                "completed": completed_budget_work,
+            },
+            "shutdown_physical_owners": {
+                "configured_duration_sec": options.shutdown_physical_owner_duration_sec,
+                "execution_timeouts": physical_owner_timeouts,
+                "before_shutdown": physical_owner_before_shutdown,
             },
             "attention_drained_before_shutdown": attention_drained,
             "budget_idle_report": idle_report,
@@ -833,6 +990,7 @@ async def run_pressure(options: PressureOptions) -> dict[str, Any]:
                 "budget_resumed": budget_resumed,
                 "provider_completed": reload_provider_completed,
             },
+            "memory_projection": memory_probe,
             "snapshots": {
                 "input_stopped": stopped_snapshot,
                 "before_shutdown": before_shutdown,
@@ -900,6 +1058,8 @@ def _parse_args() -> PressureOptions:
     parser.add_argument("--gateway-wait-timeout-sec", type=float, default=30.0)
     parser.add_argument("--attention-drain-timeout-sec", type=float, default=15.0)
     parser.add_argument("--physical-drain-timeout-sec", type=float, default=15.0)
+    parser.add_argument("--late-physical-drain-budget-sec", type=float, default=30.0)
+    parser.add_argument("--shutdown-physical-owner-duration-sec", type=float, default=0.0)
     parser.add_argument("--sample-interval-sec", type=float, default=1.0)
     parser.add_argument("--heartbeat-interval-sec", type=float, default=0.05)
     parser.add_argument("--heartbeat-p95-limit-ms", type=float, default=250.0)
@@ -925,6 +1085,8 @@ def _parse_args() -> PressureOptions:
         gateway_wait_timeout_sec=args.gateway_wait_timeout_sec,
         attention_drain_timeout_sec=args.attention_drain_timeout_sec,
         physical_drain_timeout_sec=args.physical_drain_timeout_sec,
+        late_physical_drain_budget_sec=args.late_physical_drain_budget_sec,
+        shutdown_physical_owner_duration_sec=args.shutdown_physical_owner_duration_sec,
         sample_interval_sec=args.sample_interval_sec,
         heartbeat_interval_sec=args.heartbeat_interval_sec,
         heartbeat_p95_limit_ms=args.heartbeat_p95_limit_ms,

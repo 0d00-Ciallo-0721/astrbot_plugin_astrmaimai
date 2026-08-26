@@ -55,6 +55,18 @@ class MemoryIndexProjector:
     def _projection_rebuild_active(self) -> bool:
         return bool(getattr(self.engine, "_projection_rebuild_active", False))
 
+    def _retriever_ready_for_projection(self) -> bool:
+        retriever = getattr(self.engine, "retriever", None)
+        if retriever is None:
+            return False
+        if hasattr(self.engine, "_is_ready") and not bool(getattr(self.engine, "_is_ready", False)):
+            return False
+        if hasattr(self.engine, "_vector_state"):
+            state = str(getattr(self.engine, "_vector_state", "") or "")
+            if state and state != "ready":
+                return False
+        return True
+
     async def _defer_projection_ids(self, memory_ids: list[str], reason: str) -> None:
         for memory_id in memory_ids:
             if memory_id:
@@ -197,7 +209,7 @@ class MemoryIndexProjector:
                 expected_revision = int(await revision_reader(memory_id) or 0)
             except Exception:
                 expected_revision = 0
-        if not getattr(self.engine, "retriever", None):
+        if not self._retriever_ready_for_projection():
             scheduled = await self._mark_pending_persisted(memory_id, "retriever_not_ready")
             logger.info(
                 f"[MemoryIndexProjector] projection deferred memory_id={memory_id} "
@@ -357,6 +369,7 @@ class MemoryIndexProjector:
             return False
 
     async def _refresh_outbox_diagnostics(self) -> dict[str, object]:
+        self._outbox_diagnostics = dict(getattr(self, "_outbox_diagnostics", {}) or {})
         store = getattr(self.engine, "v2_store", None)
         diagnostics = getattr(store, "projection_retry_diagnostics", None)
         if callable(diagnostics):
@@ -371,19 +384,19 @@ class MemoryIndexProjector:
         faiss_db = getattr(self.engine, "faiss_db", None)
         return {
             "retriever_present": bool(getattr(self.engine, "retriever", None)),
-            "retriever_ready": bool(
-                getattr(self.engine, "_is_ready", False)
-                and getattr(self.engine, "_vector_state", "") == "ready"
-            ),
+            "retriever_ready": self._retriever_ready_for_projection(),
             "faiss_db_present": faiss_db is not None,
             "coordinated_delete_supported": callable(getattr(vector_retriever, "delete_document", None)),
             "faiss_delete_supported": callable(getattr(faiss_db, "delete", None)),
+            "vector_delete_supported": callable(getattr(vector_retriever, "delete_document", None))
+            or callable(getattr(faiss_db, "delete", None)),
+            "fts_delete_supported": callable(getattr(self.engine, "_execute_documents_write", None)),
             "vector_state": str(getattr(self.engine, "_vector_state", "unknown") or "unknown"),
             "rebuild_generation": int(getattr(self.engine, "_vector_generation", 0) or 0),
         }
 
     def describe_status(self) -> dict[str, object]:
-        diagnostics = dict(self._outbox_diagnostics)
+        diagnostics = dict(getattr(self, "_outbox_diagnostics", {}) or {})
         pending_count = int(diagnostics.get("pending_count", 0) or 0)
         dead_letter_count = int(diagnostics.get("dead_letter_count", 0) or 0)
         diagnostics.update(
@@ -394,10 +407,15 @@ class MemoryIndexProjector:
                     **({"in_memory": len(self._pending_projection_ids)} if self._pending_projection_ids else {}),
                 },
                 "repair_required": bool(pending_count or dead_letter_count or self._pending_projection_ids),
+                "pending_projection_count": max(pending_count, len(self._pending_projection_ids)),
+                "pending_by_reason": {
+                    **dict(diagnostics.get("pending_count_by_reason", {}) or {}),
+                    **({"in_memory": len(self._pending_projection_ids)} if self._pending_projection_ids else {}),
+                },
                 "retry_worker_alive": bool(self._retry_task is not None and not self._retry_task.done()),
-                "retry_success_count": int(self._retry_success_count),
-                "retry_failure_count": int(self._retry_failure_count),
-                "retry_rejected_by_shutdown": int(self._retry_rejected_by_shutdown),
+                "retry_success_count": int(getattr(self, "_retry_success_count", 0) or 0),
+                "retry_failure_count": int(getattr(self, "_retry_failure_count", 0) or 0),
+                "retry_rejected_by_shutdown": int(getattr(self, "_retry_rejected_by_shutdown", 0) or 0),
                 "storage_mode": "sqlite_outbox"
                 if callable(getattr(getattr(self.engine, "v2_store", None), "schedule_projection_retry", None))
                 else "memory_process_local",
@@ -434,6 +452,8 @@ class MemoryIndexProjector:
         return_result: bool = False,
     ) -> int | dict[str, object]:
         if not memory_ids or not hasattr(self.engine, "_execute_documents_write"):
+            for memory_id in memory_ids or []:
+                await self._mark_pending_persisted(str(memory_id), "documents_write_unavailable")
             return {"deleted": 0, "failed": bool(memory_ids)} if return_result else 0
         deleted = 0
         failed_ids: list[str] = []
@@ -450,11 +470,19 @@ class MemoryIndexProjector:
                         expected_revision = int(await revision_reader(memory_id) or 0)
                     except Exception:
                         expected_revision = 0
-                rows = await self.engine._run_documents_query(
-                    "SELECT id, doc_id FROM documents WHERE json_extract(metadata, '$.canonical_id') = ?",
-                    (memory_id,),
-                    db_path=self._documents_db_path(),
-                )
+                try:
+                    rows = await self.engine._run_documents_query(
+                        "SELECT id, doc_id FROM documents WHERE json_extract(metadata, '$.canonical_id') = ?",
+                        (memory_id,),
+                        db_path=self._documents_db_path(),
+                    )
+                except Exception as exc:
+                    await self._mark_pending_persisted(memory_id, "documents_query_failed")
+                    logger.warning(
+                        f"[MemoryIndexProjector] documents lookup failed for {memory_id}: {exc}"
+                    )
+                    failed_ids.append(memory_id)
+                    continue
                 if not rows:
                     orphan_fts_result = await self._cleanup_orphan_fts_rows()
                     if orphan_fts_result is None or orphan_fts_result:
@@ -520,27 +548,53 @@ class MemoryIndexProjector:
                     failed_ids.append(memory_id)
                     continue
                 if len(successful_rows) == len(rows):
-                    removed_rows = await self.engine._execute_documents_write(
-                        "DELETE FROM documents WHERE json_extract(metadata, '$.canonical_id') = ?",
-                        (memory_id,),
-                        db_path=self._documents_db_path(),
-                    )
+                    documents_delete_failed = False
+                    try:
+                        removed_rows = await self.engine._execute_documents_write(
+                            "DELETE FROM documents WHERE json_extract(metadata, '$.canonical_id') = ?",
+                            (memory_id,),
+                            db_path=self._documents_db_path(),
+                        )
+                    except Exception as exc:
+                        documents_delete_failed = True
+                        await self._mark_pending_persisted(memory_id, "documents_delete_failed")
+                        logger.warning(
+                            f"[MemoryIndexProjector] documents delete failed for {memory_id}: {exc}"
+                        )
+                        failed_ids.append(memory_id)
+                        continue
                     deleted += max(int(removed_rows or 0), len(successful_rows))
                     fts_failed_ids = await self._delete_fts_rows(
                         [doc_id for doc_id, _ in successful_rows]
                     ) or []
                 else:
                     fts_failed_ids = []
+                    documents_delete_failed = False
                     for doc_id, doc_key in successful_rows:
-                        removed_rows = await self.engine._execute_documents_write(
-                            "DELETE FROM documents WHERE id = ?",
-                            (doc_id,),
-                            db_path=self._documents_db_path(),
-                        )
+                        try:
+                            removed_rows = await self.engine._execute_documents_write(
+                                "DELETE FROM documents WHERE id = ?",
+                                (doc_id,),
+                                db_path=self._documents_db_path(),
+                            )
+                        except Exception as exc:
+                            documents_delete_failed = True
+                            await self._mark_pending_persisted(memory_id, "documents_delete_failed")
+                            logger.warning(
+                                f"[MemoryIndexProjector] documents delete failed for {memory_id}: {exc}"
+                            )
+                            failed_ids.append(memory_id)
+                            break
                         deleted += max(int(removed_rows or 0), 1)
                         fts_failed_ids.extend(await self._delete_fts_rows([doc_id]) or [])
-                if vector_delete_failed or fts_failed_ids:
-                    reason = "vector_delete_failed" if vector_delete_failed else "fts_delete_failed"
+                if documents_delete_failed or vector_delete_failed or fts_failed_ids:
+                    reason = (
+                        "documents_delete_failed"
+                        if documents_delete_failed
+                        else "vector_delete_failed"
+                        if vector_delete_failed
+                        else "fts_delete_failed"
+                    )
                     await self._mark_pending_persisted(memory_id, reason)
                     failed_ids.append(memory_id)
                 elif settle_outbox:
@@ -661,6 +715,9 @@ class MemoryIndexProjector:
             for memory_id, reason in pending_reasons.items()
             if memory_id in pending_ids
         }
+        pending_by_reason: dict[str, int] = {}
+        for reason in pending_reasons.values():
+            pending_by_reason[str(reason or "unknown")] = pending_by_reason.get(str(reason or "unknown"), 0) + 1
         report = {
             "missing_projection_ids": [],
             "orphan_projection_ids": [],
@@ -673,6 +730,8 @@ class MemoryIndexProjector:
             "pending_projection_count_by_reason": dict(
                 outbox_diagnostics.get("pending_count_by_reason", {}) or {}
             ),
+            "pending_projection_count": len(pending_ids),
+            "pending_by_reason": pending_by_reason,
             "dead_letter_count": int(outbox_diagnostics.get("dead_letter_count", 0) or 0),
             "dead_letter_count_by_reason": dict(
                 outbox_diagnostics.get("dead_letter_count_by_reason", {}) or {}

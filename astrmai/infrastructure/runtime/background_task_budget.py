@@ -18,6 +18,9 @@ class _BudgetLease:
     budget: "BackgroundTaskBudget"
     active: bool = True
     owner: asyncio.Future | None = None
+    task_name: str = "unknown"
+    scope_key: str = ""
+    started_at: float = 0.0
 
 
 _ACTIVE_BUDGET_LEASES: ContextVar[tuple[_BudgetLease, ...]] = ContextVar(
@@ -79,6 +82,8 @@ class BackgroundTaskBudget:
     _active_leases: dict[int, _BudgetLease] = field(init=False, default_factory=dict, repr=False)
     _drain_cancelled_waiters: int = field(init=False, default=0, repr=False)
     _accepting: bool = field(init=False, default=True, repr=False)
+    _shutdown_rejected: int = field(init=False, default=0, repr=False)
+    _shutdown_rejected_by_kind: dict[str, int] = field(init=False, default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
         self.limit = max(1, int(self.limit or 1))
@@ -120,6 +125,8 @@ class BackgroundTaskBudget:
             # lease.  The outer execution deadline remains authoritative.
             return await awaitable_factory()
         if not self._accepting:
+            self._shutdown_rejected += 1
+            self._shutdown_rejected_by_kind[task_name] = self._shutdown_rejected_by_kind.get(task_name, 0) + 1
             raise BackgroundTaskQueueFull("background task budget is draining")
         scope_key = self._scope_key(task_name, scope_id)
         self._touch_scope(scope_key)
@@ -142,7 +149,13 @@ class BackgroundTaskBudget:
         started_at = time.monotonic()
         timeout_sec = self.execution_timeout_sec if execution_timeout_sec is None else max(0.1, float(execution_timeout_sec))
         timeout_scope = asyncio.timeout(timeout_sec)
-        lease = _BudgetLease(self, owner=asyncio.current_task())
+        lease = _BudgetLease(
+            self,
+            owner=asyncio.current_task(),
+            task_name=task_name,
+            scope_key=scope_key,
+            started_at=started_at,
+        )
         self._active_leases[id(lease)] = lease
         lease_token = None
         work_task: asyncio.Future | None = None
@@ -307,7 +320,43 @@ class BackgroundTaskBudget:
             if not waiter.done():
                 waiter.cancel()
 
-    async def drain(self, timeout_sec: float = 2.0) -> dict[str, int]:
+    def _owner_diagnostics(self) -> dict[str, object]:
+        now = time.monotonic()
+        active_by_kind = dict(self._active_by_kind)
+        queued_by_kind: dict[str, int] = {}
+        deferred_by_kind: dict[str, int] = {}
+        owner_task_names: list[str] = []
+        owner_ages: list[float] = []
+        physical_owner_count = 0
+        for waiter in self._waiters:
+            if waiter.done():
+                continue
+            task_name = str(getattr(waiter, "_astrmai_task_name", "unknown") or "unknown")
+            queued_by_kind[task_name] = queued_by_kind.get(task_name, 0) + 1
+        deferred_tasks = self._deferred_tasks
+        for lease in self._active_leases.values():
+            if not lease.active:
+                continue
+            owner = lease.owner
+            if owner is None or owner.done():
+                continue
+            physical_owner_count += 1
+            if lease.started_at:
+                owner_ages.append(max(0.0, now - lease.started_at))
+            owner_name = getattr(owner, "get_name", lambda: "unknown")()
+            owner_task_names.append(str(owner_name or lease.task_name or "unknown"))
+            if owner in deferred_tasks:
+                deferred_by_kind[lease.task_name] = deferred_by_kind.get(lease.task_name, 0) + 1
+        return {
+            "active_by_kind": active_by_kind,
+            "queued_by_kind": queued_by_kind,
+            "deferred_by_kind": deferred_by_kind,
+            "physical_owner_count": physical_owner_count,
+            "oldest_owner_age_ms": round(max(owner_ages, default=0.0) * 1000.0, 3),
+            "owner_task_names": sorted(set(owner_task_names)),
+        }
+
+    async def drain(self, timeout_sec: float = 2.0) -> dict[str, object]:
         """Wait for all physical owners without pretending cancelled threads ended."""
         self.begin_drain()
         pending = [
@@ -338,6 +387,7 @@ class BackgroundTaskBudget:
                     "physical": int(remaining_deferred),
                 }
             )
+            report.update(self._owner_diagnostics())
         return report
 
     async def wait_until_idle(self, timeout_sec: float | None = None) -> dict[str, int]:
@@ -482,7 +532,10 @@ class BackgroundTaskBudget:
             "peak_queued": int(self._peak_queued),
             "rejected": int(self._rejected),
             "timed_out": int(self._timed_out),
+            "shutdown_rejected": int(self._shutdown_rejected),
+            "shutdown_rejected_by_kind": dict(self._shutdown_rejected_by_kind),
         }
+        status.update(self._owner_diagnostics())
         deferred_count = sum(1 for task in self._deferred_tasks if not task.done())
         if deferred_count or not self._accepting:
             status["queued_waiters"] = sum(1 for waiter in self._waiters if not waiter.done())

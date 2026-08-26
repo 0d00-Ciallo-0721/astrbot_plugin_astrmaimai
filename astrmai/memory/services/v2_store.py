@@ -593,9 +593,13 @@ class MemoryV2Store:
 
         oldest = min((float(row[3] or now) for row in pending), default=0.0)
         next_retry = min((float(row[4] or 0.0) for row in pending), default=0.0)
+        pending_count = len(pending)
+        pending_by_reason = reason_counts(pending)
         return {
-            "pending_count": len(pending),
-            "pending_count_by_reason": reason_counts(pending),
+            "pending_count": pending_count,
+            "pending_count_by_reason": pending_by_reason,
+            "pending_projection_count": pending_count,
+            "pending_by_reason": pending_by_reason,
             "dead_letter_count": len(dead),
             "dead_letter_count_by_reason": reason_counts(dead),
             "oldest_pending_age_sec": max(0.0, now - oldest) if oldest else 0.0,

@@ -317,6 +317,22 @@ class ScheduledScenarioServiceTests(unittest.TestCase):
         self.assertGreater(service._generation_retry_at["2026-05-11"], 0.0)
         self.assertIn("RuntimeError", service.describe_status()["generation_last_error"]["2026-05-11"])
 
+    def test_shutdown_rejection_does_not_schedule_daily_retry(self):
+        service = self._service(
+            _Dispatcher(),
+            _config(daily_schedule_ai_enabled=True, daily_schedule_retry_base_sec=30),
+        )
+        service.request_shutdown()
+        service._schedule_generation_failed(
+            "2026-05-11",
+            self.module.BackgroundTaskQueueFull("background task budget is draining"),
+        )
+
+        status = service.describe_status()
+        self.assertEqual(status["generation_state"]["2026-05-11"], "shutdown_rejected")
+        self.assertNotIn("2026-05-11", status["generation_retry_at"])
+        self.assertTrue(status["shutdown_requested"])
+
     def test_invalid_schedule_shapes_are_retryable(self):
         invalid_payloads = ("{}", '{"morning": ""}', '{"unexpected": "value"}', "[]")
         for raw in invalid_payloads:

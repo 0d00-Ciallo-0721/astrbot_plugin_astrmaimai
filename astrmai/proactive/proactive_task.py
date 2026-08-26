@@ -360,6 +360,13 @@ class ProactiveTask:
     async def start(self):
         if self._is_running:
             return
+        resume_scenarios = getattr(
+            getattr(self, "scheduled_scenario_service", None),
+            "resume",
+            None,
+        )
+        if callable(resume_scenarios):
+            resume_scenarios()
         resume_dispatcher = getattr(self.proactive_dispatcher, "resume", None)
         if callable(resume_dispatcher) and resume_dispatcher() is False:
             logger.warning("[ProactiveTask] dispatcher is still draining; start deferred")
@@ -396,6 +403,13 @@ class ProactiveTask:
             safe_create_task(self.start())
 
     async def stop(self):
+        request_shutdown = getattr(
+            getattr(self, "scheduled_scenario_service", None),
+            "request_shutdown",
+            None,
+        )
+        if callable(request_shutdown):
+            request_shutdown()
         self._is_running = False
         try:
             await self.proactive_dispatcher.shutdown()
@@ -511,7 +525,18 @@ class ProactiveTask:
                 if isinstance(exc, (BackgroundTaskQueueFull, BackgroundTaskQueueTimeout)):
                     if getattr(task, "_astrmai_task_name", "") == "proactive.profile":
                         self._profile_stat_inc("profile_budget_rejected")
-                    logger.warning(f"[ProactiveTask] background task skipped: {exc}")
+                    budget = getattr(self, "background_task_budget", None)
+                    budget_status = getattr(budget, "status", None)
+                    draining = bool(
+                        callable(budget_status)
+                        and (budget_status() or {}).get("draining") is True
+                    )
+                    if draining:
+                        logger.info(
+                            f"[ProactiveTask] background task shutdown_rejected: {exc}"
+                        )
+                    else:
+                        logger.warning(f"[ProactiveTask] background task skipped: {exc}")
                 else:
                     logger.error(f"[Proactive Task Error] {exc}", exc_info=exc)
         except asyncio.CancelledError:

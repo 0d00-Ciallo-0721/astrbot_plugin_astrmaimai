@@ -1,5 +1,7 @@
 import asyncio
 import tempfile
+import threading
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -514,6 +516,127 @@ class PluginLifecycleShutdownRegressionTests(unittest.TestCase):
 
         asyncio.run(_run())
 
+    def test_two_physical_owners_are_tracked_and_watcher_finishes_after_deadline(self):
+        async def _run():
+            from astrmai.app.lifecycle import PluginLifecycleManager
+            from astrmai.infrastructure.runtime.background_task_budget import (
+                BackgroundTaskBudget,
+                BackgroundTaskExecutionTimeout,
+                BackgroundTaskQueueFull,
+            )
+
+            calls = []
+            runtime = self._build_runtime(calls)
+            runtime.config = SimpleNamespace(
+                timing=SimpleNamespace(shutdown_late_physical_drain_budget_sec=0.01)
+            )
+            budget = BackgroundTaskBudget(2, execution_timeout_sec=0.01)
+            runtime.background_task_budget = budget
+            releases = [asyncio.Event(), asyncio.Event()]
+            entered = [threading.Event(), threading.Event()]
+
+            async def physical(index):
+                def blocking():
+                    entered[index].set()
+                    while not releases[index].is_set():
+                        time.sleep(0.005)
+
+                await asyncio.to_thread(blocking)
+
+            for index, task_name in enumerate(("memory_projection", "proactive.profile")):
+                with self.assertRaises(BackgroundTaskExecutionTimeout):
+                    await budget.run(
+                        lambda index=index: physical(index),
+                        task_name=task_name,
+                        defer_release_on_timeout=True,
+                    )
+                self.assertTrue(entered[index].wait(0.5))
+
+            manager = PluginLifecycleManager(runtime)
+            manager._shutdown_started_monotonic = asyncio.get_running_loop().time()
+            manager._shutdown_pending_drain = True
+            budget.begin_drain()
+            with self.assertRaises(BackgroundTaskQueueFull):
+                await budget.run(lambda: asyncio.sleep(0), task_name="memory_projection")
+            manager._schedule_late_shutdown_cleanup(budget)
+            cleanup = manager._late_shutdown_cleanup_task
+            self.assertIsNotNone(cleanup)
+            await cleanup
+
+            status = budget.status()
+            self.assertEqual(status["physical_owner_count"], 2)
+            self.assertEqual(
+                status["deferred_by_kind"],
+                {"memory_projection": 1, "proactive.profile": 1},
+            )
+            self.assertEqual(status["shutdown_rejected_by_kind"], {"memory_projection": 1})
+            self.assertEqual(runtime.status.shutdown_final_status, "degraded")
+            self.assertEqual(runtime.status.shutdown_late_cleanup_task_count, 1)
+            self.assertTrue(runtime.status.shutdown_stage_stats["late_cleanup"]["remaining_by_kind"])
+
+            for release in releases:
+                release.set()
+            watcher = manager._late_shutdown_cleanup_task
+            await asyncio.wait_for(watcher, timeout=1.5)
+            self.assertEqual(runtime.status.shutdown_final_status, "complete")
+            self.assertEqual(runtime.status.shutdown_late_cleanup_task_count, 0)
+            self.assertIn("event_bus.stop", calls)
+            self.assertIn("persistence.dispose", calls)
+
+        asyncio.run(_run())
+
+    def test_late_cleanup_cancellation_records_degraded_terminal_state(self):
+        async def _run():
+            from astrmai.app.lifecycle import PluginLifecycleManager
+            from astrmai.infrastructure.runtime.background_task_budget import (
+                BackgroundTaskBudget,
+                BackgroundTaskExecutionTimeout,
+            )
+
+            calls = []
+            runtime = self._build_runtime(calls)
+            runtime.config = SimpleNamespace(
+                timing=SimpleNamespace(shutdown_late_physical_drain_budget_sec=1.0)
+            )
+            release = threading.Event()
+            entered = threading.Event()
+            budget = BackgroundTaskBudget(1, execution_timeout_sec=0.01)
+            runtime.background_task_budget = budget
+
+            async def physical():
+                def blocking():
+                    entered.set()
+                    while not release.is_set():
+                        time.sleep(0.005)
+
+                await asyncio.to_thread(blocking)
+
+            manager = PluginLifecycleManager(runtime)
+            with self.assertRaises(BackgroundTaskExecutionTimeout):
+                await budget.run(
+                    physical,
+                    task_name="memory_projection",
+                    defer_release_on_timeout=True,
+                )
+            self.assertTrue(entered.wait(0.5))
+            manager._shutdown_started_monotonic = asyncio.get_running_loop().time()
+            manager._shutdown_pending_drain = True
+            manager._schedule_late_shutdown_cleanup(budget)
+            cleanup = manager._late_shutdown_cleanup_task
+            await asyncio.sleep(0)
+            cleanup.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await cleanup
+            self.assertEqual(runtime.status.shutdown_final_status, "degraded")
+            self.assertTrue(runtime.status.shutdown_forced_termination_risk)
+            self.assertTrue(runtime.status.shutdown_pending_drain)
+            self.assertIn("shutdown.cleanup_cancelled", runtime.status.degraded_components)
+            self.assertEqual(runtime.status.boot_phase, "shutdown.degraded")
+            release.set()
+            await asyncio.wait_for(budget.wait_until_idle(1.0), timeout=1.5)
+
+        asyncio.run(_run())
+
     def test_startup_is_idempotent_after_runtime_becomes_ready(self):
         async def _run():
             from astrmai.app.lifecycle import PluginLifecycleManager
@@ -630,8 +753,63 @@ class PluginLifecycleShutdownRegressionTests(unittest.TestCase):
 
             self.assertIn("event_bus.stop", calls)
             self.assertIn("persistence.dispose", calls)
-            self.assertEqual(runtime.status.boot_phase, "shutdown.complete")
+            self.assertEqual(runtime.status.boot_phase, "shutdown.degraded")
+            self.assertEqual(runtime.status.shutdown_final_status, "degraded")
+            self.assertTrue(runtime.status.shutdown_forced_termination_risk)
+            self.assertIn("shutdown.dependency_close", runtime.status.degraded_components)
+            self.assertFalse(await manager._prepare_reinitialize())
             self.assertFalse(runtime.status.lifecycle_started)
+
+        asyncio.run(_run())
+
+    def test_late_cleanup_dependency_failure_stays_degraded(self):
+        async def _run():
+            from astrmai.app.lifecycle import PluginLifecycleManager
+            from astrmai.infrastructure.runtime.background_task_budget import BackgroundTaskBudget
+
+            calls = []
+            runtime = self._build_runtime(calls, failing_tail=True)
+            runtime.config = SimpleNamespace(
+                timing=SimpleNamespace(shutdown_late_physical_drain_budget_sec=0.1)
+            )
+            runtime.background_task_budget = BackgroundTaskBudget(1)
+            manager = PluginLifecycleManager(runtime)
+            manager._shutdown_started_monotonic = asyncio.get_running_loop().time()
+            manager._shutdown_pending_drain = True
+            manager._schedule_late_shutdown_cleanup(runtime.background_task_budget)
+
+            cleanup = manager._late_shutdown_cleanup_task
+            self.assertIsNotNone(cleanup)
+            await cleanup
+
+            self.assertEqual(runtime.status.boot_phase, "shutdown.degraded")
+            self.assertEqual(runtime.status.shutdown_final_status, "degraded")
+            self.assertTrue(runtime.status.shutdown_forced_termination_risk)
+            self.assertFalse(manager._termination_complete)
+            self.assertIn("shutdown.dependency_close", runtime.status.degraded_components)
+
+        asyncio.run(_run())
+
+    def test_unrelated_isolated_task_cancellation_does_not_mark_late_cleanup_cancelled(self):
+        async def _run():
+            from astrmai.app.lifecycle import PluginLifecycleManager
+
+            runtime = self._build_runtime([])
+            manager = PluginLifecycleManager(runtime)
+            late_cleanup = asyncio.create_task(asyncio.sleep(60), name="late-cleanup")
+            unrelated = asyncio.create_task(asyncio.sleep(60), name="unrelated-cleanup")
+            manager._late_shutdown_cleanup_task = late_cleanup
+            manager._isolated_shutdown_tasks.update({late_cleanup, unrelated})
+            runtime.status.shutdown_late_cleanup_task_count = 1
+            unrelated.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await unrelated
+            manager._consume_isolated_shutdown_task(unrelated)
+
+            self.assertEqual(runtime.status.shutdown_late_cleanup_task_count, 1)
+            self.assertNotIn("shutdown.cleanup_cancelled", runtime.status.degraded_components)
+            late_cleanup.cancel()
+            await asyncio.gather(late_cleanup, return_exceptions=True)
 
         asyncio.run(_run())
 
@@ -645,7 +823,8 @@ class PluginLifecycleShutdownRegressionTests(unittest.TestCase):
 
             await manager.terminate()
 
-            self.assertEqual(calls[0], "memory_pipeline.stop")
+            self.assertEqual(calls[0], "proactive.stop")
+            self.assertLess(calls.index("proactive.stop"), calls.index("memory_pipeline.stop"))
             self.assertIn("private_chat.persist", calls)
             self.assertIn("proactive.stop", calls)
             self.assertIn("expression.stop", calls)

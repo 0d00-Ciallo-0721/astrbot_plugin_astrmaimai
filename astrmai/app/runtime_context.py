@@ -104,6 +104,7 @@ class RuntimeStatus:
     shutdown_pending_drain: bool = False
     shutdown_forced_termination_risk: bool = False
     shutdown_late_cleanup_deadline: float = 0.0
+    shutdown_late_cleanup_task_count: int = 0
     degraded_components: dict[str, str] = field(default_factory=dict)
     # ponytail: threading.Lock is safe here (sync-only during bootstrap, not held across await)
     _degraded_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -148,6 +149,7 @@ class RuntimeStatus:
             "shutdown_pending_drain": self.shutdown_pending_drain,
             "shutdown_forced_termination_risk": self.shutdown_forced_termination_risk,
             "shutdown_late_cleanup_deadline": self.shutdown_late_cleanup_deadline,
+            "shutdown_late_cleanup_task_count": self.shutdown_late_cleanup_task_count,
             "degraded_components": self._snapshot_degraded(),
         }
 

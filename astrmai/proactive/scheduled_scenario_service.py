@@ -25,6 +25,7 @@ except ImportError:  # Optional at import time so plugin startup can degrade cle
     LunarDate = None
 
 from ..infrastructure.persistence.sqlite_helpers import connect_aiosqlite
+from ..infrastructure.runtime.background_task_budget import BackgroundTaskQueueFull
 from .dispatcher import ProactiveMessageIntent
 
 
@@ -424,12 +425,21 @@ class ScheduledScenarioService:
         self._generation_retry_at: dict[str, float] = {}
         self._generation_state: dict[str, str] = {}
         self._generation_last_error: dict[str, str] = {}
+        self._shutdown_requested = False
         self._last_tick_at = 0.0
         self._last_report: dict[str, Any] = {}
 
     def refresh_config(self, config: Any) -> None:
         self.config = config
         self.weather.refresh_config(config)
+
+    def request_shutdown(self) -> None:
+        """Fence schedule generation retries before lifecycle drains the budget."""
+        self._shutdown_requested = True
+        self._generation_started.clear()
+
+    def resume(self) -> None:
+        self._shutdown_requested = False
 
     @staticmethod
     def _slot(now: datetime) -> str:
@@ -474,6 +484,8 @@ class ScheduledScenarioService:
 
     def _start_schedule_generation(self, plan_date: str) -> None:
         life = getattr(self.config, "life", None)
+        if self._shutdown_requested:
+            return
         if plan_date in self._generation_started:
             return
         if self._generation_state.get(plan_date) in {"succeeded", "exhausted"}:
@@ -548,6 +560,16 @@ class ScheduledScenarioService:
             self._schedule_generation_failed(plan_date, exc)
 
     def _schedule_generation_failed(self, plan_date: str, exc: Exception) -> None:
+        if self._shutdown_requested or isinstance(exc, BackgroundTaskQueueFull):
+            self._generation_started.discard(plan_date)
+            self._generation_retry_at.pop(plan_date, None)
+            self._generation_state[plan_date] = "shutdown_rejected"
+            self._generation_last_error[plan_date] = f"{type(exc).__name__}: {exc}"[:500]
+            logger.info(
+                f"[ScheduledScenario] daily schedule retry rejected during shutdown "
+                f"date={plan_date} reason={type(exc).__name__}"
+            )
+            return
         life = getattr(self.config, "life", None)
         attempts = int(self._generation_attempts.get(plan_date, 0) or 0) + 1
         self._generation_attempts[plan_date] = attempts
@@ -776,6 +798,7 @@ class ScheduledScenarioService:
             "memory_claim_count": len(self.delivery_store._memory_claims),
             "memory_claim_limit": self.delivery_store.MEMORY_CLAIM_LIMIT,
             "memory_claim_capacity_rejected": self.delivery_store._memory_claim_capacity_rejected,
+            "shutdown_requested": self._shutdown_requested,
             "last_tick": dict(self._last_report),
         }
 
