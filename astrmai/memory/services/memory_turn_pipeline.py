@@ -8,6 +8,7 @@ from typing import Any
 from astrbot.api import logger
 
 from ...infrastructure.runtime.event_bus import EventBus
+from ...infrastructure.runtime.background_task_budget import BackgroundTaskQueueFull
 from ...infrastructure.runtime.turn_call_ledger import detach_turn_telemetry
 from ..contracts.memory_query import CommittedMemoryTurn, InstantGateResult
 
@@ -48,6 +49,9 @@ class MemoryTurnPipeline:
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._instant_llm_last_check: dict[str, float] = {}
         self._running = False
+        self._accepting = True
+        self._shutdown_rejected_count = 0
+        self._shutdown_generation = 0
         self._sweep_task: asyncio.Task[Any] | None = None
         self._maintenance_limit = self._maintenance_concurrency()
         self._maintenance_semaphore = asyncio.Semaphore(self._maintenance_limit)
@@ -77,6 +81,7 @@ class MemoryTurnPipeline:
         if self._running:
             return
         await self._restore_checkpoints()
+        self._accepting = True
         self._running = True
         self.event_bus.subscribe(self.event_bus.TOPIC_MEMORY_TURN_COMMITTED, self.on_turn_committed)
         self._sweep_task = asyncio.create_task(self._sweep_loop())
@@ -85,6 +90,7 @@ class MemoryTurnPipeline:
         await self._observe_global("memory_pipeline", "pipeline_started", summary="Memory pipeline started")
 
     async def stop(self) -> None:
+        self.begin_shutdown()
         self.event_bus.unsubscribe(self.event_bus.TOPIC_MEMORY_TURN_COMMITTED, self.on_turn_committed)
         self._running = False
         await self._persist_all_checkpoints()
@@ -104,6 +110,17 @@ class MemoryTurnPipeline:
         self._background_tasks.clear()
         self._sweep_task = None
         await self._observe_global("memory_pipeline", "pipeline_stopped", level="warning", summary="Memory pipeline stopped")
+
+    def begin_shutdown(self) -> None:
+        """Fence new maintenance work while retaining durable buffers/checkpoints."""
+        if not self._accepting:
+            return
+        self._accepting = False
+        self._running = False
+        self._shutdown_generation += 1
+
+    def is_accepting_work(self) -> bool:
+        return bool(self._accepting)
 
     def _timing_value(self, name: str, default: float) -> float:
         timing = getattr(self.config, "timing", None)
@@ -345,6 +362,9 @@ class MemoryTurnPipeline:
         active_workers = [chat_id for chat_id, task in self._worker_tasks.items() if task is not None and not task.done()]
         return {
             "running": bool(self._running),
+            "accepting_work": bool(self._accepting),
+            "shutdown_generation": int(self._shutdown_generation),
+            "shutdown_rejected_count": int(self._shutdown_rejected_count),
             "sweep_task_running": bool(self._sweep_task is not None and not self._sweep_task.done()),
             "buffered_chats": len([chat_id for chat_id, data in self._session_history_buffer.items() if (data or {}).get("buffer")]),
             "tracked_chats": len(self._session_history_buffer),
@@ -363,6 +383,7 @@ class MemoryTurnPipeline:
         threshold = int(getattr(getattr(self.config, "memory", None), "summary_threshold", 30) or 30)
         now = time.time()
         lock = self._get_memory_lock(chat_id)
+        shutdown_rejected_pending = 0
         async with lock:
             session_data = self._session_history_buffer.setdefault(
                 chat_id,
@@ -373,26 +394,42 @@ class MemoryTurnPipeline:
             last_update = float(session_data.get("last_update", 0.0) or 0.0)
             if not buffer:
                 return {"performed": False, "reason": "no_buffer", "pending_messages": 0}
-            if now < cooldown_until and not force:
-                return {"performed": False, "reason": "cooldown", "pending_messages": len(buffer), "cooldown_until": cooldown_until}
-            force_due = last_update > 0 and (now - last_update) >= self.TURN_FORCE_SUMMARIZE_AFTER_SECONDS
-            if len(buffer) < threshold * 2 and not force_due and not force:
-                await self._observe_chat(
-                    chat_id,
-                    "memory_pipeline",
-                    "maintenance_skipped",
-                    reason="below_threshold",
-                    summary=f"pending_messages={len(buffer)} threshold={threshold * 2}",
-                )
-                return {
-                    "performed": False,
-                    "reason": "below_threshold",
-                    "pending_messages": len(buffer),
-                    "threshold_messages": threshold * 2,
-                }
-            messages_to_process = buffer.copy()
-            session_data["buffer"] = []
-            self._inflight_maintenance[chat_id] = messages_to_process
+            if not self._accepting:
+                self._shutdown_rejected_count += 1
+                shutdown_rejected_pending = len(buffer)
+            if not shutdown_rejected_pending:
+                if now < cooldown_until and not force:
+                    return {"performed": False, "reason": "cooldown", "pending_messages": len(buffer), "cooldown_until": cooldown_until}
+                force_due = last_update > 0 and (now - last_update) >= self.TURN_FORCE_SUMMARIZE_AFTER_SECONDS
+                if len(buffer) < threshold * 2 and not force_due and not force:
+                    await self._observe_chat(
+                        chat_id,
+                        "memory_pipeline",
+                        "maintenance_skipped",
+                        reason="below_threshold",
+                        summary=f"pending_messages={len(buffer)} threshold={threshold * 2}",
+                    )
+                    return {
+                        "performed": False,
+                        "reason": "below_threshold",
+                        "pending_messages": len(buffer),
+                        "threshold_messages": threshold * 2,
+                    }
+                messages_to_process = buffer.copy()
+                session_data["buffer"] = []
+                self._inflight_maintenance[chat_id] = messages_to_process
+
+        if shutdown_rejected_pending:
+            await self._observe_chat(
+                chat_id,
+                "memory_pipeline",
+                "maintenance_rejected",
+                level="warning",
+                reason="shutdown_rejected",
+                summary="maintenance admission fenced during shutdown",
+                payload={"pending_messages": shutdown_rejected_pending, "shutdown_generation": self._shutdown_generation},
+            )
+            return {"performed": False, "reason": "shutdown_rejected", "pending_messages": shutdown_rejected_pending}
 
         await self._persist_checkpoint(chat_id)
 
@@ -409,6 +446,8 @@ class MemoryTurnPipeline:
             await self._maintenance_semaphore.acquire()
             self._active_maintenance += 1
             try:
+                if not self._accepting:
+                    raise BackgroundTaskQueueFull("memory maintenance admission fenced during shutdown")
                 if self.background_task_budget is not None:
                     await self.background_task_budget.run(
                         lambda: self.session_summarizer.summarize_session(
@@ -451,6 +490,33 @@ class MemoryTurnPipeline:
                 "pending_messages_processed": len(messages_to_process),
                 "last_memory_run_at": completed_at,
             }
+        except BackgroundTaskQueueFull as exc:
+            async with lock:
+                current_data = self._session_history_buffer.setdefault(
+                    chat_id,
+                    {"buffer": [], "last_update": time.time(), "cooldown_until": 0.0, "failures": 0, "last_run_at": 0.0},
+                )
+                current_data["buffer"] = messages_to_process + list(current_data.get("buffer", []) or [])
+                current_data["last_update"] = time.time()
+                self._inflight_maintenance.pop(chat_id, None)
+            await self._persist_checkpoint(chat_id)
+            if not self._accepting or "draining" in str(exc).lower() or "fenced" in str(exc).lower():
+                self._shutdown_rejected_count += 1
+                await self._observe_chat(
+                    chat_id,
+                    "memory_pipeline",
+                    "maintenance_rejected",
+                    level="warning",
+                    reason="shutdown_rejected",
+                    summary="maintenance budget rejected shutdown admission",
+                    payload={"pending_messages": len(messages_to_process), "shutdown_generation": self._shutdown_generation},
+                )
+                return {
+                    "performed": False,
+                    "reason": "shutdown_rejected",
+                    "pending_messages": len(current_data.get("buffer", []) or []),
+                }
+            raise
         except asyncio.CancelledError:
             async with lock:
                 current_data = self._session_history_buffer.setdefault(

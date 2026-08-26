@@ -49,6 +49,13 @@ class VectorRetriever:
         self._active_index_jobs = 0
         self._background_index_tasks: set[asyncio.Task] = set()
         self._half_open_probe_active = False
+        self._retrieval_sequence = 0
+        self._circuit_state = "closed"
+        self._circuit_last_transition = "closed"
+        self._circuit_last_error = ""
+        self._circuit_opened_at = 0.0
+        self._circuit_recovered_at = 0.0
+        self._fallback_counts: Dict[str, int] = {}
         self._status_counts: Dict[str, int] = {}
         self._last_stage_timings: Dict[str, float] = {}
         self._timeout_origin_counts: Dict[str, int] = {}
@@ -130,7 +137,11 @@ class VectorRetriever:
         except asyncio.TimeoutError as exc:
             raise _VectorStageTimeout(stage) from exc
         finally:
-            timings[f"{stage}_ms"] = round((time.monotonic() - stage_started) * 1000.0, 1)
+            elapsed_ms = round((time.monotonic() - stage_started) * 1000.0, 1)
+            timings[f"{stage}_ms"] = elapsed_ms
+            if stage == "embedding":
+                timings["embedding_total_ms"] = elapsed_ms
+                timings["embedding_provider_latency_ms"] = elapsed_ms
 
     def _search_index_sync(self, vector: np.ndarray, k: int):
         import faiss
@@ -304,6 +315,7 @@ class VectorRetriever:
         self._active_queries += 1
         release_on_exit = True
         stage_timings: Dict[str, float] = {}
+        stage_timings["embedding_queue_wait_ms"] = wait_ms
         try:
             remaining = max(0.1, timeout - wait_ms / 1000.0)
             deadline = time.monotonic() + remaining
@@ -347,33 +359,53 @@ class VectorRetriever:
                 self._release_query_slot()
 
     def _circuit_open(self) -> bool:
-        return time.monotonic() < self._unavailable_until
+        if time.monotonic() < self._unavailable_until:
+            self._circuit_state = "open"
+            return True
+        if self._failure_count >= self._failure_threshold() and self._circuit_state == "open":
+            self._circuit_state = "half_open"
+        return False
 
     def _begin_circuit_probe(self) -> bool:
         if self._circuit_open():
             return False
         if self._failure_count < self._failure_threshold():
+            self._circuit_state = "degraded" if self._failure_count else "closed"
             return True
         if self._half_open_probe_active:
             return False
         self._half_open_probe_active = True
+        self._circuit_state = "half_open"
+        self._circuit_last_transition = "half_open"
         return True
 
     def _mark_failure(self, reason: str) -> None:
+        self._circuit_last_error = str(reason or "unknown")
         self._half_open_probe_active = False
         self._failure_count += 1
         if self._failure_count >= self._failure_threshold():
             cooldown = max(5.0, self._timing_value("faiss_circuit_breaker_cooldown_sec", 180.0))
             self._unavailable_until = time.monotonic() + cooldown
+            self._circuit_state = "open"
+            self._circuit_last_transition = "open"
+            self._circuit_opened_at = time.time()
             logger.warning(
                 f"[VectorStore] Faiss circuit opened: failures={self._failure_count} "
                 f"cooldown_sec={cooldown:.1f} reason={reason}"
             )
+        else:
+            self._circuit_state = "degraded"
+            self._circuit_last_transition = "degraded"
 
     def _mark_success(self) -> None:
+        was_degraded = self._failure_count > 0 or self._circuit_state in {"open", "half_open", "degraded"}
         self._half_open_probe_active = False
         self._failure_count = 0
         self._unavailable_until = 0.0
+        if was_degraded:
+            self._circuit_last_transition = "recovered"
+            self._circuit_recovered_at = time.time()
+        self._circuit_state = "closed"
 
     def describe_status(self) -> Dict[str, Any]:
         total = sum(self._status_counts.values())
@@ -393,11 +425,17 @@ class VectorRetriever:
             "background_index_jobs": int(len(self._background_index_tasks)),
             "failure_count": int(self._failure_count),
             "circuit_open": bool(self._circuit_open()),
+            "circuit_state": str(self._circuit_state or "closed"),
+            "circuit_last_transition": str(self._circuit_last_transition or ""),
+            "circuit_last_error": str(self._circuit_last_error or ""),
+            "circuit_opened_at": self._circuit_opened_at or None,
+            "circuit_recovered_at": self._circuit_recovered_at or None,
             "half_open_probe_active": bool(self._half_open_probe_active),
             "total_queries": int(total),
             "degraded_queries": int(degraded),
             "degraded_ratio": round(degraded / total, 4) if total else 0.0,
             "status_counts": dict(self._status_counts),
+            "fallback_counts": dict(self._fallback_counts),
             "timeout_origin_counts": dict(self._timeout_origin_counts),
             "stage_latency_ms": {
                 stage: self._latency_summary(samples)
@@ -579,22 +617,33 @@ class VectorRetriever:
         timeout_origin: str = "",
         stage_timings: Optional[Dict[str, float]] = None,
         query_queue_wait_ms: float = 0.0,
+        retrieval_id: str = "",
+        circuit_state_before: str = "",
+        fallback_source: str = "",
     ) -> None:
         normalized_status = str(status or "unknown")
+        normalized_stage_timings = dict(stage_timings or {})
+        normalized_stage_timings.setdefault(
+            "retrieval_total_ms",
+            round(max(0.0, time.monotonic() - started_at) * 1000.0, 1),
+        )
         self._status_counts[normalized_status] = self._status_counts.get(normalized_status, 0) + 1
-        self._last_stage_timings = dict(stage_timings or {})
+        self._last_stage_timings = dict(normalized_stage_timings)
         normalized_origin = str(timeout_origin or "").strip()
         if normalized_origin:
             self._timeout_origin_counts[normalized_origin] = (
                 self._timeout_origin_counts.get(normalized_origin, 0) + 1
             )
-        for stage, value in (stage_timings or {}).items():
+        for stage, value in normalized_stage_timings.items():
             if not str(stage).endswith("_ms"):
                 continue
             samples = self._stage_latency_samples.setdefault(str(stage), [])
             samples.append(round(max(0.0, float(value or 0.0)), 1))
             if len(samples) > 512:
                 del samples[:-512]
+        normalized_fallback = str(fallback_source or "").strip()
+        if normalized_fallback:
+            self._fallback_counts[normalized_fallback] = self._fallback_counts.get(normalized_fallback, 0) + 1
         if query_queue_wait_ms:
             queue_samples = self._stage_latency_samples.setdefault("query_queue_wait_ms", [])
             queue_samples.append(round(max(0.0, float(query_queue_wait_ms)), 1))
@@ -608,8 +657,15 @@ class VectorRetriever:
         )
         effective_timeout = float(timeout_sec or 0.0)
         observation.clear()
+        timeout_source = {
+            "embedding": "embedding_provider_timeout",
+            "faiss_index": "faiss_search_timeout",
+            "document_read": "sqlite_timeout",
+            "faiss_db.retrieve": "faiss_search_timeout",
+        }.get(normalized_origin, normalized_origin)
         observation.update(
             {
+                "retrieval_id": str(retrieval_id or ""),
                 "status": normalized_status,
                 "retrieve_stage": "phased" if self._supports_phased_retrieval() else "faiss_db.retrieve",
                 "timeout_origin": str(timeout_origin or ""),
@@ -629,6 +685,11 @@ class VectorRetriever:
                 "result_count": max(0, int(result_count or 0)),
                 "failure_count": max(0, int(self._failure_count or 0)),
                 "circuit_open": bool(self._circuit_open()),
+                "circuit_state_before": str(circuit_state_before or ""),
+                "circuit_state_after": str(self._circuit_state or "closed"),
+                "circuit_transition": str(self._circuit_last_transition or ""),
+                "fallback_source": str(fallback_source or ""),
+                "timeout_source": timeout_source,
                 "cooldown_remaining_sec": round(cooldown_remaining, 3),
                 "error_type": str(error_type or ""),
                 "error_detail": str(error_detail or "")[:240],
@@ -636,7 +697,7 @@ class VectorRetriever:
                 "active_queries": int(self._active_queries),
                 "faiss_thread_count": int(self._faiss_thread_count()),
                 "query_queue_wait_ms": round(max(0.0, float(query_queue_wait_ms or 0.0)), 1),
-                "stage_timings": dict(stage_timings or {}),
+                "stage_timings": dict(normalized_stage_timings),
                 "runtime_metrics": self.describe_status(),
             }
         )
@@ -651,6 +712,9 @@ class VectorRetriever:
     ) -> List[SearchResult]:
         """执行向量相似度搜索"""
         started_at = time.monotonic()
+        self._retrieval_sequence += 1
+        retrieval_id = f"vector-retrieval-{self._retrieval_sequence}"
+        circuit_state_before = str(self._circuit_state or "closed")
         configured_timeout_sec = max(0.5, self._timing_value("faiss_timeout_sec", 20.0))
         timeout_sec = clamp_timeout_to_turn_budget(
             None,
@@ -666,6 +730,8 @@ class VectorRetriever:
                 timeout_sec=timeout_sec,
                 configured_timeout_sec=configured_timeout_sec,
                 requested_k=k,
+                retrieval_id=retrieval_id,
+                circuit_state_before=circuit_state_before,
             )
             return []
         if not self._begin_circuit_probe():
@@ -677,6 +743,8 @@ class VectorRetriever:
                 timeout_sec=timeout_sec,
                 configured_timeout_sec=configured_timeout_sec,
                 requested_k=k,
+                retrieval_id=retrieval_id,
+                circuit_state_before=circuit_state_before,
             )
             return []
             
@@ -723,6 +791,9 @@ class VectorRetriever:
                 fetch_k=fetch_k,
                 metadata_filter_count=metadata_filter_count,
                 query_queue_wait_ms=query_wait_ms,
+                retrieval_id=retrieval_id,
+                circuit_state_before=circuit_state_before,
+                fallback_source="canonical_fts",
             )
             return []
         except asyncio.CancelledError:
@@ -746,6 +817,9 @@ class VectorRetriever:
                 timeout_origin=exc.stage,
                 stage_timings=getattr(exc, "stage_timings", {}),
                 query_queue_wait_ms=locals().get("query_wait_ms", 0.0),
+                retrieval_id=retrieval_id,
+                circuit_state_before=circuit_state_before,
+                fallback_source="canonical_fts",
             )
             return []
         except Exception as e:
@@ -763,6 +837,9 @@ class VectorRetriever:
                 fetch_k=fetch_k,
                 metadata_filter_count=metadata_filter_count,
                 stage_timings=getattr(e, "stage_timings", {}),
+                retrieval_id=retrieval_id,
+                circuit_state_before=circuit_state_before,
+                fallback_source="canonical_fts",
             )
             return []
 
@@ -794,6 +871,8 @@ class VectorRetriever:
             metadata_filter_count=metadata_filter_count,
             stage_timings=stage_timings,
             query_queue_wait_ms=query_wait_ms,
+            retrieval_id=retrieval_id,
+            circuit_state_before=circuit_state_before,
         )
         self._schedule_storage_metrics_refresh()
         return out

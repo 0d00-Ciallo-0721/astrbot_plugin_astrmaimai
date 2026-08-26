@@ -102,6 +102,7 @@ class MemoryEngine:
         self._is_ready = False
         self._vector_state = "uninitialized"
         self._vector_bootstrap_task: asyncio.Task | None = None
+        self._projection_ready_replay_task: asyncio.Task | None = None
         self._vector_retirement_tasks: set[asyncio.Task] = set()
         self._vector_last_error = ""
         self._vector_bootstrap_started_at = 0.0
@@ -896,6 +897,14 @@ class MemoryEngine:
                         await confirm(pending_ids)
                     except Exception as exc:
                         logger.warning(f"[AstrMai] projection outbox confirmation deferred: {exc}")
+                replay = getattr(active_projector, "replay_pending_after_ready", None)
+                if callable(replay):
+                    previous_replay = self._projection_ready_replay_task
+                    if previous_replay is None or previous_replay.done():
+                        self._projection_ready_replay_task = asyncio.create_task(
+                            replay(limit=int(self._timing_value("projection_retry_batch_size", 20) or 20)),
+                            name="astrmai-memory-projection-ready-replay",
+                        )
                 self._cleanup_stale_vector_indexes(candidate_index_path, keep_history=1)
                 logger.info("[AstrMai] hybrid memory engine ready (BM25 + FaissVecDB).")
             finally:
@@ -936,6 +945,10 @@ class MemoryEngine:
                 "bootstrap_running": bool(
                     self._vector_bootstrap_task is not None
                     and not self._vector_bootstrap_task.done()
+                ),
+                "projection_ready_replay_running": bool(
+                    self._projection_ready_replay_task is not None
+                    and not self._projection_ready_replay_task.done()
                 ),
                 "bootstrap_started_at": self._vector_bootstrap_started_at or None,
                 "bootstrap_completed_at": self._vector_bootstrap_completed_at or None,
@@ -1529,6 +1542,10 @@ class MemoryEngine:
         self._schedule_vector_bootstrap()
 
     async def stop_background_producers(self):
+        pipeline = getattr(self, "memory_pipeline", None)
+        begin_pipeline_shutdown = getattr(pipeline, "begin_shutdown", None)
+        if callable(begin_pipeline_shutdown):
+            begin_pipeline_shutdown()
         bootstrap_task = self._vector_bootstrap_task
         self._vector_bootstrap_task = None
         if bootstrap_task is not None and not bootstrap_task.done():
@@ -1537,10 +1554,14 @@ class MemoryEngine:
                 await bootstrap_task
             except asyncio.CancelledError:
                 pass
+        replay_task = self._projection_ready_replay_task
+        self._projection_ready_replay_task = None
+        if replay_task is not None and not replay_task.done():
+            replay_task.cancel()
+            await asyncio.gather(replay_task, return_exceptions=True)
         retirement_tasks = list(self._vector_retirement_tasks)
         if retirement_tasks:
             await asyncio.gather(*retirement_tasks, return_exceptions=True)
-        pipeline = getattr(self, "memory_pipeline", None)
         if pipeline is not None:
             await pipeline.stop()
         projector = getattr(self, "index_projector", None)
