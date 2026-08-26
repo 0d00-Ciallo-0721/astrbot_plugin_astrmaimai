@@ -326,6 +326,27 @@ class MemoryProjectionOutboxTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_projection_single_flight_rejects_duplicate_owner(self):
+        async def run():
+            projector = self.projector_mod.MemoryIndexProjector.__new__(self.projector_mod.MemoryIndexProjector)
+            projector._projection_inflight_ids = set()
+            calls = []
+
+            async def _project_once(memory_id, request=None):
+                calls.append(memory_id)
+                await asyncio.sleep(0.02)
+                return True
+
+            projector._project_once = _project_once
+            first, second = await asyncio.gather(
+                projector.project("same-memory"),
+                projector.project("same-memory"),
+            )
+            self.assertEqual(sum(bool(item) for item in (first, second)), 1)
+            self.assertEqual(calls, ["same-memory"])
+
+        asyncio.run(run())
+
 
 if __name__ == "__main__":
     unittest.main()

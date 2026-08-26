@@ -139,9 +139,6 @@ class VectorRetriever:
         finally:
             elapsed_ms = round((time.monotonic() - stage_started) * 1000.0, 1)
             timings[f"{stage}_ms"] = elapsed_ms
-            if stage == "embedding":
-                timings["embedding_total_ms"] = elapsed_ms
-                timings["embedding_provider_latency_ms"] = elapsed_ms
 
     def _search_index_sync(self, vector: np.ndarray, k: int):
         import faiss
@@ -218,6 +215,7 @@ class VectorRetriever:
         deadline: float,
         timings: Dict[str, float],
     ):
+        embedding_started = time.monotonic()
         try:
             embedding = await self._await_stage(
                 self.faiss_db.embedding_provider.get_embedding(query),
@@ -225,9 +223,16 @@ class VectorRetriever:
                 stage="embedding",
                 timings=timings,
             )
+            timings["embedding_provider_latency_ms"] = round(
+                max(0.0, time.monotonic() - embedding_started) * 1000.0, 1
+            )
         except _VectorStageTimeout as exc:
             setattr(exc, "stage_timings", dict(timings))
             raise
+        finally:
+            timings["embedding_total_ms"] = round(
+                max(0.0, time.monotonic() - embedding_started) * 1000.0, 1
+            )
         vector = np.array([embedding], dtype=np.float32)
         index_started = time.monotonic()
         index_task = asyncio.create_task(
@@ -315,7 +320,8 @@ class VectorRetriever:
         self._active_queries += 1
         release_on_exit = True
         stage_timings: Dict[str, float] = {}
-        stage_timings["embedding_queue_wait_ms"] = wait_ms
+        stage_timings["faiss_query_queue_wait_ms"] = wait_ms
+        stage_timings["embedding_gateway_queue_wait_ms"] = 0.0
         try:
             remaining = max(0.1, timeout - wait_ms / 1000.0)
             deadline = time.monotonic() + remaining
@@ -359,12 +365,14 @@ class VectorRetriever:
                 self._release_query_slot()
 
     def _circuit_open(self) -> bool:
-        if time.monotonic() < self._unavailable_until:
-            self._circuit_state = "open"
-            return True
-        if self._failure_count >= self._failure_threshold() and self._circuit_state == "open":
-            self._circuit_state = "half_open"
-        return False
+        return time.monotonic() < self._unavailable_until
+
+    def _peek_circuit_state(self) -> str:
+        if self._circuit_open():
+            return "open"
+        if self._failure_count >= self._failure_threshold() and self._circuit_state in {"open", "half_open"}:
+            return "half_open"
+        return str(self._circuit_state or "closed")
 
     def _begin_circuit_probe(self) -> bool:
         if self._circuit_open():
@@ -424,8 +432,8 @@ class VectorRetriever:
             "active_index_jobs": int(self._active_index_jobs),
             "background_index_jobs": int(len(self._background_index_tasks)),
             "failure_count": int(self._failure_count),
-            "circuit_open": bool(self._circuit_open()),
-            "circuit_state": str(self._circuit_state or "closed"),
+            "circuit_open": self._peek_circuit_state() == "open",
+            "circuit_state": self._peek_circuit_state(),
             "circuit_last_transition": str(self._circuit_last_transition or ""),
             "circuit_last_error": str(self._circuit_last_error or ""),
             "circuit_opened_at": self._circuit_opened_at or None,
@@ -684,12 +692,13 @@ class VectorRetriever:
                 "metadata_filter_count": max(0, int(metadata_filter_count or 0)),
                 "result_count": max(0, int(result_count or 0)),
                 "failure_count": max(0, int(self._failure_count or 0)),
-                "circuit_open": bool(self._circuit_open()),
+                "circuit_open": self._peek_circuit_state() == "open",
                 "circuit_state_before": str(circuit_state_before or ""),
-                "circuit_state_after": str(self._circuit_state or "closed"),
+                "circuit_state_after": self._peek_circuit_state(),
                 "circuit_transition": str(self._circuit_last_transition or ""),
                 "fallback_source": str(fallback_source or ""),
                 "timeout_source": timeout_source,
+                "embedding_latency_source": "provider_await_elapsed" if "embedding_provider_latency_ms" in normalized_stage_timings else "",
                 "cooldown_remaining_sec": round(cooldown_remaining, 3),
                 "error_type": str(error_type or ""),
                 "error_detail": str(error_detail or "")[:240],
@@ -745,6 +754,7 @@ class VectorRetriever:
                 requested_k=k,
                 retrieval_id=retrieval_id,
                 circuit_state_before=circuit_state_before,
+                fallback_source="canonical_fts",
             )
             return []
             

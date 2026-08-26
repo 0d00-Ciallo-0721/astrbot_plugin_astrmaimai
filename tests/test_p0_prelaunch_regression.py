@@ -658,6 +658,29 @@ class P0PrelaunchRegressionTests(unittest.TestCase):
         self.assertIsNone(ImagePipeline.prepare_image("not base64"))
         self.assertIsNone(ImagePipeline.prepare_image(base64.b64encode(b"not an image").decode("ascii")))
 
+    def test_vector_diagnostics_peek_circuit_without_transition_and_count_fallback(self):
+        from astrmai.memory.retrieval.vector_store import VectorRetriever
+
+        class _Faiss:
+            async def retrieve(self, **kwargs):
+                await asyncio.sleep(0)
+                return []
+
+        retriever = VectorRetriever(_Faiss())
+        retriever._failure_count = retriever._failure_threshold()
+        retriever._circuit_state = "open"
+        retriever._unavailable_until = time.monotonic() - 1.0
+        status_before = retriever._circuit_state
+        status = retriever.describe_status()
+        self.assertEqual(status["circuit_state"], "half_open")
+        self.assertEqual(retriever._circuit_state, status_before)
+
+        retriever._unavailable_until = time.monotonic() + 10.0
+        observation = {}
+        asyncio.run(retriever.search("hello", observation=observation))
+        self.assertEqual(observation["fallback_source"], "canonical_fts")
+        self.assertGreaterEqual(retriever.describe_status()["fallback_counts"]["canonical_fts"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

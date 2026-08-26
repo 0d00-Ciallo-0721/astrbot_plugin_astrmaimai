@@ -51,6 +51,7 @@ class MemoryTurnPipeline:
         self._running = False
         self._accepting = True
         self._shutdown_rejected_count = 0
+        self._started_after_shutdown = 0
         self._shutdown_generation = 0
         self._sweep_task: asyncio.Task[Any] | None = None
         self._maintenance_limit = self._maintenance_concurrency()
@@ -365,6 +366,7 @@ class MemoryTurnPipeline:
             "accepting_work": bool(self._accepting),
             "shutdown_generation": int(self._shutdown_generation),
             "shutdown_rejected_count": int(self._shutdown_rejected_count),
+            "started_after_shutdown": int(self._started_after_shutdown),
             "sweep_task_running": bool(self._sweep_task is not None and not self._sweep_task.done()),
             "buffered_chats": len([chat_id for chat_id, data in self._session_history_buffer.items() if (data or {}).get("buffer")]),
             "tracked_chats": len(self._session_history_buffer),

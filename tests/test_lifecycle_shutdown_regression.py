@@ -94,6 +94,17 @@ class PluginLifecycleShutdownRegressionTests(unittest.TestCase):
         )
         return runtime
 
+    def test_begin_shutdown_fences_memory_pipeline_immediately(self):
+        calls = []
+        runtime = self._build_runtime(calls)
+        runtime.memory_engine.memory_pipeline.begin_shutdown = lambda: calls.append("memory_pipeline.begin_shutdown")
+        from astrmai.app.lifecycle import PluginLifecycleManager
+
+        manager = PluginLifecycleManager(runtime)
+        manager.begin_shutdown()
+        self.assertIn("memory_pipeline.begin_shutdown", calls)
+        self.assertFalse(runtime.status.accepting_events)
+
     def test_terminate_runs_shutdown_order_and_resets_runtime_flags(self):
         async def _run():
             from astrmai.app.lifecycle import PluginLifecycleManager

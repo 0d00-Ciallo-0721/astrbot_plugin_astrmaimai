@@ -509,6 +509,14 @@ class PluginLifecycleManager:
         request_scenario_shutdown = getattr(scheduled_scenarios, "request_shutdown", None)
         if callable(request_scenario_shutdown):
             request_scenario_shutdown()
+        memory_engine = getattr(self.runtime, "memory_engine", None)
+        memory_pipeline = getattr(memory_engine, "memory_pipeline", None)
+        fence_memory_pipeline = getattr(memory_pipeline, "begin_shutdown", None)
+        if callable(fence_memory_pipeline):
+            try:
+                fence_memory_pipeline()
+            except Exception as exc:
+                logger.warning(f"[AstrMai] Memory pipeline shutdown fence degraded: {exc}")
         self.runtime.status.shutdown_generation = int(
             getattr(self.runtime.status, "shutdown_generation", 0) or 0
         ) + 1

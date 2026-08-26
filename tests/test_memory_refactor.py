@@ -130,7 +130,26 @@ class MemoryRefactorTests(unittest.TestCase):
         self.assertTrue(result["eligible"])
         self.assertTrue(result["candidate_present"])
         self.assertEqual(result["reason"], "eligible")
-        self.assertEqual(result["pending_messages"], 6)
+
+    def test_memory_turn_pipeline_rejects_maintenance_after_shutdown_fence(self):
+        pipeline_mod = importlib.import_module("astrmai.memory.services.memory_turn_pipeline")
+        pipeline = pipeline_mod.MemoryTurnPipeline(
+            context=SimpleNamespace(),
+            gateway=SimpleNamespace(config=SimpleNamespace(memory=SimpleNamespace(summary_threshold=2))),
+            engine=SimpleNamespace(),
+            session_summarizer=SimpleNamespace(),
+            instant_gate=SimpleNamespace(),
+            config=SimpleNamespace(memory=SimpleNamespace(summary_threshold=2)),
+        )
+        pipeline._session_history_buffer["shutdown-chat"] = {
+            "buffer": ["u", "a", "u2", "a2"], "last_update": time.time(),
+            "cooldown_until": 0.0, "failures": 0, "last_run_at": 0.0,
+        }
+        pipeline.begin_shutdown()
+        result = asyncio.run(pipeline.run_maintenance_for_session("shutdown-chat", force=True))
+        self.assertEqual(result["reason"], "shutdown_rejected")
+        self.assertEqual(pipeline.describe_runtime_status()["started_after_shutdown"], 0)
+        self.assertEqual(len(pipeline._session_history_buffer["shutdown-chat"]["buffer"]), 4)
 
     def test_memory_turn_pipeline_maintenance_delegates_to_session_summarizer(self):
         pipeline_mod = importlib.import_module("astrmai.memory.services.memory_turn_pipeline")

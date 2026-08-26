@@ -308,6 +308,8 @@ class MemoryV2Store:
                     revision INTEGER NOT NULL DEFAULT 0,
                     next_retry_at REAL NOT NULL DEFAULT 0,
                     last_error TEXT NOT NULL DEFAULT '',
+                    last_error_type TEXT NOT NULL DEFAULT '',
+                    last_failed_stage TEXT NOT NULL DEFAULT '',
                     created_at REAL NOT NULL DEFAULT 0,
                     updated_at REAL NOT NULL DEFAULT 0
                 )
@@ -318,6 +320,14 @@ class MemoryV2Store:
             if "revision" not in outbox_columns:
                 await db.execute(
                     "ALTER TABLE memory_projection_outbox ADD COLUMN revision INTEGER NOT NULL DEFAULT 0"
+                )
+            if "last_error_type" not in outbox_columns:
+                await db.execute(
+                    "ALTER TABLE memory_projection_outbox ADD COLUMN last_error_type TEXT NOT NULL DEFAULT ''"
+                )
+            if "last_failed_stage" not in outbox_columns:
+                await db.execute(
+                    "ALTER TABLE memory_projection_outbox ADD COLUMN last_failed_stage TEXT NOT NULL DEFAULT ''"
                 )
             await db.execute(
                 "INSERT OR IGNORE INTO memory_v2_meta(key, value) VALUES ('projection_outbox_revision', '0')"
@@ -367,6 +377,17 @@ class MemoryV2Store:
                 previous_attempts = int(row[0] or 0) if row else 0
                 previous_status = str(row[3] or "pending") if row and len(row) > 3 else "pending"
                 attempts = previous_attempts + 1
+                reason_text = str(reason or "unknown")
+                error_type = reason_text.split(":", 1)[0]
+                failed_stage = {
+                    "embedding_timeout": "embedding",
+                    "embedding_queue_timeout": "embedding_queue",
+                    "vector_add_failed": "faiss_add",
+                    "vector_delete_failed": "faiss_delete",
+                    "fts_delete_failed": "fts_delete",
+                    "documents_delete_failed": "documents_delete",
+                    "projection_lock_timeout": "projection_lock",
+                }.get(reason_text, "")
                 if previous_status == "dead_letter":
                     await db.commit()
                     return False
@@ -385,17 +406,19 @@ class MemoryV2Store:
                     await db.execute(
                         """
                         INSERT INTO memory_projection_outbox(
-                            memory_id, status, attempts, revision, next_retry_at, last_error, created_at, updated_at
-                        ) VALUES (?, 'dead_letter', ?, ?, 0, ?, ?, ?)
+                            memory_id, status, attempts, revision, next_retry_at, last_error, last_error_type, last_failed_stage, created_at, updated_at
+                        ) VALUES (?, 'dead_letter', ?, ?, 0, ?, ?, ?, ?, ?)
                         ON CONFLICT(memory_id) DO UPDATE SET
                             status = 'dead_letter',
                             attempts = excluded.attempts,
                             revision = excluded.revision,
                             next_retry_at = 0,
                             last_error = excluded.last_error,
+                            last_error_type = excluded.last_error_type,
+                            last_failed_stage = excluded.last_failed_stage,
                             updated_at = excluded.updated_at
                         """,
-                        (clean_id, attempts, revision, str(reason or "unknown")[:500], created_at, now),
+                        (clean_id, attempts, revision, reason_text[:500], error_type, failed_stage, created_at, now),
                     )
                     await db.commit()
                     return False
@@ -406,17 +429,19 @@ class MemoryV2Store:
                 await db.execute(
                 """
                 INSERT INTO memory_projection_outbox(
-                    memory_id, status, attempts, revision, next_retry_at, last_error, created_at, updated_at
-                ) VALUES (?, 'pending', ?, ?, ?, ?, ?, ?)
+                    memory_id, status, attempts, revision, next_retry_at, last_error, last_error_type, last_failed_stage, created_at, updated_at
+                ) VALUES (?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(memory_id) DO UPDATE SET
                     status = 'pending',
                     attempts = excluded.attempts,
                     revision = excluded.revision,
                     next_retry_at = excluded.next_retry_at,
                     last_error = excluded.last_error,
+                    last_error_type = excluded.last_error_type,
+                    last_failed_stage = excluded.last_failed_stage,
                     updated_at = excluded.updated_at
                 """,
-                (clean_id, attempts, revision, now + delay, str(reason or "unknown")[:500], created_at, now),
+                (clean_id, attempts, revision, now + delay, reason_text[:500], error_type, failed_stage, created_at, now),
                 )
                 await db.commit()
             except Exception:

@@ -46,6 +46,8 @@ class MemoryIndexProjector:
         self._retry_rejected_by_shutdown = 0
         self._last_retry_items: list[dict[str, object]] = []
         self._projection_failure_by_reason: dict[str, int] = {}
+        self._projection_deferred_by_reason: dict[str, int] = {}
+        self._projection_inflight_ids: set[str] = set()
 
     def _get_projection_lock(self) -> asyncio.Lock:
         lock = getattr(self, "_projection_lock", None)
@@ -188,6 +190,14 @@ class MemoryIndexProjector:
         normalized_reason = str(reason or "unknown")
         self._pending_projection_ids.add(memory_id)
         self._pending_projection_reasons[memory_id] = normalized_reason
+        deferred_reasons = {"retriever_not_ready", "projection_rebuild_in_progress", "shutdown_rejected"}
+        if normalized_reason in deferred_reasons:
+            deferred_counts = getattr(self, "_projection_deferred_by_reason", None)
+            if deferred_counts is None:
+                deferred_counts = {}
+                self._projection_deferred_by_reason = deferred_counts
+            deferred_counts[normalized_reason] = deferred_counts.get(normalized_reason, 0) + 1
+            return
         failure_counts = getattr(self, "_projection_failure_by_reason", None)
         if failure_counts is None:
             failure_counts = {}
@@ -208,6 +218,20 @@ class MemoryIndexProjector:
         return getattr(self.engine, "db_path", None)
 
     async def project(self, memory_id: str, request: MemoryWriteRequest | None = None) -> bool:
+        normalized_id = str(memory_id or "").strip()
+        inflight = getattr(self, "_projection_inflight_ids", None)
+        if inflight is None:
+            inflight = set()
+            self._projection_inflight_ids = inflight
+        if not normalized_id or normalized_id in inflight:
+            return False
+        inflight.add(normalized_id)
+        try:
+            return await self._project_once(normalized_id, request)
+        finally:
+            inflight.discard(normalized_id)
+
+    async def _project_once(self, memory_id: str, request: MemoryWriteRequest | None = None) -> bool:
         if self._projection_rebuild_active():
             await self._mark_pending_persisted(memory_id, "projection_rebuild_in_progress")
             return False
@@ -484,6 +508,7 @@ class MemoryIndexProjector:
                 "retry_rejected_by_shutdown": int(getattr(self, "_retry_rejected_by_shutdown", 0) or 0),
                 "last_retry_items": list(getattr(self, "_last_retry_items", []) or []),
                 "projection_failure_by_reason": dict(getattr(self, "_projection_failure_by_reason", {}) or {}),
+                "projection_deferred_by_reason": dict(getattr(self, "_projection_deferred_by_reason", {}) or {}),
                 "storage_mode": "sqlite_outbox"
                 if callable(getattr(getattr(self.engine, "v2_store", None), "schedule_projection_retry", None))
                 else "memory_process_local",
