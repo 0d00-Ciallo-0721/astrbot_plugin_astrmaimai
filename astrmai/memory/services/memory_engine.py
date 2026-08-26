@@ -945,6 +945,16 @@ class MemoryEngine:
                 "index_path": self._vector_index_path,
             }
         )
+        projector = getattr(self, "index_projector", None)
+        describe_projector = getattr(projector, "describe_status", None)
+        if callable(describe_projector):
+            try:
+                runtime["projection"] = describe_projector()
+            except Exception as exc:
+                runtime["projection"] = {
+                    "repair_required": True,
+                    "diagnostics_error": type(exc).__name__,
+                }
         return runtime
 
     async def add_memory(

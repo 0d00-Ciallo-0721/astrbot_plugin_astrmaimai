@@ -471,6 +471,49 @@ class PluginLifecycleShutdownRegressionTests(unittest.TestCase):
 
         asyncio.run(_run())
 
+    def test_late_physical_drain_budget_enters_explicit_degraded_state(self):
+        async def _run():
+            from astrmai.app.lifecycle import PluginLifecycleManager
+            from astrmai.infrastructure.runtime.background_task_budget import BackgroundTaskBudget
+
+            calls = []
+            runtime = self._build_runtime(calls)
+            runtime.config = SimpleNamespace(
+                timing=SimpleNamespace(shutdown_late_physical_drain_budget_sec=0.01)
+            )
+            release = asyncio.Event()
+            budget = BackgroundTaskBudget(1, execution_timeout_sec=0.01)
+            runtime.background_task_budget = budget
+
+            async def slow_work():
+                await release.wait()
+
+            manager = PluginLifecycleManager(runtime)
+            with self.assertRaises(TimeoutError):
+                await budget.run(
+                    slow_work,
+                    task_name="memory.vector_delete",
+                    defer_release_on_timeout=True,
+                )
+
+            manager._shutdown_started_monotonic = asyncio.get_running_loop().time()
+            manager._shutdown_pending_drain = True
+            manager._schedule_late_shutdown_cleanup(budget)
+            cleanup = manager._late_shutdown_cleanup_task
+            self.assertIsNotNone(cleanup)
+            await cleanup
+
+            self.assertEqual(runtime.status.boot_phase, "shutdown.degraded")
+            self.assertEqual(runtime.status.shutdown_final_status, "degraded")
+            self.assertTrue(runtime.status.shutdown_pending_drain)
+            self.assertTrue(runtime.status.shutdown_forced_termination_risk)
+            self.assertIn("shutdown.late_cleanup", runtime.status.degraded_components)
+            self.assertNotIn("event_bus.stop", calls)
+            release.set()
+            await budget.wait_until_idle(0.5)
+
+        asyncio.run(_run())
+
     def test_startup_is_idempotent_after_runtime_becomes_ready(self):
         async def _run():
             from astrmai.app.lifecycle import PluginLifecycleManager

@@ -27,6 +27,7 @@ class PluginLifecycleManager:
         self._shutdown_pending_drain = False
         self._shutdown_started_monotonic = 0.0
         self._late_shutdown_cleanup_task: asyncio.Task[Any] | None = None
+        self._late_shutdown_cleanup_deadline_monotonic = 0.0
         self.runtime.lifecycle.manager = self
 
     def track_task(self, coro: Any) -> asyncio.Task[Any]:
@@ -604,6 +605,8 @@ class PluginLifecycleManager:
         if pending_budget:
             self._shutdown_pending_drain = True
             self._schedule_late_shutdown_cleanup(budget)
+            self.runtime.status.shutdown_pending_drain = True
+            self.runtime.status.shutdown_final_status = "pending_drain"
             elapsed_ms = round((time.monotonic() - started) * 1000, 3)
             self.runtime.status.shutdown_stage_stats["forced_tail"] = {
                 "status": "pending_drain",
@@ -722,6 +725,10 @@ class PluginLifecycleManager:
             self.runtime.status.shutdown_started_at = time.time()
             self.runtime.status.shutdown_stage_stats = {}
             self.runtime.status.shutdown_isolated_tasks = 0
+            self.runtime.status.shutdown_final_status = "running"
+            self.runtime.status.shutdown_pending_drain = False
+            self.runtime.status.shutdown_forced_termination_risk = False
+            self.runtime.status.shutdown_late_cleanup_deadline = 0.0
             deadline = started + self._shutdown_timing("hot_reload_shutdown_budget_sec", 5.0)
 
             try:
@@ -770,6 +777,8 @@ class PluginLifecycleManager:
                 self._reset_runtime_status_flags()
                 if self._shutdown_pending_drain:
                     self.runtime.set_boot_phase("shutdown.pending_drain")
+                    self.runtime.status.shutdown_pending_drain = True
+                    self.runtime.status.shutdown_final_status = "pending_drain"
                     self._termination_complete = False
                     logger.warning("[AstrMai] shutdown pending physical background work drain")
                 else:
@@ -783,6 +792,9 @@ class PluginLifecycleManager:
                         default="",
                     )
                     self.runtime.set_boot_phase("shutdown.complete")
+                    self.runtime.status.shutdown_final_status = "complete"
+                    self.runtime.status.shutdown_pending_drain = False
+                    self.runtime.status.shutdown_forced_termination_risk = False
                     self._termination_complete = True
                     logger.info(
                         f"[AstrMai] shutdown complete elapsed_ms={elapsed_ms:.1f} "
@@ -911,6 +923,8 @@ class PluginLifecycleManager:
         if drain_report.get("remaining", 0):
             self._shutdown_pending_drain = True
             self._schedule_late_shutdown_cleanup(budget)
+            self.runtime.status.shutdown_pending_drain = True
+            self.runtime.status.shutdown_final_status = "pending_drain"
             logger.warning(
                 "[AstrMai] keeping dependent resources open until background drain completes: "
                 f"remaining={drain_report.get('remaining', 0)}"
@@ -946,14 +960,52 @@ class PluginLifecycleManager:
 
     def _schedule_late_shutdown_cleanup(self, budget: Any) -> None:
         if not budget or not hasattr(budget, "wait_until_idle"):
+            self.runtime.status.shutdown_final_status = "degraded"
+            self.runtime.status.shutdown_forced_termination_risk = True
+            self.runtime.set_boot_phase("shutdown.degraded")
+            self.runtime.mark_degraded("shutdown.late_cleanup", "budget_idle_waiter_unavailable")
             logger.warning("[AstrMai] late shutdown cleanup unavailable: budget has no idle waiter")
             return
         existing = getattr(self, "_late_shutdown_cleanup_task", None)
         if existing is not None and not existing.done():
             return
 
+        late_budget = self._shutdown_timing("shutdown_late_physical_drain_budget_sec", 30.0)
+        late_started = time.monotonic()
+        self._late_shutdown_cleanup_deadline_monotonic = late_started + late_budget
+        self.runtime.status.shutdown_late_cleanup_deadline = time.time() + late_budget
+
         async def _cleanup() -> None:
-            await budget.wait_until_idle()
+            try:
+                report = await budget.wait_until_idle(timeout_sec=late_budget)
+            except Exception as exc:
+                self.runtime.mark_degraded("shutdown.late_cleanup", str(exc))
+                report = {"remaining": self._background_budget_pending(budget)}
+            remaining = max(
+                int(report.get("remaining", 0) or 0),
+                self._background_budget_pending(budget),
+            )
+            if remaining:
+                self.runtime.status.shutdown_stage_stats["late_cleanup"] = {
+                    "status": "degraded",
+                    "elapsed_ms": round((time.monotonic() - late_started) * 1000, 3),
+                    "remaining": remaining,
+                    "deadline": self.runtime.status.shutdown_late_cleanup_deadline,
+                    "forced_termination_risk": True,
+                }
+                self.runtime.status.shutdown_final_status = "degraded"
+                self.runtime.status.shutdown_pending_drain = True
+                self.runtime.status.shutdown_forced_termination_risk = True
+                self.runtime.set_boot_phase("shutdown.degraded")
+                self.runtime.mark_degraded(
+                    "shutdown.late_cleanup",
+                    f"physical_background_work_remaining={remaining}",
+                )
+                logger.warning(
+                    "[AstrMai] late shutdown drain deadline reached; dependencies remain open: "
+                    f"remaining={remaining} budget_sec={late_budget:.1f}"
+                )
+                return
             try:
                 close_memory_resources = getattr(
                     self.runtime.memory_engine,
@@ -981,6 +1033,10 @@ class PluginLifecycleManager:
             finally:
                 self._shutdown_pending_drain = False
                 self._reset_runtime_status_flags()
+                self.runtime.status.shutdown_pending_drain = False
+                self.runtime.status.shutdown_final_status = "complete"
+                self.runtime.status.shutdown_forced_termination_risk = False
+                self.runtime.status.shutdown_late_cleanup_deadline = 0.0
                 elapsed_ms = (time.monotonic() - self._shutdown_started_monotonic) * 1000
                 self.runtime.status.shutdown_completed_at = time.time()
                 self.runtime.status.last_shutdown_elapsed_ms = round(elapsed_ms, 3)

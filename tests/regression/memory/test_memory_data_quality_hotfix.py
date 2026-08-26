@@ -597,6 +597,34 @@ class FaissAwareCleanupTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertEqual(projector.pending_reason("mem-1"), "vector_delete_unavailable")
 
+    def test_retry_worker_treats_budget_drain_rejection_as_shutdown(self):
+        async def run():
+            from astrmai.infrastructure.runtime.background_task_budget import BackgroundTaskQueueFull
+
+            class _Budget:
+                def status(self):
+                    return {"draining": True}
+
+                async def run(self, *_args, **_kwargs):
+                    raise BackgroundTaskQueueFull("background task budget is draining")
+
+            class _Store:
+                async def list_due_projection_retries(self, *, limit=20):
+                    return []
+
+            class _Engine:
+                background_task_budget = _Budget()
+                v2_store = _Store()
+
+            projector = MemoryIndexProjector(_Engine())
+            await projector._retry_loop()
+            status = projector.describe_status()
+            self.assertEqual(status["retry_rejected_by_shutdown"], 1)
+            self.assertEqual(status["retry_failure_count"], 0)
+            self.assertFalse(status["retry_worker_alive"])
+
+        asyncio.run(run())
+
     def test_failed_faiss_delete_retains_rows_for_retry(self):
         calls = []
 

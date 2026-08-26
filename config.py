@@ -722,6 +722,12 @@ class TimingConfig(BaseModel):
     # 丢弃，UI 关闭无效。None=未设置（回退 private_chat 侧）。
     turn_merge_enabled: bool | None = Field(default=None, repr=False)
     hot_reload_shutdown_budget_sec: float = Field(default=5.0, ge=1.0, le=30.0)
+    shutdown_late_physical_drain_budget_sec: float = Field(
+        default=30.0,
+        ge=0.0,
+        le=300.0,
+        description="正常停机窗口结束后，等待不可立即取消物理任务的独立上限（秒）",
+    )
     shutdown_component_timeout_sec: float = Field(default=1.5, ge=0.1, le=10.0)
     shutdown_cancel_grace_sec: float = Field(default=1.0, ge=0.0, le=10.0)
     shutdown_snapshot_timeout_sec: float = Field(default=0.5, ge=0.1, le=5.0)
@@ -777,6 +783,12 @@ class TimingConfig(BaseModel):
     projection_retry_base_delay_sec: float = Field(default=30.0, ge=1.0, le=3600.0)
     projection_retry_max_delay_sec: float = Field(default=900.0, ge=5.0, le=86400.0)
     projection_retry_batch_size: int = Field(default=20, ge=1, le=200)
+    projection_retry_max_attempts: int = Field(
+        default=8,
+        ge=1,
+        le=100,
+        description="记忆投影失败后的最大自动重试次数，超过后进入 dead-letter 并保留原始数据",
+    )
     projection_lock_timeout_sec: float = Field(default=1.0, ge=0.1, le=30.0)
     projection_rebuild_lock_timeout_sec: float = Field(default=60.0, ge=1.0, le=3600.0)
     private_wait_timeout_sec: int = Field(default=300, ge=1, le=7200)

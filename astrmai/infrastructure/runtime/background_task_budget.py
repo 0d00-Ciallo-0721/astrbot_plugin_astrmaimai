@@ -325,10 +325,20 @@ class BackgroundTaskBudget:
             await asyncio.sleep(0)
         remaining_leases = sum(1 for lease in self._active_leases.values() if lease.active)
         remaining_deferred = sum(1 for task in self._deferred_tasks if not task.done())
-        return {
+        report = {
             "observed": len(pending) + queued + self._drain_cancelled_waiters,
             "remaining": max(remaining_leases, remaining_deferred, queued, self._active),
         }
+        if report["remaining"]:
+            report.update(
+                {
+                    "active": int(self._active),
+                    "queued_waiters": int(queued),
+                    "deferred": int(remaining_deferred),
+                    "physical": int(remaining_deferred),
+                }
+            )
+        return report
 
     async def wait_until_idle(self, timeout_sec: float | None = None) -> dict[str, int]:
         """Wait for every physical owner to finish after admission is fenced."""
@@ -474,6 +484,11 @@ class BackgroundTaskBudget:
             "timed_out": int(self._timed_out),
         }
         deferred_count = sum(1 for task in self._deferred_tasks if not task.done())
+        if deferred_count or not self._accepting:
+            status["queued_waiters"] = sum(1 for waiter in self._waiters if not waiter.done())
+            status["deferred"] = int(deferred_count)
+            status["physical_tasks"] = int(deferred_count)
+            status["draining"] = not bool(self._accepting)
         if deferred_count or not self._accepting:
             status["deferred_tasks"] = int(deferred_count)
             status["accepting"] = bool(self._accepting)

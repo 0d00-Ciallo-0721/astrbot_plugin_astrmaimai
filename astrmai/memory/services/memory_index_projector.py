@@ -6,6 +6,7 @@ import json
 from astrbot.api import logger
 
 from ..contracts.memory_query import MemoryWriteRequest
+from ...infrastructure.runtime.background_task_budget import BackgroundTaskQueueFull
 
 
 class MemoryIndexProjector:
@@ -31,6 +32,18 @@ class MemoryIndexProjector:
         }
         self._candidate_outbox_ids: set[str] = set()
         self._candidate_outbox_confirmations: dict[str, int] = {}
+        self._outbox_diagnostics: dict[str, object] = {
+            "pending_count": 0,
+            "pending_count_by_reason": {},
+            "dead_letter_count": 0,
+            "dead_letter_count_by_reason": {},
+            "oldest_pending_age_sec": 0.0,
+            "max_attempts": 0,
+            "next_retry_at": None,
+        }
+        self._retry_success_count = 0
+        self._retry_failure_count = 0
+        self._retry_rejected_by_shutdown = 0
 
     def _get_projection_lock(self) -> asyncio.Lock:
         lock = getattr(self, "_projection_lock", None)
@@ -83,9 +96,19 @@ class MemoryIndexProjector:
                 reason,
                 base_delay_sec=float(self._config_value("projection_retry_base_delay_sec", 30.0) or 30.0),
                 max_delay_sec=float(self._config_value("projection_retry_max_delay_sec", 900.0) or 900.0),
+                max_attempts=int(self._config_value("projection_retry_max_attempts", 8) or 8),
             )
         )
         self._pending_projection_scheduled[memory_id] = scheduled
+        await self._refresh_outbox_diagnostics()
+        if not scheduled:
+            status_reader = getattr(store, "projection_retry_status", None)
+            if callable(status_reader):
+                try:
+                    if await status_reader(memory_id) == "dead_letter":
+                        self._clear_pending(memory_id)
+                except Exception as exc:
+                    logger.debug(f"[MemoryIndexProjector] retry status unavailable: {exc}")
         return scheduled
 
     async def _clear_pending_persisted(self, memory_id: str, expected_revision: int = 0) -> None:
@@ -103,10 +126,12 @@ class MemoryIndexProjector:
         conditional = getattr(store, "complete_projection_retry_if_unchanged", None)
         if callable(conditional):
             await conditional(memory_id, int(expected_revision or 0))
+            await self._refresh_outbox_diagnostics()
             return
         complete = getattr(store, "complete_projection_retry", None)
         if callable(complete):
             await complete(memory_id)
+            await self._refresh_outbox_diagnostics()
 
     def candidate_outbox_ids(self) -> set[str]:
         return {item for item in self._candidate_outbox_ids if item}
@@ -243,6 +268,7 @@ class MemoryIndexProjector:
             self._retry_loop(),
             name="astrmai-memory-projection-retry",
         )
+        await self._refresh_outbox_diagnostics()
 
     async def stop(self) -> None:
         self._retry_stop.set()
@@ -279,7 +305,19 @@ class MemoryIndexProjector:
                 continue
             except asyncio.CancelledError:
                 raise
+            except BackgroundTaskQueueFull as exc:
+                if self._budget_is_draining():
+                    self._retry_rejected_by_shutdown += 1
+                    logger.info(
+                        "[MemoryIndexProjector] retry worker stopped during shutdown: "
+                        f"{exc}"
+                    )
+                    return
+                self._retry_failure_count += 1
+                logger.warning(f"[MemoryIndexProjector] retry worker degraded: {exc}")
+                await asyncio.sleep(min(interval, 30.0))
             except Exception as exc:
+                self._retry_failure_count += 1
                 logger.warning(f"[MemoryIndexProjector] retry worker degraded: {exc}")
                 await asyncio.sleep(min(interval, 30.0))
 
@@ -297,14 +335,76 @@ class MemoryIndexProjector:
             result["attempted"] += 1
             if await self.project(memory_id):
                 result["projected"] += 1
+                self._retry_success_count += 1
             else:
                 result["failed"] += 1
+                self._retry_failure_count += 1
         if result["attempted"]:
             logger.info(
                 "[MemoryIndexProjector] retry batch "
                 f"attempted={result['attempted']} projected={result['projected']} failed={result['failed']}"
             )
         return result
+
+    def _budget_is_draining(self) -> bool:
+        budget = getattr(self.engine, "background_task_budget", None)
+        status = getattr(budget, "status", None)
+        if not callable(status):
+            return False
+        try:
+            return bool((status() or {}).get("draining") is True)
+        except Exception:
+            return False
+
+    async def _refresh_outbox_diagnostics(self) -> dict[str, object]:
+        store = getattr(self.engine, "v2_store", None)
+        diagnostics = getattr(store, "projection_retry_diagnostics", None)
+        if callable(diagnostics):
+            try:
+                self._outbox_diagnostics = dict(await diagnostics() or {})
+            except Exception as exc:
+                logger.debug(f"[MemoryIndexProjector] outbox diagnostics unavailable: {exc}")
+        return dict(self._outbox_diagnostics)
+
+    def _vector_capability_status(self) -> dict[str, object]:
+        vector_retriever = getattr(self.engine, "vec_retriever", None)
+        faiss_db = getattr(self.engine, "faiss_db", None)
+        return {
+            "retriever_present": bool(getattr(self.engine, "retriever", None)),
+            "retriever_ready": bool(
+                getattr(self.engine, "_is_ready", False)
+                and getattr(self.engine, "_vector_state", "") == "ready"
+            ),
+            "faiss_db_present": faiss_db is not None,
+            "coordinated_delete_supported": callable(getattr(vector_retriever, "delete_document", None)),
+            "faiss_delete_supported": callable(getattr(faiss_db, "delete", None)),
+            "vector_state": str(getattr(self.engine, "_vector_state", "unknown") or "unknown"),
+            "rebuild_generation": int(getattr(self.engine, "_vector_generation", 0) or 0),
+        }
+
+    def describe_status(self) -> dict[str, object]:
+        diagnostics = dict(self._outbox_diagnostics)
+        pending_count = int(diagnostics.get("pending_count", 0) or 0)
+        dead_letter_count = int(diagnostics.get("dead_letter_count", 0) or 0)
+        diagnostics.update(
+            {
+                "pending_count": max(pending_count, len(self._pending_projection_ids)),
+                "pending_count_by_reason": {
+                    **dict(diagnostics.get("pending_count_by_reason", {}) or {}),
+                    **({"in_memory": len(self._pending_projection_ids)} if self._pending_projection_ids else {}),
+                },
+                "repair_required": bool(pending_count or dead_letter_count or self._pending_projection_ids),
+                "retry_worker_alive": bool(self._retry_task is not None and not self._retry_task.done()),
+                "retry_success_count": int(self._retry_success_count),
+                "retry_failure_count": int(self._retry_failure_count),
+                "retry_rejected_by_shutdown": int(self._retry_rejected_by_shutdown),
+                "storage_mode": "sqlite_outbox"
+                if callable(getattr(getattr(self.engine, "v2_store", None), "schedule_projection_retry", None))
+                else "memory_process_local",
+            }
+        )
+        diagnostics.update(self._vector_capability_status())
+        return diagnostics
 
     async def delete_projection(self, memory_id: str) -> int:
         return await self.cleanup_deleted([memory_id])
@@ -515,6 +615,7 @@ class MemoryIndexProjector:
             self._get_projection_lock().release()
 
     async def check_consistency(self) -> dict:
+        outbox_diagnostics = await self._refresh_outbox_diagnostics()
         persisted_pending: dict[str, str] = {}
         snapshot = getattr(self.engine.v2_store, "projection_retry_snapshot_with_revisions", None)
         if callable(snapshot):
@@ -569,6 +670,26 @@ class MemoryIndexProjector:
             "canonical_projectable_count": 0,
             "pending_projection_count": len(pending_ids),
             "pending_projection_reasons": pending_reasons,
+            "pending_projection_count_by_reason": dict(
+                outbox_diagnostics.get("pending_count_by_reason", {}) or {}
+            ),
+            "dead_letter_count": int(outbox_diagnostics.get("dead_letter_count", 0) or 0),
+            "dead_letter_count_by_reason": dict(
+                outbox_diagnostics.get("dead_letter_count_by_reason", {}) or {}
+            ),
+            "oldest_pending_age_sec": float(
+                outbox_diagnostics.get("oldest_pending_age_sec", 0.0) or 0.0
+            ),
+            "max_attempts": int(outbox_diagnostics.get("max_attempts", 0) or 0),
+            "next_retry_at": outbox_diagnostics.get("next_retry_at"),
+            "repair_required": bool(
+                pending_ids or int(outbox_diagnostics.get("dead_letter_count", 0) or 0)
+            ),
+            "retry_worker_alive": bool(self._retry_task is not None and not self._retry_task.done()),
+            "retry_success_count": int(self._retry_success_count),
+            "retry_failure_count": int(self._retry_failure_count),
+            "retry_rejected_by_shutdown": int(self._retry_rejected_by_shutdown),
+            **self._vector_capability_status(),
             "deferred_projection_ids": sorted(deferred_projection_ids),
             "faiss_index_count": None,
             "faiss_index_count_observed": False,

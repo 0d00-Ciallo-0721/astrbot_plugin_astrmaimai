@@ -1724,6 +1724,14 @@
         "maximum": 30,
         "hint": "保存必须重载的配置时，旧实例最多占用这段时间完成全部关闭工作。超时组件会被隔离，新实例不会继续等待。"
       },
+      "shutdown_late_physical_drain_budget_sec": {
+        "description": "迟到物理任务排空上限（秒）",
+        "type": "float",
+        "default": 30.0,
+        "minimum": 0,
+        "maximum": 300,
+        "hint": "正常停机窗口结束后，最多继续等待不可立即取消的线程或物理模型服务任务。超时后进入关闭降级状态，不会无限等待。"
+      },
       "shutdown_component_timeout_sec": {
         "description": "单个关闭步骤最长等待（秒）",
         "type": "float",
@@ -2043,6 +2051,14 @@
         "minimum": 1,
         "maximum": 200,
         "hint": "限制单轮后台修复规模，避免抢占正常聊天资源。"
+      },
+      "projection_retry_max_attempts": {
+        "description": "记忆投影最大自动重试次数",
+        "type": "int",
+        "default": 8,
+        "minimum": 1,
+        "maximum": 100,
+        "hint": "超过次数后进入需要修复的隔离队列，保留原始记忆数据并等待人工修复，不再无限重试。"
       },
       "projection_lock_timeout_sec": {
         "description": "在线记忆投影锁最长等待（秒）",

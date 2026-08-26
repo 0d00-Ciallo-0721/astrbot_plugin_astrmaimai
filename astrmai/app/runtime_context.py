@@ -100,6 +100,10 @@ class RuntimeStatus:
     last_shutdown_slowest_stage: str = ""
     shutdown_stage_stats: dict[str, dict[str, Any]] = field(default_factory=dict)
     shutdown_isolated_tasks: int = 0
+    shutdown_final_status: str = "idle"
+    shutdown_pending_drain: bool = False
+    shutdown_forced_termination_risk: bool = False
+    shutdown_late_cleanup_deadline: float = 0.0
     degraded_components: dict[str, str] = field(default_factory=dict)
     # ponytail: threading.Lock is safe here (sync-only during bootstrap, not held across await)
     _degraded_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -140,6 +144,10 @@ class RuntimeStatus:
             "last_shutdown_slowest_stage": self.last_shutdown_slowest_stage,
             "shutdown_stage_stats": dict(self.shutdown_stage_stats),
             "shutdown_isolated_tasks": self.shutdown_isolated_tasks,
+            "shutdown_final_status": self.shutdown_final_status,
+            "shutdown_pending_drain": self.shutdown_pending_drain,
+            "shutdown_forced_termination_risk": self.shutdown_forced_termination_risk,
+            "shutdown_late_cleanup_deadline": self.shutdown_late_cleanup_deadline,
             "degraded_components": self._snapshot_degraded(),
         }
 
@@ -583,9 +591,18 @@ class PluginRuntimeContext:
             "elapsed_ms_p99": percentile(elapsed, 0.99),
             "sample_size": len(elapsed),
         }
+        projection_status = vector_status.get("projection", {}) if isinstance(vector_status, dict) else {}
+        diagnostics_degraded = bool(
+            component_errors
+            or (
+                isinstance(projection_status, dict)
+                and projection_status.get("repair_required")
+            )
+            or self.status.shutdown_final_status == "degraded"
+        )
         snapshot = {
             "snapshot_at": time.time(),
-            "diagnostics_status": "degraded" if component_errors else "ok",
+            "diagnostics_status": "degraded" if diagnostics_degraded else "ok",
             "component_errors": component_errors,
             "status": self.status.as_dict(),
             "infrastructure": {

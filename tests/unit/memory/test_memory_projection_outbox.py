@@ -185,6 +185,49 @@ class MemoryProjectionOutboxTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_projection_retry_enters_dead_letter_after_max_attempts(self):
+        async def run():
+            db_path = self._db_path("outbox-dead-letter.db")
+            store = self.store_mod.MemoryV2Store(db_path, data_path=self.temp_dir.name)
+            self.assertTrue(
+                await store.schedule_projection_retry(
+                    "mem-dead",
+                    "vector_delete_unavailable",
+                    base_delay_sec=1,
+                    max_delay_sec=1,
+                    max_attempts=2,
+                )
+            )
+            self.assertTrue(
+                await store.schedule_projection_retry(
+                    "mem-dead",
+                    "vector_delete_unavailable",
+                    base_delay_sec=1,
+                    max_delay_sec=1,
+                    max_attempts=2,
+                )
+            )
+            self.assertFalse(
+                await store.schedule_projection_retry(
+                    "mem-dead",
+                    "vector_delete_unavailable",
+                    base_delay_sec=1,
+                    max_delay_sec=1,
+                    max_attempts=2,
+                )
+            )
+
+            diagnostics = await store.projection_retry_diagnostics()
+            self.assertEqual(diagnostics["pending_count"], 0)
+            self.assertEqual(diagnostics["dead_letter_count"], 1)
+            self.assertEqual(
+                diagnostics["dead_letter_count_by_reason"],
+                {"vector_delete_unavailable": 1},
+            )
+            self.assertEqual(diagnostics["max_attempts"], 3)
+
+        asyncio.run(run())
+
 
 if __name__ == "__main__":
     unittest.main()

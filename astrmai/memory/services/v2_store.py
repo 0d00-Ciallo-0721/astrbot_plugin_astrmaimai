@@ -349,6 +349,7 @@ class MemoryV2Store:
         *,
         base_delay_sec: float = 30.0,
         max_delay_sec: float = 900.0,
+        max_attempts: int | None = None,
     ) -> bool:
         await self.initialize()
         clean_id = str(memory_id or "").strip()
@@ -359,11 +360,16 @@ class MemoryV2Store:
             await db.execute("BEGIN IMMEDIATE")
             try:
                 cursor = await db.execute(
-                    "SELECT attempts, created_at, revision FROM memory_projection_outbox WHERE memory_id = ? LIMIT 1",
+                    "SELECT attempts, created_at, revision, status FROM memory_projection_outbox WHERE memory_id = ? LIMIT 1",
                     (clean_id,),
                 )
                 row = await cursor.fetchone()
-                attempts = int(row[0] or 0) + 1 if row else 1
+                previous_attempts = int(row[0] or 0) if row else 0
+                previous_status = str(row[3] or "pending") if row and len(row) > 3 else "pending"
+                attempts = previous_attempts + 1
+                if previous_status == "dead_letter":
+                    await db.commit()
+                    return False
                 created_at = float(row[1] or now) if row else now
                 revision_cursor = await db.execute(
                     "SELECT CAST(value AS INTEGER) FROM memory_v2_meta "
@@ -375,6 +381,24 @@ class MemoryV2Store:
                     "UPDATE memory_v2_meta SET value = ? WHERE key = 'projection_outbox_revision'",
                     (str(revision),),
                 )
+                if max_attempts is not None and attempts > max(1, int(max_attempts)):
+                    await db.execute(
+                        """
+                        INSERT INTO memory_projection_outbox(
+                            memory_id, status, attempts, revision, next_retry_at, last_error, created_at, updated_at
+                        ) VALUES (?, 'dead_letter', ?, ?, 0, ?, ?, ?)
+                        ON CONFLICT(memory_id) DO UPDATE SET
+                            status = 'dead_letter',
+                            attempts = excluded.attempts,
+                            revision = excluded.revision,
+                            next_retry_at = 0,
+                            last_error = excluded.last_error,
+                            updated_at = excluded.updated_at
+                        """,
+                        (clean_id, attempts, revision, str(reason or "unknown")[:500], created_at, now),
+                    )
+                    await db.commit()
+                    return False
                 delay = min(
                     max(float(max_delay_sec or 900.0), 1.0),
                     max(float(base_delay_sec or 30.0), 1.0) * (2 ** max(attempts - 1, 0)),
@@ -413,6 +437,19 @@ class MemoryV2Store:
             )
             row = await cursor.fetchone()
         return int(row[0] or 0) if row else 0
+
+    async def projection_retry_status(self, memory_id: str) -> str:
+        await self.initialize()
+        clean_id = str(memory_id or "").strip()
+        if not clean_id:
+            return ""
+        async with connect_aiosqlite(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT status FROM memory_projection_outbox WHERE memory_id = ? LIMIT 1",
+                (clean_id,),
+            )
+            row = await cursor.fetchone()
+        return str(row[0] or "") if row else ""
 
     async def complete_projection_retry(self, memory_id: str) -> None:
         await self.initialize()
@@ -529,6 +566,41 @@ class MemoryV2Store:
             str(row[0]): {"reason": str(row[1] or "unknown"), "revision": int(row[2] or 0)}
             for row in rows
             if row and str(row[0] or "").strip()
+        }
+
+    async def projection_retry_diagnostics(self) -> dict[str, object]:
+        """Return bounded, persisted repair state for runtime diagnostics."""
+        await self.initialize()
+        now = self._now()
+        async with connect_aiosqlite(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                SELECT status, last_error, attempts, created_at, next_retry_at
+                FROM memory_projection_outbox
+                WHERE status IN ('pending', 'dead_letter')
+                """
+            )
+            rows = await cursor.fetchall()
+        pending = [row for row in rows if str(row[0] or "") == "pending"]
+        dead = [row for row in rows if str(row[0] or "") == "dead_letter"]
+
+        def reason_counts(items) -> dict[str, int]:
+            counts: dict[str, int] = {}
+            for row in items:
+                reason = str(row[1] or "unknown")
+                counts[reason] = counts.get(reason, 0) + 1
+            return counts
+
+        oldest = min((float(row[3] or now) for row in pending), default=0.0)
+        next_retry = min((float(row[4] or 0.0) for row in pending), default=0.0)
+        return {
+            "pending_count": len(pending),
+            "pending_count_by_reason": reason_counts(pending),
+            "dead_letter_count": len(dead),
+            "dead_letter_count_by_reason": reason_counts(dead),
+            "oldest_pending_age_sec": max(0.0, now - oldest) if oldest else 0.0,
+            "max_attempts": max((int(row[2] or 0) for row in rows), default=0),
+            "next_retry_at": next_retry or None,
         }
 
     async def _ensure_fts_projection(self, db) -> None:
