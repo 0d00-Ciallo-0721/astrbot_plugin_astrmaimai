@@ -106,11 +106,29 @@ class MemoryTurnPipeline:
                 self._consume_stopped_task(task)
             for task in pending:
                 task.add_done_callback(self._consume_stopped_task)
-        self._worker_tasks.clear()
-        self._worker_queues.clear()
-        self._background_tasks.clear()
-        self._sweep_task = None
+            for chat_id, worker in list(self._worker_tasks.items()):
+                if worker in pending:
+                    worker.add_done_callback(
+                        lambda completed, key=chat_id, expected=worker: self._remove_stopped_worker(
+                            key, expected, completed
+                        )
+                    )
+                elif worker in done:
+                    self._remove_stopped_worker(chat_id, worker, worker)
+        if self._sweep_task is not None and self._sweep_task.done():
+            self._sweep_task = None
         await self._observe_global("memory_pipeline", "pipeline_stopped", level="warning", summary="Memory pipeline stopped")
+
+    def _remove_stopped_worker(
+        self,
+        chat_id: str,
+        expected: asyncio.Task[Any],
+        completed: asyncio.Task[Any],
+    ) -> None:
+        self._consume_stopped_task(completed)
+        if self._worker_tasks.get(chat_id) is expected:
+            self._worker_tasks.pop(chat_id, None)
+            self._worker_queues.pop(chat_id, None)
 
     def begin_shutdown(self) -> None:
         """Fence new maintenance work while retaining durable buffers/checkpoints."""
@@ -299,13 +317,27 @@ class MemoryTurnPipeline:
         if not isinstance(turn, CommittedMemoryTurn) or turn.is_proactive:
             return
         queue = self._worker_queues.get(turn.chat_id)
-        if queue is None:
-            queue = asyncio.Queue()
-            self._worker_queues[turn.chat_id] = queue
+        if not self._accepting:
+            if queue is None:
+                self._started_after_shutdown += 1
+            return
+        existing = self._worker_tasks.get(turn.chat_id)
+        if existing is not None and existing.done() and self._accepting:
+            if self._worker_tasks.get(turn.chat_id) is existing:
+                self._worker_tasks.pop(turn.chat_id, None)
+            existing = None
+        if queue is None or existing is None:
+            if queue is None:
+                queue = asyncio.Queue()
+                self._worker_queues[turn.chat_id] = queue
             task = asyncio.create_task(self._chat_worker(turn.chat_id, queue))
             self._worker_tasks[turn.chat_id] = task
             self._background_tasks.add(task)
-            task.add_done_callback(self._handle_task_result)
+            task.add_done_callback(
+                lambda completed, key=turn.chat_id, expected=task: self._handle_worker_result(
+                    key, expected, completed
+                )
+            )
             await self._observe_turn(
                 turn,
                 "memory_pipeline",
@@ -360,7 +392,16 @@ class MemoryTurnPipeline:
         }
 
     def describe_runtime_status(self) -> dict[str, Any]:
-        active_workers = [chat_id for chat_id, task in self._worker_tasks.items() if task is not None and not task.done()]
+        active_workers = [
+            chat_id
+            for chat_id, task in self._worker_tasks.items()
+            if task is not None and not task.done() and self._accepting
+        ]
+        stopping_workers = [
+            chat_id
+            for chat_id, task in self._worker_tasks.items()
+            if task is not None and not task.done() and not self._accepting
+        ]
         return {
             "running": bool(self._running),
             "accepting_work": bool(self._accepting),
@@ -371,6 +412,8 @@ class MemoryTurnPipeline:
             "buffered_chats": len([chat_id for chat_id, data in self._session_history_buffer.items() if (data or {}).get("buffer")]),
             "tracked_chats": len(self._session_history_buffer),
             "active_worker_count": len(active_workers),
+            "stopping_worker_count": len(stopping_workers),
+            "pending_worker_count": len(stopping_workers),
             "active_worker_chats": list(active_workers[:50]),
             "maintenance_concurrency": int(self._maintenance_limit),
             "active_maintenance": int(self._active_maintenance),
@@ -671,6 +714,27 @@ class MemoryTurnPipeline:
                 logger.error(f"[MemoryTurnPipeline] background task exception: {exc}", exc_info=exc)
         except asyncio.CancelledError:
             pass
+
+    def _handle_worker_result(
+        self,
+        chat_id: str,
+        expected: asyncio.Task[Any],
+        task: asyncio.Task[Any],
+    ) -> None:
+        self._handle_task_result(task)
+        if self._worker_tasks.get(chat_id) is not expected:
+            return
+        self._worker_tasks.pop(chat_id, None)
+        queue = self._worker_queues.get(chat_id)
+        if self._accepting and queue is not None and not queue.empty():
+            replacement = asyncio.create_task(self._chat_worker(chat_id, queue))
+            self._worker_tasks[chat_id] = replacement
+            self._background_tasks.add(replacement)
+            replacement.add_done_callback(
+                lambda completed, key=chat_id, owner=replacement: self._handle_worker_result(
+                    key, owner, completed
+                )
+            )
 
     async def _observe_turn(
         self,

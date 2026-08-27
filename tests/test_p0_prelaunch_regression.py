@@ -253,6 +253,7 @@ class P0PrelaunchRegressionTests(unittest.TestCase):
         self.assertEqual(results[0].content, "hit")
         self.assertEqual(observation["retrieve_stage"], "phased")
         self.assertIn("embedding_ms", observation["stage_timings"])
+        self.assertNotIn("embedding_gateway_queue_wait_ms", observation["stage_timings"])
         self.assertIn("faiss_index_ms", observation["stage_timings"])
         self.assertIn("document_read_ms", observation["stage_timings"])
         self.assertEqual(observation["timeout_origin"], "")
@@ -340,9 +341,117 @@ class P0PrelaunchRegressionTests(unittest.TestCase):
                         break
                     await asyncio.sleep(0.01)
                 self.assertEqual(retriever.describe_status()["active_queries"], 0)
-                self.assertEqual(retriever.describe_status()["background_index_jobs"], 0)
+        self.assertEqual(retriever.describe_status()["background_index_jobs"], 0)
+
+    def test_vector_retriever_waits_for_physical_executor_future_after_async_cancel(self):
+        from astrmai.memory.retrieval.vector_store import VectorRetriever
+
+        retriever = VectorRetriever(SimpleNamespace())
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking_job():
+            started.set()
+            release.wait(timeout=2.0)
+            return "done"
+
+        async def run():
+            task = asyncio.create_task(retriever._run_index_job(blocking_job))
+            self.assertTrue(await asyncio.to_thread(started.wait, 0.5))
+            self.assertFalse(await retriever.wait_index_idle(0.01))
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertFalse(await retriever.wait_index_idle(0.01))
+            release.set()
+            self.assertTrue(await retriever.wait_index_idle(1.0))
+            await retriever.close()
 
         asyncio.run(run())
+
+    def test_vector_close_fences_query_waiting_for_admission(self):
+        from astrmai.memory.retrieval.vector_store import VectorRetriever
+
+        class _Faiss:
+            def __init__(self):
+                self.calls = 0
+
+            async def retrieve(self, **_kwargs):
+                self.calls += 1
+                return []
+
+        faiss = _Faiss()
+        retriever = VectorRetriever(
+            faiss,
+            SimpleNamespace(
+                timing=SimpleNamespace(
+                    faiss_timeout_sec=1.0,
+                    faiss_query_concurrency=1,
+                    faiss_failure_threshold=10,
+                )
+            ),
+        )
+
+        async def run():
+            await retriever._query_semaphore.acquire()
+            query = asyncio.create_task(retriever.search("late query"))
+            await asyncio.sleep(0)
+            self.assertTrue(await retriever.close(timeout_sec=0.1))
+            retriever._query_semaphore.release()
+            self.assertEqual(await query, [])
+
+        asyncio.run(run())
+
+        status = retriever.describe_status()
+        self.assertEqual(faiss.calls, 0)
+        self.assertFalse(status["accepting_work"])
+        self.assertTrue(status["closed"])
+        self.assertEqual(status["active_operations"], 0)
+
+    def test_vector_close_waits_for_admitted_mutation_then_can_retry(self):
+        from astrmai.memory.retrieval.vector_store import VectorRetriever
+
+        embedding_started = asyncio.Event()
+        embedding_release = asyncio.Event()
+
+        class _Embedding:
+            async def get_embedding(self, _content):
+                embedding_started.set()
+                await embedding_release.wait()
+                return [1.0, 0.0]
+
+        class _Documents:
+            async def insert_document(self, *_args):
+                return 7
+
+        retriever = VectorRetriever(
+            SimpleNamespace(
+                embedding_provider=_Embedding(),
+                embedding_storage=SimpleNamespace(
+                    index=object(),
+                    dimension=2,
+                ),
+                document_storage=_Documents(),
+            )
+        )
+        inserted = []
+        retriever._insert_index_sync = lambda vector, doc_id: inserted.append(
+            (vector.tolist(), doc_id)
+        )
+
+        async def run():
+            mutation = asyncio.create_task(retriever.add_document("content"))
+            await embedding_started.wait()
+            self.assertFalse(await retriever.close(timeout_sec=0.01))
+            self.assertTrue(retriever.describe_status()["closing"])
+            embedding_release.set()
+            self.assertEqual(await mutation, 7)
+            self.assertTrue(await retriever.close(timeout_sec=0.5))
+
+        asyncio.run(run())
+
+        self.assertEqual(inserted[0][1], 7)
+        self.assertTrue(retriever.describe_status()["closed"])
 
     def test_vector_store_allows_only_one_half_open_probe(self):
         from astrmai.memory.retrieval.vector_store import VectorRetriever

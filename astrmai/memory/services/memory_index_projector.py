@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 from astrbot.api import logger
 
@@ -48,6 +49,16 @@ class MemoryIndexProjector:
         self._projection_failure_by_reason: dict[str, int] = {}
         self._projection_deferred_by_reason: dict[str, int] = {}
         self._projection_inflight_ids: set[str] = set()
+        self._projection_inflight_tasks: dict[str, asyncio.Task] = {}
+        self._projection_latest_requests: dict[str, MemoryWriteRequest | None] = {}
+        self._projection_request_versions: dict[str, int] = {}
+        self._projection_task_diagnostics: list[dict[str, object]] = []
+        self._persistence_timeout_total = 0
+        self._persistence_error_total = 0
+        self._background_tasks: set[asyncio.Task] = set()
+        self._durable_cleanup_tasks: set[asyncio.Task] = set()
+        self._accepting = True
+        self._last_shutdown_diagnostics: dict[str, object] = {}
 
     def _get_projection_lock(self) -> asyncio.Lock:
         lock = getattr(self, "_projection_lock", None)
@@ -93,7 +104,7 @@ class MemoryIndexProjector:
             return False
 
     def _config_value(self, name: str, default):
-        config = getattr(self.engine, "config", None)
+        config = getattr(getattr(self, "engine", None), "config", None)
         timing_config = getattr(config, "timing", None)
         if timing_config is not None and hasattr(timing_config, name):
             return getattr(timing_config, name)
@@ -116,37 +127,134 @@ class MemoryIndexProjector:
             return "vector_add_failed"
         return f"projection_error:{name}"
 
+    def _persistence_timeout_sec(self) -> float:
+        configured = self._config_value(
+            "projection_persistence_timeout_sec",
+            self._config_value("projection_lock_timeout_sec", 1.0),
+        )
+        if not getattr(self, "_accepting", True):
+            configured = min(
+                float(configured or 1.0),
+                float(self._config_value("shutdown_cancel_grace_sec", 1.0) or 1.0),
+            )
+        try:
+            return max(0.05, float(configured or 1.0))
+        except (TypeError, ValueError):
+            return 1.0
+
+    def _record_persistence_issue(
+        self,
+        *,
+        event: str,
+        operation: str,
+        memory_id: str = "",
+        error: BaseException | None = None,
+    ) -> None:
+        diagnostics = getattr(self, "_projection_task_diagnostics", None)
+        if diagnostics is None:
+            diagnostics = []
+            self._projection_task_diagnostics = diagnostics
+        diagnostics.append(
+            {
+                "event": event,
+                "operation": operation,
+                "memory_id": str(memory_id or ""),
+                "error_type": type(error).__name__ if error is not None else "",
+                "error": str(error or "")[:500],
+                "recorded_at": time.time(),
+            }
+        )
+        if len(diagnostics) > 100:
+            del diagnostics[:-100]
+
+    async def _await_persistence(
+        self,
+        awaitable,
+        *,
+        operation: str,
+        memory_id: str = "",
+        timeout_sec: float | None = None,
+    ):
+        try:
+            return await asyncio.wait_for(
+                awaitable,
+                timeout=(
+                    self._persistence_timeout_sec()
+                    if timeout_sec is None
+                    else max(0.001, float(timeout_sec))
+                ),
+            )
+        except asyncio.TimeoutError as exc:
+            self._persistence_timeout_total = int(
+                getattr(self, "_persistence_timeout_total", 0) or 0
+            ) + 1
+            self._record_persistence_issue(
+                event="projection_persistence_timeout",
+                operation=operation,
+                memory_id=memory_id,
+                error=exc,
+            )
+            raise
+        except Exception as exc:
+            self._persistence_error_total = int(
+                getattr(self, "_persistence_error_total", 0) or 0
+            ) + 1
+            self._record_persistence_issue(
+                event="projection_persistence_failed",
+                operation=operation,
+                memory_id=memory_id,
+                error=exc,
+            )
+            raise
+
     async def _mark_pending_persisted(self, memory_id: str, reason: str) -> bool:
         self._mark_pending(memory_id, reason)
         store = getattr(self.engine, "v2_store", None)
         schedule = getattr(store, "schedule_projection_retry", None)
         if not callable(schedule):
             return False
-        scheduled = bool(
-            await schedule(
-                memory_id,
-                reason,
-                base_delay_sec=float(self._config_value("projection_retry_base_delay_sec", 30.0) or 30.0),
-                max_delay_sec=float(self._config_value("projection_retry_max_delay_sec", 900.0) or 900.0),
-                max_attempts=int(self._config_value("projection_retry_max_attempts", 8) or 8),
+        try:
+            scheduled = bool(
+                await self._await_persistence(
+                    schedule(
+                        memory_id,
+                        reason,
+                        base_delay_sec=float(self._config_value("projection_retry_base_delay_sec", 30.0) or 30.0),
+                        max_delay_sec=float(self._config_value("projection_retry_max_delay_sec", 900.0) or 900.0),
+                        max_attempts=int(self._config_value("projection_retry_max_attempts", 8) or 8),
+                    ),
+                    operation="schedule_projection_retry",
+                    memory_id=memory_id,
+                )
             )
-        )
+        except Exception as exc:
+            self._pending_projection_scheduled[memory_id] = False
+            logger.warning(
+                f"[MemoryIndexProjector] retry persistence unavailable "
+                f"memory_id={memory_id} reason={reason}: {exc}"
+            )
+            return False
         self._pending_projection_scheduled[memory_id] = scheduled
         await self._refresh_outbox_diagnostics()
         if not scheduled:
             status_reader = getattr(store, "projection_retry_status", None)
             if callable(status_reader):
                 try:
-                    if await status_reader(memory_id) == "dead_letter":
+                    status = await self._await_persistence(
+                        status_reader(memory_id),
+                        operation="projection_retry_status",
+                        memory_id=memory_id,
+                    )
+                    if status == "dead_letter":
                         self._clear_pending(memory_id)
                 except Exception as exc:
                     logger.debug(f"[MemoryIndexProjector] retry status unavailable: {exc}")
         return scheduled
 
     async def _clear_pending_persisted(self, memory_id: str, expected_revision: int = 0) -> None:
-        self._clear_pending(memory_id)
-        self._pending_projection_scheduled.pop(memory_id, None)
         if not self._ack_projection_outbox:
+            self._clear_pending(memory_id)
+            self._pending_projection_scheduled.pop(memory_id, None)
             normalized_id = str(memory_id or "")
             if normalized_id in self._candidate_outbox_candidates:
                 self._candidate_outbox_ids.add(normalized_id)
@@ -157,13 +265,33 @@ class MemoryIndexProjector:
         store = getattr(self.engine, "v2_store", None)
         conditional = getattr(store, "complete_projection_retry_if_unchanged", None)
         if callable(conditional):
-            await conditional(memory_id, int(expected_revision or 0))
-            await self._refresh_outbox_diagnostics()
+            try:
+                await self._await_persistence(
+                    conditional(memory_id, int(expected_revision or 0)),
+                    operation="complete_projection_retry_if_unchanged",
+                    memory_id=memory_id,
+                )
+                await self._refresh_outbox_diagnostics()
+            except Exception:
+                self._mark_pending(memory_id, "outbox_ack_failed")
+                return
+            self._clear_pending(memory_id)
+            self._pending_projection_scheduled.pop(memory_id, None)
             return
         complete = getattr(store, "complete_projection_retry", None)
         if callable(complete):
-            await complete(memory_id)
-            await self._refresh_outbox_diagnostics()
+            try:
+                await self._await_persistence(
+                    complete(memory_id),
+                    operation="complete_projection_retry",
+                    memory_id=memory_id,
+                )
+                await self._refresh_outbox_diagnostics()
+            except Exception:
+                self._mark_pending(memory_id, "outbox_ack_failed")
+                return
+        self._clear_pending(memory_id)
+        self._pending_projection_scheduled.pop(memory_id, None)
 
     def candidate_outbox_ids(self) -> set[str]:
         return {item for item in self._candidate_outbox_ids if item}
@@ -171,18 +299,51 @@ class MemoryIndexProjector:
     def candidate_outbox_confirmations(self) -> dict[str, int]:
         return dict(self._candidate_outbox_confirmations)
 
-    async def confirm_projection_outbox(self, memory_ids) -> None:
+    async def confirm_projection_outbox(self, memory_ids) -> bool:
         store = getattr(self.engine, "v2_store", None)
         complete = getattr(store, "complete_projection_retry", None)
         conditional = getattr(store, "complete_projection_retry_if_unchanged", None)
+        deadline = time.monotonic() + self._persistence_timeout_sec()
+        all_confirmed = True
         if isinstance(memory_ids, dict) and callable(conditional):
-            for memory_id, watermark in memory_ids.items():
-                await conditional(str(memory_id), int(watermark))
-            return
-        if not callable(complete):
-            return
-        for memory_id in set(memory_ids or []):
-            await complete(str(memory_id))
+            confirmations = [
+                (str(memory_id), int(watermark))
+                for memory_id, watermark in memory_ids.items()
+            ]
+            operation = "complete_projection_retry_if_unchanged"
+        elif callable(complete):
+            source_ids = memory_ids.keys() if isinstance(memory_ids, dict) else memory_ids
+            confirmations = [(str(memory_id), None) for memory_id in set(source_ids or [])]
+            operation = "complete_projection_retry"
+        else:
+            return False
+        for index, (memory_id, watermark) in enumerate(confirmations):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                all_confirmed = False
+                for pending_id, _pending_watermark in confirmations[index:]:
+                    self._mark_pending(pending_id, "outbox_ack_failed")
+                break
+            try:
+                awaitable = (
+                    conditional(memory_id, watermark)
+                    if watermark is not None
+                    else complete(memory_id)
+                )
+                await self._await_persistence(
+                    awaitable,
+                    operation=operation,
+                    memory_id=memory_id,
+                    timeout_sec=remaining,
+                )
+            except Exception:
+                all_confirmed = False
+                self._mark_pending(memory_id, "outbox_ack_failed")
+        try:
+            await self._refresh_outbox_diagnostics()
+        except Exception:
+            all_confirmed = False
+        return all_confirmed
 
     def _mark_pending(self, memory_id: str, reason: str) -> None:
         if not memory_id:
@@ -219,24 +380,160 @@ class MemoryIndexProjector:
 
     async def project(self, memory_id: str, request: MemoryWriteRequest | None = None) -> bool:
         normalized_id = str(memory_id or "").strip()
-        inflight = getattr(self, "_projection_inflight_ids", None)
-        if inflight is None:
-            inflight = set()
-            self._projection_inflight_ids = inflight
-        if not normalized_id or normalized_id in inflight:
+        if not normalized_id:
             return False
-        inflight.add(normalized_id)
+        if not getattr(self, "_accepting", True):
+            await self._mark_pending_persisted(normalized_id, "shutdown_rejected")
+            return False
+        inflight_tasks = getattr(self, "_projection_inflight_tasks", None)
+        if inflight_tasks is None:
+            inflight_tasks = {}
+            self._projection_inflight_tasks = inflight_tasks
+        latest_requests = getattr(self, "_projection_latest_requests", None)
+        if latest_requests is None:
+            latest_requests = {}
+            self._projection_latest_requests = latest_requests
+        request_versions = getattr(self, "_projection_request_versions", None)
+        if request_versions is None:
+            request_versions = {}
+            self._projection_request_versions = request_versions
+        latest_requests[normalized_id] = request
+        request_versions[normalized_id] = int(request_versions.get(normalized_id, 0) or 0) + 1
+        task = inflight_tasks.get(normalized_id)
+        if task is not None and task.done():
+            inflight_tasks.pop(normalized_id, None)
+            getattr(self, "_projection_inflight_ids", set()).discard(normalized_id)
+            task = None
+        if task is None:
+            task = asyncio.create_task(
+                self._run_projection_owner(normalized_id),
+                name=f"astrmai-memory-projection:{normalized_id}",
+            )
+            inflight_tasks[normalized_id] = task
+            inflight_ids = getattr(self, "_projection_inflight_ids", None)
+            if inflight_ids is None:
+                inflight_ids = set()
+                self._projection_inflight_ids = inflight_ids
+            inflight_ids.add(normalized_id)
+
+            def _clear_inflight(done: asyncio.Task, *, memory_key: str = normalized_id) -> None:
+                request_revision = int(request_versions.get(memory_key, 0) or 0)
+                is_current_task = inflight_tasks.get(memory_key) is done
+                if is_current_task:
+                    inflight_tasks.pop(memory_key, None)
+                ids = getattr(self, "_projection_inflight_ids", None)
+                if is_current_task and ids is not None:
+                    ids.discard(memory_key)
+                if is_current_task:
+                    latest_requests.pop(memory_key, None)
+                    request_versions.pop(memory_key, None)
+                background_tasks = getattr(self, "_background_tasks", None)
+                if background_tasks is not None:
+                    background_tasks.discard(done)
+                diagnostic: dict[str, object] | None = None
+                if done.cancelled():
+                    diagnostic = {
+                        "event": "projection_task_cancelled",
+                        "memory_id": memory_key,
+                        "request_revision": request_revision,
+                    }
+                else:
+                    try:
+                        error = done.exception()
+                    except BaseException as exc:
+                        error = exc
+                    if error is not None:
+                        diagnostic = {
+                            "event": "projection_task_failed",
+                            "memory_id": memory_key,
+                            "request_revision": request_revision,
+                            "error_type": type(error).__name__,
+                            "error": str(error),
+                        }
+                if diagnostic is not None:
+                    diagnostics = getattr(self, "_projection_task_diagnostics", None)
+                    if diagnostics is None:
+                        diagnostics = []
+                        self._projection_task_diagnostics = diagnostics
+                    diagnostics.append(diagnostic)
+                    del diagnostics[:-100]
+                    logger.warning(f"[MemoryIndexProjector] {diagnostic}")
+
+            task.add_done_callback(_clear_inflight)
+            background_tasks = getattr(self, "_background_tasks", None)
+            if background_tasks is None:
+                background_tasks = set()
+                self._background_tasks = background_tasks
+            background_tasks.add(task)
+        return await asyncio.shield(task)
+
+    def _track_background_task(self, task: asyncio.Task, *, durable: bool = False) -> None:
+        tasks = getattr(self, "_durable_cleanup_tasks" if durable else "_background_tasks", None)
+        if tasks is None:
+            tasks = set()
+            setattr(self, "_durable_cleanup_tasks" if durable else "_background_tasks", tasks)
+        tasks.add(task)
+
+        def _consume(done: asyncio.Task) -> None:
+            tasks.discard(done)
+            if done.cancelled():
+                return
+            try:
+                error = done.exception()
+            except BaseException as exc:
+                error = exc
+            if error is not None:
+                logger.warning(f"[MemoryIndexProjector] background cleanup failed: {error}")
+
+        task.add_done_callback(_consume)
+
+    async def wait_durable_cleanup(self, timeout_sec: float = 1.0) -> int:
+        tasks = [task for task in (getattr(self, "_durable_cleanup_tasks", set()) or set()) if task is not None and not task.done()]
+        if not tasks:
+            return 0
+        _done, pending = await asyncio.wait(tasks, timeout=max(0.0, float(timeout_sec)))
+        return len(pending)
+
+    async def _persist_shutdown_rejection(self, memory_id: str) -> None:
+        cleanup = asyncio.create_task(
+            self._mark_pending_persisted(memory_id, "shutdown_rejected"),
+            name=f"astrmai-memory-projection-reject:{memory_id}",
+        )
+        self._track_background_task(cleanup, durable=True)
         try:
-            return await self._project_once(normalized_id, request)
-        finally:
-            inflight.discard(normalized_id)
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            # The tracked cleanup task remains alive for lifecycle drain.
+            pass
+
+    async def _run_projection_owner(self, memory_id: str) -> bool:
+        version = int(getattr(self, "_projection_request_versions", {}).get(memory_id, 0) or 0)
+        final_result = False
+        try:
+            while True:
+                request = getattr(self, "_projection_latest_requests", {}).get(memory_id)
+                final_result = await self._project_once(memory_id, request)
+                current_version = int(getattr(self, "_projection_request_versions", {}).get(memory_id, version) or version)
+                if current_version <= version:
+                    return final_result
+                version = current_version
+        except asyncio.CancelledError:
+            await self._persist_shutdown_rejection(memory_id)
+            raise
 
     async def _project_once(self, memory_id: str, request: MemoryWriteRequest | None = None) -> bool:
+        if not getattr(self, "_accepting", True):
+            await self._mark_pending_persisted(memory_id, "shutdown_rejected")
+            return False
         if self._projection_rebuild_active():
             await self._mark_pending_persisted(memory_id, "projection_rebuild_in_progress")
             return False
         if not await self._acquire_projection_lock():
             await self._mark_pending_persisted(memory_id, "projection_lock_timeout")
+            return False
+        if not getattr(self, "_accepting", True):
+            self._get_projection_lock().release()
+            await self._mark_pending_persisted(memory_id, "shutdown_rejected")
             return False
         if self._projection_rebuild_active():
             self._get_projection_lock().release()
@@ -321,6 +618,7 @@ class MemoryIndexProjector:
             return False
 
     async def start(self) -> None:
+        self._accepting = True
         if self._retry_task is not None and not self._retry_task.done():
             return
         self._retry_stop = asyncio.Event()
@@ -330,17 +628,55 @@ class MemoryIndexProjector:
         )
         await self._refresh_outbox_diagnostics()
 
-    async def stop(self) -> None:
+    def begin_shutdown(self) -> None:
+        """Synchronously fence new projections before async resource teardown."""
+        if not getattr(self, "_accepting", True):
+            return
+        self._accepting = False
+        retry_stop = getattr(self, "_retry_stop", None)
+        if retry_stop is not None:
+            retry_stop.set()
+
+    async def stop(self) -> dict[str, object]:
+        self.begin_shutdown()
         self._retry_stop.set()
         task = self._retry_task
         self._retry_task = None
-        if task is None:
-            return
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        owners = list(getattr(self, "_projection_inflight_tasks", {}).values())
+        active = [item for item in owners if item is not None and not item.done()]
+        forced_cancelled = 0
+        remaining = 0
+        if active:
+            grace = max(
+                0.05,
+                float(
+                    self._config_value(
+                        "projection_shutdown_grace_sec",
+                        self._config_value("shutdown_cancel_grace_sec", 1.0),
+                    )
+                    or 1.0
+                ),
+            )
+            _done, pending = await asyncio.wait(active, timeout=grace)
+            forced_cancelled = len(pending)
+            for pending_task in pending:
+                pending_task.cancel()
+            if pending:
+                _cancel_done, still_pending = await asyncio.wait(pending, timeout=grace)
+                remaining = len(still_pending)
+        self._last_shutdown_diagnostics = {
+            "active_at_stop": len(active),
+            "forced_cancelled": forced_cancelled,
+            "remaining": remaining,
+            "accepting_work": bool(self._accepting),
+        }
+        return dict(self._last_shutdown_diagnostics)
 
     async def _retry_loop(self) -> None:
         interval = max(
@@ -464,7 +800,13 @@ class MemoryIndexProjector:
         diagnostics = getattr(store, "projection_retry_diagnostics", None)
         if callable(diagnostics):
             try:
-                self._outbox_diagnostics = dict(await diagnostics() or {})
+                self._outbox_diagnostics = dict(
+                    await self._await_persistence(
+                        diagnostics(),
+                        operation="projection_retry_diagnostics",
+                    )
+                    or {}
+                )
             except Exception as exc:
                 logger.debug(f"[MemoryIndexProjector] outbox diagnostics unavailable: {exc}")
         return dict(self._outbox_diagnostics)
@@ -509,6 +851,35 @@ class MemoryIndexProjector:
                 "last_retry_items": list(getattr(self, "_last_retry_items", []) or []),
                 "projection_failure_by_reason": dict(getattr(self, "_projection_failure_by_reason", {}) or {}),
                 "projection_deferred_by_reason": dict(getattr(self, "_projection_deferred_by_reason", {}) or {}),
+                "projection_deferred_total_by_reason": dict(
+                    getattr(self, "_projection_deferred_by_reason", {}) or {}
+                ),
+                "projection_inflight_count": sum(
+                    1
+                    for task in (getattr(self, "_projection_inflight_tasks", {}) or {}).values()
+                    if task is not None and not task.done()
+                ),
+                "projection_task_diagnostics": list(
+                    getattr(self, "_projection_task_diagnostics", []) or []
+                ),
+                "projection_persistence_timeout_total": int(
+                    getattr(self, "_persistence_timeout_total", 0) or 0
+                ),
+                "projection_persistence_error_total": int(
+                    getattr(self, "_persistence_error_total", 0) or 0
+                ),
+                "projection_background_task_count": sum(
+                    1
+                    for task in (getattr(self, "_background_tasks", set()) or set())
+                    if task is not None and not task.done()
+                ),
+                "durable_cleanup_task_count": sum(
+                    1
+                    for task in (getattr(self, "_durable_cleanup_tasks", set()) or set())
+                    if task is not None and not task.done()
+                ),
+                "last_shutdown": dict(getattr(self, "_last_shutdown_diagnostics", {}) or {}),
+                "accepting_work": bool(getattr(self, "_accepting", True)),
                 "storage_mode": "sqlite_outbox"
                 if callable(getattr(getattr(self.engine, "v2_store", None), "schedule_projection_retry", None))
                 else "memory_process_local",
@@ -522,11 +893,18 @@ class MemoryIndexProjector:
 
     async def cleanup_deleted(self, memory_ids: list[str]) -> int:
         normalized_ids = [str(memory_id or "") for memory_id in memory_ids or []]
+        if not getattr(self, "_accepting", True):
+            await self._defer_projection_ids(normalized_ids, "shutdown_rejected")
+            return 0
         if self._projection_rebuild_active():
             await self._defer_projection_ids(normalized_ids, "projection_rebuild_in_progress")
             return 0
         if not await self._acquire_projection_lock():
             await self._defer_projection_ids(normalized_ids, "projection_lock_timeout")
+            return 0
+        if not getattr(self, "_accepting", True):
+            self._get_projection_lock().release()
+            await self._defer_projection_ids(normalized_ids, "shutdown_rejected")
             return 0
         if self._projection_rebuild_active():
             self._get_projection_lock().release()
@@ -544,6 +922,10 @@ class MemoryIndexProjector:
         settle_outbox: bool = True,
         return_result: bool = False,
     ) -> int | dict[str, object]:
+        if not getattr(self, "_accepting", True):
+            for memory_id in memory_ids or []:
+                await self._mark_pending_persisted(str(memory_id), "shutdown_rejected")
+            return {"deleted": 0, "failed": bool(memory_ids)} if return_result else 0
         if not memory_ids or not hasattr(self.engine, "_execute_documents_write"):
             for memory_id in memory_ids or []:
                 await self._mark_pending_persisted(str(memory_id), "documents_write_unavailable")

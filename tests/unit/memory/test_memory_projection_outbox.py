@@ -326,7 +326,7 @@ class MemoryProjectionOutboxTests(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_projection_single_flight_rejects_duplicate_owner(self):
+    def test_projection_single_flight_waits_for_duplicate_owner(self):
         async def run():
             projector = self.projector_mod.MemoryIndexProjector.__new__(self.projector_mod.MemoryIndexProjector)
             projector._projection_inflight_ids = set()
@@ -342,8 +342,273 @@ class MemoryProjectionOutboxTests(unittest.TestCase):
                 projector.project("same-memory"),
                 projector.project("same-memory"),
             )
-            self.assertEqual(sum(bool(item) for item in (first, second)), 1)
+            self.assertEqual((first, second), (True, True))
             self.assertEqual(calls, ["same-memory"])
+
+        asyncio.run(run())
+
+    def test_projection_caller_cancellation_does_not_cancel_owner_task(self):
+        async def run():
+            projector = self.projector_mod.MemoryIndexProjector.__new__(self.projector_mod.MemoryIndexProjector)
+            projector._projection_inflight_tasks = {}
+            projector._projection_inflight_ids = set()
+            projector._projection_latest_requests = {}
+            projector._projection_request_versions = {}
+            projector._background_tasks = set()
+            projector._accepting = True
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def _project_once(memory_id, request=None):
+                started.set()
+                await release.wait()
+                return True
+
+            projector._project_once = _project_once
+            caller = asyncio.create_task(projector.project("cancelled-memory"))
+            await started.wait()
+            caller.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await caller
+            owner = projector._projection_inflight_tasks["cancelled-memory"]
+            self.assertFalse(owner.done())
+            release.set()
+            self.assertTrue(await asyncio.wait_for(asyncio.shield(owner), timeout=0.5))
+            await asyncio.sleep(0)
+            self.assertFalse(projector._projection_inflight_tasks)
+
+        asyncio.run(run())
+
+    def test_projection_latest_request_is_applied_after_older_owner_finishes(self):
+        async def run():
+            from astrmai.memory.contracts.memory_query import MemoryWriteRequest
+
+            projector = self.projector_mod.MemoryIndexProjector.__new__(self.projector_mod.MemoryIndexProjector)
+            projector._projection_inflight_tasks = {}
+            projector._projection_inflight_ids = set()
+            projector._projection_latest_requests = {}
+            projector._projection_request_versions = {}
+            projector._background_tasks = set()
+            projector._accepting = True
+            first_started = asyncio.Event()
+            release_first = asyncio.Event()
+            contents = []
+
+            async def _project_once(memory_id, request=None):
+                contents.append(request.content if request is not None else "")
+                if len(contents) == 1:
+                    first_started.set()
+                    await release_first.wait()
+                return True
+
+            projector._project_once = _project_once
+            request_a = MemoryWriteRequest(source="test", kind="memory", session_id="s", content="old")
+            request_b = MemoryWriteRequest(source="test", kind="memory", session_id="s", content="new")
+            first = asyncio.create_task(projector.project("same-memory", request_a))
+            await first_started.wait()
+            second = asyncio.create_task(projector.project("same-memory", request_b))
+            await asyncio.sleep(0)
+            release_first.set()
+            self.assertEqual(await asyncio.wait_for(first, timeout=0.5), True)
+            self.assertEqual(await asyncio.wait_for(second, timeout=0.5), True)
+            self.assertEqual(contents, ["old", "new"])
+
+        asyncio.run(run())
+
+    def test_projection_stop_waits_for_active_owner_and_rejects_new_work(self):
+        async def run():
+            projector = self.projector_mod.MemoryIndexProjector.__new__(self.projector_mod.MemoryIndexProjector)
+            projector._projection_inflight_tasks = {}
+            projector._projection_inflight_ids = set()
+            projector._projection_latest_requests = {}
+            projector._projection_request_versions = {}
+            projector._background_tasks = set()
+            projector._accepting = True
+            projector._retry_task = None
+            projector._retry_stop = asyncio.Event()
+            release = asyncio.Event()
+
+            async def _mark_pending_persisted(memory_id, reason):
+                return True
+
+            projector._mark_pending_persisted = _mark_pending_persisted
+
+            async def _project_once(memory_id, request=None):
+                await release.wait()
+                return True
+
+            projector._project_once = _project_once
+            active = asyncio.create_task(projector.project("stopping-memory"))
+            await asyncio.sleep(0)
+            stopper = asyncio.create_task(projector.stop())
+            await asyncio.sleep(0)
+            self.assertFalse(stopper.done())
+            self.assertFalse(await projector.project("new-memory"))
+            release.set()
+            await asyncio.wait_for(stopper, timeout=0.5)
+            self.assertTrue(await active)
+            self.assertFalse(projector._projection_inflight_tasks)
+
+        asyncio.run(run())
+
+    def test_projection_owner_exception_is_consumed_when_all_callers_cancel(self):
+        async def run():
+            projector = self.projector_mod.MemoryIndexProjector.__new__(self.projector_mod.MemoryIndexProjector)
+            projector._projection_inflight_tasks = {}
+            projector._projection_inflight_ids = set()
+            projector._projection_latest_requests = {}
+            projector._projection_request_versions = {}
+            projector._background_tasks = set()
+            projector._projection_task_diagnostics = []
+            projector._accepting = True
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def _project_once(memory_id, request=None):
+                started.set()
+                await release.wait()
+                raise RuntimeError("projection boom")
+
+            projector._project_once = _project_once
+            loop = asyncio.get_running_loop()
+            errors = []
+            loop.set_exception_handler(lambda _loop, context: errors.append(context))
+            caller = asyncio.create_task(projector.project("failed-memory"))
+            await started.wait()
+            caller.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await caller
+            release.set()
+            await asyncio.sleep(0.05)
+            self.assertEqual(errors, [])
+            self.assertEqual(projector._projection_task_diagnostics[0]["event"], "projection_task_failed")
+
+        asyncio.run(run())
+
+    def test_pending_outbox_persistence_timeout_is_bounded_and_retryable(self):
+        async def run():
+            never = asyncio.Event()
+
+            class _Store:
+                async def schedule_projection_retry(self, *_args, **_kwargs):
+                    await never.wait()
+
+            engine = type(
+                "_Engine",
+                (),
+                {
+                    "v2_store": _Store(),
+                    "config": type(
+                        "_Config",
+                        (),
+                        {
+                            "timing": type(
+                                "_Timing",
+                                (),
+                                {
+                                    "projection_lock_timeout_sec": 0.05,
+                                    "shutdown_cancel_grace_sec": 0.05,
+                                },
+                            )()
+                        },
+                    )(),
+                },
+            )()
+            projector = self.projector_mod.MemoryIndexProjector(engine)
+            started = time.monotonic()
+
+            scheduled = await projector._mark_pending_persisted(
+                "bounded-memory",
+                "shutdown_rejected",
+            )
+
+            self.assertFalse(scheduled)
+            self.assertLess(time.monotonic() - started, 0.2)
+            self.assertEqual(
+                projector.pending_reason("bounded-memory"),
+                "shutdown_rejected",
+            )
+            self.assertFalse(projector.retry_scheduled("bounded-memory"))
+            status = projector.describe_status()
+            self.assertEqual(status["projection_persistence_timeout_total"], 1)
+            self.assertEqual(
+                status["projection_task_diagnostics"][-1]["operation"],
+                "schedule_projection_retry",
+            )
+
+        asyncio.run(run())
+
+    def test_outbox_diagnostics_timeout_preserves_last_snapshot(self):
+        async def run():
+            never = asyncio.Event()
+
+            class _Store:
+                async def projection_retry_diagnostics(self):
+                    await never.wait()
+
+            engine = type(
+                "_Engine",
+                (),
+                {
+                    "v2_store": _Store(),
+                    "config": type(
+                        "_Config",
+                        (),
+                        {
+                            "timing": type(
+                                "_Timing",
+                                (),
+                                {"projection_lock_timeout_sec": 0.05},
+                            )()
+                        },
+                    )(),
+                },
+            )()
+            projector = self.projector_mod.MemoryIndexProjector(engine)
+            projector._outbox_diagnostics = {"pending_count": 3}
+
+            snapshot = await projector._refresh_outbox_diagnostics()
+
+            self.assertEqual(snapshot["pending_count"], 3)
+            self.assertEqual(projector._persistence_timeout_total, 1)
+
+        asyncio.run(run())
+
+    def test_confirm_projection_outbox_timeout_preserves_retryable_pending(self):
+        async def run():
+            never = asyncio.Event()
+
+            class _Store:
+                async def complete_projection_retry(self, _memory_id):
+                    await never.wait()
+
+            engine = type(
+                "_Engine",
+                (),
+                {
+                    "v2_store": _Store(),
+                    "config": type(
+                        "_Config",
+                        (),
+                        {
+                            "timing": type(
+                                "_Timing",
+                                (),
+                                {"projection_lock_timeout_sec": 0.05},
+                            )()
+                        },
+                    )(),
+                },
+            )()
+            projector = self.projector_mod.MemoryIndexProjector(engine)
+            started = time.monotonic()
+
+            confirmed = await projector.confirm_projection_outbox({"memory-1"})
+
+            self.assertFalse(confirmed)
+            self.assertLess(time.monotonic() - started, 0.2)
+            self.assertEqual(projector.pending_reason("memory-1"), "outbox_ack_failed")
+            self.assertEqual(projector._persistence_timeout_total, 1)
 
         asyncio.run(run())
 

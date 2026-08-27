@@ -4,8 +4,10 @@ import hashlib
 import inspect
 import json
 import os
+import threading
 import time
 import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -104,11 +106,28 @@ class MemoryEngine:
         self._vector_bootstrap_task: asyncio.Task | None = None
         self._projection_ready_replay_task: asyncio.Task | None = None
         self._vector_retirement_tasks: set[asyncio.Task] = set()
+        self._vector_sync_retirement_executor: ThreadPoolExecutor | None = None
+        self._vector_sync_retirement_futures: set[Future] = set()
+        self._vector_candidate_executor: ThreadPoolExecutor | None = None
+        self._vector_candidate_futures: set[Future] = set()
+        self._vector_candidate_build_tasks: set[asyncio.Task] = set()
+        self._vector_candidate_paths: set[str] = set()
+        self._retired_vector_stacks: dict[str, dict[str, Any]] = {}
+        self._vector_retirement_capacity_rejected_total = 0
+        self._vector_physical_timeout_exceeded_total = 0
+        self._vector_registry_lock = threading.RLock()
+        self._vector_close_tasks: dict[int, tuple[Any, Any]] = {}
+        self._vector_close_retry_after: dict[int, tuple[Any, float]] = {}
         self._vector_last_error = ""
+        self._projection_replay_status = "idle"
+        self._projection_replay_error = ""
+        self._projection_replay_completed_at = 0.0
         self._vector_bootstrap_started_at = 0.0
         self._vector_bootstrap_completed_at = 0.0
         self._vector_consistency_report: dict[str, Any] = {}
         self._vector_generation = 0
+        self._vector_shutdown_generation = 0
+        self._accepting_vector_work = True
         self._vector_index_path = ""
         self._init_failures = 0
         self._next_retry_time = 0.0
@@ -164,7 +183,12 @@ class MemoryEngine:
                 bootstrap_task.cancel()
             previous_retriever = self.vec_retriever
             previous_faiss_db = self.faiss_db
-            self._schedule_vector_stack_retirement(previous_retriever, previous_faiss_db)
+            self._schedule_vector_stack_retirement(
+                previous_retriever,
+                previous_faiss_db,
+                index_path=self._vector_index_path,
+                generation=self._vector_generation - 1,
+            )
             self.faiss_db = None
             self.vec_retriever = None
             self.retriever = None
@@ -233,10 +257,27 @@ class MemoryEngine:
         keep_history: int = 1,
     ) -> int:
         current_path = Path(current_index_path).resolve()
+        with self._vector_registry_lock:
+            protected_paths = set(self._vector_candidate_paths)
+            retired_paths = [
+                str(stack.get("index_path") or "").strip()
+                for stack in self._retired_vector_stacks.values()
+            ]
+        for raw_path in retired_paths:
+            if raw_path:
+                try:
+                    protected_paths.add(str(Path(raw_path).resolve()))
+                except OSError:
+                    protected_paths.add(raw_path)
         historical: list[tuple[int, Path]] = []
         for candidate in self.data_path.glob("vectors.g*.index"):
             try:
-                if candidate.is_file() and candidate.resolve() != current_path:
+                resolved = candidate.resolve()
+                if (
+                    candidate.is_file()
+                    and resolved != current_path
+                    and str(resolved) not in protected_paths
+                ):
                     historical.append((candidate.stat().st_mtime_ns, candidate))
             except OSError:
                 continue
@@ -528,6 +569,8 @@ class MemoryEngine:
             return float(default)
 
     def _schedule_vector_bootstrap(self) -> None:
+        if not getattr(self, "_accepting_vector_work", True):
+            return
         task = self._vector_bootstrap_task
         if task is not None and not task.done():
             return
@@ -590,46 +633,731 @@ class MemoryEngine:
         )
 
     @staticmethod
-    async def _close_vector_stack(retriever, faiss_db) -> None:
+    async def _close_vector_stack(retriever, faiss_db, *, timeout_sec: float | None = None) -> bool:
+        def _invoke_close(close_fn):
+            try:
+                signature = inspect.signature(close_fn)
+            except (TypeError, ValueError):
+                return close_fn()
+            try:
+                signature.bind(timeout_sec=timeout_sec)
+            except TypeError:
+                return close_fn()
+            return close_fn(timeout_sec=timeout_sec)
+
+        async def _invoke_close_bounded(close_fn):
+            is_async = inspect.iscoroutinefunction(close_fn)
+            if is_async:
+                result = _invoke_close(close_fn)
+            else:
+                call = asyncio.to_thread(_invoke_close, close_fn)
+                result = await (asyncio.wait_for(call, timeout=timeout_sec) if timeout_sec is not None else call)
+            if inspect.isawaitable(result):
+                result = await (asyncio.wait_for(result, timeout=timeout_sec) if timeout_sec is not None else result)
+            return result
+
+        success = True
         if retriever is not None:
             try:
                 close_retriever = getattr(retriever, "close", None)
                 if callable(close_retriever):
-                    result = close_retriever()
-                    if inspect.isawaitable(result):
-                        await result
+                    result = await _invoke_close_bounded(close_retriever)
+                    if result is False:
+                        success = False
             except Exception as exc:
+                success = False
                 logger.warning(f"[AstrMai] vector retriever close degraded: {exc}")
+            if not success:
+                return False
         if faiss_db is not None:
             try:
                 close_database = getattr(faiss_db, "close", None)
                 if callable(close_database):
-                    result = close_database()
-                    if inspect.isawaitable(result):
-                        await result
+                    result = await _invoke_close_bounded(close_database)
+                    if result is False:
+                        success = False
             except Exception as exc:
+                success = False
                 logger.warning(f"[AstrMai] vector database close degraded: {exc}")
+        return success
 
-    def _schedule_vector_stack_retirement(self, retriever, faiss_db) -> None:
+    @staticmethod
+    def _close_vector_stack_physical(retriever, faiss_db, *, timeout_sec: float) -> bool:
+        def _invoke(resource) -> bool:
+            if resource is None:
+                return True
+            close_fn = getattr(resource, "close", None)
+            if not callable(close_fn):
+                return True
+            try:
+                kwargs: dict[str, Any] = {}
+                try:
+                    signature = inspect.signature(close_fn)
+                except (TypeError, ValueError):
+                    pass
+                else:
+                    try:
+                        signature.bind(timeout_sec=timeout_sec)
+                    except TypeError:
+                        pass
+                    else:
+                        kwargs["timeout_sec"] = timeout_sec
+                result = close_fn(**kwargs)
+                if inspect.isawaitable(result):
+                    result = asyncio.run(
+                        asyncio.wait_for(result, timeout=max(0.05, timeout_sec))
+                    )
+                return result is not False
+            except Exception as exc:
+                logger.warning(f"[AstrMai] physical vector close degraded: {exc}")
+                return False
+
+        if not _invoke(retriever):
+            return False
+        return _invoke(faiss_db)
+
+    def _vector_close_timeout_sec(self) -> float:
+        return max(0.05, self._timing_value("shutdown_cancel_grace_sec", 1.0))
+
+    def _consume_vector_close_task(self, resource, task: asyncio.Task) -> None:
+        try:
+            failed = task.exception() is not None or task.result() is False
+        except (asyncio.CancelledError, Exception):
+            failed = True
+        if failed:
+            with self._vector_registry_lock:
+                self._vector_close_retry_after[id(resource)] = (
+                    resource,
+                    time.monotonic() + 0.25,
+                )
+
+    async def _await_vector_resource_close(self, resource, *, timeout_sec: float | None) -> bool:
+        if resource is None:
+            return True
+        started_at = time.monotonic()
+        key = id(resource)
+        with self._vector_registry_lock:
+            entry = self._vector_close_tasks.get(key)
+            task = entry[1] if entry is not None and entry[0] is resource else None
+        if task is not None and task.done():
+            try:
+                if bool(task.result()):
+                    return True
+            except (asyncio.CancelledError, Exception):
+                pass
+            with self._vector_registry_lock:
+                current = self._vector_close_tasks.get(key)
+                if current is not None and current[0] is resource and current[1] is task:
+                    self._vector_close_tasks.pop(key, None)
+            task = None
+        joined_existing = task is not None
+        if task is None:
+            with self._vector_registry_lock:
+                entry = self._vector_close_tasks.get(key)
+                task = entry[1] if entry is not None and entry[0] is resource else None
+                if task is None:
+                    retry_entry = self._vector_close_retry_after.get(key)
+                    if retry_entry is not None and retry_entry[0] is resource:
+                        if time.monotonic() < retry_entry[1]:
+                            return False
+                        self._vector_close_retry_after.pop(key, None)
+                    task = asyncio.create_task(
+                        self._close_vector_stack(resource, None),
+                        name="astrmai-vector-resource-close",
+                    )
+                    self._vector_close_tasks[key] = (resource, task)
+                    task.add_done_callback(
+                        lambda completed, owner=resource: self._consume_vector_close_task(owner, completed)
+                    )
+        async def _await_owner(owner):
+            if isinstance(owner, asyncio.Future):
+                return await asyncio.shield(owner)
+            return await asyncio.shield(asyncio.wrap_future(owner))
+
+        try:
+            if timeout_sec is None:
+                closed = await _await_owner(task)
+            else:
+                closed = await asyncio.wait_for(_await_owner(task), timeout=max(0.0, timeout_sec))
+        except asyncio.TimeoutError:
+            return False
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            with self._vector_registry_lock:
+                current = self._vector_close_tasks.get(key)
+                if task.done() and current is not None and current[0] is resource and current[1] is task:
+                    self._vector_close_tasks.pop(key, None)
+            return False
+        if not closed:
+            with self._vector_registry_lock:
+                current = self._vector_close_tasks.get(key)
+                if current is not None and current[0] is resource and current[1] is task:
+                    self._vector_close_tasks.pop(key, None)
+        else:
+            with self._vector_registry_lock:
+                retry_entry = self._vector_close_retry_after.get(key)
+                if retry_entry is not None and retry_entry[0] is resource:
+                    self._vector_close_retry_after.pop(key, None)
+        if not closed and joined_existing:
+            remaining = None
+            if timeout_sec is not None:
+                remaining = max(0.0, timeout_sec - (time.monotonic() - started_at))
+                if remaining <= 0.0:
+                    return False
+            return await self._await_vector_resource_close(resource, timeout_sec=remaining)
+        return bool(closed)
+
+    async def _await_vector_stack_close(
+        self,
+        retriever,
+        faiss_db,
+        *,
+        timeout_sec: float | None,
+    ) -> bool:
+        deadline = None if timeout_sec is None else time.monotonic() + max(0.0, timeout_sec)
+
+        def _remaining() -> float | None:
+            if deadline is None:
+                return None
+            return max(0.0, deadline - time.monotonic())
+
+        if not await self._await_vector_resource_close(retriever, timeout_sec=_remaining()):
+            return False
+        return await self._await_vector_resource_close(faiss_db, timeout_sec=_remaining())
+
+    def _forget_vector_stack_close(self, retriever, faiss_db) -> None:
+        with self._vector_registry_lock:
+            for resource in (retriever, faiss_db):
+                if resource is None:
+                    continue
+                key = id(resource)
+                entry = self._vector_close_tasks.get(key)
+                if entry is not None and entry[0] is resource and entry[1].done():
+                    self._vector_close_tasks.pop(key, None)
+                retry_entry = self._vector_close_retry_after.get(key)
+                if retry_entry is not None and retry_entry[0] is resource:
+                    self._vector_close_retry_after.pop(key, None)
+
+    async def _construct_vector_candidate(
+        self,
+        *,
+        index_path: Path,
+        embedding_provider,
+    ):
+        candidate_path = str(Path(index_path).resolve())
+        with self._vector_registry_lock:
+            self._vector_candidate_paths.add(candidate_path)
+        cleanup_state = {"abandoned": False, "scheduled": False}
+        with self._vector_registry_lock:
+            executor = self._vector_candidate_executor
+            if executor is None:
+                executor = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="astrmai-vector-candidate",
+                )
+                self._vector_candidate_executor = executor
+        physical_future = executor.submit(
+            FaissVecDB,
+            doc_store_path=str(self.data_path / "docs.db"),
+            index_store_path=str(index_path),
+            embedding_provider=embedding_provider,
+        )
+        with self._vector_registry_lock:
+            self._vector_candidate_futures.add(physical_future)
+
+        async def _wait_for_candidate():
+            return await asyncio.wrap_future(physical_future)
+
+        task = asyncio.create_task(_wait_for_candidate(), name="astrmai-vector-candidate-build")
+        with self._vector_registry_lock:
+            self._vector_candidate_build_tasks.add(task)
+
+        def _finish_candidate_build(done: Future) -> None:
+            with self._vector_registry_lock:
+                self._vector_candidate_futures.discard(done)
+            try:
+                if done.cancelled():
+                    with self._vector_registry_lock:
+                        self._vector_candidate_paths.discard(candidate_path)
+                    return
+                try:
+                    candidate_db = done.result()
+                except Exception as exc:
+                    logger.warning(f"[AstrMai] vector candidate construction failed: {exc}")
+                    with self._vector_registry_lock:
+                        self._vector_candidate_paths.discard(candidate_path)
+                    return
+                with self._vector_registry_lock:
+                    if not cleanup_state["abandoned"] or cleanup_state["scheduled"]:
+                        return
+                    cleanup_state["scheduled"] = True
+                try:
+                    self._schedule_vector_stack_retirement(
+                        None,
+                        candidate_db,
+                        index_path=index_path,
+                        generation=self._vector_generation,
+                        delete_index=True,
+                    )
+                finally:
+                    with self._vector_registry_lock:
+                        self._vector_candidate_paths.discard(candidate_path)
+            finally:
+                with self._vector_registry_lock:
+                    active_executor = self._vector_candidate_executor
+                    shutdown_executor = (
+                        active_executor is executor and not self._vector_candidate_futures
+                    )
+                    if shutdown_executor:
+                        self._vector_candidate_executor = None
+                if shutdown_executor:
+                    active_executor.shutdown(wait=False, cancel_futures=True)
+
+        def _finish_candidate_waiter(done: asyncio.Task) -> None:
+            with self._vector_registry_lock:
+                self._vector_candidate_build_tasks.discard(done)
+            try:
+                done.exception()
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        physical_future.add_done_callback(_finish_candidate_build)
+        task.add_done_callback(_finish_candidate_waiter)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            with self._vector_registry_lock:
+                cleanup_state["abandoned"] = True
+            if physical_future.done():
+                _finish_candidate_build(physical_future)
+            raise
+        except Exception:
+            with self._vector_registry_lock:
+                self._vector_candidate_paths.discard(candidate_path)
+            raise
+
+    def _schedule_vector_stack_retirement(
+        self,
+        retriever,
+        faiss_db,
+        *,
+        index_path=None,
+        generation=None,
+        delete_index: bool = False,
+    ) -> bool:
         if retriever is None and faiss_db is None:
-            return
+            return True
+        registry_limit = max(
+            1,
+            int(self._timing_value("vector_retirement_registry_limit", 32.0)),
+        )
+        stack_id = uuid.uuid4().hex
+        with self._vector_registry_lock:
+            if len(self._retired_vector_stacks) >= registry_limit:
+                self._vector_retirement_capacity_rejected_total += 1
+                logger.error(
+                    "[AstrMai] vector retirement registry hard limit reached; "
+                    f"rejecting stack limit={registry_limit}"
+                )
+                reject = True
+            else:
+                reject = False
+            if reject:
+                pass
+            else:
+                self._retired_vector_stacks[stack_id] = {
+                    "retriever": retriever,
+                    "faiss_db": faiss_db,
+                    "index_path": str(index_path) if index_path else "",
+                    "generation": generation,
+                    "delete_index": bool(delete_index),
+                    "attempts": 0,
+                    "close_attempt_total": 0,
+                    "shutdown_retry_attempts": 0,
+                    "physical_timeout_exceeded": False,
+                    "max_attempts": max(
+                        1,
+                        int(self._timing_value("vector_retirement_retry_max_attempts", 5.0)),
+                    ),
+                    "next_retry_at": 0.0,
+                    "status": "pending",
+                    "last_error": "",
+                    "task": None,
+                    "sync_future": None,
+                }
+            registry_size = len(self._retired_vector_stacks)
+        if reject:
+            self._schedule_rejected_vector_cleanup(
+                retriever,
+                faiss_db,
+                index_path=index_path,
+                delete_index=delete_index,
+            )
+            return False
+        self._schedule_vector_retirement_attempt(stack_id)
+        return True
+
+    def _schedule_rejected_vector_cleanup(
+        self,
+        retriever,
+        faiss_db,
+        *,
+        index_path=None,
+        delete_index: bool = False,
+    ) -> None:
+        """Close an overflow stack without retaining it in the retired registry."""
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            asyncio.run(self._close_vector_stack(retriever, faiss_db))
+            loop = None
+        if loop is not None and not loop.is_closed():
+            async def _close() -> bool:
+                closed = await self._await_vector_stack_close(
+                    retriever,
+                    faiss_db,
+                    timeout_sec=self._vector_close_timeout_sec(),
+                )
+                if closed and delete_index and index_path:
+                    try:
+                        Path(index_path).unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                return closed
+
+            task = loop.create_task(_close(), name="astrmai-vector-retirement-overflow")
+            with self._vector_registry_lock:
+                self._vector_retirement_tasks.add(task)
+
+            def _consume(done: asyncio.Task) -> None:
+                with self._vector_registry_lock:
+                    self._vector_retirement_tasks.discard(done)
+                try:
+                    if not done.result():
+                        logger.error("[AstrMai] rejected vector retirement cleanup failed")
+                except Exception as exc:
+                    logger.error(f"[AstrMai] rejected vector retirement cleanup degraded: {exc}")
+
+            task.add_done_callback(_consume)
             return
-        task = loop.create_task(
-            self._close_vector_stack(retriever, faiss_db),
-            name="astrmai-vector-stack-retirement",
+        with self._vector_registry_lock:
+            executor = self._vector_sync_retirement_executor
+            if executor is None:
+                executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="astrmai-vector-retire")
+                self._vector_sync_retirement_executor = executor
+            future = executor.submit(
+                self._close_vector_stack_physical,
+                retriever,
+                faiss_db,
+                timeout_sec=self._vector_close_timeout_sec(),
+            )
+            self._vector_sync_retirement_futures.add(future)
+
+        def _consume_sync(done: Future) -> None:
+            with self._vector_registry_lock:
+                self._vector_sync_retirement_futures.discard(done)
+            try:
+                if done.result() and delete_index and index_path:
+                    Path(index_path).unlink(missing_ok=True)
+            except Exception as exc:
+                logger.error(f"[AstrMai] rejected vector retirement cleanup degraded: {exc}")
+
+        future.add_done_callback(_consume_sync)
+
+    def _retirement_retry_delay(self, attempts: int) -> float:
+        base = max(0.25, self._timing_value("vector_retirement_retry_base_sec", 0.25))
+        maximum = max(base, self._timing_value("vector_retirement_retry_max_sec", 5.0))
+        return min(maximum, base * (2 ** max(0, int(attempts) - 1)))
+
+    def _vector_stack_close_retry_after(self, stack: dict[str, Any]) -> float:
+        retry_after = 0.0
+        with self._vector_registry_lock:
+            for resource in (stack.get("retriever"), stack.get("faiss_db")):
+                if resource is None:
+                    continue
+                entry = self._vector_close_retry_after.get(id(resource))
+                if entry is not None and entry[0] is resource:
+                    retry_after = max(retry_after, float(entry[1] or 0.0))
+        return retry_after
+
+    def _finalize_retired_vector_stack(self, stack_id: str) -> None:
+        with self._vector_registry_lock:
+            stack = self._retired_vector_stacks.pop(stack_id, None) or {}
+        self._forget_vector_stack_close(stack.get("retriever"), stack.get("faiss_db"))
+        retired_path = str(stack.get("index_path") or "").strip()
+        if retired_path:
+            try:
+                with self._vector_registry_lock:
+                    self._vector_candidate_paths.discard(str(Path(retired_path).resolve()))
+            except OSError:
+                with self._vector_registry_lock:
+                    self._vector_candidate_paths.discard(retired_path)
+        if stack.get("delete_index") and retired_path:
+            try:
+                Path(retired_path).unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning(f"[AstrMai] retired vector index cleanup degraded: {exc}")
+        self._schedule_deferred_vector_retirements()
+
+    def _schedule_deferred_vector_retirements(self) -> None:
+        registry_limit = max(
+            1,
+            int(self._timing_value("vector_retirement_registry_limit", 32.0)),
         )
-        self._vector_retirement_tasks.add(task)
+        scheduled: list[str] = []
+        with self._vector_registry_lock:
+            active = sum(
+                1
+                for stack in self._retired_vector_stacks.values()
+                if stack.get("task") is not None or stack.get("sync_future") is not None
+            )
+            for stack_id, stack in list(self._retired_vector_stacks.items()):
+                if active >= registry_limit:
+                    break
+                if stack.get("status") != "capacity_deferred":
+                    continue
+                stack["status"] = "pending"
+                stack["last_error"] = ""
+                scheduled.append(stack_id)
+                active += 1
+        for stack_id in scheduled:
+            self._schedule_vector_retirement_attempt(stack_id)
+
+    def _schedule_vector_retirement_attempt(self, stack_id: str) -> None:
+        with self._vector_registry_lock:
+            stack = self._retired_vector_stacks.get(stack_id)
+            if not stack or stack.get("task") is not None or stack.get("sync_future") is not None:
+                return
+            if int(stack.get("attempts", 0) or 0) >= int(stack.get("max_attempts", 1) or 1):
+                stack["status"] = "retry_exhausted"
+                return
+            delay = max(
+                0.0,
+                float(stack.get("next_retry_at", 0.0) or 0.0) - time.monotonic(),
+            )
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._schedule_sync_vector_retirement(stack_id)
+            return
+        if loop.is_closed():
+            self._schedule_sync_vector_retirement(stack_id)
+            return
+
+        async def _retire() -> bool:
+            if delay:
+                await asyncio.sleep(delay)
+            with self._vector_registry_lock:
+                current = self._retired_vector_stacks.get(stack_id)
+                if current is not stack:
+                    return False
+                stack["attempts"] = int(stack.get("attempts", 0) or 0) + 1
+                stack["close_attempt_total"] = int(stack.get("close_attempt_total", 0) or 0) + 1
+                stack["status"] = "closing"
+            return await self._await_vector_stack_close(
+                stack.get("retriever"),
+                stack.get("faiss_db"),
+                timeout_sec=self._vector_close_timeout_sec(),
+            )
+
+        retirement_coro = _retire()
+        try:
+            task = loop.create_task(retirement_coro, name="astrmai-vector-stack-retirement")
+        except RuntimeError:
+            retirement_coro.close()
+            self._schedule_sync_vector_retirement(stack_id)
+            return
+        with self._vector_registry_lock:
+            current = self._retired_vector_stacks.get(stack_id)
+            if current is not stack or stack.get("task") is not None or stack.get("sync_future") is not None:
+                task.cancel()
+                return
+            stack["task"] = task
+            self._vector_retirement_tasks.add(task)
 
         def _consume(completed: asyncio.Task) -> None:
-            self._vector_retirement_tasks.discard(completed)
-            if not completed.cancelled():
-                completed.exception()
+            with self._vector_registry_lock:
+                self._vector_retirement_tasks.discard(completed)
+                current = self._retired_vector_stacks.get(stack_id)
+                if current is not stack or stack.get("task") is not completed:
+                    return
+                stack["task"] = None
+                if completed.cancelled():
+                    stack["status"] = "cancelled"
+                    return
+            try:
+                closed = bool(completed.result())
+            except Exception as exc:
+                closed = False
+                with self._vector_registry_lock:
+                    stack["last_error"] = f"{type(exc).__name__}: {exc}"[:500]
+            if closed:
+                self._finalize_retired_vector_stack(stack_id)
+                return
+            with self._vector_registry_lock:
+                stack["status"] = "retry_wait"
+                stack["last_error"] = stack.get("last_error") or "close_failed"
+                stack["next_retry_at"] = max(
+                    time.monotonic() + self._retirement_retry_delay(
+                        int(stack.get("attempts", 0) or 0)
+                    ),
+                    self._vector_stack_close_retry_after(stack) + 0.001,
+                )
+                should_retry = (
+                    getattr(self, "_accepting_vector_work", True)
+                    and int(stack.get("attempts", 0) or 0)
+                    < int(stack.get("max_attempts", 1) or 1)
+                )
+                if not should_retry:
+                    stack["status"] = "retry_exhausted"
+            if should_retry:
+                self._schedule_vector_retirement_attempt(stack_id)
+            else:
+                logger.warning(f"[AstrMai] vector stack retirement pending stack_id={stack_id}")
 
         task.add_done_callback(_consume)
+
+    def _schedule_sync_vector_retirement(self, stack_id: str) -> None:
+        with self._vector_registry_lock:
+            stack = self._retired_vector_stacks.get(stack_id)
+            if not stack or stack.get("sync_future") is not None:
+                return
+            resources = [
+                resource
+                for resource in (stack.get("retriever"), stack.get("faiss_db"))
+                if resource is not None
+            ]
+            existing_owners: dict[int, Any] = {}
+            owned_resources: list[Any] = []
+            future: Future = Future()
+            for resource in resources:
+                entry = self._vector_close_tasks.get(id(resource))
+                if entry is not None and entry[0] is resource and not entry[1].done():
+                    existing_owners[id(resource)] = entry[1]
+                else:
+                    self._vector_close_tasks[id(resource)] = (resource, future)
+                    owned_resources.append(resource)
+            stack["sync_future"] = future
+            self._vector_sync_retirement_futures.add(future)
+
+        def _run() -> None:
+            try:
+                owner_deadline = time.monotonic() + self._vector_close_timeout_sec()
+                for owner in existing_owners.values():
+                    while not owner.done() and time.monotonic() < owner_deadline:
+                        time.sleep(0.01)
+                    if not owner.done():
+                        with self._vector_registry_lock:
+                            stack["physical_timeout_exceeded"] = True
+                            self._vector_physical_timeout_exceeded_total += 1
+                        future.set_result(False)
+                        return
+                    try:
+                        if owner.result() is False:
+                            future.set_result(False)
+                            return
+                    except (asyncio.CancelledError, Exception):
+                        future.set_result(False)
+                        return
+
+                while True:
+                    with self._vector_registry_lock:
+                        if int(stack.get("attempts", 0) or 0) >= int(
+                            stack.get("max_attempts", 1) or 1
+                        ):
+                            future.set_result(False)
+                            return
+                        stack["attempts"] = int(stack.get("attempts", 0) or 0) + 1
+                        stack["close_attempt_total"] = int(
+                            stack.get("close_attempt_total", 0) or 0
+                        ) + 1
+                        stack["status"] = "closing"
+                    retriever = (
+                        stack.get("retriever")
+                        if any(resource is stack.get("retriever") for resource in owned_resources)
+                        else None
+                    )
+                    faiss_db = (
+                        stack.get("faiss_db")
+                        if any(resource is stack.get("faiss_db") for resource in owned_resources)
+                        else None
+                    )
+                    close_started_at = time.monotonic()
+                    closed = self._close_vector_stack_physical(
+                        retriever,
+                        faiss_db,
+                        timeout_sec=self._vector_close_timeout_sec(),
+                    )
+                    elapsed = time.monotonic() - close_started_at
+                    with self._vector_registry_lock:
+                        if elapsed > self._vector_close_timeout_sec():
+                            stack["physical_timeout_exceeded"] = True
+                            self._vector_physical_timeout_exceeded_total += 1
+                    if closed:
+                        future.set_result(True)
+                        return
+                    with self._vector_registry_lock:
+                        stack["status"] = "retry_wait"
+                        stack["last_error"] = "close_failed"
+                        delay = self._retirement_retry_delay(
+                            int(stack.get("attempts", 0) or 0)
+                        )
+                        stack["next_retry_at"] = time.monotonic() + delay
+                    time.sleep(delay)
+            except BaseException as exc:
+                if not future.done():
+                    future.set_exception(exc)
+
+        thread = threading.Thread(
+            target=_run,
+            name="astrmai-vector-retire-physical",
+            daemon=True,
+        )
+        thread.start()
+
+        def _consume(completed: Future) -> None:
+            try:
+                with self._vector_registry_lock:
+                    self._vector_sync_retirement_futures.discard(completed)
+                    current = self._retired_vector_stacks.get(stack_id)
+                    if current is not stack or stack.get("sync_future") is not completed:
+                        return
+                    stack["sync_future"] = None
+                try:
+                    closed = bool(completed.result())
+                except Exception as exc:
+                    closed = False
+                    with self._vector_registry_lock:
+                        stack["last_error"] = f"{type(exc).__name__}: {exc}"[:500]
+                if closed:
+                    self._finalize_retired_vector_stack(stack_id)
+                else:
+                    with self._vector_registry_lock:
+                        stack["status"] = "retry_exhausted"
+                    logger.warning(f"[AstrMai] synchronous vector retirement exhausted stack_id={stack_id}")
+            finally:
+                pass
+
+        future.add_done_callback(_consume)
+
+    async def _close_retired_vector_stacks(self, *, timeout_sec: float | None = None) -> bool:
+        all_closed = True
+        with self._vector_registry_lock:
+            stacks = list(self._retired_vector_stacks.items())
+        for stack_id, stack in stacks:
+            if stack.get("status") == "retry_exhausted":
+                all_closed = False
+                continue
+            closed = await self._await_vector_stack_close(
+                stack.get("retriever"),
+                stack.get("faiss_db"),
+                timeout_sec=timeout_sec,
+            )
+            if closed:
+                self._finalize_retired_vector_stack(stack_id)
+            else:
+                all_closed = False
+        return all_closed
 
     async def _bootstrap_vector_index(self) -> None:
         lifecycle = SimpleNamespace(
@@ -638,18 +1366,42 @@ class MemoryEngine:
             index_path=None,
             discard_index=False,
             published=False,
+            shutdown_generation=int(getattr(self, "_vector_shutdown_generation", 0) or 0),
         )
         try:
             await self._build_and_publish_vector_index(lifecycle)
         finally:
             self._projection_rebuild_active = False
             if not lifecycle.published:
-                await self._close_vector_stack(lifecycle.retriever, lifecycle.faiss_db)
-                if lifecycle.discard_index and lifecycle.index_path is not None:
+                closed = await self._await_vector_stack_close(
+                    lifecycle.retriever,
+                    lifecycle.faiss_db,
+                    timeout_sec=self._vector_close_timeout_sec(),
+                )
+                if closed:
+                    self._forget_vector_stack_close(lifecycle.retriever, lifecycle.faiss_db)
+                if not closed:
+                    self._schedule_vector_stack_retirement(
+                        lifecycle.retriever,
+                        lifecycle.faiss_db,
+                        index_path=lifecycle.index_path,
+                        generation=self._vector_generation,
+                        delete_index=bool(lifecycle.discard_index),
+                    )
+                if closed and lifecycle.discard_index and lifecycle.index_path is not None:
                     try:
                         lifecycle.index_path.unlink(missing_ok=True)
                     except OSError as exc:
                         logger.warning(f"[AstrMai] stale vector candidate cleanup degraded: {exc}")
+            if lifecycle.index_path is not None:
+                try:
+                    with self._vector_registry_lock:
+                        self._vector_candidate_paths.discard(
+                            str(Path(lifecycle.index_path).resolve())
+                        )
+                except OSError:
+                    with self._vector_registry_lock:
+                        self._vector_candidate_paths.discard(str(lifecycle.index_path))
 
     async def _build_and_publish_vector_index(self, lifecycle) -> None:
         generation = self._vector_generation
@@ -710,10 +1462,8 @@ class MemoryEngine:
                 candidate_db = None
                 candidate_retriever = None
                 try:
-                    candidate_db = await asyncio.to_thread(
-                        FaissVecDB,
-                        doc_store_path=str(self.data_path / "docs.db"),
-                        index_store_path=str(index_path),
+                    candidate_db = await self._construct_vector_candidate(
+                        index_path=index_path,
                         embedding_provider=provider_instance,
                     )
                     await candidate_db.initialize()
@@ -743,8 +1493,30 @@ class MemoryEngine:
                     candidate_projector = MemoryIndexProjector(candidate_engine)
                     candidate_retriever._projection_count_provider = candidate_projector.projection_count
                     return candidate_db, candidate_retriever, candidate_hybrid, candidate_projector
-                except Exception:
-                    await self._close_vector_stack(candidate_retriever, candidate_db)
+                except (asyncio.CancelledError, Exception):
+                    closed = await self._await_vector_stack_close(
+                        candidate_retriever,
+                        candidate_db,
+                        timeout_sec=self._vector_close_timeout_sec(),
+                    )
+                    if closed:
+                        self._forget_vector_stack_close(candidate_retriever, candidate_db)
+                    if not closed:
+                        self._schedule_vector_stack_retirement(
+                            candidate_retriever,
+                            candidate_db,
+                            index_path=index_path,
+                            generation=self._vector_generation,
+                            delete_index=True,
+                        )
+                    try:
+                        with self._vector_registry_lock:
+                            self._vector_candidate_paths.discard(
+                                str(Path(index_path).resolve())
+                            )
+                    except OSError:
+                        with self._vector_registry_lock:
+                            self._vector_candidate_paths.discard(str(index_path))
                     raise
 
             lifecycle.index_path = candidate_index_path
@@ -787,7 +1559,29 @@ class MemoryEngine:
             )
             if (index_count_mismatch or exact_id_mismatch) and not rebuild_required:
                 if index_count_mismatch or exact_id_mismatch:
-                    await self._close_vector_stack(candidate_retriever, candidate_db)
+                    closed = await self._await_vector_stack_close(
+                        candidate_retriever,
+                        candidate_db,
+                        timeout_sec=self._vector_close_timeout_sec(),
+                    )
+                    if closed:
+                        self._forget_vector_stack_close(candidate_retriever, candidate_db)
+                    if not closed:
+                        self._schedule_vector_stack_retirement(
+                            candidate_retriever,
+                            candidate_db,
+                            index_path=candidate_index_path,
+                            generation=self._vector_generation,
+                            delete_index=True,
+                        )
+                    try:
+                        with self._vector_registry_lock:
+                            self._vector_candidate_paths.discard(
+                                str(Path(candidate_index_path).resolve())
+                            )
+                    except OSError:
+                        with self._vector_registry_lock:
+                            self._vector_candidate_paths.discard(str(candidate_index_path))
                     candidate_index_path = self._new_vector_index_path(generation)
                     lifecycle.index_path = candidate_index_path
                     lifecycle.discard_index = True
@@ -864,9 +1658,16 @@ class MemoryEngine:
                 await candidate_retriever.refresh_storage_metrics(force=True)
                 if generation != self._vector_generation:
                     return
+                if (
+                    not getattr(self, "_accepting_vector_work", True)
+                    or int(getattr(self, "_vector_shutdown_generation", 0) or 0)
+                    != int(lifecycle.shutdown_generation)
+                ):
+                    return
 
                 previous_retriever = self.vec_retriever
                 previous_faiss_db = self.faiss_db
+                previous_index_path = self._vector_index_path
                 if rebuild_required:
                     self._publish_vector_index_manifest(candidate_index_path, unique_models)
                 self.faiss_db = candidate_db
@@ -884,7 +1685,20 @@ class MemoryEngine:
                 lifecycle.published = True
                 lifecycle.discard_index = False
                 if previous_retriever is not candidate_retriever or previous_faiss_db is not candidate_db:
-                    await self._close_vector_stack(previous_retriever, previous_faiss_db)
+                    closed = await self._await_vector_stack_close(
+                        previous_retriever,
+                        previous_faiss_db,
+                        timeout_sec=self._vector_close_timeout_sec(),
+                    )
+                    if closed:
+                        self._forget_vector_stack_close(previous_retriever, previous_faiss_db)
+                    if not closed:
+                        self._schedule_vector_stack_retirement(
+                            previous_retriever,
+                            previous_faiss_db,
+                            index_path=previous_index_path,
+                            generation=generation - 1,
+                        )
                 active_projector = getattr(self, "index_projector", None)
                 confirm = getattr(active_projector, "confirm_projection_outbox", None)
                 if callable(confirm):
@@ -898,13 +1712,26 @@ class MemoryEngine:
                     except Exception as exc:
                         logger.warning(f"[AstrMai] projection outbox confirmation deferred: {exc}")
                 replay = getattr(active_projector, "replay_pending_after_ready", None)
-                if callable(replay):
+                if callable(replay) and getattr(self, "_accepting_vector_work", True):
                     previous_replay = self._projection_ready_replay_task
                     if previous_replay is None or previous_replay.done():
+                        self._projection_replay_status = "running"
+                        self._projection_replay_error = ""
                         self._projection_ready_replay_task = asyncio.create_task(
                             replay(limit=int(self._timing_value("projection_retry_batch_size", 20) or 20)),
                             name="astrmai-memory-projection-ready-replay",
                         )
+                        replay_task = self._projection_ready_replay_task
+
+                        replay_task.add_done_callback(self._handle_projection_replay_result)
+                try:
+                    with self._vector_registry_lock:
+                        self._vector_candidate_paths.discard(
+                            str(Path(candidate_index_path).resolve())
+                        )
+                except OSError:
+                    with self._vector_registry_lock:
+                        self._vector_candidate_paths.discard(str(candidate_index_path))
                 self._cleanup_stale_vector_indexes(candidate_index_path, keep_history=1)
                 logger.info("[AstrMai] hybrid memory engine ready (BM25 + FaissVecDB).")
             finally:
@@ -931,8 +1758,95 @@ class MemoryEngine:
         self._schedule_vector_bootstrap()
         return False
 
+    def describe_shutdown_owners(self) -> dict[str, Any]:
+        def _running(owner: Any) -> bool:
+            return owner is not None and not owner.done()
+
+        def _owner_name(owner: Any, fallback: str) -> str:
+            get_name = getattr(owner, "get_name", None)
+            if callable(get_name):
+                try:
+                    return str(get_name())
+                except Exception:
+                    pass
+            return fallback
+
+        with self._vector_registry_lock:
+            retirement_tasks = [
+                task for task in self._vector_retirement_tasks if _running(task)
+            ]
+            candidate_build_tasks = [
+                task for task in self._vector_candidate_build_tasks if _running(task)
+            ]
+            candidate_futures = [
+                future for future in self._vector_candidate_futures if _running(future)
+            ]
+            sync_retirement_futures = [
+                future
+                for future in self._vector_sync_retirement_futures
+                if _running(future)
+            ]
+            close_owners = [
+                owner
+                for _resource, owner in self._vector_close_tasks.values()
+                if _running(owner)
+            ]
+            candidate_path_count = len(self._vector_candidate_paths)
+            retired_stacks = [dict(stack) for stack in self._retired_vector_stacks.values()]
+
+        owner_names = {
+            *(
+                _owner_name(task, "memory.vector_retirement")
+                for task in retirement_tasks
+            ),
+            *(
+                _owner_name(task, "memory.vector_candidate_build")
+                for task in candidate_build_tasks
+            ),
+            *("astrmai-vector-candidate-physical" for _future in candidate_futures),
+            *("astrmai-vector-sync-retirement" for _future in sync_retirement_futures),
+            *(
+                _owner_name(owner, "memory.vector_close_owner")
+                for owner in close_owners
+            ),
+        }
+        retirement_statuses = {
+            str(stack.get("status") or "pending") for stack in retired_stacks
+        }
+        return {
+            "vector_retirement_count": len(retirement_tasks),
+            "vector_candidate_build_count": len(candidate_build_tasks),
+            "vector_candidate_physical_count": len(candidate_futures),
+            "vector_candidate_path_count": candidate_path_count,
+            "vector_sync_retirement_count": len(sync_retirement_futures),
+            "vector_close_owner_count": len(close_owners),
+            "retired_vector_stack_count": len(retired_stacks),
+            "owner_task_names": sorted(owner_names),
+            "vector_retirement_by_status": {
+                status: sum(
+                    1
+                    for stack in retired_stacks
+                    if str(stack.get("status") or "pending") == status
+                )
+                for status in sorted(retirement_statuses)
+            },
+            "vector_close_attempt_total": sum(
+                int(stack.get("close_attempt_total", stack.get("attempts", 0)) or 0)
+                for stack in retired_stacks
+            ),
+            "vector_shutdown_retry_attempts": sum(
+                int(stack.get("shutdown_retry_attempts", 0) or 0)
+                for stack in retired_stacks
+            ),
+            "vector_physical_timeout_exceeded_count": sum(
+                int(bool(stack.get("physical_timeout_exceeded")))
+                for stack in retired_stacks
+            ),
+        }
+
     def describe_vector_status(self) -> dict[str, Any]:
         retriever = self.vec_retriever
+        shutdown_owners = self.describe_shutdown_owners()
         runtime = (
             retriever.describe_status()
             if retriever is not None and hasattr(retriever, "describe_status")
@@ -956,6 +1870,35 @@ class MemoryEngine:
                 "next_retry_at": self._next_retry_time or None,
                 "consistency": dict(self._vector_consistency_report),
                 "index_path": self._vector_index_path,
+                "vector_retirement_task_count": shutdown_owners["vector_retirement_count"],
+                "vector_candidate_build_task_count": shutdown_owners["vector_candidate_build_count"],
+                "vector_candidate_physical_future_count": shutdown_owners[
+                    "vector_candidate_physical_count"
+                ],
+                "vector_candidate_path_count": shutdown_owners["vector_candidate_path_count"],
+                "vector_sync_retirement_future_count": shutdown_owners[
+                    "vector_sync_retirement_count"
+                ],
+                "vector_retirement_by_status": shutdown_owners["vector_retirement_by_status"],
+                "vector_close_attempt_total": shutdown_owners["vector_close_attempt_total"],
+                "vector_shutdown_retry_attempts": shutdown_owners[
+                    "vector_shutdown_retry_attempts"
+                ],
+                "vector_physical_timeout_exceeded_count": shutdown_owners[
+                    "vector_physical_timeout_exceeded_count"
+                ],
+                "vector_physical_timeout_exceeded_total": int(
+                    getattr(self, "_vector_physical_timeout_exceeded_total", 0) or 0
+                ),
+                "vector_close_owner_task_count": shutdown_owners["vector_close_owner_count"],
+                "retired_vector_stack_count": shutdown_owners["retired_vector_stack_count"],
+                "vector_close_state": str(getattr(self, "_vector_close_state", "idle")),
+                "last_projector_shutdown": dict(
+                    getattr(self, "_last_projector_shutdown", {}) or {}
+                ),
+                "projection_replay_status": self._projection_replay_status,
+                "projection_replay_error": self._projection_replay_error,
+                "projection_replay_completed_at": self._projection_replay_completed_at or None,
             }
         )
         projector = getattr(self, "index_projector", None)
@@ -969,6 +1912,26 @@ class MemoryEngine:
                     "diagnostics_error": type(exc).__name__,
                 }
         return runtime
+
+    def _handle_projection_replay_result(self, task: asyncio.Task) -> None:
+        if self._projection_ready_replay_task is not task:
+            return
+        self._projection_ready_replay_task = None
+        self._projection_replay_completed_at = time.time()
+        if task.cancelled():
+            self._projection_replay_status = "cancelled"
+            return
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            self._projection_replay_status = "cancelled"
+            return
+        if error is None:
+            self._projection_replay_status = "completed"
+            return
+        self._projection_replay_status = "failed"
+        self._projection_replay_error = f"{type(error).__name__}: {error}"[:500]
+        logger.warning(f"[AstrMai] projection replay failed: {error}")
 
     async def add_memory(
         self,
@@ -1511,6 +2474,7 @@ class MemoryEngine:
         return await self.recall_persona_lore(query=query, persona_id=persona_id, top_k=kwargs.get("top_k", 3))
 
     async def start_background_tasks(self):
+        self._accepting_vector_work = True
         projector = getattr(self, "index_projector", None)
         if projector is not None:
             await projector.start()
@@ -1542,41 +2506,101 @@ class MemoryEngine:
         self._schedule_vector_bootstrap()
 
     async def stop_background_producers(self):
+        self.begin_shutdown()
         pipeline = getattr(self, "memory_pipeline", None)
         begin_pipeline_shutdown = getattr(pipeline, "begin_shutdown", None)
         if callable(begin_pipeline_shutdown):
             begin_pipeline_shutdown()
         bootstrap_task = self._vector_bootstrap_task
-        self._vector_bootstrap_task = None
-        if bootstrap_task is not None and not bootstrap_task.done():
-            bootstrap_task.cancel()
-            try:
-                await bootstrap_task
-            except asyncio.CancelledError:
-                pass
+        await self._cancel_background_task_safely(bootstrap_task, "vector bootstrap")
+        if self._vector_bootstrap_task is bootstrap_task and bootstrap_task is not None and bootstrap_task.done():
+            self._vector_bootstrap_task = None
         replay_task = self._projection_ready_replay_task
-        self._projection_ready_replay_task = None
-        if replay_task is not None and not replay_task.done():
-            replay_task.cancel()
-            await asyncio.gather(replay_task, return_exceptions=True)
-        retirement_tasks = list(self._vector_retirement_tasks)
+        await self._cancel_background_task_safely(replay_task, "projection replay")
+        if self._projection_ready_replay_task is replay_task and replay_task is not None and replay_task.done():
+            self._projection_ready_replay_task = None
+        with self._vector_registry_lock:
+            retirement_tasks = list(self._vector_retirement_tasks)
         if retirement_tasks:
-            await asyncio.gather(*retirement_tasks, return_exceptions=True)
+            _done, pending = await asyncio.wait(
+                retirement_tasks,
+                timeout=self._vector_close_timeout_sec(),
+            )
+            for task in pending:
+                logger.warning("[AstrMai] vector retirement remains pending during shutdown")
         if pipeline is not None:
             await pipeline.stop()
         projector = getattr(self, "index_projector", None)
         if projector is not None:
-            await projector.stop()
+            self._last_projector_shutdown = await projector.stop()
 
-    async def close_background_resources(self):
+    async def _cancel_background_task_safely(self, task: asyncio.Task | None, label: str) -> None:
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            if not task.done():
+                logger.warning(f"[AstrMai] {label} did not stop within grace")
+        except Exception as exc:
+            logger.warning(f"[AstrMai] {label} stopped with error: {exc}")
+
+    def begin_shutdown(self) -> None:
+        if not getattr(self, "_accepting_vector_work", True):
+            return
+        self._accepting_vector_work = False
+        self._vector_shutdown_generation = int(
+            getattr(self, "_vector_shutdown_generation", 0) or 0
+        ) + 1
+
+    async def close_background_resources(self) -> bool:
         retriever = getattr(self, "vec_retriever", None)
         faiss_db = getattr(self, "faiss_db", None)
-        await self._close_vector_stack(retriever, faiss_db)
-        self.faiss_db = None
-        self.vec_retriever = None
-        self.retriever = None
+        timeout_sec = self._vector_close_timeout_sec()
+        closed = await self._await_vector_stack_close(
+            retriever,
+            faiss_db,
+            timeout_sec=timeout_sec,
+        )
+        if closed:
+            if self.vec_retriever is retriever and self.faiss_db is faiss_db:
+                self.faiss_db = None
+                self.vec_retriever = None
+                self.retriever = None
+            self._forget_vector_stack_close(retriever, faiss_db)
+        retired_closed = await self._close_retired_vector_stacks(timeout_sec=timeout_sec)
+        if not closed or not retired_closed:
+            self._vector_state = "degraded"
+            self._is_ready = False
+            self._vector_close_state = "pending"
+            return False
         self._is_ready = False
         self._vector_state = "uninitialized"
+        self._vector_close_state = "closed"
+        with self._vector_registry_lock:
+            executor = self._vector_sync_retirement_executor
+            sync_retirement_idle = not any(
+                future is not None and not future.done()
+                for future in self._vector_sync_retirement_futures
+            )
+        if executor is not None and sync_retirement_idle:
+            executor.shutdown(wait=False, cancel_futures=True)
+            with self._vector_registry_lock:
+                if self._vector_sync_retirement_executor is executor:
+                    self._vector_sync_retirement_executor = None
+        with self._vector_registry_lock:
+            candidate_executor = self._vector_candidate_executor
+            candidate_retirement_idle = not any(
+                future is not None and not future.done()
+                for future in self._vector_candidate_futures
+            )
+        if candidate_executor is not None and candidate_retirement_idle:
+            candidate_executor.shutdown(wait=False, cancel_futures=True)
+            with self._vector_registry_lock:
+                if self._vector_candidate_executor is candidate_executor:
+                    self._vector_candidate_executor = None
+        return True
 
     async def stop_background_tasks(self):
         await self.stop_background_producers()

@@ -5,8 +5,10 @@ import importlib
 import json
 import sys
 import tempfile
+import threading
 import time
 import unittest
+from concurrent.futures import Future
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -734,12 +736,853 @@ class MemoryGapCoverageTests(unittest.TestCase):
         engine._is_ready = True
 
         engine.refresh_config(new_config)
+        deadline = time.monotonic() + 1.0
+        while (not retriever.closed or not faiss_db.closed) and time.monotonic() < deadline:
+            time.sleep(0.01)
 
         self.assertTrue(retriever.closed)
         self.assertTrue(faiss_db.closed)
         self.assertIsNone(engine.vec_retriever)
         self.assertIsNone(engine.faiss_db)
         self.assertFalse(engine._is_ready)
+
+    def test_memory_engine_vector_close_failure_keeps_stack_references(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=["embedding"]),
+            memory=SimpleNamespace(recall_top_k=5),
+            timing=SimpleNamespace(shutdown_cancel_grace_sec=0.05),
+        )
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+
+        class _Retriever:
+            def close(self, **_kwargs):
+                return False
+
+        class _Faiss:
+            closed = False
+
+            def close(self):
+                self.closed = True
+
+        retriever = _Retriever()
+        faiss_db = _Faiss()
+        engine.vec_retriever = retriever
+        engine.faiss_db = faiss_db
+        engine.retriever = object()
+
+        closed = asyncio.run(engine.close_background_resources())
+
+        self.assertFalse(closed)
+        self.assertIs(engine.vec_retriever, retriever)
+        self.assertIs(engine.faiss_db, faiss_db)
+        self.assertFalse(faiss_db.closed)
+
+    def test_vector_admitted_job_is_rejected_after_executor_close(self):
+        vector_store_mod = importlib.import_module("astrmai.memory.retrieval.vector_store")
+        retriever = vector_store_mod.VectorRetriever.__new__(
+            vector_store_mod.VectorRetriever
+        )
+        retriever._admission_lock = threading.RLock()
+        retriever._index_future_lock = threading.Lock()
+        retriever._index_futures = set()
+        retriever._accepting_work = False
+        retriever._closing = False
+        retriever._closed = True
+        retriever._index_executor = None
+
+        async def run():
+            with self.assertRaises(vector_store_mod._VectorClosedError):
+                await retriever._run_index_job(lambda: None, _admitted=True)
+
+        asyncio.run(run())
+
+    def test_vector_close_internal_type_error_is_not_retried(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+
+        class _Retriever:
+            calls = 0
+
+            def close(self, timeout_sec=None):
+                self.calls += 1
+                raise TypeError("internal close failure")
+
+        retriever = _Retriever()
+        closed = asyncio.run(
+            memory_engine_mod.MemoryEngine._close_vector_stack(
+                retriever,
+                None,
+                timeout_sec=0.05,
+            )
+        )
+
+        self.assertFalse(closed)
+        self.assertEqual(retriever.calls, 1)
+
+    def test_physical_vector_close_internal_type_error_is_not_retried(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+
+        class _Retriever:
+            calls = 0
+
+            def close(self, timeout_sec=None):
+                self.calls += 1
+                raise TypeError("internal physical close failure")
+
+        retriever = _Retriever()
+
+        closed = memory_engine_mod.MemoryEngine._close_vector_stack_physical(
+            retriever,
+            None,
+            timeout_sec=0.05,
+        )
+
+        self.assertFalse(closed)
+        self.assertEqual(retriever.calls, 1)
+
+    def test_failed_retired_vector_stack_remains_registered_until_retry_succeeds(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=["embedding"]),
+            memory=SimpleNamespace(recall_top_k=5),
+        )
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+
+        class _Retriever:
+            should_close = False
+
+            def close(self, **_kwargs):
+                return self.should_close
+
+        retriever = _Retriever()
+
+        async def run():
+            engine._schedule_vector_stack_retirement(retriever, None, generation=1)
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            self.assertEqual(len(engine._retired_vector_stacks), 1)
+            retriever.should_close = True
+            await asyncio.sleep(0.26)
+            self.assertTrue(await engine._close_retired_vector_stacks(timeout_sec=0.05))
+            self.assertFalse(engine._retired_vector_stacks)
+
+        asyncio.run(run())
+
+    def test_vector_close_timeout_reuses_the_same_physical_close_owner(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=["embedding"]),
+            memory=SimpleNamespace(recall_top_k=5),
+            timing=SimpleNamespace(shutdown_cancel_grace_sec=0.01),
+        )
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+
+        class _Retriever:
+            def __init__(self):
+                self.calls = 0
+                self.release = asyncio.Event()
+
+            async def close(self, **_kwargs):
+                self.calls += 1
+                await self.release.wait()
+                return True
+
+        retriever = _Retriever()
+        engine.vec_retriever = retriever
+        engine.retriever = object()
+
+        async def run():
+            self.assertFalse(await engine.close_background_resources())
+            self.assertFalse(await engine.close_background_resources())
+            self.assertEqual(retriever.calls, 1)
+            retriever.release.set()
+            await asyncio.sleep(0)
+            self.assertTrue(await engine.close_background_resources())
+
+        asyncio.run(run())
+
+        self.assertEqual(retriever.calls, 1)
+        self.assertIsNone(engine.vec_retriever)
+
+    def test_vector_close_false_result_is_rate_limited_before_retry(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=["embedding"]),
+            memory=SimpleNamespace(recall_top_k=5),
+            timing=SimpleNamespace(shutdown_cancel_grace_sec=0.01),
+        )
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+
+        class _Retriever:
+            def __init__(self):
+                self.calls = 0
+
+            async def close(self, **_kwargs):
+                self.calls += 1
+                return False
+
+        retriever = _Retriever()
+        engine.vec_retriever = retriever
+
+        async def run():
+            self.assertFalse(await engine.close_background_resources())
+            self.assertFalse(await engine.close_background_resources())
+            self.assertEqual(retriever.calls, 1)
+            await asyncio.sleep(0.26)
+            self.assertFalse(await engine.close_background_resources())
+
+        asyncio.run(run())
+
+        self.assertEqual(retriever.calls, 2)
+
+    def test_vector_close_waiter_cancellation_keeps_shared_owner_running(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=["embedding"]),
+            memory=SimpleNamespace(recall_top_k=5),
+            timing=SimpleNamespace(shutdown_cancel_grace_sec=0.2),
+        )
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+
+        class _Retriever:
+            def __init__(self):
+                self.calls = 0
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def close(self, **_kwargs):
+                self.calls += 1
+                self.started.set()
+                await self.release.wait()
+                return True
+
+        retriever = _Retriever()
+        engine.vec_retriever = retriever
+        engine.retriever = object()
+
+        async def run():
+            waiter = asyncio.create_task(engine.close_background_resources())
+            await asyncio.wait_for(retriever.started.wait(), timeout=1.0)
+            waiter.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await waiter
+            self.assertEqual(engine.describe_vector_status()["vector_close_owner_task_count"], 1)
+            retriever.release.set()
+            await asyncio.sleep(0)
+            self.assertTrue(await engine.close_background_resources())
+
+        asyncio.run(run())
+
+        self.assertEqual(retriever.calls, 1)
+
+    def test_active_vector_stack_is_cleared_when_only_retired_close_is_pending(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=["embedding"]),
+            memory=SimpleNamespace(recall_top_k=5),
+            timing=SimpleNamespace(shutdown_cancel_grace_sec=0.01),
+        )
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+
+        class _ActiveRetriever:
+            calls = 0
+
+            async def close(self, **_kwargs):
+                self.calls += 1
+                return True
+
+        class _RetiredRetriever:
+            def __init__(self):
+                self.calls = 0
+                self.release = asyncio.Event()
+
+            async def close(self, **_kwargs):
+                self.calls += 1
+                await self.release.wait()
+                return True
+
+        active = _ActiveRetriever()
+        retired = _RetiredRetriever()
+        engine.vec_retriever = active
+        engine.faiss_db = object()
+        engine.retriever = object()
+
+        async def run():
+            engine._schedule_vector_stack_retirement(retired, None, generation=1)
+            await asyncio.sleep(0)
+            self.assertFalse(await engine.close_background_resources())
+            self.assertIsNone(engine.vec_retriever)
+            self.assertIsNone(engine.faiss_db)
+            self.assertIsNone(engine.retriever)
+            self.assertEqual(active.calls, 1)
+            self.assertEqual(retired.calls, 1)
+            self.assertEqual(len(engine._retired_vector_stacks), 1)
+            retired.release.set()
+            await asyncio.sleep(0)
+            self.assertTrue(await engine.close_background_resources())
+
+        asyncio.run(run())
+
+        self.assertEqual(active.calls, 1)
+        self.assertEqual(retired.calls, 1)
+        self.assertFalse(engine._retired_vector_stacks)
+
+    def test_vector_retirement_does_not_block_background_producer_shutdown(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=["embedding"]),
+            memory=SimpleNamespace(recall_top_k=5),
+            timing=SimpleNamespace(shutdown_cancel_grace_sec=0.05),
+        )
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+
+        class _Retriever:
+            def __init__(self):
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def close(self, **_kwargs):
+                self.started.set()
+                await self.release.wait()
+                return True
+
+        retriever = _Retriever()
+
+        async def run():
+            engine._schedule_vector_stack_retirement(retriever, None, generation=1)
+            await asyncio.wait_for(retriever.started.wait(), timeout=0.2)
+            started_at = time.monotonic()
+            await engine.stop_background_producers()
+            self.assertLess(time.monotonic() - started_at, 0.2)
+            self.assertEqual(len(engine._retired_vector_stacks), 1)
+            self.assertEqual(engine.describe_vector_status()["vector_close_owner_task_count"], 1)
+            retriever.release.set()
+            close_tasks = [task for _resource, task in engine._vector_close_tasks.values()]
+            await asyncio.gather(*close_tasks)
+            self.assertTrue(await engine._close_retired_vector_stacks(timeout_sec=0.05))
+
+        asyncio.run(run())
+
+    def test_cancelled_candidate_construction_retains_and_closes_physical_result(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=["embedding"]),
+            memory=SimpleNamespace(recall_top_k=5),
+            timing=SimpleNamespace(shutdown_cancel_grace_sec=0.05),
+        )
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+        engine.data_path = Path(self.temp_dir.name)
+        constructor_started = threading.Event()
+        constructor_release = threading.Event()
+
+        class _CandidateDB:
+            def __init__(self, **_kwargs):
+                self.close_calls = 0
+                self.close_started = threading.Event()
+                self.close_release = threading.Event()
+                constructor_started.set()
+                constructor_release.wait(timeout=1.0)
+
+            async def close(self, **_kwargs):
+                self.close_calls += 1
+                self.close_started.set()
+                while not self.close_release.is_set():
+                    await asyncio.sleep(0.01)
+                return True
+
+        async def run():
+            with patch.object(memory_engine_mod, "FaissVecDB", _CandidateDB):
+                caller = asyncio.create_task(
+                    engine._construct_vector_candidate(
+                        index_path=engine.data_path / "cancelled-candidate.index",
+                        embedding_provider=object(),
+                    )
+                )
+                while not constructor_started.is_set():
+                    await asyncio.sleep(0)
+                build_owner = next(iter(engine._vector_candidate_build_tasks))
+                caller.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await caller
+                self.assertFalse(build_owner.done())
+                constructor_release.set()
+                candidate_db = await build_owner
+                deadline = time.monotonic() + 0.5
+                while not candidate_db.close_started.is_set() and time.monotonic() < deadline:
+                    await asyncio.sleep(0.01)
+                self.assertTrue(candidate_db.close_started.is_set())
+                self.assertEqual(candidate_db.close_calls, 1)
+                self.assertFalse(engine._vector_candidate_build_tasks)
+                self.assertEqual(len(engine._retired_vector_stacks), 1)
+                sync_futures = list(engine._vector_sync_retirement_futures)
+                self.assertEqual(len(sync_futures), 1)
+                candidate_db.close_release.set()
+                self.assertTrue(await asyncio.to_thread(sync_futures[0].result, 1.0))
+                await asyncio.sleep(0)
+
+        asyncio.run(run())
+
+        self.assertFalse(engine._retired_vector_stacks)
+
+    def test_cancelled_candidate_construction_failure_releases_protected_path(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=["embedding"]),
+            memory=SimpleNamespace(recall_top_k=5),
+            timing=SimpleNamespace(shutdown_cancel_grace_sec=0.05),
+        )
+        engine = memory_engine_mod.MemoryEngine(
+            SimpleNamespace(),
+            SimpleNamespace(config=config),
+            config=config,
+        )
+        engine.data_path = Path(self.temp_dir.name)
+        constructor_started = threading.Event()
+        constructor_release = threading.Event()
+        candidate_path = engine.data_path / "failed-candidate.index"
+
+        class _FailedCandidateDB:
+            def __init__(self, **_kwargs):
+                constructor_started.set()
+                constructor_release.wait(timeout=1.0)
+                raise RuntimeError("candidate construction failed")
+
+        async def run():
+            with patch.object(memory_engine_mod, "FaissVecDB", _FailedCandidateDB):
+                caller = asyncio.create_task(
+                    engine._construct_vector_candidate(
+                        index_path=candidate_path,
+                        embedding_provider=object(),
+                    )
+                )
+                while not constructor_started.is_set():
+                    await asyncio.sleep(0)
+                caller.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await caller
+                constructor_release.set()
+                physical_future = next(iter(engine._vector_candidate_futures))
+                with self.assertRaises(RuntimeError):
+                    await asyncio.wrap_future(physical_future)
+                await asyncio.sleep(0)
+
+        asyncio.run(run())
+
+        self.assertNotIn(str(candidate_path.resolve()), engine._vector_candidate_paths)
+        self.assertFalse(engine._vector_candidate_futures)
+
+    def test_vector_retirement_without_event_loop_returns_before_sync_close_finishes(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=["embedding"]),
+            memory=SimpleNamespace(recall_top_k=5),
+            timing=SimpleNamespace(shutdown_cancel_grace_sec=0.05),
+        )
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+
+        class _Retriever:
+            calls = 0
+
+            def close(self, **_kwargs):
+                self.calls += 1
+                time.sleep(0.35)
+                return True
+
+        retriever = _Retriever()
+        started_at = time.monotonic()
+        engine._schedule_vector_stack_retirement(retriever, None, generation=1)
+        elapsed = time.monotonic() - started_at
+
+        self.assertLess(elapsed, 0.15)
+        self.assertEqual(len(engine._vector_sync_retirement_futures), 1)
+        future = next(iter(engine._vector_sync_retirement_futures))
+        self.assertTrue(future.result(timeout=1.0))
+        self.assertEqual(retriever.calls, 1)
+        self.assertEqual(
+            engine.describe_vector_status()["vector_physical_timeout_exceeded_total"],
+            1,
+        )
+
+    def test_sync_retirement_and_async_close_share_one_resource_owner(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=["embedding"]),
+            memory=SimpleNamespace(recall_top_k=5),
+            timing=SimpleNamespace(shutdown_cancel_grace_sec=0.2),
+        )
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+        close_started = threading.Event()
+        close_release = threading.Event()
+
+        class _Retriever:
+            def __init__(self):
+                self.calls = 0
+
+            def close(self, **_kwargs):
+                self.calls += 1
+                close_started.set()
+                close_release.wait(timeout=1.0)
+                return True
+
+        retriever = _Retriever()
+        engine._schedule_vector_stack_retirement(retriever, None, generation=1)
+        self.assertTrue(close_started.wait(timeout=0.5))
+        sync_future = next(iter(engine._vector_sync_retirement_futures))
+
+        async def run():
+            waiter = asyncio.create_task(
+                engine._await_vector_stack_close(retriever, None, timeout_sec=0.5)
+            )
+            await asyncio.sleep(0.02)
+            self.assertEqual(retriever.calls, 1)
+            close_release.set()
+            self.assertTrue(await waiter)
+
+        asyncio.run(run())
+        self.assertTrue(sync_future.result(timeout=1.0))
+        self.assertEqual(retriever.calls, 1)
+
+    def test_blocking_sync_retirement_wait_is_bounded_and_owner_remains_tracked(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=["embedding"]),
+            memory=SimpleNamespace(recall_top_k=5),
+            timing=SimpleNamespace(shutdown_cancel_grace_sec=0.05),
+        )
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+        close_started = threading.Event()
+        close_release = threading.Event()
+
+        class _Retriever:
+            def close(self, **_kwargs):
+                close_started.set()
+                close_release.wait(timeout=2.0)
+                return True
+
+        retriever = _Retriever()
+        engine._schedule_vector_stack_retirement(retriever, None, generation=1)
+        self.assertTrue(close_started.wait(timeout=0.5))
+
+        async def run():
+            started = time.monotonic()
+            closed = await engine._await_vector_stack_close(
+                retriever,
+                None,
+                timeout_sec=0.05,
+            )
+            self.assertFalse(closed)
+            self.assertLess(time.monotonic() - started, 0.2)
+            self.assertEqual(len(engine._vector_sync_retirement_futures), 1)
+
+        asyncio.run(run())
+        close_release.set()
+        future = next(iter(engine._vector_sync_retirement_futures))
+        self.assertTrue(future.result(timeout=1.0))
+
+    def test_async_and_sync_close_owner_registry_is_thread_safe_under_contention(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=["embedding"]),
+            memory=SimpleNamespace(recall_top_k=5),
+            timing=SimpleNamespace(shutdown_cancel_grace_sec=0.1),
+        )
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+        close_started = threading.Event()
+        close_release = threading.Event()
+
+        class _Retriever:
+            def __init__(self):
+                self.calls = 0
+
+            def close(self, **_kwargs):
+                self.calls += 1
+                close_started.set()
+                close_release.wait(timeout=1.0)
+                return True
+
+        retriever = _Retriever()
+        start = threading.Barrier(2)
+
+        def schedule_sync():
+            start.wait(timeout=1.0)
+            engine._schedule_vector_stack_retirement(retriever, None, generation=1)
+
+        thread = threading.Thread(target=schedule_sync)
+        thread.start()
+
+        async def run():
+            start.wait(timeout=1.0)
+            waiter = asyncio.create_task(
+                engine._await_vector_stack_close(retriever, None, timeout_sec=0.5)
+            )
+            self.assertTrue(await asyncio.to_thread(close_started.wait, 0.5))
+            close_release.set()
+            self.assertTrue(await waiter)
+
+        asyncio.run(run())
+        thread.join(timeout=1.0)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(retriever.calls, 1)
+
+    def test_shutdown_owner_snapshot_serializes_registry_mutation(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=["embedding"]),
+            memory=SimpleNamespace(recall_top_k=5),
+        )
+        engine = memory_engine_mod.MemoryEngine(
+            SimpleNamespace(),
+            SimpleNamespace(config=config),
+            config=config,
+        )
+        mutation_started = threading.Event()
+        mutation_completed = threading.Event()
+
+        def mutate_registry():
+            mutation_started.set()
+            with engine._vector_registry_lock:
+                engine._vector_candidate_paths.add("candidate.index")
+            mutation_completed.set()
+
+        with engine._vector_registry_lock:
+            thread = threading.Thread(target=mutate_registry)
+            thread.start()
+            self.assertTrue(mutation_started.wait(timeout=0.5))
+            self.assertFalse(mutation_completed.wait(timeout=0.05))
+            snapshot = engine.describe_shutdown_owners()
+            self.assertEqual(snapshot["vector_candidate_path_count"], 0)
+
+        thread.join(timeout=1.0)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(mutation_completed.is_set())
+        self.assertEqual(
+            engine.describe_shutdown_owners()["vector_candidate_path_count"],
+            1,
+        )
+
+    def test_cancelled_queued_candidate_releases_protected_path(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=["embedding"]),
+            memory=SimpleNamespace(recall_top_k=5),
+        )
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+        engine.data_path = Path(self.temp_dir.name)
+        candidate_path = engine.data_path / "cancelled-queued.index"
+
+        class _CancelledExecutor:
+            def submit(self, *_args, **_kwargs):
+                future = Future()
+                future.cancel()
+                return future
+
+            def shutdown(self, **_kwargs):
+                return None
+
+        engine._vector_candidate_executor = _CancelledExecutor()
+
+        async def run():
+            with self.assertRaises(asyncio.CancelledError):
+                await engine._construct_vector_candidate(
+                    index_path=candidate_path,
+                    embedding_provider=object(),
+                )
+            await asyncio.sleep(0)
+
+        asyncio.run(run())
+
+        self.assertNotIn(str(candidate_path.resolve()), engine._vector_candidate_paths)
+        self.assertFalse(engine._vector_candidate_futures)
+
+    def test_stale_vector_cleanup_protects_retired_and_candidate_paths(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=["embedding"]),
+            memory=SimpleNamespace(recall_top_k=5),
+        )
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+        engine.data_path = Path(self.temp_dir.name)
+        retired = engine.data_path / "vectors.g1.retired.index"
+        candidate = engine.data_path / "vectors.g2.candidate.index"
+        current = engine.data_path / "vectors.g3.current.index"
+        for path in (retired, candidate, current):
+            path.write_bytes(b"index")
+        engine._retired_vector_stacks["retired"] = {
+            "retriever": object(),
+            "faiss_db": None,
+            "index_path": str(retired),
+            "delete_index": True,
+        }
+        engine._vector_candidate_paths.add(str(candidate.resolve()))
+
+        removed = engine._cleanup_stale_vector_indexes(current, keep_history=0)
+
+        self.assertEqual(removed, 0)
+        self.assertTrue(retired.exists())
+        self.assertTrue(candidate.exists())
+
+    def test_retired_vector_stack_retries_during_runtime_until_success(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=["embedding"]),
+            memory=SimpleNamespace(recall_top_k=5),
+            timing=SimpleNamespace(
+                shutdown_cancel_grace_sec=0.05,
+                vector_retirement_retry_base_sec=0.01,
+                vector_retirement_retry_max_sec=0.02,
+                vector_retirement_retry_max_attempts=3,
+            ),
+        )
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+
+        class _Retriever:
+            def __init__(self):
+                self.calls = 0
+                self.succeeded = asyncio.Event()
+
+            async def close(self, **_kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    return False
+                self.succeeded.set()
+                return True
+
+        retriever = _Retriever()
+
+        async def run():
+            engine._schedule_vector_stack_retirement(retriever, None, generation=1)
+            await asyncio.wait_for(retriever.succeeded.wait(), timeout=0.5)
+            await asyncio.sleep(0)
+
+        asyncio.run(run())
+
+        self.assertEqual(retriever.calls, 2)
+        self.assertFalse(engine._retired_vector_stacks)
+
+    def test_retired_vector_stack_stops_after_configured_retry_limit(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=["embedding"]),
+            memory=SimpleNamespace(recall_top_k=5),
+            timing=SimpleNamespace(
+                shutdown_cancel_grace_sec=0.05,
+                vector_retirement_retry_max_attempts=2,
+            ),
+        )
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+
+        class _Retriever:
+            def __init__(self):
+                self.calls = 0
+
+            async def close(self, **_kwargs):
+                self.calls += 1
+                return False
+
+        retriever = _Retriever()
+
+        async def run():
+            engine._schedule_vector_stack_retirement(retriever, None, generation=1)
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                stack = next(iter(engine._retired_vector_stacks.values()))
+                if stack.get("status") == "retry_exhausted":
+                    return stack
+                await asyncio.sleep(0.01)
+            self.fail("retirement retry did not reach retry_exhausted")
+
+        stack = asyncio.run(run())
+
+        self.assertEqual(retriever.calls, 2)
+        self.assertEqual(stack["attempts"], 2)
+        self.assertEqual(stack["status"], "retry_exhausted")
+
+    def test_shutdown_close_does_not_retry_exhausted_retired_stack(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=["embedding"]),
+            memory=SimpleNamespace(recall_top_k=5),
+            timing=SimpleNamespace(
+                shutdown_cancel_grace_sec=0.05,
+                vector_retirement_retry_max_attempts=1,
+            ),
+        )
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+
+        class _Retriever:
+            def __init__(self):
+                self.calls = 0
+
+            async def close(self, **_kwargs):
+                self.calls += 1
+                return False
+
+        retriever = _Retriever()
+
+        async def run():
+            engine._schedule_vector_stack_retirement(retriever, None, generation=1)
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline:
+                stack = next(iter(engine._retired_vector_stacks.values()))
+                if stack.get("status") == "retry_exhausted":
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(retriever.calls, 1)
+            self.assertFalse(await engine.close_background_resources())
+
+        asyncio.run(run())
+
+        stack = next(iter(engine._retired_vector_stacks.values()))
+        self.assertEqual(retriever.calls, 1)
+        self.assertEqual(stack["close_attempt_total"], 1)
+        self.assertEqual(stack["shutdown_retry_attempts"], 0)
+
+    def test_retired_vector_registry_limit_rejects_overflow_and_cleans_up(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=["embedding"]),
+            memory=SimpleNamespace(recall_top_k=5),
+            timing=SimpleNamespace(
+                shutdown_cancel_grace_sec=0.05,
+                vector_retirement_registry_limit=1,
+            ),
+        )
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+
+        class _BlockingRetriever:
+            def __init__(self):
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def close(self, **_kwargs):
+                self.started.set()
+                await self.release.wait()
+                return True
+
+        class _SecondRetriever:
+            def __init__(self):
+                self.closed = asyncio.Event()
+
+            async def close(self, **_kwargs):
+                self.closed.set()
+                return True
+
+        first = _BlockingRetriever()
+        second = _SecondRetriever()
+
+        async def run():
+            engine._schedule_vector_stack_retirement(first, None, generation=1)
+            await asyncio.wait_for(first.started.wait(), timeout=0.2)
+            engine._schedule_vector_stack_retirement(second, None, generation=2)
+            self.assertEqual(len(engine._retired_vector_stacks), 1)
+            self.assertEqual(engine._vector_retirement_capacity_rejected_total, 1)
+            first.release.set()
+            await asyncio.wait_for(second.closed.wait(), timeout=0.5)
+            await asyncio.sleep(0)
+
+        asyncio.run(run())
+
+        self.assertFalse(engine._retired_vector_stacks)
 
     def test_memory_engine_vector_generation_cleanup_keeps_current_and_one_history(self):
         memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")

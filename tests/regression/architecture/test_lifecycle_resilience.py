@@ -8,6 +8,7 @@ PL-09：GroupDialogueStore 纯内存，面板改配置触发重载即丢全部�
 """
 
 import asyncio
+import importlib
 import json
 import tempfile
 import time
@@ -19,7 +20,6 @@ from unittest.mock import AsyncMock, Mock
 from astrmai.app.lifecycle import PluginLifecycleManager
 from astrmai.conversation.attention.group_dialogue_store import GroupDialogueStore
 from astrmai.infrastructure.runtime.chat_runtime_coordinator import ChatRuntimeCoordinator
-from astrmai.infrastructure.runtime.event_bus import EventBus
 from astrmai.multimodal.visual_cortex import VisualCortex
 from astrmai.workmode.cron_guard.heartbeat import CronHeartbeatGuard
 
@@ -94,10 +94,13 @@ class RuntimeReinitializeTests(unittest.TestCase):
     """显式重新启用必须恢复真正的运行能力，而不只是复位生命周期布尔值。"""
 
     def setUp(self):
-        EventBus._instance = None
+        self.event_bus_class = importlib.import_module(
+            "astrmai.infrastructure.runtime.event_bus"
+        ).EventBus
+        self.event_bus_class._instance = None
 
     def tearDown(self):
-        EventBus._instance = None
+        self.event_bus_class._instance = None
 
     def test_runtime_coordinator_reopens_after_shutdown(self):
         async def _run():
@@ -166,7 +169,7 @@ class RuntimeReinitializeTests(unittest.TestCase):
 
     def test_prepare_reinitialize_reopens_services_and_rebinds_learning(self):
         async def _run():
-            event_bus = EventBus()
+            event_bus = self.event_bus_class()
             state_handler = AsyncMock()
             reply_handler = AsyncMock()
             mining_handler = AsyncMock()

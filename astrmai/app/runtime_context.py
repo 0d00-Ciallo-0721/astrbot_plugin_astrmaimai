@@ -406,9 +406,11 @@ class PluginRuntimeContext:
             self.evolution,
             self.expression_governance_runner,
             self.proactive_task,
+            getattr(self.memory_engine, "index_projector", None),
             self.group_social_feedback_observer,
             self.group_reread_observer,
             self.reread_action_dispatcher,
+            self.event_bus,
         )
 
     def build_diagnostics(self) -> dict[str, Any]:

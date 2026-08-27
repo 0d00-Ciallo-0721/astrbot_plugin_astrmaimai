@@ -151,6 +151,153 @@ class MemoryRefactorTests(unittest.TestCase):
         self.assertEqual(pipeline.describe_runtime_status()["started_after_shutdown"], 0)
         self.assertEqual(len(pipeline._session_history_buffer["shutdown-chat"]["buffer"]), 4)
 
+    def test_memory_turn_pipeline_counts_worker_start_attempt_after_shutdown(self):
+        pipeline_mod = importlib.import_module("astrmai.memory.services.memory_turn_pipeline")
+        pipeline = pipeline_mod.MemoryTurnPipeline(
+            context=SimpleNamespace(),
+            gateway=SimpleNamespace(config=SimpleNamespace(memory=SimpleNamespace(summary_threshold=2))),
+            engine=SimpleNamespace(),
+            session_summarizer=SimpleNamespace(),
+            instant_gate=SimpleNamespace(),
+            config=SimpleNamespace(memory=SimpleNamespace(summary_threshold=2)),
+        )
+        pipeline.begin_shutdown()
+        turn = pipeline.build_turn(
+            chat_id="late-chat",
+            user_text="hello",
+            assistant_text="world",
+            source="test",
+        )
+
+        asyncio.run(pipeline.on_turn_committed({"turn": turn}))
+
+        self.assertEqual(pipeline.describe_runtime_status()["started_after_shutdown"], 1)
+        self.assertEqual(pipeline._worker_tasks, {})
+
+    def test_memory_turn_pipeline_replaces_externally_cancelled_chat_worker(self):
+        pipeline_mod = importlib.import_module("astrmai.memory.services.memory_turn_pipeline")
+        pipeline = pipeline_mod.MemoryTurnPipeline(
+            context=SimpleNamespace(),
+            gateway=SimpleNamespace(config=SimpleNamespace(memory=SimpleNamespace(summary_threshold=2))),
+            engine=SimpleNamespace(),
+            session_summarizer=SimpleNamespace(),
+            instant_gate=SimpleNamespace(),
+            config=SimpleNamespace(memory=SimpleNamespace(summary_threshold=2)),
+        )
+
+        async def _run():
+            first_started = asyncio.Event()
+            second_consumed = asyncio.Event()
+            consumed = []
+
+            async def _consume(turn):
+                consumed.append(turn.user_text)
+                if turn.user_text == "first":
+                    first_started.set()
+                    await asyncio.Event().wait()
+                second_consumed.set()
+
+            pipeline._maybe_run_llm_backfill = _consume
+            pipeline._running = True
+            first = pipeline.build_turn(
+                chat_id="worker-recovery",
+                user_text="first",
+                assistant_text="one",
+                source="test",
+            )
+            await pipeline.on_turn_committed({"turn": first})
+            await asyncio.wait_for(first_started.wait(), timeout=0.2)
+            cancelled_worker = pipeline._worker_tasks[first.chat_id]
+            cancelled_worker.cancel()
+            await asyncio.wait_for(cancelled_worker, timeout=0.2)
+            await asyncio.sleep(0)
+
+            second = pipeline.build_turn(
+                chat_id="worker-recovery",
+                user_text="second",
+                assistant_text="two",
+                source="test",
+            )
+            await pipeline.on_turn_committed({"turn": second})
+            replacement = pipeline._worker_tasks[second.chat_id]
+            await asyncio.wait_for(second_consumed.wait(), timeout=0.2)
+            pipeline.begin_shutdown()
+            replacement.cancel()
+            await asyncio.gather(replacement, return_exceptions=True)
+            return cancelled_worker, replacement, consumed
+
+        cancelled_worker, replacement, consumed = asyncio.run(_run())
+
+        self.assertIsNot(cancelled_worker, replacement)
+        self.assertEqual(consumed, ["first", "second"])
+
+    def test_memory_engine_replay_cancellation_does_not_skip_component_stops(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=[]),
+            memory=SimpleNamespace(recall_top_k=5),
+        )
+        engine = memory_engine_mod.MemoryEngine(
+            SimpleNamespace(),
+            SimpleNamespace(config=config),
+            config=config,
+        )
+        calls = []
+
+        class _Pipeline:
+            def begin_shutdown(self):
+                calls.append("pipeline.begin_shutdown")
+
+            async def stop(self):
+                calls.append("pipeline.stop")
+
+        class _Projector:
+            async def stop(self):
+                calls.append("projector.stop")
+                return {"remaining": 0}
+
+        async def _run():
+            engine.memory_pipeline = _Pipeline()
+            engine.index_projector = _Projector()
+            engine._projection_ready_replay_task = asyncio.create_task(asyncio.Event().wait())
+            await asyncio.sleep(0)
+            await engine.stop_background_producers()
+
+        asyncio.run(_run())
+
+        self.assertIn("pipeline.stop", calls)
+        self.assertIn("projector.stop", calls)
+
+    def test_memory_engine_replay_failure_is_consumed_and_observed(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=[]),
+            memory=SimpleNamespace(recall_top_k=5),
+        )
+        engine = memory_engine_mod.MemoryEngine(
+            SimpleNamespace(),
+            SimpleNamespace(config=config),
+            config=config,
+        )
+
+        async def _run():
+            async def _fail():
+                raise RuntimeError("replay failed")
+
+            task = asyncio.create_task(_fail())
+            engine._projection_ready_replay_task = task
+            engine._projection_replay_status = "running"
+            task.add_done_callback(engine._handle_projection_replay_result)
+            await asyncio.gather(task, return_exceptions=True)
+            await asyncio.sleep(0)
+
+        asyncio.run(_run())
+
+        self.assertIsNone(engine._projection_ready_replay_task)
+        self.assertEqual(engine._projection_replay_status, "failed")
+        self.assertIn("RuntimeError: replay failed", engine._projection_replay_error)
+        self.assertGreater(engine._projection_replay_completed_at, 0.0)
+
     def test_memory_turn_pipeline_maintenance_delegates_to_session_summarizer(self):
         pipeline_mod = importlib.import_module("astrmai.memory.services.memory_turn_pipeline")
         pipeline_mod = importlib.reload(pipeline_mod)

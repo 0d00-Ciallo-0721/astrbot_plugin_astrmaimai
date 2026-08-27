@@ -4,7 +4,7 @@ import json
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import List, Dict, Any, Optional
 
@@ -23,6 +23,10 @@ class _VectorStageTimeout(asyncio.TimeoutError):
     def __init__(self, stage: str):
         super().__init__(stage)
         self.stage = stage
+
+
+class _VectorClosedError(RuntimeError):
+    """Raised when vector work arrives after shutdown admission is fenced."""
 
 class VectorRetriever:
     """
@@ -46,7 +50,14 @@ class VectorRetriever:
             thread_name_prefix="astrmai-faiss",
         )
         self._index_lock = threading.RLock()
+        self._index_future_lock = threading.Lock()
+        self._admission_lock = threading.RLock()
+        self._index_futures: set[Future] = set()
         self._active_index_jobs = 0
+        self._active_operations = 0
+        self._accepting_work = True
+        self._closing = False
+        self._closed = False
         self._background_index_tasks: set[asyncio.Task] = set()
         self._half_open_probe_active = False
         self._retrieval_sequence = 0
@@ -92,21 +103,66 @@ class VectorRetriever:
     def refresh_config(self, config) -> None:
         self.config = config or {}
         configured = self._query_concurrency()
-        if configured != self._query_limit and self._active_queries == 0:
-            previous_executor = self._index_executor
-            self._query_limit = configured
-            self._query_semaphore = asyncio.Semaphore(configured)
-            self._index_executor = ThreadPoolExecutor(
-                max_workers=configured,
-                thread_name_prefix="astrmai-faiss",
-            )
+        previous_executor = None
+        with self._admission_lock:
+            if (
+                configured != self._query_limit
+                and self._active_queries == 0
+                and self._active_operations == 0
+                and self._accepting_work
+            ):
+                previous_executor = self._index_executor
+                self._query_limit = configured
+                self._query_semaphore = asyncio.Semaphore(configured)
+                self._index_executor = ThreadPoolExecutor(
+                    max_workers=configured,
+                    thread_name_prefix="astrmai-faiss",
+                )
+        if previous_executor is not None:
             previous_executor.shutdown(wait=False, cancel_futures=True)
 
-    def close(self) -> None:
+    async def close(self, timeout_sec: float | None = None) -> bool:
+        with self._admission_lock:
+            if self._closed:
+                return True
+            self._accepting_work = False
+            self._closing = True
         metrics_task = self._storage_metrics_task
         if metrics_task is not None and not metrics_task.done():
             metrics_task.cancel()
-        self._index_executor.shutdown(wait=False, cancel_futures=True)
+        if timeout_sec is None:
+            timeout_sec = self._timing_value("shutdown_cancel_grace_sec", 1.0)
+        if not await self.wait_index_idle(timeout_sec=timeout_sec):
+            return False
+        with self._admission_lock:
+            if self._closed:
+                return True
+            # Serialize the final admission check with executor shutdown. A
+            # shielded operation already admitted before the fence may finish,
+            # but no late caller can submit after the executor is closed.
+            executor = self._index_executor
+            self._closed = True
+            self._closing = False
+            executor.shutdown(wait=True, cancel_futures=True)
+        return True
+
+    async def wait_index_idle(self, timeout_sec: float | None = None) -> bool:
+        """Wait until all submitted executor jobs, including late shielded jobs, finish."""
+        deadline = None if timeout_sec is None else time.monotonic() + max(0.0, float(timeout_sec))
+        while True:
+            with self._index_future_lock:
+                pending = [future for future in self._index_futures if not future.done()]
+            with self._admission_lock:
+                active_operations = self._active_operations
+                active_queries = self._active_queries
+            background_tasks = [
+                task for task in self._background_index_tasks if task is not None and not task.done()
+            ]
+            if not pending and not background_tasks and not active_operations and not active_queries:
+                return True
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(min(0.02, max(0.001, (deadline - time.monotonic()) if deadline else 0.02)))
 
     def _supports_phased_retrieval(self) -> bool:
         return all(
@@ -201,9 +257,36 @@ class VectorRetriever:
         if len(self._index_lock_wait_samples) > 512:
             del self._index_lock_wait_samples[:-512]
 
-    async def _run_index_job(self, func, *args):
+    def _begin_operation(self) -> None:
+        with self._admission_lock:
+            if not self._accepting_work:
+                raise _VectorClosedError("vector retriever is closing")
+            self._active_operations += 1
+
+    def _finish_operation(self) -> None:
+        with self._admission_lock:
+            self._active_operations = max(0, self._active_operations - 1)
+
+    async def _run_index_job(self, func, *args, _admitted: bool = False):
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._index_executor, func, *args)
+        with self._admission_lock:
+            if self._closed or (not self._accepting_work and not _admitted):
+                raise _VectorClosedError("vector retriever is closing")
+            try:
+                future = self._index_executor.submit(func, *args)
+            except RuntimeError as exc:
+                # ThreadPoolExecutor raises this after shutdown. Normalize it
+                # so callers follow the same rejected-work path as the fence.
+                raise _VectorClosedError("vector executor is closed") from exc
+            with self._index_future_lock:
+                self._index_futures.add(future)
+
+        def _finish_index_future(done: Future) -> None:
+            with self._index_future_lock:
+                self._index_futures.discard(done)
+
+        future.add_done_callback(_finish_index_future)
+        return await asyncio.wrap_future(future, loop=loop)
 
     async def _retrieve_phased(
         self,
@@ -236,11 +319,12 @@ class VectorRetriever:
         vector = np.array([embedding], dtype=np.float32)
         index_started = time.monotonic()
         index_task = asyncio.create_task(
-            self._run_index_job(
-                self._search_index_sync,
-                vector,
-                fetch_k if metadata_filters else k,
-            )
+                self._run_index_job(
+                    self._search_index_sync,
+                    vector,
+                    fetch_k if metadata_filters else k,
+                    _admitted=True,
+                )
         )
         try:
             scores, indices = await asyncio.wait_for(
@@ -293,7 +377,9 @@ class VectorRetriever:
         return results[:k]
 
     def _release_query_slot(self) -> None:
-        self._active_queries = max(0, self._active_queries - 1)
+        with self._admission_lock:
+            self._active_queries = max(0, self._active_queries - 1)
+            self._active_operations = max(0, self._active_operations - 1)
         self._query_semaphore.release()
 
     def _finish_background_index_task(self, task: asyncio.Task) -> None:
@@ -317,11 +403,15 @@ class VectorRetriever:
         else:
             await self._query_semaphore.acquire()
         wait_ms = round((time.monotonic() - wait_started) * 1000.0, 1)
-        self._active_queries += 1
+        with self._admission_lock:
+            if not self._accepting_work:
+                self._query_semaphore.release()
+                raise _VectorClosedError("vector retriever is closing")
+            self._active_queries += 1
+            self._active_operations += 1
         release_on_exit = True
         stage_timings: Dict[str, float] = {}
         stage_timings["faiss_query_queue_wait_ms"] = wait_ms
-        stage_timings["embedding_gateway_queue_wait_ms"] = 0.0
         try:
             remaining = max(0.1, timeout - wait_ms / 1000.0)
             deadline = time.monotonic() + remaining
@@ -425,12 +515,24 @@ class VectorRetriever:
         index_count = self._index_count()
         projection_count = self._projection_count_cache
         document_count = self._document_count_cache
+        with self._index_future_lock:
+            index_future_count = sum(1 for future in self._index_futures if not future.done())
+        with self._admission_lock:
+            accepting_work = self._accepting_work
+            closing = self._closing
+            closed = self._closed
+            active_operations = self._active_operations
         return {
             "query_concurrency": int(self._query_limit),
             "faiss_thread_count": int(self._faiss_thread_count()),
             "active_queries": int(self._active_queries),
             "active_index_jobs": int(self._active_index_jobs),
+            "physical_index_future_count": int(index_future_count),
             "background_index_jobs": int(len(self._background_index_tasks)),
+            "accepting_work": bool(accepting_work),
+            "closing": bool(closing),
+            "closed": bool(closed),
+            "active_operations": int(active_operations),
             "failure_count": int(self._failure_count),
             "circuit_open": self._peek_circuit_state() == "open",
             "circuit_state": self._peek_circuit_state(),
@@ -563,50 +665,66 @@ class VectorRetriever:
 
     async def add_document(self, content: str, metadata: Dict[str, Any] = None) -> int:
         """存入文本，返回 document id (由 FaissVecDB 底层的 DocumentStorage 提供的主键)"""
+        self._begin_operation()
         metadata = metadata or {}
-        
-        # 补充默认字段
-        if "importance" not in metadata:
-            metadata["importance"] = 0.5
-        if "create_time" not in metadata:
-            metadata["create_time"] = time.time()
-        if "last_access_time" not in metadata:
-            metadata["last_access_time"] = time.time()
-            
-        if not self._supports_phased_retrieval():
-            return await self.faiss_db.insert(content=content, metadata=metadata)
+        try:
+            # 补充默认字段
+            if "importance" not in metadata:
+                metadata["importance"] = 0.5
+            if "create_time" not in metadata:
+                metadata["create_time"] = time.time()
+            if "last_access_time" not in metadata:
+                metadata["last_access_time"] = time.time()
 
-        embedding = await asyncio.wait_for(
-            self.faiss_db.embedding_provider.get_embedding(content),
-            timeout=max(0.1, self._timing_value("embedding_timeout_sec", 30.0)),
-        )
-        vector = np.asarray(embedding, dtype=np.float32)
-        expected_dimension = int(
-            getattr(self.faiss_db.embedding_storage, "dimension", vector.shape[0])
-            or vector.shape[0]
-        )
-        if vector.shape[0] != expected_dimension:
-            raise ValueError(
-                f"embedding dimension mismatch: expected={expected_dimension} actual={vector.shape[0]}"
+            if not self._supports_phased_retrieval():
+                return await self.faiss_db.insert(content=content, metadata=metadata)
+
+            embedding = await asyncio.wait_for(
+                self.faiss_db.embedding_provider.get_embedding(content),
+                timeout=max(0.1, self._timing_value("embedding_timeout_sec", 30.0)),
             )
-        doc_id = await self.faiss_db.document_storage.insert_document(
-            str(uuid.uuid4()),
-            content,
-            metadata,
-        )
-        await self._run_index_job(self._insert_index_sync, vector, int(doc_id))
-        return int(doc_id)
+            vector = np.asarray(embedding, dtype=np.float32)
+            expected_dimension = int(
+                getattr(self.faiss_db.embedding_storage, "dimension", vector.shape[0])
+                or vector.shape[0]
+            )
+            if vector.shape[0] != expected_dimension:
+                raise ValueError(
+                    f"embedding dimension mismatch: expected={expected_dimension} actual={vector.shape[0]}"
+                )
+            doc_id = await self.faiss_db.document_storage.insert_document(
+                str(uuid.uuid4()),
+                content,
+                metadata,
+            )
+            await self._run_index_job(
+                self._insert_index_sync,
+                vector,
+                int(doc_id),
+                _admitted=True,
+            )
+            return int(doc_id)
+        finally:
+            self._finish_operation()
 
     async def delete_document(self, doc_key: str) -> bool:
-        if not self._supports_phased_retrieval():
-            await self.faiss_db.delete(doc_key)
+        self._begin_operation()
+        try:
+            if not self._supports_phased_retrieval():
+                await self.faiss_db.delete(doc_key)
+                return True
+            document = await self.faiss_db.document_storage.get_document_by_doc_id(doc_key)
+            if not document:
+                return False
+            await self._run_index_job(
+                self._delete_index_sync,
+                int(document["id"]),
+                _admitted=True,
+            )
+            await self.faiss_db.document_storage.delete_document_by_doc_id(doc_key)
             return True
-        document = await self.faiss_db.document_storage.get_document_by_doc_id(doc_key)
-        if not document:
-            return False
-        await self._run_index_job(self._delete_index_sync, int(document["id"]))
-        await self.faiss_db.document_storage.delete_document_by_doc_id(doc_key)
-        return True
+        finally:
+            self._finish_operation()
 
     def _record_observation(
         self,
@@ -809,6 +927,24 @@ class VectorRetriever:
         except asyncio.CancelledError:
             self._half_open_probe_active = False
             raise
+        except _VectorClosedError as exc:
+            self._half_open_probe_active = False
+            self._record_observation(
+                observation,
+                status="shutdown_rejected",
+                started_at=started_at,
+                timeout_sec=timeout_sec,
+                configured_timeout_sec=configured_timeout_sec,
+                error_type=type(exc).__name__,
+                error_detail=str(exc),
+                requested_k=k,
+                fetch_k=fetch_k,
+                metadata_filter_count=metadata_filter_count,
+                retrieval_id=retrieval_id,
+                circuit_state_before=circuit_state_before,
+                fallback_source="canonical_fts",
+            )
+            return []
         except _VectorStageTimeout as exc:
             self._mark_failure("timeout")
             logger.warning(

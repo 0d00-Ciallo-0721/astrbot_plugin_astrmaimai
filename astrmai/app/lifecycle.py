@@ -28,6 +28,8 @@ class PluginLifecycleManager:
         self._shutdown_started_monotonic = 0.0
         self._late_shutdown_cleanup_task: asyncio.Task[Any] | None = None
         self._late_shutdown_cleanup_deadline_monotonic = 0.0
+        self._shutdown_fence_errors: dict[str, str] = {}
+        self._persistence_dispose_task: asyncio.Task[Any] | None = None
         self.runtime.lifecycle.manager = self
 
     def track_task(self, coro: Any) -> asyncio.Task[Any]:
@@ -120,53 +122,202 @@ class PluginLifecycleManager:
         can_resume_budget = getattr(budget, "can_resume", None)
         resume_budget = getattr(budget, "resume", None)
         resume_budget_if_idle = getattr(budget, "resume_if_idle", None)
+        begin_budget_drain = getattr(budget, "begin_drain", None)
+        budget_resume = resume_budget_if_idle if callable(resume_budget_if_idle) else resume_budget
+        reopened = {
+            "budget": False,
+            "reread": False,
+            "event_bus": False,
+            "coordinator": False,
+            "persona": False,
+            "cron": False,
+        }
+        bound_collaboration: list[tuple[Any, str, Any]] = []
+
+        async def _await_result(result: Any) -> Any:
+            return await result if inspect.isawaitable(result) else result
+
+        async def _rollback(stage: str, error: BaseException | str) -> bool:
+            rollback_errors: list[str] = []
+            status = getattr(self.runtime, "status", None)
+            if status is not None:
+                status.accepting_events = False
+                status.startup_blocked_reason = f"reinitialize_failed:{stage}"
+            if reopened["budget"] and callable(begin_budget_drain):
+                try:
+                    begin_budget_drain()
+                except Exception as exc:
+                    rollback_errors.append(f"budget:{type(exc).__name__}: {exc}")
+            event_bus = getattr(self.runtime, "event_bus", None)
+            trigger_abort = getattr(event_bus, "trigger_abort", None)
+            if reopened["event_bus"] and callable(trigger_abort):
+                try:
+                    trigger_abort()
+                except Exception as exc:
+                    rollback_errors.append(f"event_bus:{type(exc).__name__}: {exc}")
+            if reopened["reread"]:
+                shutdown_reread = getattr(reread_dispatcher, "shutdown", None)
+                if callable(shutdown_reread):
+                    try:
+                        await _await_result(
+                            self._invoke_with_optional_keyword(
+                                shutdown_reread,
+                                "wait_for_active",
+                                False,
+                            )
+                        )
+                    except Exception as exc:
+                        rollback_errors.append(f"reread:{type(exc).__name__}: {exc}")
+            if reopened["coordinator"]:
+                shutdown_coordinator = getattr(
+                    getattr(self.runtime, "runtime_coordinator", None),
+                    "shutdown",
+                    None,
+                )
+                if callable(shutdown_coordinator):
+                    try:
+                        await _await_result(
+                            self._invoke_with_optional_keyword(
+                                shutdown_coordinator,
+                                "timeout_sec",
+                                self._shutdown_timing("shutdown_cancel_grace_sec", 1.0),
+                            )
+                        )
+                    except Exception as exc:
+                        rollback_errors.append(f"coordinator:{type(exc).__name__}: {exc}")
+            if reopened["persona"]:
+                stop_persona = getattr(
+                    getattr(self.runtime, "persona_summarizer", None),
+                    "stop",
+                    None,
+                )
+                if callable(stop_persona):
+                    try:
+                        await _await_result(stop_persona())
+                    except Exception as exc:
+                        rollback_errors.append(f"persona:{type(exc).__name__}: {exc}")
+            if reopened["cron"]:
+                stop_cron = getattr(getattr(self.runtime, "cron_guard", None), "stop", None)
+                if callable(stop_cron):
+                    try:
+                        await _await_result(stop_cron())
+                    except Exception as exc:
+                        rollback_errors.append(f"cron:{type(exc).__name__}: {exc}")
+            event_bus = getattr(self.runtime, "event_bus", None)
+            unsubscribe = getattr(event_bus, "unsubscribe", None)
+            if callable(unsubscribe):
+                for bus, topic, callback in reversed(bound_collaboration):
+                    try:
+                        unsubscribe(topic, callback)
+                    except Exception as exc:
+                        rollback_errors.append(
+                            f"collaboration:{topic}:{type(exc).__name__}: {exc}"
+                        )
+            detail = f"{type(error).__name__}: {error}" if isinstance(error, BaseException) else str(error)
+            stage_stats = getattr(status, "shutdown_stage_stats", None)
+            if isinstance(stage_stats, dict):
+                stage_stats["reinitialize"] = {
+                    "status": "rolled_back",
+                    "failed_stage": stage,
+                    "error": detail[:500],
+                    "rollback_errors": rollback_errors,
+                }
+            mark_degraded = getattr(self.runtime, "mark_degraded", None)
+            if callable(mark_degraded):
+                mark_degraded("lifecycle.reinitialize", f"{stage}: {detail}"[:500])
+            logger.warning(
+                f"[AstrMai] runtime reinitialize rolled back stage={stage} "
+                f"error={detail} rollback_errors={rollback_errors}"
+            )
+            return False
         if callable(can_resume_budget):
-            if can_resume_budget() is False:
+            try:
+                budget_ready = can_resume_budget()
+            except Exception as exc:
+                logger.warning(f"[AstrMai] runtime reinitialize deferred: budget status failed: {exc}")
+                return False
+            if budget_ready is False:
                 logger.warning("[AstrMai] runtime reinitialize deferred: background work is still draining")
                 return False
-            if callable(resume_reread) and resume_reread() is False:
-                logger.warning("[AstrMai] runtime reinitialize deferred: reread dispatcher still has pending work")
-                return False
-            budget_resume = resume_budget_if_idle if callable(resume_budget_if_idle) else resume_budget
-            if callable(budget_resume) and budget_resume() is False:
+            reopened["budget"] = callable(budget_resume)
+            try:
+                budget_resumed = budget_resume() if callable(budget_resume) else True
+            except Exception as exc:
+                return await _rollback("budget.resume", exc)
+            if budget_resumed is False:
                 logger.warning("[AstrMai] runtime reinitialize deferred: background work is still draining")
                 return False
         else:
-            if callable(resume_budget) and resume_budget() is False:
+            reopened["budget"] = callable(budget_resume)
+            try:
+                budget_resumed = budget_resume() if callable(budget_resume) else True
+            except Exception as exc:
+                return await _rollback("budget.resume", exc)
+            if budget_resumed is False:
                 logger.warning("[AstrMai] runtime reinitialize deferred: background work is still draining")
                 return False
-            if callable(resume_reread) and resume_reread() is False:
-                logger.warning("[AstrMai] runtime reinitialize deferred: reread dispatcher still has pending work")
-                return False
+        reopened["reread"] = callable(resume_reread)
+        try:
+            reread_resumed = resume_reread() if callable(resume_reread) else True
+        except Exception as exc:
+            return await _rollback("reread.resume", exc)
+        if reread_resumed is False:
+            return await _rollback("reread.resume", "dispatcher still has pending work")
         event_bus = getattr(self.runtime, "event_bus", None)
         reset_abort = getattr(event_bus, "reset_abort", None)
         if callable(reset_abort):
-            reset_abort()
+            reopened["event_bus"] = True
+            try:
+                reset_abort()
+            except Exception as exc:
+                return await _rollback("event_bus.reset_abort", exc)
 
         coordinator = getattr(self.runtime, "runtime_coordinator", None)
         reopen_coordinator = getattr(coordinator, "reopen", None)
         if callable(reopen_coordinator):
-            await reopen_coordinator()
+            reopened["coordinator"] = True
+            try:
+                result = await _await_result(reopen_coordinator())
+                if result is False:
+                    raise RuntimeError("coordinator reopen returned false")
+            except Exception as exc:
+                return await _rollback("coordinator.reopen", exc)
 
         persona_summarizer = getattr(self.runtime, "persona_summarizer", None)
         reopen_persona = getattr(persona_summarizer, "reopen", None)
         if callable(reopen_persona):
-            reopen_persona()
+            reopened["persona"] = True
+            try:
+                result = await _await_result(reopen_persona())
+                if result is False:
+                    raise RuntimeError("persona reopen returned false")
+            except Exception as exc:
+                return await _rollback("persona.reopen", exc)
 
         cron_guard = getattr(self.runtime, "cron_guard", None)
         start_cron_guard = getattr(cron_guard, "start", None)
         if callable(start_cron_guard):
-            start_cron_guard()
+            reopened["cron"] = True
+            try:
+                result = await _await_result(start_cron_guard())
+                if result is False:
+                    raise RuntimeError("cron start returned false")
+            except Exception as exc:
+                return await _rollback("cron.start", exc)
 
-        self._bind_learning_collaboration()
+        try:
+            bound_collaboration = self._bind_learning_collaboration()
+        except Exception as exc:
+            return await _rollback("learning_collaboration.bind", exc)
         return True
 
-    def _bind_learning_collaboration(self) -> None:
+    def _bind_learning_collaboration(self) -> list[tuple[Any, str, Any]]:
         event_bus = getattr(self.runtime, "event_bus", None)
         state_engine = getattr(self.runtime, "state_engine", None)
         memory_engine = getattr(self.runtime, "memory_engine", None)
         if event_bus is None or state_engine is None or memory_engine is None:
-            return
+            return []
+        bound: list[tuple[Any, str, Any]] = []
         bindings = (
             (
                 event_bus.TOPIC_LEARNING_MESSAGE_RECORDED,
@@ -181,9 +332,24 @@ class PluginLifecycleManager:
                 getattr(memory_engine, "on_learning_mining_completed", None),
             ),
         )
-        for topic, callback in bindings:
-            if callable(callback):
-                event_bus.subscribe(topic, callback)
+        try:
+            for topic, callback in bindings:
+                if callable(callback):
+                    event_bus.subscribe(topic, callback)
+                    bound.append((event_bus, topic, callback))
+        except Exception:
+            unsubscribe = getattr(event_bus, "unsubscribe", None)
+            if callable(unsubscribe):
+                for _bus, topic, callback in reversed(bound):
+                    try:
+                        unsubscribe(topic, callback)
+                    except Exception as rollback_exc:
+                        logger.warning(
+                            "[AstrMai] learning collaboration partial bind rollback degraded "
+                            f"topic={topic}: {rollback_exc}"
+                        )
+            raise
+        return bound
 
     def _persona_retry_bounds(self) -> tuple[float, float]:
         persona_config = getattr(self.runtime.config, "persona", None)
@@ -492,6 +658,176 @@ class PluginLifecycleManager:
             except Exception as exc:
                 logger.error(f"[AstrMai-GC] 内存 GC 任务异常: {exc}")
 
+    def _apply_shutdown_fences(self) -> dict[str, str]:
+        errors = dict(getattr(self, "_shutdown_fence_errors", {}) or {})
+        memory_engine = getattr(self.runtime, "memory_engine", None)
+        fences = (
+            (
+                "background_budget.begin_drain",
+                getattr(getattr(self.runtime, "background_task_budget", None), "begin_drain", None),
+            ),
+            ("memory.engine.begin_shutdown", getattr(memory_engine, "begin_shutdown", None)),
+            (
+                "memory.pipeline.begin_shutdown",
+                getattr(getattr(memory_engine, "memory_pipeline", None), "begin_shutdown", None),
+            ),
+            (
+                "memory.projector.begin_shutdown",
+                getattr(getattr(memory_engine, "index_projector", None), "begin_shutdown", None),
+            ),
+        )
+        for name, fence in fences:
+            if not callable(fence):
+                continue
+            try:
+                fence()
+            except Exception as exc:
+                errors[name] = f"{type(exc).__name__}: {exc}"[:500]
+                logger.warning(f"[AstrMai] shutdown fence degraded name={name}: {exc}")
+            else:
+                errors.pop(name, None)
+        self._shutdown_fence_errors = errors
+        if errors:
+            self.runtime.status.shutdown_stage_stats["shutdown_fence"] = {
+                "status": "pending_drain",
+                "errors": dict(errors),
+            }
+        return dict(errors)
+
+    def _apply_fence_errors_to_pending_report(self, report: dict[str, Any]) -> dict[str, Any]:
+        errors = dict(getattr(self, "_shutdown_fence_errors", {}) or {})
+        if not errors:
+            return report
+        remaining_by_kind = dict(report.get("remaining_by_kind", {}) or {})
+        for name in errors:
+            remaining_by_kind[f"shutdown_fence.{name}"] = 1
+        report["remaining"] = max(1, int(report.get("remaining", 0) or 0))
+        report["has_pending"] = True
+        report["remaining_by_kind"] = remaining_by_kind
+        report["shutdown_fence_errors"] = errors
+        return self._recompute_pending_report(report)
+
+    @staticmethod
+    def _recompute_pending_report(report: dict[str, Any]) -> dict[str, Any]:
+        """Re-derive pending fields after merging component diagnostics."""
+        scalar_fields = (
+            "active",
+            "queued",
+            "deferred",
+            "physical",
+            "worker_count",
+            "projection_count",
+            "pipeline_count",
+            "physical_index_future_count",
+            "vector_retirement_count",
+            "vector_candidate_build_count",
+            "vector_candidate_physical_count",
+            "vector_candidate_path_count",
+            "vector_sync_retirement_count",
+            "vector_close_owner_count",
+            "retired_vector_stack_count",
+            "isolated_shutdown_task_count",
+        )
+        values = []
+        for field in scalar_fields:
+            value = report.get(field, 0)
+            if isinstance(value, bool):
+                value = int(value)
+            if isinstance(value, int) and value >= 0:
+                values.append(value)
+        nested_max = 0
+        remaining_by_kind = report.get("remaining_by_kind")
+        if isinstance(remaining_by_kind, dict):
+            for value in remaining_by_kind.values():
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    nested_max = max(nested_max, value)
+        owner_names = report.get("owner_task_names")
+        owner_count = len(owner_names) if isinstance(owner_names, (list, tuple, set, frozenset)) else 0
+        unknown = bool(report.get("unknown_components"))
+        remaining = max(
+            [int(report.get("remaining", 0) or 0), nested_max, owner_count, int(unknown), *values]
+        )
+        report["remaining"] = remaining
+        report["has_pending"] = bool(remaining)
+        if isinstance(remaining_by_kind, dict):
+            report["remaining_total"] = sum(
+                value
+                for value in remaining_by_kind.values()
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            )
+            report["remaining_by_category_total"] = report["remaining_total"]
+            report["category_sum"] = report["remaining_total"]
+            report["category_count_sum"] = report["remaining_total"]
+            report["remaining_max_by_category"] = nested_max
+        report["unique_remaining_owner_count"] = max(remaining, owner_count)
+        report["unique_owner_count_estimate"] = report["unique_remaining_owner_count"]
+        return report
+
+    @staticmethod
+    def _validate_budget_drain_report(report: Any) -> dict[str, Any]:
+        if not isinstance(report, dict):
+            raise TypeError(f"report must be dict, got {type(report).__name__}")
+        normalized = dict(report)
+
+        def _count(value: Any, field: str) -> int:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{field} must be a non-negative integer")
+            if value < 0:
+                raise ValueError(f"{field} must be a non-negative integer")
+            return value
+
+        for field in (
+            "observed",
+            "remaining",
+            "active",
+            "queued",
+            "queued_waiters",
+            "deferred",
+            "physical",
+            "physical_owner_count",
+        ):
+            if field in normalized:
+                normalized[field] = _count(normalized[field], field)
+        normalized.setdefault("observed", 0)
+        normalized.setdefault("remaining", 0)
+        for field in ("active_by_kind", "queued_by_kind", "deferred_by_kind"):
+            value = normalized.get(field)
+            if value is None:
+                continue
+            if not isinstance(value, dict):
+                raise TypeError(f"{field} must be dict, got {type(value).__name__}")
+            normalized[field] = {
+                str(name): _count(count, f"{field}.{name}")
+                for name, count in value.items()
+            }
+        owner_names = normalized.get("owner_task_names")
+        if owner_names is not None:
+            if not isinstance(owner_names, (list, tuple, set, frozenset)):
+                raise TypeError(
+                    "owner_task_names must be a collection, "
+                    f"got {type(owner_names).__name__}"
+                )
+            if any(not isinstance(name, str) for name in owner_names):
+                raise TypeError("owner_task_names entries must be strings")
+            normalized["owner_task_names"] = list(owner_names)
+        return normalized
+
+    @staticmethod
+    def _invoke_with_optional_keyword(callable_obj: Any, name: str, value: Any) -> Any:
+        kwargs: dict[str, Any] = {}
+        try:
+            signature = inspect.signature(callable_obj)
+        except (TypeError, ValueError):
+            pass
+        else:
+            try:
+                signature.bind(**{name: value})
+            except TypeError:
+                pass
+            else:
+                kwargs[name] = value
+        return callable_obj(**kwargs)
+
     def begin_shutdown(self) -> None:
         """Fence new ingress synchronously before asynchronous cleanup."""
         if self._shutdown_requested:
@@ -509,14 +845,7 @@ class PluginLifecycleManager:
         request_scenario_shutdown = getattr(scheduled_scenarios, "request_shutdown", None)
         if callable(request_scenario_shutdown):
             request_scenario_shutdown()
-        memory_engine = getattr(self.runtime, "memory_engine", None)
-        memory_pipeline = getattr(memory_engine, "memory_pipeline", None)
-        fence_memory_pipeline = getattr(memory_pipeline, "begin_shutdown", None)
-        if callable(fence_memory_pipeline):
-            try:
-                fence_memory_pipeline()
-            except Exception as exc:
-                logger.warning(f"[AstrMai] Memory pipeline shutdown fence degraded: {exc}")
+        self._apply_shutdown_fences()
         self.runtime.status.shutdown_generation = int(
             getattr(self.runtime.status, "shutdown_generation", 0) or 0
         ) + 1
@@ -579,20 +908,40 @@ class PluginLifecycleManager:
                     async def _late_reread_cleanup() -> None:
                         try:
                             await reread_dispatcher.shutdown()
-                            self._force_shutdown_tail(wait_dispatcher=False)
                         except asyncio.CancelledError:
                             raise
                         except Exception as exc:
+                            self._shutdown_pending_drain = True
+                            self._termination_complete = False
+                            self.runtime.status.shutdown_pending_drain = True
+                            self.runtime.status.shutdown_final_status = "degraded"
+                            self.runtime.status.shutdown_forced_termination_risk = True
+                            self.runtime.set_boot_phase("shutdown.degraded")
                             self.runtime.mark_degraded("shutdown.reread_late_cleanup", str(exc))
                             logger.warning(f"[AstrMai] late reread cleanup degraded: {exc}")
-                        finally:
-                            self._shutdown_pending_drain = False
-                            self._reset_runtime_status_flags()
-                            elapsed_ms = (time.monotonic() - self._shutdown_started_monotonic) * 1000
-                            self.runtime.status.shutdown_completed_at = time.time()
-                            self.runtime.status.last_shutdown_elapsed_ms = round(elapsed_ms, 3)
-                            self.runtime.set_boot_phase("shutdown.complete")
-                            self._termination_complete = True
+                            return
+
+                        try:
+                            self.stop_visual_services()
+                            tasks = collect_background_tasks(*self.runtime.iter_task_owners())
+                            current = asyncio.current_task()
+                            for pending_task in dict.fromkeys(
+                                task for task in tasks if task is not None and task is not current
+                            ):
+                                if not pending_task.done():
+                                    pending_task.cancel()
+                        except Exception as exc:
+                            logger.warning(f"[AstrMai] late reread tail fencing degraded: {exc}")
+                        budget = getattr(self.runtime, "background_task_budget", None)
+                        begin_drain = getattr(budget, "begin_drain", None)
+                        if callable(begin_drain):
+                            try:
+                                begin_drain()
+                            except Exception as exc:
+                                logger.warning(f"[AstrMai] late reread budget drain degraded: {exc}")
+                        if self._late_shutdown_cleanup_task is asyncio.current_task():
+                            self._late_shutdown_cleanup_task = None
+                        self._schedule_late_shutdown_cleanup(budget)
 
                     task = asyncio.create_task(_late_reread_cleanup(), name="astrmai:shutdown:reread-late")
                     self._late_shutdown_cleanup_task = task
@@ -625,14 +974,36 @@ class PluginLifecycleManager:
             errors.append(f"tasks:{exc}")
 
         budget = getattr(self.runtime, "background_task_budget", None)
-        begin_drain = getattr(budget, "begin_drain", None)
-        if callable(begin_drain):
-            try:
-                begin_drain()
-            except Exception as exc:
-                errors.append(f"budget.begin_drain:{exc}")
-        pending_report = self._shutdown_pending_report(budget)
+        fence_errors = self._apply_shutdown_fences()
+        errors.extend(f"{name}:{error}" for name, error in fence_errors.items())
+        pending_report = self._apply_fence_errors_to_pending_report(
+            self._shutdown_pending_report(budget)
+        )
         pending_budget = int(pending_report.get("remaining", 0) or 0)
+        if pending_report.get("vector_stack_present"):
+            self._shutdown_pending_drain = True
+            self.runtime.status.shutdown_pending_drain = True
+            self.runtime.status.shutdown_final_status = "pending_drain"
+            if budget is not None and hasattr(budget, "wait_until_idle"):
+                self._schedule_late_shutdown_cleanup(budget)
+            else:
+                close_memory_resources = getattr(
+                    getattr(self.runtime, "memory_engine", None),
+                    "close_background_resources",
+                    None,
+                )
+                if callable(close_memory_resources):
+                    async def _close_memory_then_resume() -> None:
+                        closed = await close_memory_resources()
+                        if closed is not False:
+                            self._force_shutdown_tail(wait_dispatcher=False)
+
+                    self._schedule_forced_shutdown_cleanup(
+                        "memory_resources",
+                        _close_memory_then_resume,
+                    )
+            logger.warning("[AstrMai] vector stack remains open; dependency close deferred")
+            return
         if pending_budget:
             self._shutdown_pending_drain = True
             self._schedule_late_shutdown_cleanup(budget)
@@ -655,16 +1026,43 @@ class PluginLifecycleManager:
 
         event_bus = getattr(self.runtime, "event_bus", None)
         stop_event_bus = getattr(event_bus, "stop", None)
-        if callable(stop_event_bus):
-            self._schedule_forced_shutdown_cleanup("event_bus", stop_event_bus)
-
         persistence = getattr(self.runtime, "persistence", None)
         dispose = getattr(persistence, "dispose", None)
-        if callable(dispose):
-            try:
-                dispose()
-            except Exception as exc:
-                errors.append(f"persistence:{exc}")
+        if callable(stop_event_bus) or callable(dispose):
+            async def _close_tail_dependencies() -> None:
+                if callable(stop_event_bus):
+                    await stop_event_bus()
+                    describe_event_bus = getattr(event_bus, "describe_status", None)
+                    if callable(describe_event_bus):
+                        status = describe_event_bus() or {}
+                        pending_count = status.get("pending_stop_task_count", 0)
+                        if (
+                            isinstance(pending_count, bool)
+                            or not isinstance(pending_count, int)
+                            or pending_count < 0
+                        ):
+                            raise RuntimeError("event_bus pending_stop_task_count is invalid")
+                        if pending_count:
+                            self._shutdown_pending_drain = True
+                            self.runtime.status.shutdown_pending_drain = True
+                            self.runtime.status.shutdown_final_status = "pending_drain"
+                            self.runtime.status.shutdown_forced_termination_risk = True
+                            raise RuntimeError(
+                                f"event_bus pending_stop_tasks={pending_count}"
+                            )
+                if callable(dispose):
+                    disposed = await self._dispose_persistence_bounded(
+                        persistence,
+                        timeout_sec=self._shutdown_timing("shutdown_cancel_grace_sec", 1.0),
+                    )
+                    if not disposed:
+                        self._shutdown_pending_drain = True
+                        self.runtime.status.shutdown_pending_drain = True
+                        self.runtime.status.shutdown_final_status = "pending_drain"
+                        self.runtime.status.shutdown_forced_termination_risk = True
+                        raise RuntimeError("persistence dispose pending")
+
+            self._schedule_forced_shutdown_cleanup("tail_dependencies", _close_tail_dependencies)
 
         elapsed_ms = round((time.monotonic() - started) * 1000, 3)
         self.runtime.status.shutdown_stage_stats["forced_tail"] = {
@@ -675,66 +1073,450 @@ class PluginLifecycleManager:
 
     @staticmethod
     def _background_budget_pending(budget: Any) -> int:
+        if budget is None:
+            return 0
         status_fn = getattr(budget, "status", None)
         if not callable(status_fn):
-            return 0
+            return 1
         try:
             status = status_fn() or {}
         except Exception:
-            return 0
-        return max(
-            int(status.get("active", 0) or 0),
-            int(status.get("queued", 0) or 0),
-            int(status.get("deferred_tasks", 0) or 0),
-            int(status.get("physical_owner_count", 0) or 0),
-        )
+            return 1
+        if not isinstance(status, dict):
+            return 1
+        try:
+            return max(
+                max(0, int(status.get("active", 0) or 0)),
+                max(0, int(status.get("queued", 0) or 0)),
+                max(0, int(status.get("deferred_tasks", 0) or 0)),
+                max(0, int(status.get("physical_owner_count", 0) or 0)),
+            )
+        except (TypeError, ValueError, OverflowError):
+            return 1
 
     def _shutdown_pending_report(self, budget: Any, *, include_late_task: bool = False) -> dict[str, Any]:
-        status_fn = getattr(budget, "status", None)
-        budget_status = status_fn() if callable(status_fn) else {}
-        if not isinstance(budget_status, dict):
-            budget_status = {}
+        diagnostics_errors: dict[str, str] = {}
+        unknown_components: set[str] = set()
+
+        def _mark_unknown(component: str, reason: str) -> None:
+            unknown_components.add(component)
+            diagnostics_errors.setdefault(component, str(reason)[:500])
+
+        def _safe_int(value: Any, component: str, field: str) -> int:
+            if value is None:
+                return 0
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                _mark_unknown(component, f"invalid {field}: {type(value).__name__}")
+                return 0
+            return value
+
+        def _safe_float(value: Any, component: str, field: str) -> float:
+            try:
+                return max(0.0, float(value or 0.0))
+            except (TypeError, ValueError, OverflowError):
+                _mark_unknown(component, f"invalid {field}: {type(value).__name__}")
+                return 0.0
+
+        def _safe_mapping(value: Any, component: str, field: str) -> dict[str, Any]:
+            if value is None:
+                return {}
+            if not isinstance(value, dict):
+                _mark_unknown(component, f"invalid {field}: {type(value).__name__}")
+                return {}
+            return value
+
+        def _read_status(component: str, target: Any, method_name: str) -> dict[str, Any]:
+            if target is None:
+                return {}
+            status_fn = getattr(target, method_name, None)
+            if not callable(status_fn):
+                _mark_unknown(component, f"missing {method_name}()")
+                return {}
+            try:
+                status = status_fn()
+            except Exception as exc:
+                _mark_unknown(component, f"{type(exc).__name__}: {exc}")
+                return {}
+            if not isinstance(status, dict):
+                _mark_unknown(component, f"invalid status: {type(status).__name__}")
+                return {}
+            return status
+
+        def _read_vector_owner_status(target: Any) -> dict[str, Any]:
+            if target is None:
+                return {}
+            describe = getattr(target, "describe_shutdown_owners", None)
+            if callable(describe):
+                return _read_status("memory.vector_owners", target, "describe_shutdown_owners")
+            legacy_fields = (
+                "_vector_retirement_tasks",
+                "_vector_candidate_build_tasks",
+                "_vector_candidate_futures",
+                "_vector_candidate_paths",
+                "_vector_sync_retirement_futures",
+                "_vector_close_tasks",
+                "_retired_vector_stacks",
+            )
+            if not any(hasattr(target, field) for field in legacy_fields):
+                return {}
+            registry_lock = getattr(target, "_vector_registry_lock", None)
+            if registry_lock is None or not hasattr(registry_lock, "__enter__"):
+                _mark_unknown(
+                    "memory.vector_owners",
+                    "legacy vector owner registry is missing _vector_registry_lock",
+                )
+                return {}
+            try:
+                with registry_lock:
+                    retirement_tasks = list(getattr(target, "_vector_retirement_tasks", set()) or set())
+                    candidate_tasks = list(getattr(target, "_vector_candidate_build_tasks", set()) or set())
+                    candidate_futures = list(getattr(target, "_vector_candidate_futures", set()) or set())
+                    sync_futures = list(getattr(target, "_vector_sync_retirement_futures", set()) or set())
+                    candidate_path_count = len(
+                        getattr(target, "_vector_candidate_paths", set()) or set()
+                    )
+                    retired_stack_count = len(
+                        getattr(target, "_retired_vector_stacks", {}) or {}
+                    )
+                    close_owners = [
+                        owner
+                        for _resource, owner in (
+                            getattr(target, "_vector_close_tasks", {}) or {}
+                        ).values()
+                    ]
+                running_retirements = [task for task in retirement_tasks if task is not None and not task.done()]
+                running_candidates = [task for task in candidate_tasks if task is not None and not task.done()]
+                running_candidate_futures = [
+                    future for future in candidate_futures if future is not None and not future.done()
+                ]
+                running_sync_futures = [
+                    future for future in sync_futures if future is not None and not future.done()
+                ]
+                running_close_owners = [
+                    owner for owner in close_owners if owner is not None and not owner.done()
+                ]
+                owner_names = []
+                for owner, fallback in (
+                    *((task, "memory.vector_retirement") for task in running_retirements),
+                    *((task, "memory.vector_candidate_build") for task in running_candidates),
+                    *((owner, "memory.vector_close_owner") for owner in running_close_owners),
+                ):
+                    get_name = getattr(owner, "get_name", None)
+                    owner_names.append(str(get_name()) if callable(get_name) else fallback)
+                owner_names.extend(
+                    "astrmai-vector-candidate-physical" for _future in running_candidate_futures
+                )
+                owner_names.extend(
+                    "astrmai-vector-sync-retirement" for _future in running_sync_futures
+                )
+                return {
+                    "vector_retirement_count": len(running_retirements),
+                    "vector_candidate_build_count": len(running_candidates),
+                    "vector_candidate_physical_count": len(running_candidate_futures),
+                    "vector_candidate_path_count": candidate_path_count,
+                    "vector_sync_retirement_count": len(running_sync_futures),
+                    "vector_close_owner_count": len(running_close_owners),
+                    "retired_vector_stack_count": retired_stack_count,
+                    "owner_task_names": owner_names,
+                }
+            except Exception as exc:
+                _mark_unknown(
+                    "memory.vector_owners",
+                    f"legacy snapshot {type(exc).__name__}: {exc}",
+                )
+                return {}
+
+        budget_status = _read_status("background_budget", budget, "status")
+        budget_state_unknown = "background_budget" in unknown_components
         remaining_by_kind: dict[str, int] = {}
         for field in ("active_by_kind", "queued_by_kind", "deferred_by_kind"):
-            for name, count in dict(budget_status.get(field, {}) or {}).items():
-                if int(count or 0) > 0:
+            for name, count in _safe_mapping(
+                budget_status.get(field), "background_budget", field
+            ).items():
+                normalized_count = _safe_int(count, "background_budget", f"{field}.{name}")
+                if normalized_count > 0:
                     remaining_by_kind[str(name)] = max(
-                        remaining_by_kind.get(str(name), 0), int(count or 0)
+                        remaining_by_kind.get(str(name), 0), normalized_count
                     )
         attention = getattr(self.runtime, "attention_gate", None)
-        attention_status = {}
-        describe_attention = getattr(attention, "describe_status", None)
-        if callable(describe_attention):
-            try:
-                attention_status = describe_attention() or {}
-            except Exception:
-                attention_status = {}
-        worker_count = int(attention_status.get("worker_count", 0) or 0)
+        attention_status = _read_status("attention", attention, "describe_status")
+        worker_count = _safe_int(
+            attention_status.get("worker_count"), "attention", "worker_count"
+        )
         if worker_count:
             remaining_by_kind["attention.worker"] = worker_count
+        memory_engine = getattr(self.runtime, "memory_engine", None)
+        projector = getattr(memory_engine, "index_projector", None)
+        projector_status = _read_status(
+            "memory.projector", projector, "describe_status"
+        )
+        projection_count = max(
+            _safe_int(projector_status.get("projection_inflight_count"), "memory.projector", "projection_inflight_count"),
+            _safe_int(projector_status.get("projection_background_task_count"), "memory.projector", "projection_background_task_count"),
+            _safe_int(projector_status.get("durable_cleanup_task_count"), "memory.projector", "durable_cleanup_task_count"),
+        )
+        if projection_count:
+            remaining_by_kind["memory.projection"] = projection_count
+        pipeline = getattr(memory_engine, "memory_pipeline", None)
+        pipeline_status = _read_status(
+            "memory.pipeline", pipeline, "describe_runtime_status"
+        )
+        pipeline_count = max(
+            _safe_int(pipeline_status.get("active_worker_count"), "memory.pipeline", "active_worker_count"),
+            _safe_int(pipeline_status.get("stopping_worker_count"), "memory.pipeline", "stopping_worker_count"),
+            int(bool(pipeline_status.get("sweep_task_running"))),
+        )
+        if pipeline_count:
+            remaining_by_kind["memory.pipeline"] = pipeline_count
+        vector_retriever = getattr(memory_engine, "vec_retriever", None)
+        vector_stack_present = bool(
+            getattr(memory_engine, "faiss_db", None) is not None
+            or vector_retriever is not None
+            or getattr(memory_engine, "retriever", None) is not None
+        )
+        vector_status = _read_status(
+            "memory.vector", vector_retriever, "describe_status"
+        )
+        physical_future_count = _safe_int(
+            vector_status.get("physical_index_future_count"),
+            "memory.vector",
+            "physical_index_future_count",
+        )
+        if physical_future_count:
+            remaining_by_kind["memory.faiss_physical"] = physical_future_count
+        if vector_stack_present:
+            remaining_by_kind["memory.vector_stack"] = 1
+        event_bus = getattr(self.runtime, "event_bus", None)
+        event_bus_status = {}
+        if event_bus is not None and (
+            callable(getattr(event_bus, "describe_status", None))
+            or hasattr(event_bus, "_pending_stop_tasks")
+        ):
+            event_bus_status = _read_status("event_bus", event_bus, "describe_status")
+            event_task_count = max(
+                _safe_int(event_bus_status.get("background_task_count"), "event_bus", "background_task_count"),
+                _safe_int(event_bus_status.get("pending_stop_task_count"), "event_bus", "pending_stop_task_count"),
+            )
+            if event_task_count:
+                remaining_by_kind["event_bus.task"] = event_task_count
+        vector_owner_status = _read_vector_owner_status(memory_engine)
+        retirement_count = _safe_int(
+            vector_owner_status.get("vector_retirement_count"),
+            "memory.vector_owners",
+            "vector_retirement_count",
+        )
+        candidate_build_count = _safe_int(
+            vector_owner_status.get("vector_candidate_build_count"),
+            "memory.vector_owners",
+            "vector_candidate_build_count",
+        )
+        candidate_physical_count = _safe_int(
+            vector_owner_status.get("vector_candidate_physical_count"),
+            "memory.vector_owners",
+            "vector_candidate_physical_count",
+        )
+        candidate_path_count = _safe_int(
+            vector_owner_status.get("vector_candidate_path_count"),
+            "memory.vector_owners",
+            "vector_candidate_path_count",
+        )
+        sync_retirement_count = _safe_int(
+            vector_owner_status.get("vector_sync_retirement_count"),
+            "memory.vector_owners",
+            "vector_sync_retirement_count",
+        )
+        close_owner_count = _safe_int(
+            vector_owner_status.get("vector_close_owner_count"),
+            "memory.vector_owners",
+            "vector_close_owner_count",
+        )
+        retired_stack_count = _safe_int(
+            vector_owner_status.get("retired_vector_stack_count"),
+            "memory.vector_owners",
+            "retired_vector_stack_count",
+        )
+        try:
+            current_task = asyncio.current_task()
+        except RuntimeError:
+            current_task = None
+        isolated_shutdown_tasks = [
+            task
+            for task in (getattr(self, "_isolated_shutdown_tasks", set()) or set())
+            if task is not None and task is not current_task and not task.done()
+        ]
+        isolated_shutdown_count = len(isolated_shutdown_tasks)
+        if retirement_count:
+            remaining_by_kind["memory.vector_retirement"] = retirement_count
+        if candidate_build_count:
+            remaining_by_kind["memory.vector_candidate_build"] = candidate_build_count
+        if candidate_physical_count:
+            remaining_by_kind["memory.vector_candidate_physical"] = candidate_physical_count
+        if candidate_path_count:
+            remaining_by_kind["memory.vector_candidate_path"] = candidate_path_count
+        if sync_retirement_count:
+            remaining_by_kind["memory.vector_sync_retirement"] = sync_retirement_count
+        if close_owner_count:
+            remaining_by_kind["memory.vector_close_owner"] = close_owner_count
+        if retired_stack_count:
+            remaining_by_kind["memory.retired_vector_stack"] = retired_stack_count
+        if isolated_shutdown_count:
+            remaining_by_kind["shutdown.isolated_task"] = isolated_shutdown_count
+        lifecycle_tasks = {
+            "memory.vector_bootstrap": getattr(memory_engine, "_vector_bootstrap_task", None),
+            "memory.projection_replay": getattr(memory_engine, "_projection_ready_replay_task", None),
+        }
+        for kind, task in lifecycle_tasks.items():
+            if task is not None and not task.done():
+                remaining_by_kind[kind] = 1
+        budget_active = _safe_int(budget_status.get("active"), "background_budget", "active")
+        budget_queued = _safe_int(budget_status.get("queued"), "background_budget", "queued")
+        budget_deferred = _safe_int(
+            budget_status.get("deferred", budget_status.get("deferred_tasks")),
+            "background_budget",
+            "deferred",
+        )
+        budget_physical = _safe_int(
+            budget_status.get("physical", budget_status.get("physical_owner_count")),
+            "background_budget",
+            "physical",
+        )
+        for component in sorted(unknown_components):
+            remaining_by_kind[f"{component}.state_unknown"] = 1
         remaining = max(
-            int(budget_status.get("active", 0) or 0),
-            int(budget_status.get("queued", 0) or 0),
-            int(budget_status.get("deferred", budget_status.get("deferred_tasks", 0)) or 0),
-            int(budget_status.get("physical", budget_status.get("physical_owner_count", 0)) or 0),
+            budget_active,
+            budget_queued,
+            budget_deferred,
+            budget_physical,
             worker_count,
+            projection_count,
+            pipeline_count,
+            physical_future_count,
+            int(vector_stack_present),
+            retirement_count,
+            candidate_build_count,
+            candidate_physical_count,
+            candidate_path_count,
+            sync_retirement_count,
+            close_owner_count,
+            retired_stack_count,
+            isolated_shutdown_count,
+            int(bool(unknown_components)),
+            *(1 for task in lifecycle_tasks.values() if task is not None and not task.done()),
         )
         if include_late_task and int(getattr(self.runtime.status, "shutdown_late_cleanup_task_count", 0) or 0):
             remaining = max(remaining, 1)
             remaining_by_kind["shutdown.late_cleanup"] = 1
+        raw_owner_names = budget_status.get("owner_task_names")
+        if raw_owner_names is None:
+            owner_names = []
+        elif isinstance(raw_owner_names, (list, tuple, set, frozenset)):
+            owner_names = raw_owner_names
+        else:
+            _mark_unknown("background_budget", f"invalid owner_task_names: {type(raw_owner_names).__name__}")
+            owner_names = []
+            remaining_by_kind["background_budget.state_unknown"] = 1
+            remaining = max(remaining, 1)
+        owner_task_names = set(str(name) for name in owner_names)
+        for task in (getattr(projector, "_background_tasks", set()) or set()):
+            if task is not None and not task.done():
+                owner_task_names.add(str(task.get_name() if hasattr(task, "get_name") else "memory.projection"))
+        raw_vector_owner_names = vector_owner_status.get("owner_task_names")
+        if raw_vector_owner_names is None:
+            vector_owner_names = []
+        elif isinstance(raw_vector_owner_names, (list, tuple, set, frozenset)):
+            vector_owner_names = raw_vector_owner_names
+        else:
+            _mark_unknown(
+                "memory.vector_owners",
+                f"invalid owner_task_names: {type(raw_vector_owner_names).__name__}",
+            )
+            vector_owner_names = []
+        owner_task_names.update(str(name) for name in vector_owner_names)
+        if event_bus_status.get("pending_stop_task_count"):
+            owner_task_names.update(
+                f"eventbus:pending-stop:{index}"
+                for index in range(
+                    int(event_bus_status.get("pending_stop_task_count", 0) or 0)
+                )
+            )
+        for task in lifecycle_tasks.values():
+            if task is not None and not task.done():
+                owner_task_names.add(str(task.get_name() if hasattr(task, "get_name") else "memory.lifecycle"))
+        for task in isolated_shutdown_tasks:
+            owner_task_names.add(
+                str(task.get_name() if hasattr(task, "get_name") else "shutdown.isolated_task")
+            )
+        oldest_owner_age_ms = _safe_float(
+            budget_status.get("oldest_owner_age_ms"),
+            "background_budget",
+            "oldest_owner_age_ms",
+        )
+        active_by_kind = _safe_mapping(
+            budget_status.get("active_by_kind"), "background_budget", "active_by_kind"
+        )
+        queued_by_kind = _safe_mapping(
+            budget_status.get("queued_by_kind"), "background_budget", "queued_by_kind"
+        )
+        deferred_by_kind = _safe_mapping(
+            budget_status.get("deferred_by_kind"), "background_budget", "deferred_by_kind"
+        )
+        for component in sorted(unknown_components):
+            remaining_by_kind[f"{component}.state_unknown"] = 1
+        remaining = max(
+            remaining,
+            int(bool(unknown_components)),
+            max(remaining_by_kind.values(), default=0),
+            len(owner_task_names),
+        )
+        category_sum = sum(remaining_by_kind.values())
+        unique_remaining_owner_count = max(int(remaining or 0), len(owner_task_names))
+        diagnostics_error = "; ".join(
+            f"{component}: {reason}"
+            for component, reason in sorted(diagnostics_errors.items())
+        )[:1000]
+        budget_state_unknown = "background_budget" in unknown_components
         return {
             "remaining": remaining,
             "remaining_by_kind": remaining_by_kind,
-            "active": int(budget_status.get("active", 0) or 0),
-            "queued": int(budget_status.get("queued", 0) or 0),
-            "deferred": int(budget_status.get("deferred", budget_status.get("deferred_tasks", 0)) or 0),
-            "physical": int(budget_status.get("physical", budget_status.get("physical_owner_count", 0)) or 0),
+            "active": budget_active,
+            "queued": budget_queued,
+            "deferred": budget_deferred,
+            "physical": budget_physical,
             "worker_count": worker_count,
-            "owner_task_names": list(budget_status.get("owner_task_names", []) or []),
-            "oldest_owner_age_ms": float(budget_status.get("oldest_owner_age_ms", 0.0) or 0.0),
-            "active_by_kind": dict(budget_status.get("active_by_kind", {}) or {}),
-            "queued_by_kind": dict(budget_status.get("queued_by_kind", {}) or {}),
-            "deferred_by_kind": dict(budget_status.get("deferred_by_kind", {}) or {}),
+            "vector_stack_present": vector_stack_present,
+            "has_pending": bool(remaining),
+            "remaining_total": category_sum,
+            "remaining_by_category_total": category_sum,
+            "category_sum": category_sum,
+            "remaining_max_by_category": remaining,
+            "category_count_sum": category_sum,
+            "unique_remaining_owner_count": unique_remaining_owner_count,
+            "unique_remaining_owner_count_basis": "max_category_or_named_owner",
+            "unique_owner_count_estimate": unique_remaining_owner_count,
+            "diagnostics_error": diagnostics_error,
+            "diagnostics_errors": dict(sorted(diagnostics_errors.items())),
+            "unknown_components": sorted(unknown_components),
+            "budget_state_unknown": budget_state_unknown,
+            "projection_count": projection_count,
+            "pipeline_count": pipeline_count,
+            "physical_index_future_count": physical_future_count,
+            "vector_retirement_count": retirement_count,
+            "vector_candidate_build_count": candidate_build_count,
+            "vector_candidate_physical_count": candidate_physical_count,
+            "vector_candidate_path_count": candidate_path_count,
+            "vector_sync_retirement_count": sync_retirement_count,
+            "vector_close_owner_count": close_owner_count,
+            "retired_vector_stack_count": retired_stack_count,
+            "isolated_shutdown_task_count": isolated_shutdown_count,
+            "projector_status": projector_status,
+            "pipeline_status": pipeline_status,
+            "vector_status": vector_status,
+            "owner_task_names": sorted(owner_task_names),
+            "oldest_owner_age_ms": oldest_owner_age_ms,
+            "active_by_kind": active_by_kind,
+            "queued_by_kind": queued_by_kind,
+            "deferred_by_kind": deferred_by_kind,
+            "event_bus_status": event_bus_status,
         }
 
     async def _run_bounded_shutdown_stage(
@@ -755,6 +1537,7 @@ class PluginLifecycleManager:
                 "elapsed_ms": 0.0,
             }
             return False
+
         try:
             result = operation() if callable(operation) else operation
             if not inspect.isawaitable(result):
@@ -793,6 +1576,43 @@ class PluginLifecycleManager:
             logger.warning(f"[AstrMai] shutdown stage degraded name={name}: {exc}")
             return False
 
+    async def _dispose_persistence_bounded(self, persistence: Any, *, timeout_sec: float) -> bool:
+        dispose = getattr(persistence, "dispose", None)
+        if not callable(dispose):
+            return True
+        task = self._persistence_dispose_task
+        if task is None or task.done():
+            if task is not None and task.done():
+                try:
+                    task.result()
+                    return True
+                except Exception:
+                    self._persistence_dispose_task = None
+            task = asyncio.create_task(
+                asyncio.to_thread(dispose),
+                name="astrmai:shutdown:persistence-dispose",
+            )
+            self._persistence_dispose_task = task
+        done, pending = await asyncio.wait(
+            {task},
+            timeout=max(0.0, float(timeout_sec or 0.0)),
+        )
+        if pending:
+            self._isolated_shutdown_tasks.add(task)
+            task.add_done_callback(self._consume_isolated_shutdown_task)
+            self.runtime.status.shutdown_isolated_tasks += 1
+            self.runtime.status.shutdown_stage_stats["persistence_dispose"] = {
+                "status": "isolated_timeout",
+                "timeout_sec": max(0.0, float(timeout_sec or 0.0)),
+            }
+            return False
+        try:
+            task.result()
+        except Exception as exc:
+            logger.warning(f"[AstrMai] persistence dispose degraded: {exc}")
+            return False
+        return True
+
     async def terminate(self) -> None:
         async with self._terminate_lock:
             if self._termination_complete:
@@ -825,12 +1645,13 @@ class PluginLifecycleManager:
                 shutdown_coordinator = getattr(coordinator, "shutdown", None)
                 if callable(shutdown_coordinator):
                     async def _shutdown_runtime_coordinator() -> None:
-                        try:
-                            await shutdown_coordinator(
-                                timeout_sec=self._shutdown_timing("shutdown_cancel_grace_sec", 1.0)
-                            )
-                        except TypeError:
-                            await shutdown_coordinator()
+                        result = self._invoke_with_optional_keyword(
+                            shutdown_coordinator,
+                            "timeout_sec",
+                            self._shutdown_timing("shutdown_cancel_grace_sec", 1.0),
+                        )
+                        if inspect.isawaitable(result):
+                            await result
 
                     await self._run_bounded_shutdown_stage(
                         "runtime_coordinator",
@@ -859,9 +1680,11 @@ class PluginLifecycleManager:
                     )
                 self._reset_runtime_status_flags()
                 final_budget = getattr(self.runtime, "background_task_budget", None)
-                final_pending = self._shutdown_pending_report(
-                    final_budget,
-                    include_late_task=True,
+                final_pending = self._apply_fence_errors_to_pending_report(
+                    self._shutdown_pending_report(
+                        final_budget,
+                        include_late_task=True,
+                    )
                 )
                 dependency_errors = list(getattr(self, "_shutdown_dependency_close_errors", []) or [])
                 if dependency_errors:
@@ -924,12 +1747,29 @@ class PluginLifecycleManager:
     async def _terminate_impl(self) -> None:
         self._shutdown_dependency_close_errors = []
         budget = getattr(self.runtime, "background_task_budget", None)
-        begin_drain = getattr(budget, "begin_drain", None)
-        if callable(begin_drain):
-            try:
-                begin_drain()
-            except Exception as exc:
-                logger.warning(f"[AstrMai] background budget drain admission degraded: {exc}")
+        initial_fence_errors = self._apply_shutdown_fences()
+        if initial_fence_errors:
+            self._shutdown_pending_drain = True
+            self._termination_complete = False
+            self.runtime.status.shutdown_pending_drain = True
+            self.runtime.status.shutdown_final_status = "pending_drain"
+            self.runtime.status.shutdown_forced_termination_risk = True
+            self.runtime.status.shutdown_stage_stats["budget_drain"] = {
+                "status": "pending_drain",
+                "remaining": 1,
+                "has_pending": True,
+                "shutdown_fence_errors": dict(initial_fence_errors),
+                "remaining_by_kind": {
+                    f"shutdown_fence.{name}": 1
+                    for name in initial_fence_errors
+                },
+            }
+            self._schedule_late_shutdown_cleanup(budget)
+            logger.warning(
+                "[AstrMai] shutdown fence failed; dependent resources remain open: "
+                f"errors={initial_fence_errors}"
+            )
+            return
 
         attention_gate = getattr(self.runtime, "attention_gate", None)
         shutdown_attention = getattr(attention_gate, "shutdown_workers", None)
@@ -948,6 +1788,7 @@ class PluginLifecycleManager:
                 logger.warning(f"[AstrMai] Reread dispatcher shutdown degraded: {exc}")
         drain_budget = getattr(budget, "drain", None)
         drain_report: dict[str, object] = {}
+        budget_drain_error = ""
 
         # Fence all producer loops before stopping memory/projector workers;
         # their durable outbox remains available for the next bootstrap.
@@ -1001,11 +1842,17 @@ class PluginLifecycleManager:
         except Exception as exc:
             logger.warning(f"[AstrMai] Cron guard shutdown degraded: {exc}")
 
+        projector = None
         try:
             tasks_to_wait = collect_background_tasks(*self.runtime.iter_task_owners())
+            durable_tasks: set[Any] = set()
+            projector = getattr(getattr(self.runtime, "memory_engine", None), "index_projector", None)
+            durable_tasks.update(getattr(projector, "_durable_cleanup_tasks", set()) or set())
+            tasks_to_wait = [task for task in tasks_to_wait if task not in durable_tasks]
         except Exception as exc:
             logger.warning(f"[AstrMai] Shutdown task collection degraded: {exc}")
             tasks_to_wait = []
+            durable_tasks = set()
 
         try:
             self.stop_visual_services()
@@ -1029,11 +1876,29 @@ class PluginLifecycleManager:
             except Exception as exc:
                 logger.warning(f"[AstrMai] Background task cleanup degraded: {exc}")
 
+        try:
+            wait_durable = getattr(projector, "wait_durable_cleanup", None)
+            if callable(wait_durable):
+                pending_durable = await wait_durable(
+                    timeout_sec=min(2.0, float(self.SHUTDOWN_TASK_TIMEOUT or 2.0))
+                )
+                if pending_durable:
+                    logger.warning(
+                        f"[AstrMai] durable projection cleanup remains pending={pending_durable}"
+                    )
+        except Exception as exc:
+            logger.warning(f"[AstrMai] durable projection cleanup degraded: {exc}")
+
         if callable(drain_budget):
             try:
                 drain_report = await drain_budget(
                     timeout_sec=min(2.0, float(self.SHUTDOWN_TASK_TIMEOUT or 2.0))
                 )
+                try:
+                    drain_report = self._validate_budget_drain_report(drain_report)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    budget_drain_error = f"invalid drain report: {exc}"[:500]
+                    drain_report = {}
                 if drain_report.get("observed", 0):
                     logger.info(
                         "[AstrMai] deferred background work drained: "
@@ -1041,13 +1906,27 @@ class PluginLifecycleManager:
                         f"remaining={drain_report.get('remaining', 0)}"
                     )
             except Exception as exc:
+                budget_drain_error = f"{type(exc).__name__}: {exc}"[:500]
                 logger.warning(f"[AstrMai] deferred background drain degraded: {exc}")
 
-        pending_report = self._shutdown_pending_report(budget)
-        if drain_report.get("remaining", 0):
+        pending_report = self._apply_fence_errors_to_pending_report(
+            self._shutdown_pending_report(budget)
+        )
+        if budget_drain_error:
+            pending_report["remaining"] = max(
+                1, int(pending_report.get("remaining", 0) or 0)
+            )
+            pending_report["has_pending"] = True
+            pending_report["budget_drain_error"] = budget_drain_error
+            pending_report["remaining_by_kind"] = {
+                **dict(pending_report.get("remaining_by_kind", {}) or {}),
+                "background_budget.drain_unknown": 1,
+            }
+        drain_remaining = int(drain_report.get("remaining", 0) or 0)
+        if drain_remaining:
             pending_report["remaining"] = max(
                 int(pending_report.get("remaining", 0) or 0),
-                int(drain_report.get("remaining", 0) or 0),
+                drain_remaining,
             )
             for field in ("active_by_kind", "queued_by_kind", "deferred_by_kind"):
                 pending_report[field] = {
@@ -1058,6 +1937,7 @@ class PluginLifecycleManager:
                 set(pending_report.get("owner_task_names", []) or [])
                 | set(drain_report.get("owner_task_names", []) or [])
             )
+        pending_report = self._recompute_pending_report(pending_report)
         self.runtime.status.shutdown_stage_stats["budget_drain"] = {
             "status": "pending_drain" if pending_report["remaining"] else "completed",
             **pending_report,
@@ -1081,31 +1961,76 @@ class PluginLifecycleManager:
                 None,
             )
             if callable(close_memory_resources):
-                await close_memory_resources()
+                close_result = await close_memory_resources()
+                if close_result is False:
+                    pending = self._shutdown_pending_report(budget)
+                    self._shutdown_pending_drain = True
+                    self.runtime.status.shutdown_pending_drain = True
+                    self.runtime.status.shutdown_final_status = "pending_drain"
+                    self._schedule_late_shutdown_cleanup(budget)
+                    logger.warning(
+                        "[AstrMai] keeping dependent resources open after bounded vector close failure: "
+                        f"remaining={pending.get('remaining', 0)}"
+                    )
+                    return
         except Exception as exc:
-            self._shutdown_dependency_close_errors.append(f"memory:{exc}")
-            self.runtime.mark_degraded("shutdown.dependency_close", f"memory:{exc}")
-            logger.warning(f"[AstrMai] Memory resource shutdown degraded: {exc}")
+            self._shutdown_pending_drain = True
+            self.runtime.status.shutdown_pending_drain = True
+            self.runtime.status.shutdown_final_status = "pending_drain"
+            self._schedule_late_shutdown_cleanup(budget)
+            logger.warning(
+                "[AstrMai] keeping dependent resources open after Memory close exception: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return
 
         # 停止 EventBus workers
         event_bus = getattr(self.runtime, "event_bus", None)
         if event_bus is not None:
             try:
                 await event_bus.stop()
+                event_bus_status = {}
+                describe_event_bus = getattr(event_bus, "describe_status", None)
+                if callable(describe_event_bus):
+                    event_bus_status = describe_event_bus() or {}
+                pending_event_tasks = event_bus_status.get("pending_stop_task_count", 0)
+                if isinstance(pending_event_tasks, bool) or not isinstance(pending_event_tasks, int):
+                    raise RuntimeError("event_bus pending_stop_task_count is invalid")
+                if pending_event_tasks > 0:
+                    self._shutdown_dependency_close_errors.append(
+                        f"event_bus:pending_stop_tasks={pending_event_tasks}"
+                    )
+                    self._shutdown_pending_drain = True
+                    self.runtime.status.shutdown_pending_drain = True
+                    self.runtime.status.shutdown_final_status = "pending_drain"
+                    self.runtime.status.shutdown_forced_termination_risk = True
+                    self._schedule_late_shutdown_cleanup(budget)
+                    logger.warning(
+                        "[AstrMai] EventBus stop still has physical tasks; "
+                        f"persistence dispose deferred count={pending_event_tasks}"
+                    )
+                    return
             except Exception as exc:
                 self._shutdown_dependency_close_errors.append(f"event_bus:{exc}")
                 self.runtime.mark_degraded("shutdown.dependency_close", f"event_bus:{exc}")
+                self.runtime.status.shutdown_forced_termination_risk = True
                 logger.warning(f"[AstrMai] EventBus shutdown degraded: {exc}")
 
         # 释放 DB 连接池
         persistence = getattr(self.runtime, "persistence", None)
         if persistence is not None:
-            try:
-                persistence.dispose()
-            except Exception as exc:
-                self._shutdown_dependency_close_errors.append(f"persistence:{exc}")
-                self.runtime.mark_degraded("shutdown.dependency_close", f"persistence:{exc}")
-                logger.warning(f"[AstrMai] Persistence dispose degraded: {exc}")
+            disposed = await self._dispose_persistence_bounded(
+                persistence,
+                timeout_sec=min(2.0, float(self.SHUTDOWN_TASK_TIMEOUT or 2.0)),
+            )
+            if not disposed:
+                self._shutdown_dependency_close_errors.append("persistence:dispose pending")
+                self.runtime.mark_degraded("shutdown.dependency_close", "persistence dispose pending")
+                self._shutdown_pending_drain = True
+                self.runtime.status.shutdown_pending_drain = True
+                self.runtime.status.shutdown_final_status = "pending_drain"
+                self._schedule_late_shutdown_cleanup(budget)
+                return
 
         if self._shutdown_dependency_close_errors:
             self.runtime.status.shutdown_stage_stats["dependency_close"] = {
@@ -1119,14 +2044,6 @@ class PluginLifecycleManager:
             self._termination_complete = False
 
     def _schedule_late_shutdown_cleanup(self, budget: Any) -> None:
-        if not budget or not hasattr(budget, "wait_until_idle"):
-            self.runtime.status.shutdown_final_status = "degraded"
-            self.runtime.status.shutdown_forced_termination_risk = True
-            self.runtime.status.shutdown_late_cleanup_task_count = 0
-            self.runtime.set_boot_phase("shutdown.degraded")
-            self.runtime.mark_degraded("shutdown.late_cleanup", "budget_idle_waiter_unavailable")
-            logger.warning("[AstrMai] late shutdown cleanup unavailable: budget has no idle waiter")
-            return
         existing = getattr(self, "_late_shutdown_cleanup_task", None)
         if existing is not None and not existing.done():
             return
@@ -1160,8 +2077,21 @@ class PluginLifecycleManager:
                 f"remaining={pending.get('remaining', 0)}"
             )
 
-        async def _close_dependencies() -> None:
+        async def _close_dependencies() -> bool:
             close_errors: list[str] = []
+            retryable_pending = False
+            event_bus_blocked = False
+            fence_errors = self._apply_shutdown_fences()
+            if fence_errors:
+                self._shutdown_pending_drain = True
+                self.runtime.status.shutdown_pending_drain = True
+                self.runtime.status.shutdown_final_status = "pending_drain"
+                self.runtime.status.shutdown_forced_termination_risk = True
+                self.runtime.status.shutdown_stage_stats["shutdown_fence"] = {
+                    "status": "pending_drain",
+                    "errors": dict(fence_errors),
+                }
+                return False
             try:
                 close_memory_resources = getattr(
                     self.runtime.memory_engine,
@@ -1169,43 +2099,85 @@ class PluginLifecycleManager:
                     None,
                 )
                 if callable(close_memory_resources):
-                    await close_memory_resources()
+                    close_result = await close_memory_resources()
+                    if close_result is False:
+                        close_errors.append("memory:vector resources remain open")
+                        self.runtime.mark_degraded("shutdown.dependency_close", "vector resources remain open")
+                        self.runtime.status.shutdown_pending_drain = True
+                        self.runtime.status.shutdown_final_status = "pending_drain"
+                        self.runtime.status.shutdown_forced_termination_risk = True
+                        self.runtime.status.shutdown_stage_stats["dependency_close"] = {
+                            "status": "pending_drain",
+                            "errors": list(close_errors),
+                        }
+                        return False
             except Exception as exc:
                 close_errors.append(f"memory:{exc}")
                 self.runtime.mark_degraded("shutdown.dependency_close", f"memory:{exc}")
                 logger.warning(f"[AstrMai] late Memory resource shutdown degraded: {exc}")
+                self.runtime.status.shutdown_pending_drain = True
+                self.runtime.status.shutdown_final_status = "pending_drain"
+                self.runtime.status.shutdown_forced_termination_risk = True
+                return False
             try:
                 event_bus = getattr(self.runtime, "event_bus", None)
                 stop_event_bus = getattr(event_bus, "stop", None)
                 if callable(stop_event_bus):
                     await stop_event_bus()
+                    describe_event_bus = getattr(event_bus, "describe_status", None)
+                    if callable(describe_event_bus):
+                        event_bus_status = describe_event_bus() or {}
+                        pending_event_tasks = event_bus_status.get("pending_stop_task_count", 0)
+                        if (
+                            isinstance(pending_event_tasks, bool)
+                            or not isinstance(pending_event_tasks, int)
+                            or pending_event_tasks < 0
+                        ):
+                            raise RuntimeError("event_bus pending_stop_task_count is invalid")
+                        if pending_event_tasks:
+                            close_errors.append(
+                                f"event_bus:pending_stop_tasks={pending_event_tasks}"
+                            )
+                            retryable_pending = True
+                            event_bus_blocked = True
             except Exception as exc:
                 close_errors.append(f"event_bus:{exc}")
                 self.runtime.mark_degraded("shutdown.dependency_close", f"event_bus:{exc}")
                 logger.warning(f"[AstrMai] late EventBus shutdown degraded: {exc}")
-            try:
-                persistence = getattr(self.runtime, "persistence", None)
-                dispose = getattr(persistence, "dispose", None)
-                if callable(dispose):
-                    dispose()
-            except Exception as exc:
-                close_errors.append(f"persistence:{exc}")
-                self.runtime.mark_degraded("shutdown.dependency_close", f"persistence:{exc}")
-                logger.warning(f"[AstrMai] late Persistence dispose degraded: {exc}")
+            if not event_bus_blocked:
+                try:
+                    persistence = getattr(self.runtime, "persistence", None)
+                    dispose = getattr(persistence, "dispose", None)
+                    if callable(dispose):
+                        disposed = await self._dispose_persistence_bounded(
+                            persistence,
+                            timeout_sec=self._shutdown_timing("shutdown_cancel_grace_sec", 1.0),
+                        )
+                        if not disposed:
+                            close_errors.append("persistence:dispose pending")
+                            retryable_pending = True
+                except Exception as exc:
+                    close_errors.append(f"persistence:{exc}")
+                    retryable_pending = True
+                    self.runtime.mark_degraded("shutdown.dependency_close", f"persistence:{exc}")
+                    logger.warning(f"[AstrMai] late Persistence dispose degraded: {exc}")
             if close_errors:
                 self._shutdown_dependency_close_errors = close_errors
-                self._shutdown_pending_drain = False
+                self._shutdown_pending_drain = retryable_pending
                 self._termination_complete = False
-                self.runtime.status.shutdown_pending_drain = False
-                self.runtime.status.shutdown_final_status = "degraded"
+                self.runtime.status.shutdown_pending_drain = retryable_pending
+                self.runtime.status.shutdown_final_status = (
+                    "pending_drain" if retryable_pending else "degraded"
+                )
                 self.runtime.status.shutdown_forced_termination_risk = True
-                self.runtime.status.shutdown_late_cleanup_task_count = 0
                 self.runtime.status.shutdown_stage_stats["dependency_close"] = {
-                    "status": "degraded",
+                    "status": "pending_drain" if retryable_pending else "degraded",
                     "errors": list(close_errors),
                 }
-                self.runtime.set_boot_phase("shutdown.degraded")
-                return
+                self.runtime.set_boot_phase(
+                    "shutdown.pending_drain" if retryable_pending else "shutdown.degraded"
+                )
+                return False
             else:
                 self._shutdown_pending_drain = False
                 self._reset_runtime_status_flags()
@@ -1226,16 +2198,46 @@ class PluginLifecycleManager:
                 self.runtime.set_boot_phase("shutdown.complete")
                 self._termination_complete = True
                 logger.info(f"[AstrMai] deferred shutdown cleanup complete elapsed_ms={elapsed_ms:.1f}")
+                return True
+
+        async def _retry_close_dependencies(deadline: float | None) -> bool:
+            while True:
+                if await _close_dependencies():
+                    return True
+                if deadline is not None and time.monotonic() >= deadline:
+                    return False
+                await asyncio.sleep(0.05)
 
         async def _wait_for_quiescence(timeout_sec: float | None) -> dict[str, Any]:
             deadline = None if timeout_sec is None else time.monotonic() + max(0.0, timeout_sec)
+            wait_until_idle = getattr(budget, "wait_until_idle", None)
             while True:
+                fence_errors = self._apply_shutdown_fences()
                 if deadline is None:
                     slice_timeout = 0.5
                 else:
                     slice_timeout = min(0.5, max(0.0, deadline - time.monotonic()))
-                await budget.wait_until_idle(timeout_sec=slice_timeout)
-                pending = self._shutdown_pending_report(budget)
+                if callable(wait_until_idle):
+                    await wait_until_idle(timeout_sec=slice_timeout)
+                pending = self._apply_fence_errors_to_pending_report(
+                    self._shutdown_pending_report(budget)
+                )
+                if not fence_errors and (pending.get("vector_stack_present") or int(
+                    pending.get("retired_vector_stack_count", 0) or 0
+                )):
+                    close_memory_resources = getattr(
+                        getattr(self.runtime, "memory_engine", None),
+                        "close_background_resources",
+                        None,
+                    )
+                    if callable(close_memory_resources):
+                        try:
+                            await close_memory_resources()
+                        except Exception as exc:
+                            logger.warning(f"[AstrMai] late vector close attempt degraded: {exc}")
+                        pending = self._apply_fence_errors_to_pending_report(
+                            self._shutdown_pending_report(budget)
+                        )
                 if not pending["remaining"]:
                     return pending
                 if deadline is not None and time.monotonic() >= deadline:
@@ -1243,18 +2245,35 @@ class PluginLifecycleManager:
                 await asyncio.sleep(0.05)
 
         async def _watch_late_shutdown_cleanup() -> None:
-            try:
-                pending = await _wait_for_quiescence(None)
-            except asyncio.CancelledError:
-                await _mark_cleanup_cancelled()
-                raise
-            if pending.get("remaining"):
-                self.runtime.mark_degraded(
-                    "shutdown.late_cleanup",
-                    f"physical_background_work_remaining={pending.get('remaining', 0)}",
-                )
-                return
-            await _close_dependencies()
+            while True:
+                try:
+                    pending = await _wait_for_quiescence(None)
+                    if pending.get("remaining"):
+                        self.runtime.mark_degraded(
+                            "shutdown.late_cleanup",
+                            f"physical_background_work_remaining={pending.get('remaining', 0)}",
+                        )
+                        await asyncio.sleep(0.1)
+                        continue
+                    if await _retry_close_dependencies(None):
+                        return
+                except asyncio.CancelledError:
+                    await _mark_cleanup_cancelled()
+                    raise
+                except Exception as exc:
+                    self._shutdown_pending_drain = True
+                    self._termination_complete = False
+                    self.runtime.status.shutdown_pending_drain = True
+                    self.runtime.status.shutdown_final_status = "degraded"
+                    self.runtime.status.shutdown_forced_termination_risk = True
+                    self.runtime.status.shutdown_stage_stats["late_cleanup_watcher"] = {
+                        "status": "retrying_after_error",
+                        "error": f"{type(exc).__name__}: {exc}"[:500],
+                    }
+                    self.runtime.set_boot_phase("shutdown.degraded")
+                    self.runtime.mark_degraded("shutdown.late_cleanup_watcher", str(exc))
+                    logger.warning(f"[AstrMai] late shutdown watcher degraded; retrying: {exc}")
+                    await asyncio.sleep(0.1)
 
         async def _cleanup() -> None:
             try:
@@ -1264,7 +2283,9 @@ class PluginLifecycleManager:
                 raise
             except Exception as exc:
                 self.runtime.mark_degraded("shutdown.late_cleanup", str(exc))
-                pending = self._shutdown_pending_report(budget)
+                pending = self._apply_fence_errors_to_pending_report(
+                    self._shutdown_pending_report(budget)
+                )
             if pending.get("remaining"):
                 self.runtime.status.shutdown_stage_stats["late_cleanup"] = {
                     "status": "degraded",
@@ -1306,7 +2327,19 @@ class PluginLifecycleManager:
                 self._isolated_shutdown_tasks.add(watcher)
                 watcher.add_done_callback(self._consume_isolated_shutdown_task)
                 return
-            await _close_dependencies()
+            close_deadline = late_started + late_budget
+            if not await _retry_close_dependencies(close_deadline):
+                self.runtime.status.shutdown_final_status = "degraded"
+                self.runtime.status.shutdown_pending_drain = True
+                self.runtime.status.shutdown_forced_termination_risk = True
+                self.runtime.set_boot_phase("shutdown.degraded")
+                watcher = asyncio.create_task(
+                    _watch_late_shutdown_cleanup(),
+                    name="astrmai:shutdown:late-cleanup-watcher",
+                )
+                self._late_shutdown_cleanup_task = watcher
+                self._isolated_shutdown_tasks.add(watcher)
+                watcher.add_done_callback(self._consume_isolated_shutdown_task)
 
         try:
             task = asyncio.create_task(_cleanup(), name="astrmai:shutdown:late-cleanup")

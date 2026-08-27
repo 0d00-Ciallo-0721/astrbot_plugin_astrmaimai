@@ -43,6 +43,7 @@ class EventBus:
         self._workers_started = False
         self._background_tasks = set()
         self._worker_tasks: set = set()  # ponytail: worker-only tracking (R8)
+        self._pending_stop_tasks: set = set()
         self._generation = 0
 
     # ==========================
@@ -237,9 +238,12 @@ class EventBus:
         self._generation += 1
         for task in list(self._background_tasks):
             task.cancel()
-        if self._background_tasks:
+        stopping_tasks = list(self._background_tasks)
+        if self._pending_stop_tasks:
+            stopping_tasks.extend(self._pending_stop_tasks)
+        if stopping_tasks:
             done, pending = await asyncio.wait(
-                list(self._background_tasks),
+                list(dict.fromkeys(stopping_tasks)),
                 timeout=max(0.0, float(timeout_sec)),
             )
             for task in done:
@@ -248,6 +252,7 @@ class EventBus:
                 except (asyncio.CancelledError, Exception):
                     pass
             for task in pending:
+                self._pending_stop_tasks.add(task)
                 task.add_done_callback(self._consume_stopped_task)
         self._background_tasks.clear()
         self._worker_tasks.clear()
@@ -258,8 +263,31 @@ class EventBus:
         self.affection_changed.clear()
         self.knowledge_updated.clear()
 
-    @staticmethod
-    def _consume_stopped_task(task: asyncio.Task[Any]) -> None:
+    def describe_status(self) -> dict[str, object]:
+        background = [
+            task
+            for task in getattr(self, "_background_tasks", set())
+            if task is not None and not task.done()
+        ]
+        pending_stop = [
+            task
+            for task in getattr(self, "_pending_stop_tasks", set())
+            if task is not None and not task.done()
+        ]
+        return {
+            "background_task_count": len(background),
+            "worker_task_count": sum(
+                1
+                for task in getattr(self, "_worker_tasks", set())
+                if task is not None and not task.done()
+            ),
+            "pending_stop_task_count": len(pending_stop),
+            "workers_started": bool(getattr(self, "_workers_started", False)),
+            "queue_size": int(self._event_queue.qsize()),
+        }
+
+    def _consume_stopped_task(self, task: asyncio.Task[Any]) -> None:
+        self._pending_stop_tasks.discard(task)
         try:
             task.exception()
         except (asyncio.CancelledError, Exception):
