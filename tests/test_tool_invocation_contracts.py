@@ -5,6 +5,7 @@ import tempfile
 from types import SimpleNamespace
 
 from tests.helpers.astrbot_stubs import install_astrbot_stubs
+from astrmai.infrastructure.runtime.outbound_send_guard import OUTBOUND_SEND_GATE
 
 
 class _Event:
@@ -83,8 +84,7 @@ def test_all_chat_tools_have_registered_strict_schemas():
             tools_mod.TopicHijackTool(),
             tools_mod.SpaceTransitionTool(),
             tools_mod.RegretAndWithdrawTool(),
-            tools_mod.MessageReactionTool(),
-            tools_mod.MessageEmojiLikeTool(),
+                tools_mod.MessageEmojiLikeTool(),
             tools_mod.ProactiveLikeTool(),
         ]
         normalized = contracts.normalize_tool_schemas(tools)
@@ -107,24 +107,32 @@ def test_explicit_private_poke_is_prepared_once_without_fake_success():
 
         assert first == ["proactive_poke"]
         assert second == []
-        assert event.get_extra("astrmai_pending_actions") == [
-            {
-                "action_type": "poke",
-                "target_id": "123",
-                "target_name": "Alice",
-                "group_id": "",
-                "message_id": "",
-                "payload": {},
-                "requested_at": event.get_extra("astrmai_pending_actions")[0]["requested_at"],
-                "action": "poke",
-            }
-        ]
+        actions = event.get_extra("astrmai_pending_actions")
+        assert len(actions) == 1
+        assert actions[0]["action_type"] == "poke"
+        assert actions[0]["target_id"] == "123"
+        assert actions[0]["target_name"] == "Alice"
+        assert actions[0]["action_instance_id"]
         assert event.get_extra("astrmai_tool_execution_trace", []) == []
         assert any(
             item["tool"] == "proactive_poke" and item["phase"] == "explicit_fallback_prepared"
             for item in event.get_extra("astrmai_tool_lifecycle_trace")
         )
     finally:
+        temp_dir.cleanup()
+
+
+def test_explicit_fallback_respects_shutdown_gate_before_enqueue():
+    temp_dir, _, tools_mod = _load_modules()
+    try:
+        event = _Event("妃妃你戳一下我")
+        OUTBOUND_SEND_GATE.open()
+        OUTBOUND_SEND_GATE.close(enforce_provider=True)
+        queued = asyncio.run(tools_mod.prepare_explicit_tool_fallbacks(event, ["proactive_poke"]))
+        assert queued == []
+        assert event.get_extra("astrmai_pending_actions", []) == []
+    finally:
+        OUTBOUND_SEND_GATE.close()
         temp_dir.cleanup()
 
 

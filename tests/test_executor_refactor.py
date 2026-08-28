@@ -11,6 +11,97 @@ from tests.helpers.astrbot_stubs import install_astrbot_stubs
 from tests.helpers.executor_stubs import install_executor_stubs
 
 
+class CanonicalToolSetAliasTests(unittest.TestCase):
+    def test_aliases_are_deduplicated_from_schema_and_lookup(self):
+        install_astrbot_stubs(tempfile.mkdtemp())
+        mod = importlib.import_module("astrmai.conversation.execution.executor")
+        canonical = SimpleNamespace(name="message_emoji_reaction_action", description="", parameters={})
+        legacy = SimpleNamespace(name="message_reaction_action", description="", parameters={})
+        tool_set = mod.CanonicalToolSet([])
+        tool_set.tools = [canonical, legacy]
+        tool_set._canonicalize_tools()
+
+        self.assertEqual(len(tool_set.tools), 1)
+        self.assertIs(tool_set.get_tool("message_reaction_action"), canonical)
+        self.assertEqual([tool.name for tool in tool_set.tools], ["message_emoji_reaction_action"])
+
+    def test_alias_only_input_exposes_canonical_schema_name(self):
+        install_astrbot_stubs(tempfile.mkdtemp())
+        mod = importlib.import_module("astrmai.conversation.execution.executor")
+        legacy = SimpleNamespace(name="message_reaction_action", description="", parameters={})
+
+        tool_set = mod.CanonicalToolSet([legacy])
+
+        self.assertEqual(
+            [tool.name for tool in tool_set.tools],
+            ["message_emoji_reaction_action"],
+        )
+        self.assertIsNot(tool_set.tools[0], legacy)
+
+    def test_native_canonical_instance_wins_over_legacy_regardless_of_order(self):
+        install_astrbot_stubs(tempfile.mkdtemp())
+        mod = importlib.import_module("astrmai.conversation.execution.executor")
+        legacy = SimpleNamespace(
+            name="message_reaction_action",
+            description="legacy description",
+            parameters={"properties": {"legacy": {}}},
+            call=lambda: "legacy",
+        )
+        canonical = SimpleNamespace(
+            name="message_emoji_reaction_action",
+            description="canonical description",
+            parameters={"properties": {"emoji": {}}},
+            call=lambda: "canonical",
+        )
+
+        tool_set = mod.CanonicalToolSet([legacy, canonical])
+
+        self.assertIs(tool_set.tools[0], canonical)
+        self.assertEqual(tool_set.tools[0].description, "canonical description")
+        self.assertEqual(tool_set.tools[0].parameters, {"properties": {"emoji": {}}})
+
+    def test_add_tool_native_canonical_replaces_legacy_wrapper(self):
+        install_astrbot_stubs(tempfile.mkdtemp())
+        mod = importlib.import_module("astrmai.conversation.execution.executor")
+        legacy = SimpleNamespace(name="message_reaction_action", description="legacy", parameters={})
+        canonical = SimpleNamespace(name="message_emoji_reaction_action", description="native", parameters={})
+
+        tool_set = mod.CanonicalToolSet([legacy])
+        tool_set.add_tool(canonical)
+
+        self.assertIs(tool_set.tools[0], canonical)
+        self.assertEqual(tool_set.tools[0].description, "native")
+
+    def test_add_tool_legacy_does_not_replace_native_canonical(self):
+        install_astrbot_stubs(tempfile.mkdtemp())
+        mod = importlib.import_module("astrmai.conversation.execution.executor")
+        canonical = SimpleNamespace(name="message_emoji_reaction_action", description="native", parameters={})
+        legacy = SimpleNamespace(name="message_reaction_action", description="legacy", parameters={})
+
+        tool_set = mod.CanonicalToolSet([canonical])
+        tool_set.add_tool(legacy)
+
+        self.assertIs(tool_set.tools[0], canonical)
+
+    def test_constructor_internal_type_error_is_not_retried(self):
+        install_astrbot_stubs(tempfile.mkdtemp())
+        mod = importlib.import_module("astrmai.conversation.execution.executor")
+        calls = []
+        original_init = mod.ToolSet.__init__
+
+        def failing_init(self, tools):
+            calls.append(tools)
+            raise TypeError("internal tool validation failure")
+
+        mod.ToolSet.__init__ = failing_init
+        try:
+            with self.assertRaisesRegex(TypeError, "internal tool validation failure"):
+                mod.CanonicalToolSet([])
+        finally:
+            mod.ToolSet.__init__ = original_init
+        self.assertEqual(len(calls), 1)
+
+
 class _FakeGateway:
     def __init__(self, *, chat_responses=None, tool_responses=None, models=None):
         self.calls = []

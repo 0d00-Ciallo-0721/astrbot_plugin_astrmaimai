@@ -104,7 +104,7 @@ class WebUiGapCoverageTests(unittest.TestCase):
 
         self.assertEqual(catalog["status"], "ok")
         self.assertFalse(catalog["runtime_bound"])
-        self.assertEqual(catalog["data"]["total"], 33)
+        self.assertEqual(catalog["data"]["total"], 32)
         self.assertTrue(
             all(
                 "name" in item

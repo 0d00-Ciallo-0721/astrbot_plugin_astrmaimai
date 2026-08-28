@@ -15,7 +15,7 @@ class ToolCapabilitySpec:
     explicit_policy: str = "optional"
     autonomous_allowed: bool = False
     deterministic_fallback: bool = False
-    max_calls_per_turn: int = 1
+    max_calls_per_turn: int | None = None
     requires_explicit_authorization: bool = False
 
 
@@ -53,22 +53,21 @@ TOOL_CAPABILITIES: dict[str, ToolCapabilitySpec] = {
     "qq_message_recall_lookup": ToolCapabilitySpec("qq_message_recall_lookup", "message_recall", "query", explicit_policy="required", autonomous_allowed=True),
     "topic_thread_lookup": ToolCapabilitySpec("topic_thread_lookup", "topic_thread", "query", explicit_policy="required", autonomous_allowed=True),
     "bot_capability_lookup": ToolCapabilitySpec("bot_capability_lookup", "capability", "query", explicit_policy="required", autonomous_allowed=True),
-    "memory_write_correction_tool": ToolCapabilitySpec("memory_write_correction_tool", "memory_correction", "memory_write", explicit_policy="required"),
+    "memory_write_correction_tool": ToolCapabilitySpec("memory_write_correction_tool", "memory_correction", "memory_write", explicit_policy="optional", autonomous_allowed=True),
     "unverified_report_record_tool": ToolCapabilitySpec("unverified_report_record_tool", "unverified_report", "memory_write", explicit_policy="required"),
     "persona_fact_check_tool": ToolCapabilitySpec("persona_fact_check_tool", "persona_fact", "query", explicit_policy="required", autonomous_allowed=True),
     "group_activity_snapshot_tool": ToolCapabilitySpec("group_activity_snapshot_tool", "group_activity", "query", contexts=("group",), explicit_policy="required", autonomous_allowed=True),
     "contact_route_suggest_tool": ToolCapabilitySpec("contact_route_suggest_tool", "route_suggest", "query", explicit_policy="required", autonomous_allowed=True),
     "cross_chat_memory_query": ToolCapabilitySpec("cross_chat_memory_query", "cross_memory", "query", explicit_policy="required", autonomous_allowed=True),
-    "construct_at_event": ToolCapabilitySpec("construct_at_event", "at", "message", contexts=("group",), explicit_policy="required", autonomous_allowed=True, requires_explicit_authorization=True),
-    "proactive_poke": ToolCapabilitySpec("proactive_poke", "poke", "qq_side_effect", explicit_policy="required", autonomous_allowed=True, deterministic_fallback=True, requires_explicit_authorization=True),
-    "proactive_meme": ToolCapabilitySpec("proactive_meme", "meme", "message", explicit_policy="required", autonomous_allowed=True, deterministic_fallback=True, requires_explicit_authorization=True),
-    "meme_resonance_action": ToolCapabilitySpec("meme_resonance_action", "resonance", "control", contexts=("group",), explicit_policy="required", autonomous_allowed=True, requires_explicit_authorization=True),
-    "topic_hijack_action": ToolCapabilitySpec("topic_hijack_action", "topic", "control", explicit_policy="required", autonomous_allowed=True, requires_explicit_authorization=True),
-    "space_transition_action": ToolCapabilitySpec("space_transition_action", "private", "cross_session_message", explicit_policy="required", autonomous_allowed=True, requires_explicit_authorization=True),
-    "regret_and_withdraw_action": ToolCapabilitySpec("regret_and_withdraw_action", "withdraw", "qq_side_effect", explicit_policy="required", deterministic_fallback=True, requires_explicit_authorization=True),
-    "message_reaction_action": ToolCapabilitySpec("message_reaction_action", "reaction", "text", explicit_policy="required", autonomous_allowed=True),
-    "message_emoji_like_action": ToolCapabilitySpec("message_emoji_like_action", "qq_reaction", "qq_side_effect", explicit_policy="required", autonomous_allowed=True, deterministic_fallback=True, requires_explicit_authorization=True),
-    "proactive_like_action": ToolCapabilitySpec("proactive_like_action", "like", "text", explicit_policy="required", autonomous_allowed=True, requires_explicit_authorization=True),
+    "construct_at_event": ToolCapabilitySpec("construct_at_event", "at", "message", contexts=("group",), explicit_policy="optional", autonomous_allowed=True),
+    "proactive_poke": ToolCapabilitySpec("proactive_poke", "poke", "qq_side_effect", explicit_policy="optional", autonomous_allowed=True, deterministic_fallback=True),
+    "proactive_meme": ToolCapabilitySpec("proactive_meme", "meme", "message", explicit_policy="optional", autonomous_allowed=True, deterministic_fallback=True),
+    "meme_resonance_action": ToolCapabilitySpec("meme_resonance_action", "resonance", "control", contexts=("group",), explicit_policy="optional", autonomous_allowed=True),
+    "topic_hijack_action": ToolCapabilitySpec("topic_hijack_action", "topic", "control", explicit_policy="optional", autonomous_allowed=True),
+    "space_transition_action": ToolCapabilitySpec("space_transition_action", "private", "cross_session_message", explicit_policy="optional", autonomous_allowed=True),
+    "regret_and_withdraw_action": ToolCapabilitySpec("regret_and_withdraw_action", "withdraw", "qq_side_effect", explicit_policy="optional", autonomous_allowed=True, deterministic_fallback=True),
+    "message_emoji_reaction_action": ToolCapabilitySpec("message_emoji_reaction_action", "emoji_reaction", "qq_side_effect", explicit_policy="optional", autonomous_allowed=True, deterministic_fallback=True),
+    "proactive_like_action": ToolCapabilitySpec("proactive_like_action", "like", "qq_side_effect", explicit_policy="optional", autonomous_allowed=True),
 }
 
 
@@ -103,25 +102,54 @@ TOOL_DISPLAY_NAMES: dict[str, str] = {
     "topic_hijack_action": "话题切换",
     "space_transition_action": "跨会话发送",
     "regret_and_withdraw_action": "撤回机器人消息",
-    "message_reaction_action": "文字互动回应",
-    "message_emoji_like_action": "QQ 消息表情回应",
-    "proactive_like_action": "主动夸赞回应",
+    "message_emoji_reaction_action": "贴表情",
+    "proactive_like_action": "QQ 点赞",
 }
+
+
+TOOL_NAME_ALIASES: dict[str, str] = {
+    "message_reaction_action": "message_emoji_reaction_action",
+    "message_emoji_like_action": "message_emoji_reaction_action",
+}
+
+
+def canonical_tool_name(tool_name: str) -> str:
+    name = str(tool_name or "").strip()
+    return TOOL_NAME_ALIASES.get(name, name)
+
+
+def get_tool_capability(tool_name: str) -> ToolCapabilitySpec | None:
+    """Resolve a capability from the live registry using canonical aliases."""
+    return TOOL_CAPABILITIES.get(canonical_tool_name(tool_name))
 
 
 def is_model_disclosure_requestable(tool_name: str) -> bool:
     """Only read-only tools may be opened from a model-originated request."""
-    spec = TOOL_CAPABILITIES.get(str(tool_name or "").strip())
+    spec = get_tool_capability(tool_name)
     return bool(spec and spec.effect_type == "query")
 
 
 def requires_explicit_disclosure(tool_name: str) -> bool:
-    spec = TOOL_CAPABILITIES.get(str(tool_name or "").strip())
+    spec = get_tool_capability(tool_name)
     return bool(spec and spec.effect_type in {"memory_write", "cross_session_message"})
 
 
+def requires_explicit_authorization(tool_name: str) -> bool:
+    spec = get_tool_capability(tool_name)
+    return bool(spec and spec.requires_explicit_authorization)
+
+
+def is_autonomous_interaction(tool_name: str) -> bool:
+    spec = get_tool_capability(tool_name)
+    return bool(
+        spec
+        and spec.autonomous_allowed
+        and spec.effect_type in {"text", "message", "control", "qq_side_effect", "cross_session_message"}
+    )
+
+
 def tool_display_name(tool_name: str) -> str:
-    name = str(tool_name or "").strip()
+    name = canonical_tool_name(tool_name)
     return TOOL_DISPLAY_NAMES.get(name, name)
 
 
@@ -156,8 +184,9 @@ FAMILY_TO_TOOL: dict[str, str] = {
     "topic": "topic_hijack_action",
     "private": "space_transition_action",
     "withdraw": "regret_and_withdraw_action",
-    "reaction": "message_reaction_action",
-    "qq_reaction": "message_emoji_like_action",
+    "emoji_reaction": "message_emoji_reaction_action",
+    "reaction": "message_emoji_reaction_action",
+    "qq_reaction": "message_emoji_reaction_action",
     "like": "proactive_like_action",
 }
 
@@ -165,7 +194,7 @@ FAMILY_TO_TOOL: dict[str, str] = {
 AUTONOMOUS_INTERACTION_TOOLS = {
     name
     for name, spec in TOOL_CAPABILITIES.items()
-    if spec.autonomous_allowed and spec.effect_type in {"text", "message", "qq_side_effect", "cross_session_message"}
+    if spec.autonomous_allowed and spec.effect_type in {"text", "message", "control", "qq_side_effect", "cross_session_message"}
 }
 
 
@@ -202,8 +231,8 @@ def filter_tools_for_context(
     filtered: list[Any] = []
     for tool in tools or []:
         raw_name = str(getattr(tool, "name", "") or "")
-        tool_name = str(name_resolver(tool) if callable(name_resolver) else raw_name)
-        spec = TOOL_CAPABILITIES.get(tool_name, ToolCapabilitySpec(tool_name, "", ""))
+        tool_name = canonical_tool_name(str(name_resolver(tool) if callable(name_resolver) else raw_name))
+        spec = get_tool_capability(tool_name) or ToolCapabilitySpec(tool_name, "", "")
         if context_name in spec.contexts:
             filtered.append(tool)
     return filtered
@@ -226,8 +255,8 @@ def build_explicit_invocation_plans(
     }
     plans: list[ToolInvocationPlan] = []
     for family in ordered_families:
-        tool_name = FAMILY_TO_TOOL.get(family)
-        spec = TOOL_CAPABILITIES.get(tool_name or "")
+        tool_name = canonical_tool_name(FAMILY_TO_TOOL.get(family) or "")
+        spec = get_tool_capability(tool_name or "")
         if not spec or tool_name not in available:
             continue
         contract = contracts_by_family.get(family)
@@ -304,15 +333,20 @@ __all__ = [
     "FAMILY_TO_TOOL",
     "TOOL_CAPABILITIES",
     "TOOL_DISPLAY_NAMES",
+    "TOOL_NAME_ALIASES",
     "ToolCapabilitySpec",
     "ToolInvocationPlan",
     "build_explicit_invocation_plans",
+    "canonical_tool_name",
+    "get_tool_capability",
     "filter_tools_for_context",
     "is_model_disclosure_requestable",
+    "is_autonomous_interaction",
     "normalize_tool_schema",
     "normalize_tool_schemas",
     "publish_invocation_plans",
     "record_tool_lifecycle",
     "requires_explicit_disclosure",
+    "requires_explicit_authorization",
     "tool_display_name",
 ]

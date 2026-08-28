@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import inspect
 import json
 import re
 import time
@@ -59,10 +60,164 @@ from ..vision_state import (
 )
 from ..planning.tool_contracts import (
     TOOL_CAPABILITIES,
+    canonical_tool_name,
+    get_tool_capability,
     is_model_disclosure_requestable,
     record_tool_lifecycle,
     tool_display_name,
 )
+
+
+class CanonicalToolSet(ToolSet):
+    """ToolSet that resolves legacy AstrMai names without exposing aliases."""
+
+    def __init__(self, tools=None, **kwargs):
+        tool_list = tools or []
+        base_init = super().__init__
+        # AstrBot has shipped ToolSet constructors with both positional and
+        # keyword-only ``tools`` parameters.  Decide the call shape from the
+        # signature so a TypeError raised *inside* the constructor is never
+        # mistaken for a compatibility signal and retried.
+        try:
+            signature = inspect.signature(base_init)
+        except (TypeError, ValueError):
+            signature = None
+        if signature is None:
+            base_init(tool_list, **kwargs)
+        else:
+            parameters = signature.parameters
+            accepts_kwargs = any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            )
+            accepts_tools_keyword = (
+                "tools" in parameters
+                and parameters["tools"].kind is not inspect.Parameter.POSITIONAL_ONLY
+            ) or accepts_kwargs
+            call_kwargs = kwargs if accepts_kwargs else {
+                key: value for key, value in kwargs.items() if key in parameters
+            }
+            if accepts_tools_keyword:
+                call_kwargs = {"tools": tool_list, **call_kwargs}
+                base_init(**call_kwargs)
+            else:
+                base_init(tool_list, **call_kwargs)
+        # A few AstrBot compatibility shims expose the collection as
+        # ``items`` rather than ``tools``.  Normalize that representation
+        # before canonicalization so alias-only inputs are not silently lost.
+        if not hasattr(self, "tools") or (not getattr(self, "tools", None) and tool_list):
+            self.tools = list(getattr(self, "items", None) or tool_list)
+        self._canonicalize_tools()
+
+    @staticmethod
+    def _canonical_tool(tool, canonical_name: str):
+        """Return a model-visible tool whose schema name is canonical.
+
+        Legacy tool instances are retained as handlers where possible, but a
+        shallow copy prevents mutating shared compatibility objects.  A tiny
+        proxy is used only for immutable/slot-based instances that reject a
+        name assignment.
+        """
+        current_name = str(getattr(tool, "name", "") or "")
+        if current_name == canonical_name:
+            return tool
+        try:
+            canonical = copy.copy(tool)
+            setattr(canonical, "name", canonical_name)
+            setattr(canonical, "_astrmai_alias_wrapped", True)
+            if str(getattr(canonical, "name", "") or "") == canonical_name:
+                return canonical
+        except (AttributeError, TypeError):
+            pass
+
+        class _CanonicalToolProxy:
+            def __init__(self, wrapped):
+                self._wrapped = wrapped
+                self.name = canonical_name
+                self._astrmai_alias_wrapped = True
+
+            def __getattr__(self, attribute):
+                return getattr(self._wrapped, attribute)
+
+        return _CanonicalToolProxy(tool)
+
+    def _canonicalize_tools(self):
+        unique = []
+        positions = {}
+        native_by_key = {}
+        for tool in getattr(self, "tools", []) or []:
+            original_name = str(getattr(tool, "name", "") or "")
+            key = canonical_tool_name(original_name)
+            is_native = original_name == key and not bool(
+                getattr(tool, "_astrmai_alias_wrapped", False)
+            )
+            normalized_tool = self._canonical_tool(tool, key)
+            if key in positions:
+                index = positions[key]
+                # Compare the names before alias wrapping.  A wrapped legacy
+                # tool has a canonical *schema* name but must not outrank a
+                # real canonical implementation with its own handler/schema.
+                if is_native and not native_by_key.get(key, False):
+                    unique[index] = normalized_tool
+                    native_by_key[key] = True
+                continue
+            positions[key] = len(unique)
+            unique.append(normalized_tool)
+            native_by_key[key] = is_native
+        self.tools = unique
+        self._canonical_native_by_key = native_by_key
+        if hasattr(self, "items"):
+            self.items = self.tools
+
+    def add_tool(self, tool):
+        self._canonicalize_tools()
+        incoming_name = str(getattr(tool, "name", "") or "")
+        key = canonical_tool_name(incoming_name)
+        incoming_is_native = incoming_name == key
+        for index, existing in enumerate(getattr(self, "tools", []) or []):
+            if canonical_tool_name(getattr(existing, "name", "")) == key:
+                existing_is_native = bool(
+                    getattr(self, "_canonical_native_by_key", {}).get(key, False)
+                )
+                if incoming_is_native and not existing_is_native:
+                    self.tools[index] = tool
+                    self._canonical_native_by_key[key] = True
+                    if hasattr(self, "items"):
+                        self.items = self.tools
+                return
+        self.tools.append(self._canonical_tool(tool, key))
+        self._canonical_native_by_key[key] = incoming_is_native
+        if hasattr(self, "items"):
+            self.items = self.tools
+
+    def get_tool(self, name):
+        self._canonicalize_tools()
+        canonical_name = canonical_tool_name(name)
+        for tool in getattr(self, "tools", []) or []:
+            tool_name = str(getattr(tool, "name", "") or "")
+            if tool_name == name or canonical_tool_name(tool_name) == canonical_name:
+                return tool
+        return None
+
+    def openai_schema(self, *args, **kwargs):
+        self._canonicalize_tools()
+        return super().openai_schema(*args, **kwargs)
+
+    def anthropic_schema(self, *args, **kwargs):
+        self._canonicalize_tools()
+        return super().anthropic_schema(*args, **kwargs)
+
+    def google_schema(self, *args, **kwargs):
+        self._canonicalize_tools()
+        return super().google_schema(*args, **kwargs)
+
+    def get_light_tool_set(self):
+        self._canonicalize_tools()
+        return super().get_light_tool_set()
+
+    def get_param_only_tool_set(self):
+        self._canonicalize_tools()
+        return super().get_param_only_tool_set()
 from ..planning.tool_disclosure import (
     FAMILY_TO_PACKAGES,
     normalize_requested_packages,
@@ -1127,7 +1282,7 @@ class ConcurrentExecutor:
                     required_tools.append(name)
                 if name in planned_names:
                     continue
-                spec = TOOL_CAPABILITIES.get(name)
+                spec = get_tool_capability(name)
                 invocation_plans.append(
                     {
                         "tool_name": name,
@@ -1984,7 +2139,7 @@ class ConcurrentExecutor:
         image_urls: Optional[list[str]] = None,
         raise_on_exhaustion: bool = False,
     ) -> Optional[str]:
-        tool_set = ToolSet(tools)
+        tool_set = CanonicalToolSet(tools)
         last_error = ""
         last_failure_kind = "unknown"
         attempted_models: list[str] = []
@@ -2094,7 +2249,7 @@ class ConcurrentExecutor:
                             list(event.get_extra("astrmai_tool_invocation_plans", []) or []),
                         ),
                         system_prompt=system_prompt,
-                        tools=ToolSet(correction_tools),
+                        tools=CanonicalToolSet(correction_tools),
                         models=[provider_id],
                         max_steps=max(2, runtime["max_steps"]),
                         timeout=runtime["timeout"],

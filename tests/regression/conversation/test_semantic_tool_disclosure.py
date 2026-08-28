@@ -56,7 +56,7 @@ class SemanticIntentDisclosureTests(unittest.TestCase):
         self.assertNotIn("identity:identity_semantic_intent", plan.package_reasons)
         self.assertEqual(tuple(plan.packages).count("identity"), 1)
 
-    def test_smalltalk_stays_core_only(self):
+    def test_smalltalk_keeps_autonomous_defaults(self):
         plan = self._plan("哈哈哈哈")
 
         self.assertEqual(tuple(plan.packages), ("core", "default_actions"))

@@ -477,7 +477,7 @@ class RefactoredReplyServiceTests(unittest.TestCase):
         asyncio.run(engine.handle_reply(event, "answer", event.unified_msg_origin))
 
         self.assertEqual(order, ["reply", "send_poke"])
-        self.assertEqual(event.get_extra("astrmai_qq_action_results")[0]["status"], "success")
+        self.assertEqual(event.get_extra("astrmai_qq_action_results")[1]["status"], "sent")
 
     def test_boolean_context_send_result_is_not_recorded_as_message_id(self):
         from astrmai.conversation.contracts.turn_identity import TurnIdentity

@@ -68,8 +68,8 @@ class StateBarAuditRefactorTests(unittest.TestCase):
 
         stance = baseline["stance"]
         self.assertEqual(stance["audit_mode"], "chain_level_plus_prompt_surface")
-        self.assertTrue(stance["summary"]["guarded_tool_constraints_present"])
-        self.assertTrue(stance["summary"]["cool_tool_constraints_present"])
+        self.assertFalse(stance["summary"]["guarded_tool_constraints_present"])
+        self.assertFalse(stance["summary"]["cool_tool_constraints_present"])
         self.assertLess(
             stance["summary"]["guarded_follow_up_probability"],
             stance["summary"]["neutral_follow_up_probability"],

@@ -925,8 +925,8 @@ async def _run_stance_audit_async() -> dict:
                 and cool_answer["first_reply_hard_constraint_present"]
             ),
             "verdict": (
-                "stance is real at tool and follow-up layers, "
-                "and guarded/cool now also apply deterministic first-reply text constraints"
+                "stance remains observable at follow-up and first-reply layers; "
+                "autonomous interaction tools are preserved for model decision"
             ),
         },
     }

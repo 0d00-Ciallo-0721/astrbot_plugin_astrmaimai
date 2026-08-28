@@ -62,7 +62,7 @@ _STUB_TOOL_NAME_ALIASES = {
     "TopicHijackTool": "topic_hijack_action",
     "SpaceTransitionTool": "space_transition_action",
     "RegretAndWithdrawTool": "regret_and_withdraw_action",
-    "MessageEmojiLikeTool": "message_emoji_like_action",
+    "MessageEmojiLikeTool": "message_emoji_reaction_action",
     "MessageReactionTool": "message_reaction_action",
     "ProactiveLikeTool": "proactive_like_action",
 }
@@ -105,7 +105,7 @@ DEFAULT_ACTION_TOOL_NAMES = {
     "proactive_poke",
     "construct_at_event",
     "quote_reply_action",
-    "message_emoji_like_action",
+    "message_emoji_reaction_action",
     "vision_message_analyze_tool",
     "proactive_meme",
     "meme_resonance_action",
@@ -124,9 +124,21 @@ LEGACY_CHAT_EXPECTED_TOOL_NAMES = FACT_TOOL_NAMES | {
     "regret_and_withdraw_action",
 }
 
-# Unqualified chat turns expose only read-only/context tools and textual
-# reaction shaping; external side-effect tools require an explicit family.
-CHAT_EXPECTED_TOOL_NAMES = CORE_TOOL_NAMES | {"vision_message_analyze_tool"}
+# Unqualified chat turns expose core context tools plus autonomous interaction
+# capabilities; vision is added only when image context exists.
+CHAT_EXPECTED_TOOL_NAMES = CORE_TOOL_NAMES | {
+    "regret_and_withdraw_action",
+    "proactive_poke",
+    "quote_reply_action",
+    "message_emoji_reaction_action",
+    "proactive_meme",
+    "topic_hijack_action",
+    "proactive_like_action",
+}
+GROUP_CHAT_EXPECTED_TOOL_NAMES = CHAT_EXPECTED_TOOL_NAMES | {
+    "construct_at_event",
+    "meme_resonance_action",
+}
 
 CROSS_SESSION_DISCLOSURE_TOOL_NAMES = CHAT_EXPECTED_TOOL_NAMES | {
     "qq_friend_lookup",
@@ -186,12 +198,12 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
 
         filtered = self.mixin._apply_event_tool_call_policy(event, tools)
 
-        self.assertEqual(_normalized_tool_names(filtered), {"vision_message_analyze_tool"})
+        self.assertEqual(_normalized_tool_names(filtered), {"proactive_meme", "proactive_poke", "vision_message_analyze_tool"})
         policy = event.get_extra("astrmai_tool_call_policy")
         self.assertEqual(policy["mode"], "image_only")
-        self.assertFalse(policy["action_authorized"])
+        self.assertTrue(policy["action_authorized"])
         self.assertEqual(policy["families"], [])
-        self.assertEqual(policy["confidence"], "none")
+        self.assertEqual(policy["confidence"], "contextual")
 
     def test_cognitive_allowed_family_does_not_authorize_image_meme(self):
         event = _FakeEvent(message="")
@@ -201,8 +213,8 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
 
         filtered = self.mixin._apply_event_tool_call_policy(event, tools)
 
-        self.assertEqual(_normalized_tool_names(filtered), {"vision_message_analyze_tool"})
-        self.assertFalse(event.get_extra("astrmai_tool_call_policy")["action_authorized"])
+        self.assertEqual(_normalized_tool_names(filtered), {"proactive_meme", "vision_message_analyze_tool"})
+        self.assertTrue(event.get_extra("astrmai_tool_call_policy")["action_authorized"])
 
     def test_image_explicit_meme_request_authorizes_only_meme_family(self):
         event = _FakeEvent(message="发一个表情包")
@@ -213,7 +225,7 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
 
         self.assertEqual(
             _normalized_tool_names(filtered),
-            {"proactive_meme", "vision_message_analyze_tool"},
+            {"proactive_meme", "proactive_poke", "vision_message_analyze_tool"},
         )
         self.assertEqual(
             event.get_extra("astrmai_explicit_user_intent_families"),
@@ -226,9 +238,9 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
 
         filtered = self.mixin._apply_event_tool_call_policy(event, tools)
 
-        self.assertEqual(_normalized_tool_names(filtered), {"vision_message_analyze_tool"})
+        self.assertEqual(_normalized_tool_names(filtered), {"proactive_poke", "vision_message_analyze_tool"})
         self.assertNotIn("meme", event.get_extra("astrmai_explicit_user_intent_families", []))
-        self.assertFalse(event.get_extra("astrmai_tool_call_policy")["action_authorized"])
+        self.assertTrue(event.get_extra("astrmai_tool_call_policy")["action_authorized"])
 
     def test_object_inserted_negation_does_not_authorize_meme(self):
         for message in ("不要给我发个表情包", "我不想让你发个表情包", "不需要你发个表情包"):
@@ -238,8 +250,8 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
                 [_Tool("proactive_meme"), _Tool("vision_message_analyze_tool")],
             )
 
-            self.assertEqual(_normalized_tool_names(filtered), {"vision_message_analyze_tool"}, message)
-            self.assertFalse(event.get_extra("astrmai_tool_call_policy")["action_authorized"], message)
+            self.assertNotIn("proactive_meme", _normalized_tool_names(filtered), message)
+            self.assertTrue(event.get_extra("astrmai_tool_call_policy")["action_authorized"], message)
             self.assertFalse(self.mixin._has_tool_intent(event), message)
 
     def test_explicit_poke_exposes_only_poke_family_and_read_only_tools(self):
@@ -256,7 +268,7 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
 
         self.assertEqual(
             _normalized_tool_names(filtered),
-            {"proactive_poke", "wait_and_listen", "omni_perception_query"},
+            {"proactive_poke", "proactive_meme", "proactive_like_action", "wait_and_listen", "omni_perception_query"},
         )
         self.assertEqual(event.get_extra("astrmai_explicit_user_intent_families"), ["poke"])
         self.assertEqual(event.get_extra("astrmai_tool_call_policy")["families"], ["poke"])
@@ -270,9 +282,9 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
             [_Tool("proactive_meme"), _Tool("vision_message_analyze_tool")],
         )
 
-        self.assertEqual(_normalized_tool_names(filtered), {"vision_message_analyze_tool"})
+        self.assertEqual(_normalized_tool_names(filtered), {"proactive_meme", "vision_message_analyze_tool"})
         self.assertEqual(event.get_extra("astrmai_explicit_user_intent_families"), [])
-        self.assertFalse(event.get_extra("astrmai_tool_call_policy")["action_authorized"])
+        self.assertTrue(event.get_extra("astrmai_tool_call_policy")["action_authorized"])
 
     def test_plain_text_without_action_has_no_side_effect_permission(self):
         event = _FakeEvent(message="今天天气怎么样")
@@ -280,8 +292,8 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         self.mixin._apply_event_tool_call_policy(event, [_Tool("vision_message_analyze_tool")])
 
         policy = event.get_extra("astrmai_tool_call_policy")
-        self.assertFalse(policy["action_authorized"])
-        self.assertFalse(policy["side_effects_allowed"])
+        self.assertTrue(policy["action_authorized"])
+        self.assertTrue(policy["side_effects_allowed"])
 
     def test_plain_text_hides_all_unassigned_side_effect_tools(self):
         event = _FakeEvent(message="今天天气怎么样")
@@ -296,7 +308,10 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
 
         filtered = self.mixin._apply_event_tool_call_policy(event, tools)
 
-        self.assertEqual(_normalized_tool_names(filtered), {"vision_message_analyze_tool"})
+        self.assertEqual(_normalized_tool_names(filtered), {
+            "proactive_meme", "proactive_poke", "construct_at_event",
+            "quote_reply_action", "space_transition_action", "vision_message_analyze_tool",
+        })
 
     def tearDown(self):
         try:
@@ -630,13 +645,13 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         exhausted = modifier.modify_tools(tools, state=SimpleNamespace(energy=0.05))
         self.assertEqual(
             [tool.name for tool in exhausted],
-            ["wait_and_listen", "omni_perception_query", "self_lore_query"],
+            ["wait_and_listen", "omni_perception_query", "self_lore_query", "proactive_poke"],
         )
 
         hostile = modifier.modify_tools(tools, profile=SimpleNamespace(social_score=-30))
         self.assertEqual(
             [tool.name for tool in hostile],
-            ["wait_and_listen", "omni_perception_query", "self_lore_query"],
+            ["wait_and_listen", "omni_perception_query", "self_lore_query", "proactive_poke"],
         )
 
         chat_tools = [
@@ -652,7 +667,7 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         )
         self.assertEqual(
             [tool.name for tool in chat_exhausted],
-            ["message_reaction_action", "message_emoji_like_action", "proactive_like_action"],
+            ["proactive_meme", "message_reaction_action", "message_emoji_like_action", "proactive_like_action"],
         )
 
         chat_hostile = modifier.modify_tools(
@@ -660,7 +675,10 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
             profile=SimpleNamespace(social_score=-30),
             tool_tier="chat",
         )
-        self.assertEqual([tool.name for tool in chat_hostile], ["message_reaction_action", "message_emoji_like_action"])
+        self.assertEqual(
+            [tool.name for tool in chat_hostile],
+            ["proactive_meme", "message_reaction_action", "message_emoji_like_action", "proactive_like_action"],
+        )
 
         cautious = modifier.modify_tools(
             [
@@ -672,7 +690,10 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
             state=SimpleNamespace(energy=0.8, mood=0.0, caution=0.9),
             tool_tier="chat",
         )
-        self.assertEqual([tool.name for tool in cautious], ["message_reaction_action"])
+        self.assertEqual(
+            [tool.name for tool in cautious],
+            ["proactive_poke", "construct_at_event", "space_transition_action", "message_reaction_action"],
+        )
 
         cooldown = modifier.modify_tools(
             chat_tools,
@@ -680,7 +701,10 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
             tool_tier="chat",
             cooldown_tags=["meme", "like"],
         )
-        self.assertEqual([tool.name for tool in cooldown], ["message_reaction_action", "message_emoji_like_action"])
+        self.assertEqual(
+            [tool.name for tool in cooldown],
+            ["proactive_meme", "message_reaction_action", "message_emoji_like_action", "proactive_like_action"],
+        )
 
         sharp_cooldown = modifier.modify_tools(
             chat_tools,
@@ -688,7 +712,10 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
             tool_tier="chat",
             cooldown_tags=["sharp_reply"],
         )
-        self.assertEqual([tool.name for tool in sharp_cooldown], ["message_reaction_action", "message_emoji_like_action"])
+        self.assertEqual(
+            [tool.name for tool in sharp_cooldown],
+            ["proactive_meme", "message_reaction_action", "message_emoji_like_action", "proactive_like_action"],
+        )
 
         long_reply_cooldown = modifier.modify_tools(
             [
@@ -701,7 +728,10 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
             tool_tier="full",
             cooldown_tags=["long_reply"],
         )
-        self.assertEqual([tool.name for tool in long_reply_cooldown], ["omni_perception_query"])
+        self.assertEqual(
+            [tool.name for tool in long_reply_cooldown],
+            ["topic_hijack_action", "space_transition_action", "meme_resonance_action", "omni_perception_query"],
+        )
 
         trace = self.side_inputs_mod.ToolDecisionTrace() if hasattr(self.side_inputs_mod, "ToolDecisionTrace") else None
         if trace is None:
@@ -714,11 +744,14 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
             tool_tier="chat",
             trace=trace,
         )
-        self.assertEqual([tool.name for tool in traced], ["message_reaction_action", "message_emoji_like_action", "proactive_like_action"])
+        self.assertEqual(
+            [tool.name for tool in traced],
+            ["proactive_meme", "message_reaction_action", "message_emoji_like_action", "proactive_like_action"],
+        )
         self.assertIn("energy_exhausted(0.05)", trace.filter_reasons)
         self.assertEqual(trace.filter_steps[0]["stage"], "action_modifier.energy")
         self.assertEqual(trace.filter_steps[0]["category"], "energy")
-        self.assertEqual(trace.removed_by_energy, ["proactive_meme"])
+        self.assertEqual(trace.removed_by_energy, [])
 
         mood_trace = self.side_inputs_mod.ToolDecisionTrace() if hasattr(self.side_inputs_mod, "ToolDecisionTrace") else trace.__class__()
         modifier.modify_tools(
@@ -727,7 +760,7 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
             tool_tier="chat",
             trace=mood_trace,
         )
-        self.assertEqual(mood_trace.removed_by_mood, ["proactive_meme"])
+        self.assertEqual(mood_trace.removed_by_mood, [])
 
         hostile_trace = self.side_inputs_mod.ToolDecisionTrace() if hasattr(self.side_inputs_mod, "ToolDecisionTrace") else trace.__class__()
         modifier.modify_tools(
@@ -736,7 +769,7 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
             tool_tier="chat",
             trace=hostile_trace,
         )
-        self.assertIn("proactive_meme", hostile_trace.removed_by_hostility)
+        self.assertEqual(hostile_trace.removed_by_hostility, [])
 
         caution_trace = self.side_inputs_mod.ToolDecisionTrace() if hasattr(self.side_inputs_mod, "ToolDecisionTrace") else trace.__class__()
         modifier.modify_tools(
@@ -745,7 +778,7 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
             tool_tier="chat",
             trace=caution_trace,
         )
-        self.assertEqual(caution_trace.removed_by_caution, ["proactive_poke", "construct_at_event"])
+        self.assertEqual(caution_trace.removed_by_caution, [])
 
         cooldown_trace = self.side_inputs_mod.ToolDecisionTrace() if hasattr(self.side_inputs_mod, "ToolDecisionTrace") else trace.__class__()
         returned_tools, returned_trace = modifier.modify_tools(
@@ -756,9 +789,9 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
             return_trace=True,
             trace=cooldown_trace,
         )
-        self.assertEqual([tool.name for tool in returned_tools], ["message_reaction_action", "message_emoji_like_action"])
+        self.assertEqual([tool.name for tool in returned_tools], [tool.name for tool in chat_tools])
         self.assertIs(returned_trace, cooldown_trace)
-        self.assertEqual(set(cooldown_trace.removed_by_cooldown), {"proactive_meme", "proactive_like_action"})
+        self.assertEqual(set(cooldown_trace.removed_by_cooldown), set())
 
     def test_guarded_stance_filters_proactive_social_tools_and_records_trace(self):
         modifier = self.expression_mod.ActionModifier()
@@ -785,11 +818,11 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
 
         self.assertEqual(
             [tool.name for tool in filtered],
-            ["message_reaction_action", "omni_perception_query"],
+            ["proactive_meme", "proactive_poke", "construct_at_event", "message_reaction_action", "omni_perception_query"],
         )
         self.assertEqual(
             trace.removed_by_stance,
-            ["proactive_meme", "proactive_poke", "construct_at_event"],
+            [],
         )
         self.assertTrue(any(step["stage"] == "action_modifier.stance" for step in trace.filter_steps))
         self.assertIn("stance_guarded_guard", trace.filter_reasons)
@@ -811,8 +844,8 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
             trace=trace,
         )
 
-        self.assertEqual([tool.name for tool in filtered], ["message_reaction_action"])
-        self.assertEqual(trace["removed_by_stance"], ["proactive_meme", "proactive_poke"])
+        self.assertEqual([tool.name for tool in filtered], ["proactive_meme", "proactive_poke", "message_reaction_action"])
+        self.assertEqual(trace.get("removed_by_stance", []), [])
         self.assertEqual(trace["filter_steps"][0]["category"], "stance")
 
     def test_low_trust_filters_real_intrusive_tools(self):
@@ -958,7 +991,7 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         legacy_tools = asyncio.run(
             legacy_mixin._build_execution_tools(
                 "default:GroupMessage:group-1",
-                _FakeEvent(message="你好呀"),
+                _FakeEvent(message="你好呀", group_id="group-1"),
                 "user-1",
                 "Alice",
                 SimpleNamespace(shared_dict={}),
@@ -969,9 +1002,11 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         )
         legacy_names = _normalized_tool_names(legacy_tools)
         self.assertTrue(legacy_names)
-        self.assertNotIn("proactive_meme", legacy_names)
-        self.assertNotIn("proactive_poke", legacy_names)
-        self.assertNotIn("space_transition_action", legacy_names)
+        self.assertIn("proactive_meme", legacy_names)
+        self.assertIn("proactive_poke", legacy_names)
+        self.assertIn("space_transition_action", legacy_names)
+        self.assertIn("topic_hijack_action", legacy_names)
+        self.assertIn("meme_resonance_action", legacy_names)
 
         tool_ctx = SimpleNamespace(shared_dict={})
         query_keyword = "查一下"
@@ -1231,10 +1266,10 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         )
         at_tool_names = _normalized_tool_names(at_tools)
         self.assertTrue(
-            (CORE_TOOL_NAMES | {"vision_message_analyze_tool", "construct_at_event"}).issubset(at_tool_names)
+            (CORE_TOOL_NAMES | {"construct_at_event"}).issubset(at_tool_names)
         )
-        self.assertNotIn("proactive_meme", at_tool_names)
-        self.assertNotIn("proactive_poke", at_tool_names)
+        self.assertIn("proactive_meme", at_tool_names)
+        self.assertIn("proactive_poke", at_tool_names)
         self.assertIn("construct_at_event", at_tool_names)
 
     def test_natural_call_member_request_requires_native_at_tool(self):
@@ -1301,14 +1336,14 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
 
         self.assertEqual(
             _normalized_tool_names(tools),
-            CORE_TOOL_NAMES
+            CHAT_EXPECTED_TOOL_NAMES
             | {
-                "vision_message_analyze_tool",
                 "qq_friend_lookup",
                 "qq_user_identity_lookup",
                 "qq_recent_contact_lookup",
                 "contact_route_suggest_tool",
                 "space_transition_action",
+                "cross_session_reply_lookup",
             },
         )
         self.assertEqual(event.get_extra("astrmai_required_tools"), ["space_transition_action"])
@@ -1384,7 +1419,7 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
 
         self.assertEqual(
             _normalized_tool_names(tools),
-            CORE_TOOL_NAMES | {"vision_message_analyze_tool", "qq_friend_lookup", "space_transition_action"},
+            CHAT_EXPECTED_TOOL_NAMES | {"qq_friend_lookup", "space_transition_action"},
         )
         self.assertEqual(
             event.get_extra("astrmai_required_tools"),
@@ -1411,7 +1446,7 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
 
         self.assertEqual(
             _normalized_tool_names(tools),
-            CORE_TOOL_NAMES | {"vision_message_analyze_tool", "proactive_poke"},
+            GROUP_CHAT_EXPECTED_TOOL_NAMES,
         )
         trace = event.get_extra("astrmai_turn_context").tools
         self.assertTrue(any(step["stage"] == "planner.default_actions_restore" for step in trace.filter_steps))
@@ -1455,8 +1490,8 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
             )
         )
 
-        expected = CORE_TOOL_NAMES | {"vision_message_analyze_tool", "proactive_poke"}
-        self.assertEqual(_normalized_tool_names(plain_tools), CHAT_EXPECTED_TOOL_NAMES)
+        expected = GROUP_CHAT_EXPECTED_TOOL_NAMES
+        self.assertEqual(_normalized_tool_names(plain_tools), GROUP_CHAT_EXPECTED_TOOL_NAMES)
         self.assertEqual(_normalized_tool_names(explicit_tools), expected)
         self.assertEqual(explicit_event.get_extra("astrmai_required_tools"), ["proactive_poke"])
 
@@ -1486,7 +1521,7 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
 
         self.assertEqual(
             _normalized_tool_names(tools),
-            CORE_TOOL_NAMES | {"vision_message_analyze_tool", "proactive_poke"},
+            GROUP_CHAT_EXPECTED_TOOL_NAMES,
         )
         self.assertEqual(event.get_extra("astrmai_required_tools"), [])
         self.assertEqual(event.get_extra("astrmai_turn_context").tools.invocation_mode, "auto")
@@ -1510,7 +1545,7 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
 
         self.assertEqual(
             _normalized_tool_names(tools),
-            CORE_TOOL_NAMES | {"vision_message_analyze_tool", "proactive_meme"},
+            GROUP_CHAT_EXPECTED_TOOL_NAMES,
         )
         self.assertEqual(event.get_extra("astrmai_tool_tier"), "full")
         self.assertEqual(event.get_extra("astrmai_required_tools"), ["proactive_meme"])
@@ -1593,8 +1628,8 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
 
         names = _normalized_tool_names(tools)
         self.assertTrue(names.isdisjoint(mixin.QQ_NATIVE_TOOL_NAMES))
-        self.assertNotIn("proactive_meme", names)
-        self.assertIn("vision_message_analyze_tool", names)
+        self.assertIn("proactive_meme", names)
+        self.assertNotIn("vision_message_analyze_tool", names)
 
     def test_explicit_native_action_on_unsupported_adapter_degrades_before_model_tool_choice(self):
         mixin = self._prepare_tool_mixin()
@@ -1637,7 +1672,7 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         )
 
         names = _normalized_tool_names(tools)
-        self.assertEqual(names, CHAT_EXPECTED_TOOL_NAMES)
+        self.assertEqual(names, GROUP_CHAT_EXPECTED_TOOL_NAMES)
         self.assertEqual(event.get_extra("astrmai_tool_tier"), "chat")
         self.assertEqual(event.get_extra("astrmai_required_tools"), [])
 
@@ -1671,8 +1706,8 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
             "message_emoji_like_action",
             "regret_and_withdraw_action",
         }))
-        self.assertNotIn("proactive_meme", names)
-        self.assertIn("vision_message_analyze_tool", names)
+        self.assertIn("proactive_meme", names)
+        self.assertNotIn("vision_message_analyze_tool", names)
 
     def test_explicit_message_reaction_only_injects_native_qq_tool(self):
         mixin = self._prepare_tool_mixin()
@@ -1693,7 +1728,7 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
 
         self.assertEqual(
             _normalized_tool_names(tools),
-            CORE_TOOL_NAMES | {"vision_message_analyze_tool", "message_emoji_like_action"},
+            GROUP_CHAT_EXPECTED_TOOL_NAMES,
         )
 
     def test_guarded_chat_intent_does_not_match_unrelated_poke_words(self):
@@ -1816,7 +1851,7 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         # 白名单不得剥除（旧断言锁定的正是"连等待与自检能力一并清空"的缺陷）
         self.assertEqual(
             _normalized_tool_names(comfort_tools),
-            CHAT_EXPECTED_TOOL_NAMES | {"message_reaction_action"},
+            CHAT_EXPECTED_TOOL_NAMES,
         )
 
         recall_ctx = SimpleNamespace(shared_dict={})

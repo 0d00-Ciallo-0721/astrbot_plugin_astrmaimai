@@ -3,13 +3,28 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+import uuid
 from dataclasses import asdict, dataclass, field
 from typing import Any, Mapping
+
+
+ACTION_TYPE_ALIASES: dict[str, str] = {
+    "message_emoji_like": "message_emoji_reaction",
+    "message_emoji_like_action": "message_emoji_reaction",
+    "message_reaction": "message_emoji_reaction",
+    "message_reaction_action": "message_emoji_reaction",
+}
+
+
+def canonical_action_type(value: str) -> str:
+    action = str(value or "").strip()
+    return ACTION_TYPE_ALIASES.get(action, action)
 
 
 @dataclass(slots=True)
 class PendingQQAction:
     action_type: str
+    action_instance_id: str = field(default_factory=lambda: f"qqai_{uuid.uuid4().hex}")
     target_id: str = ""
     target_name: str = ""
     group_id: str = ""
@@ -24,7 +39,7 @@ class PendingQQAction:
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "PendingQQAction | None":
-        action_type = str(value.get("action_type") or value.get("action") or "").strip()
+        action_type = canonical_action_type(value.get("action_type") or value.get("action") or "")
         if not action_type:
             return None
         payload = value.get("payload")
@@ -34,6 +49,8 @@ class PendingQQAction:
             requested_at = 0.0
         return cls(
             action_type=action_type,
+            action_instance_id=str(value.get("action_instance_id") or value.get("instance_id") or "").strip()
+            or f"qqai_{uuid.uuid4().hex}",
             target_id=str(value.get("target_id") or "").strip(),
             target_name=str(value.get("target_name") or "").strip(),
             group_id=str(value.get("group_id") or "").strip(),
@@ -43,15 +60,15 @@ class PendingQQAction:
         )
 
     def idempotency_key(self, turn_key: str) -> str:
+        # Idempotency is scoped to one action instance.  Action content and
+        # turn identity are intentionally not part of the key so two
+        # deliberate identical actions in one turn remain independently
+        # dispatchable while transport retries reuse this instance key.
+        instance_id = str(self.action_instance_id or "").strip()
+        if instance_id:
+            return instance_id
         canonical = json.dumps(
-            {
-                "turn": str(turn_key or ""),
-                "action": self.action_type,
-                "target": self.target_id,
-                "group": self.group_id,
-                "message": self.message_id,
-                "payload": self.payload,
-            },
+            {"turn": str(turn_key or ""), "action": canonical_action_type(self.action_type)},
             ensure_ascii=True,
             sort_keys=True,
             default=str,
@@ -59,4 +76,4 @@ class PendingQQAction:
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-__all__ = ["PendingQQAction"]
+__all__ = ["ACTION_TYPE_ALIASES", "PendingQQAction", "canonical_action_type"]

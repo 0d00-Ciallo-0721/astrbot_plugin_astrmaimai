@@ -18,6 +18,7 @@ from ..contracts.prompt_envelope import PromptEnvelope
 from .tool_contracts import (
     AUTONOMOUS_INTERACTION_TOOLS,
     TOOL_CAPABILITIES,
+    get_tool_capability,
     build_explicit_invocation_plans,
     filter_tools_for_context,
     is_model_disclosure_requestable,
@@ -53,7 +54,6 @@ from .tools.pfc_tools import (
     MemeResonanceTool,
     MemoryWriteCorrectionTool,
     MessageEmojiLikeTool,
-    MessageReactionTool,
     OmniPerceptionTool,
     PersonaFactCheckTool,
     ProactiveLikeTool,
@@ -199,7 +199,7 @@ class PlannerSideInputMixin:
             "proactive_meme",
             "proactive_poke",
             "proactive_like_action",
-            "message_emoji_like_action",
+            "message_emoji_reaction_action",
             "construct_at_event",
             "meme_resonance_action",
             "topic_hijack_action",
@@ -210,10 +210,29 @@ class PlannerSideInputMixin:
     )
     _AUTHORIZED_ACTION_FAMILIES = frozenset(
         {
-            "meme", "poke", "at", "qq_reaction", "withdraw", "quote_reply",
+            "meme", "poke", "at", "emoji_reaction", "qq_reaction", "withdraw", "quote_reply",
             "resonance", "topic", "private", "like", "reaction",
         }
     )
+
+    @staticmethod
+    def _contains_negative_action(message: str, family: str) -> bool:
+        text = str(message or "").casefold()
+        cues = {
+            "poke": ("不要戳", "别戳", "不许戳"),
+            "meme": ("不要.*发.*表情", "别.*发.*表情", "不许.*发.*表情", "不想.*发.*表情", "不需要.*发.*表情"),
+            "like": ("不要.*点赞", "别.*点赞"),
+            "emoji_reaction": ("不要.*表情回应", "别.*表情回应", "不要.*贴表情", "别.*贴表情"),
+            "qq_reaction": ("不要.*表情回应", "别.*表情回应", "不要.*贴表情", "别.*贴表情"),
+            "at": ("不要艾特", "别艾特", "不要@"),
+            "private": ("不要帮我联系", "别帮我联系", "不要.*发消息"),
+            "withdraw": ("不要撤回", "别撤回"),
+            "quote_reply": ("不要引用", "别引用"),
+            "resonance": ("不要复读", "别复读"),
+            "topic": ("不要转移话题", "别转移话题"),
+            "reaction": ("不要回应", "别回应"),
+        }
+        return any(re.search(pattern, text) for pattern in cues.get(str(family or ""), ()))
 
     def _apply_event_tool_call_policy(self, event: AstrMessageEvent, tools: list) -> list:
         """Attach deterministic modality policy and remove unauthorized side effects.
@@ -237,13 +256,12 @@ class PlannerSideInputMixin:
             for family in raw_explicit_families
             if str(family or "").strip().casefold() in self._AUTHORIZED_ACTION_FAMILIES
         }
-        # Derive executable authorization from deterministic user language,
-        # never from cognitive eligibility. Keep only action families here so
-        # read-only lookup intent cannot accidentally authorize side effects.
+        # Record deterministic semantic signals for observability, but do not
+        # treat explicit user wording as a prerequisite for autonomous tools.
         explicit_families.update(
             set(self._explicit_tool_families(event))
             & {
-                "meme", "poke", "at", "qq_reaction", "withdraw", "quote_reply",
+                "meme", "poke", "at", "emoji_reaction", "qq_reaction", "withdraw", "quote_reply",
                 "resonance", "topic", "private", "like", "reaction",
             }
         )
@@ -261,20 +279,27 @@ class PlannerSideInputMixin:
         # comes from deterministic user-intent parsing (or an upstream system
         # policy that explicitly writes this separate key).
         allowed_families = set(explicit_families)
-        action_authorized = bool(explicit_families)
-        if not action_authorized:
-            allowed_families.difference_update({"meme", "poke", "like", "qq_reaction", "at", "resonance", "topic"})
+        action_authorized = True
+        negated_families = sorted(
+            family for family in self._AUTHORIZED_ACTION_FAMILIES
+            if self._contains_negative_action(text, family)
+        )
         policy = {
+            "decision": "deny" if negated_families else "allow",
+            "reason": "explicit_negative_action" if negated_families else "autonomous_contextual_decision",
             "mode": mode,
             "families": sorted(explicit_families),
             "allowed_families": sorted(allowed_families),
-            "side_effects_allowed": action_authorized,
+            "side_effects_allowed": True,
             "vision_requirement": "required" if image_question else ("optional" if has_image else "none"),
             "action_authorized": action_authorized,
-            "authorization_source": "explicit_user_intent" if action_authorized else "",
-            "confidence": "high" if action_authorized else "none",
-            "negated_families": [],
+            "authorization_source": "model_autonomous",
+            "confidence": "contextual",
+            "negated_families": negated_families,
             "unknown_families": [],
+            "matched_spans": [],
+            "negated_spans": negated_families,
+            "missing_slots": [],
         }
         event.set_extra("astrmai_tool_call_policy", policy)
         event.set_extra("astrmai_action_authorized", action_authorized)
@@ -282,13 +307,14 @@ class PlannerSideInputMixin:
         filtered = []
         for tool in tools or []:
             tool_name = self._canonical_tool_name(tool)
-            spec = TOOL_CAPABILITIES.get(tool_name)
+            spec = get_tool_capability(tool_name)
             requires_auth = bool(getattr(spec, "requires_explicit_authorization", False))
             if not requires_auth and tool_name not in self._SIDE_EFFECT_TOOL_NAMES:
                 filtered.append(tool)
                 continue
             family = str(getattr(spec, "family", "") or "")
-            if family in explicit_families:
+            negated = set(policy.get("negated_families", []))
+            if family not in negated:
                 filtered.append(tool)
         after = [self._canonical_tool_name(tool) for tool in filtered]
         if before != after:
@@ -314,7 +340,7 @@ class PlannerSideInputMixin:
     }
     CHAT_TOOL_NAMES = {
         "proactive_meme",
-        "message_emoji_like_action",
+        "message_emoji_reaction_action",
         "vision_message_analyze_tool",
         "quote_reply_action",
         "regret_and_withdraw_action",
@@ -334,7 +360,7 @@ class PlannerSideInputMixin:
     QQ_NATIVE_TOOL_NAMES = {
         "proactive_poke",
         "construct_at_event",
-        "message_emoji_like_action",
+        "message_emoji_reaction_action",
         "regret_and_withdraw_action",
         "quote_reply_action",
     }
@@ -368,8 +394,9 @@ class PlannerSideInputMixin:
         "TopicHijackTool": "topic_hijack_action",
         "SpaceTransitionTool": "space_transition_action",
         "RegretAndWithdrawTool": "regret_and_withdraw_action",
-        "MessageReactionTool": "message_reaction_action",
-        "MessageEmojiLikeTool": "message_emoji_like_action",
+        "MessageReactionTool": "message_emoji_reaction_action",
+        "MessageEmojiLikeTool": "message_emoji_reaction_action",
+        "MessageEmojiReactionActionTool": "message_emoji_reaction_action",
         "ProactiveLikeTool": "proactive_like_action",
         "LearnedLanguageLookupTool": "learned_language_lookup",
     }
@@ -404,9 +431,10 @@ class PlannerSideInputMixin:
         "topic_hijack_action": {"topic"},
         "space_transition_action": {"private"},
         "regret_and_withdraw_action": {"withdraw"},
-        "message_reaction_action": {"reaction"},
-        "message_emoji_like_action": {"qq_reaction"},
-        "proactive_like_action": {"reaction", "like"},
+        "message_emoji_reaction_action": {"emoji_reaction", "qq_reaction"},
+        "message_reaction_action": {"emoji_reaction", "qq_reaction"},
+        "message_emoji_like_action": {"emoji_reaction", "qq_reaction"},
+        "proactive_like_action": {"like"},
     }
     MODE_INSTRUCTION_MAX_CHARS = 240
     PRIVATE_JUMP_CONTEXT_MAX_CHARS = 360
@@ -886,7 +914,6 @@ class PlannerSideInputMixin:
                 runtime_coordinator=getattr(self, "runtime_coordinator", None),
             ),
             RegretAndWithdrawTool(),
-            MessageReactionTool(),
             MessageEmojiLikeTool(),
             ProactiveLikeTool(db_service=self.context_engine.db),
         ]
@@ -904,6 +931,8 @@ class PlannerSideInputMixin:
             QuoteReplyActionTool(),
             RegretAndWithdrawTool(),
             ProactiveMemeTool(emotion_mapping=self._emotion_mapping_for_meme_tool()),
+            MemeResonanceTool(),
+            TopicHijackTool(),
             MessageEmojiLikeTool(),
             ProactivePokeTool(db_service=self.context_engine.db),
             ConstructAtEventTool(db_service=self.context_engine.db),
@@ -944,7 +973,7 @@ class PlannerSideInputMixin:
                     memory_tool_service=memory_tool_service,
                     persona_id=target_persona_id,
                 ),
-                MessageReactionTool(),
+                MessageEmojiLikeTool(),
                 ProactiveLikeTool(db_service=self.context_engine.db),
                 SpaceTransitionTool(
                     db_service=self.context_engine.db,

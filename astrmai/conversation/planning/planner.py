@@ -68,24 +68,26 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         "topic_hijack_action": "转移话题",
         "space_transition_action": "跨会话私聊消息",
         "regret_and_withdraw_action": "撤回",
-        "message_reaction_action": "互动反应",
-        "message_emoji_like_action": "消息表情回复",
-        "proactive_like_action": "表达好感",
+        "message_emoji_reaction_action": "贴表情",
+        "message_reaction_action": "贴表情",
+        "message_emoji_like_action": "贴表情",
+        "proactive_like_action": "QQ 点赞",
         "vision_message_analyze_tool": "按需查看图片内容",
     }
     TOOL_CAPABILITY_CARDS = {
         "vision_message_analyze_tool": "查看图片事实；仅在回答依赖图片内容时使用；只读，不发送消息，结果只能作为内部事实。",
-        "proactive_meme": "用途：为最终回复附加表情包；触发：用户明确要求表情包/梗图；必填：合法 emotion_tag；禁止：仅图片无动作；失败：说明未完成且不重复调用；每轮最多1次。",
-        "proactive_poke": "用途：戳一戳目标；触发：用户明确要求戳人；必填：唯一合法 target_id；禁止：目标不明或仅凭上下文猜测；失败：拒绝执行并说明原因；每轮最多1次。",
-        "proactive_like_action": "用途：在文字中表达好感；触发：明确社交意图；必填：表达内容；禁止：冒充 QQ 点赞；失败：退回普通文字回复；每轮最多1次。",
-        "construct_at_event": "用途：确认当前群成员并追加 @；触发：明确 @ 请求；必填：当前群与唯一目标；禁止：空目标或多目标未确认；失败：先澄清，不发送；每轮最多1次。",
-        "quote_reply_action": "用途：引用指定 QQ 消息并发送短回复；触发：明确引用/回这条消息；必填：合法 message_id 与正文；禁止：引用不存在时退化普通发送；失败：说明未完成且不重试；每轮最多1次。",
-        "meme_resonance_action": "用途：复读或共鸣指定群消息；触发：明确原样复读请求；必填：可确认目标消息；禁止：目标不明时猜测；失败：说明未完成且不重复调用；每轮最多1次。",
-        "topic_hijack_action": "用途：生成话题切换指令；触发：明确要求换话题；必填：新的话题方向；禁止：悄悄打断正常问答；失败：改为自然询问；每轮最多1次。",
-        "space_transition_action": "用途：向已确认的机器人好友跨会话发私聊；触发：明确传话请求；必填：目标会话与非空正文；禁止：查询意图、目标不明；失败：拒绝发送并说明缺失信息；每轮最多1次。",
-        "regret_and_withdraw_action": "用途：排队撤回上一条机器人消息；触发：明确撤回请求；必填：可定位 message_id；禁止：无法定位时猜测；失败：说明未撤回且不重复调用；每轮最多1次。",
-        "message_reaction_action": "用途：把互动反应融入最终文字；触发：明确文字互动意图；必填：自然语言回复内容；禁止：声称执行 QQ 原生动作；失败：退回普通文字回复；每轮最多1次。",
-        "message_emoji_like_action": "用途：给指定 QQ 消息添加表情回应；触发：明确消息表情/点赞请求；必填：合法 message_id；禁止：消息 ID 不明；失败：拒绝执行并说明原因；每轮最多1次。",
+        "proactive_meme": "用途：为最终回复附加表情包；触发：机器人根据对话气氛自主决定；必填：合法 emotion_tag；失败：说明未完成且不伪造发送成功。",
+        "proactive_poke": "用途：戳一戳目标；触发：机器人根据上下文自主决定；必填：唯一合法 target_id；失败：记录真实平台结果。",
+        "proactive_like_action": "用途：给目标好友发送 QQ 点赞；触发：根据互动关系自主决定；参数：target_id 可选、times 默认1；必需：目标 QQ 号可解析；失败：记录真实 API 失败，不声称成功。",
+        "construct_at_event": "用途：确认当前群成员并追加 @；触发：机器人根据上下文自主决定；必填：当前群与唯一数字目标；失败：先澄清，不发送。",
+        "quote_reply_action": "用途：引用指定 QQ 消息并发送短回复；触发：机器人根据上下文自主决定；必填：合法 message_id 与正文；失败：说明未完成。",
+        "meme_resonance_action": "用途：复读或共鸣指定群消息；触发：机器人根据上下文自主决定；必填：可确认目标消息；失败：说明未完成。",
+        "topic_hijack_action": "用途：生成话题切换指令；触发：机器人根据上下文自主决定；必填：新的话题方向；失败：改为自然询问。",
+        "space_transition_action": "用途：向已确认的机器人好友跨会话发私聊；触发：机器人根据上下文自主决定；必填：目标会话与非空正文；失败：说明缺失信息。",
+        "regret_and_withdraw_action": "用途：排队撤回上一条机器人消息；触发：机器人根据上下文自主决定；必填：可定位 message_id；失败：说明未撤回。",
+        "message_emoji_reaction_action": "用途：给当前焦点 QQ 消息贴原生表情；触发：根据语气自主决定；参数：tone 可选；必需：有效 message_id；成功前不得声称已执行；失败：记录真实失败。",
+        "message_reaction_action": "兼容旧名称，内部映射到贴表情工具；不单独暴露给模型。",
+        "message_emoji_like_action": "兼容旧名称，内部映射到贴表情工具；不单独暴露给模型。",
     }
 
     def __init__(
@@ -820,7 +822,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             return []
         names: list[str] = []
         for item in trace:
-            if not isinstance(item, dict) or str(item.get("status", "success")) != "success":
+            if not isinstance(item, dict) or str(item.get("status", "success")) not in {"success", "sent"}:
                 continue
             name = str(item.get("tool_name", "") or "").strip()
             if name and name not in names:

@@ -19,14 +19,19 @@ TOOL_PACKAGES: dict[str, tuple[str, ...]] = {
         "bot_capability_lookup",
         "learned_language_lookup",
     ),
+    "default_vision": (
+        "vision_message_analyze_tool",
+    ),
     "default_actions": (
-        "regret_and_withdraw_action",
+        "message_emoji_reaction_action",
+        "proactive_like_action",
+        "proactive_meme",
         "proactive_poke",
         "construct_at_event",
         "quote_reply_action",
-        "message_emoji_like_action",
-        "vision_message_analyze_tool",
-        "proactive_meme",
+        "regret_and_withdraw_action",
+        "topic_hijack_action",
+        "meme_resonance_action",
     ),
     "persona_lore": (
         "self_lore_query",
@@ -62,7 +67,7 @@ TOOL_PACKAGES: dict[str, tuple[str, ...]] = {
         "unverified_report_record_tool",
     ),
     "fun": (
-        "message_reaction_action",
+        "message_emoji_reaction_action",
         "proactive_like_action",
     ),
     "conversation_control": (
@@ -75,6 +80,7 @@ TOOL_PACKAGES: dict[str, tuple[str, ...]] = {
 
 PACKAGE_ORDER: tuple[str, ...] = (
     "core",
+    "default_vision",
     "default_actions",
     "persona_lore",
     "identity",
@@ -90,7 +96,6 @@ PACKAGE_ORDER: tuple[str, ...] = (
 DEFAULT_VISIBLE_TOOL_NAMES: tuple[str, ...] = (
     *TOOL_PACKAGES["core"],
     *TOOL_PACKAGES["default_actions"],
-    "meme_resonance_action",
 )
 
 
@@ -106,7 +111,7 @@ FAMILY_TO_PACKAGES: dict[str, tuple[str, ...]] = {
     "group_fact": ("relationship",),
     "recent_contact": ("relationship", "cross_session"),
     "message_artifact": ("artifact",),
-    "vision_message": ("default_actions",),
+    "vision_message": ("default_vision",),
     "cross_reply": ("cross_session",),
     "quote_reply": ("default_actions",),
     "message_recall": ("artifact",),
@@ -126,6 +131,7 @@ FAMILY_TO_PACKAGES: dict[str, tuple[str, ...]] = {
     "private": ("cross_session",),
     "withdraw": ("default_actions",),
     "reaction": ("fun",),
+    "emoji_reaction": ("default_actions",),
     "qq_reaction": ("default_actions",),
     "like": ("fun",),
 }
@@ -291,20 +297,6 @@ class ToolDisclosurePlanner:
         "引用",
         "那个呢",
     )
-    CROSS_SESSION_KEYWORDS = (
-        "发消息",
-        "发个消息",
-        "发一条消息",
-        "私聊",
-        "私信",
-        "传话",
-        "转告",
-        "带话",
-        "问问你好友",
-        "问一下你好友",
-        "对方回了吗",
-        "有没有回复",
-    )
     MEMORY_GOVERNANCE_KEYWORDS = (
         "你记错了",
         "不是这样",
@@ -316,26 +308,6 @@ class ToolDisclosurePlanner:
         "不确定",
         "未确认",
     )
-    FUN_KEYWORDS = (
-        "表情包",
-        "点赞",
-        "夸夸我",
-        "夸我",
-        "发表情",
-        "来个表情",
-    )
-    CONTROL_KEYWORDS = (
-        "撤回",
-        "删掉上一条",
-        "转移话题",
-        "换个话题",
-        "别聊这个",
-        "复读",
-        "原样复读",
-        "先等等",
-        "先别回复",
-    )
-
     @staticmethod
     def _contains_any(message: str, keywords: Iterable[str]) -> bool:
         lowered = message.lower()
@@ -412,7 +384,9 @@ class ToolDisclosurePlanner:
         reasons: list[str] = []
         decisions: list[ToolDisclosureDecision] = []
         self._append_package(packages, reasons, "core", "default")
-        self._append_package(packages, reasons, "default_actions", "default")
+        self._append_package(packages, reasons, "default_actions", "autonomous_interaction")
+        if has_image:
+            self._append_package(packages, reasons, "default_vision", "image_context")
 
         explicit_families = tuple(str(family or "").strip() for family in (explicit_tool_families or []) if str(family or "").strip())
         exact_tool_names = [
@@ -465,23 +439,33 @@ class ToolDisclosurePlanner:
                 exact_tool_names.append(decision.tool_name)
             if decision.tool_name not in {item.tool_name for item in decisions}:
                 decisions.append(decision)
-        if self._contains_any(text, self.CROSS_SESSION_KEYWORDS):
-            self._append_package(packages, reasons, "cross_session", "cross_session_signal")
+        # Side-effect disclosure must follow the structured Planner decision.
+        # Raw relay words are intentionally insufficient: phrases such as
+        # "我刚才发消息给朋友了" describe past context, while negated
+        # requests such as "不要帮我给他发消息" must not open a send package.
+        explicit_cross_families = {
+            "private",
+            "cross_reply",
+            "recent_contact",
+            "route_suggest",
+        }
+        if explicit_cross_families.intersection(explicit_families):
+            self._append_package(packages, reasons, "cross_session", "explicit_cross_session_family")
         if self._contains_any(text, self.MEMORY_GOVERNANCE_KEYWORDS):
             self._append_package(packages, reasons, "memory_governance", "memory_governance_signal")
         if str(social_intent or "").strip().lower() in {"comfort", "tease"}:
             self._append_package(packages, reasons, "fun", f"social_intent_{social_intent}")
-        if not explicit_tool_intent and self._contains_any(text, self.FUN_KEYWORDS):
-            self._append_package(packages, reasons, "fun", "fun_signal")
+        if "reaction" in explicit_families or "like" in explicit_families:
+            self._append_package(packages, reasons, "fun", "explicit_fun_family")
         if str(social_intent or "").strip().lower() == "redirect":
             self._append_package(packages, reasons, "conversation_control", "social_intent_redirect")
-        if not explicit_tool_intent and self._contains_any(text, self.CONTROL_KEYWORDS):
-            self._append_package(packages, reasons, "conversation_control", "control_signal")
+        if {"resonance", "topic", "wait"}.intersection(explicit_families):
+            self._append_package(packages, reasons, "conversation_control", "explicit_control_family")
 
         dynamic_packages = [
             package
             for package in packages
-            if package not in {"core", "default_actions"}
+            if package not in {"core", "default_vision", "default_actions"}
         ]
         task_like = explicit_tool_intent or bool(dynamic_packages) or str(requested_tier or "").lower() in {"full", "sys3"}
         max_tools = max_task_tools if task_like else max_chat_tools
@@ -492,7 +476,18 @@ class ToolDisclosurePlanner:
         ]
         selected_tool_names = _ordered_unique([*package_tool_names, *exact_tool_names])
         if max_tools and max_tools > 0:
-            protected = _ordered_unique([*DEFAULT_VISIBLE_TOOL_NAMES, *exact_tool_names])
+            selected_package_tools = [
+                name
+                for name in tool_names_for_packages(
+                    packages
+                )
+                if not requires_explicit_disclosure(name) or name in exact_tool_names
+            ]
+            protected = _ordered_unique([
+                *DEFAULT_VISIBLE_TOOL_NAMES,
+                *selected_package_tools,
+                *exact_tool_names,
+            ])
             selected_tool_names = _ordered_unique(
                 [*selected_tool_names[:max_tools], *protected]
             )

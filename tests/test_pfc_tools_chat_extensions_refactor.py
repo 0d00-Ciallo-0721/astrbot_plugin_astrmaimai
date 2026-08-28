@@ -12,6 +12,7 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel, Session, create_engine
 
 from tests.helpers.astrbot_stubs import install_astrbot_stubs
+from astrmai.infrastructure.runtime.outbound_send_guard import OUTBOUND_SEND_GATE, bind_event_generation
 
 
 class _FakeApi:
@@ -113,10 +114,45 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
         self.mod = importlib.import_module("astrmai.conversation.planning.tools.pfc_tools")
 
     def tearDown(self):
+        OUTBOUND_SEND_GATE.close()
         try:
             self.temp_dir.cleanup()
         except Exception:
             pass
+
+    def test_explicit_fallback_canonicalizes_legacy_reaction_alias(self):
+        event = _FakeEvent(group_id="12345")
+        result = asyncio.run(
+            self.mod.prepare_explicit_tool_fallbacks(
+                event,
+                ["message_reaction_action"],
+            )
+        )
+        self.assertEqual(result, ["message_emoji_reaction_action"])
+        self.assertEqual(
+            event.get_extra("astrmai_pending_actions")[0]["action_type"],
+            "message_emoji_reaction",
+        )
+
+    def test_fallback_rechecks_gate_after_async_resolution(self):
+        event = _FakeEvent(group_id="12345")
+        OUTBOUND_SEND_GATE.open()
+        bind_event_generation(event)
+
+        async def resolve_then_shutdown(_event):
+            OUTBOUND_SEND_GATE.close(enforce_provider=True)
+            return "bot-message-1"
+
+        with patch.object(self.mod, "_resolve_latest_bot_message_id", resolve_then_shutdown):
+            result = asyncio.run(
+                self.mod.prepare_explicit_tool_fallbacks(
+                    event,
+                    ["regret_and_withdraw_action"],
+                )
+            )
+
+        self.assertEqual(result, [])
+        self.assertEqual(event.get_extra("astrmai_pending_actions", []), [])
 
     def test_message_emoji_like_uses_builtin_pool_and_current_message(self):
         event = _FakeEvent(group_id="12345")
@@ -131,7 +167,7 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
         self.assertEqual(api.calls, [])
         self.assertEqual(
             event.get_extra("astrmai_pending_actions")[0]["action"],
-            "message_emoji_like",
+            "message_emoji_reaction",
         )
         self.assertEqual(
             event.get_extra("astrmai_pending_actions")[0]["payload"]["emoji_id"],
@@ -141,6 +177,24 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
             event.get_extra("astrmai_tool_execution_trace", []),
             [],
         )
+
+    def test_direct_emoji_call_honors_negated_family_policy(self):
+        event = _FakeEvent(group_id="12345")
+        event.set_extra("astrmai_tool_call_policy", {"negated_families": ["emoji_reaction"]})
+
+        result = asyncio.run(self.mod.MessageEmojiLikeTool().call(_wrap_event(event), tone="approve"))
+
+        self.assertIn("明确禁止", result)
+        self.assertEqual(event.get_extra("astrmai_pending_actions", []), [])
+
+    def test_direct_like_call_honors_negated_family_policy(self):
+        event = _FakeEvent(group_id="12345")
+        event.set_extra("astrmai_tool_call_policy", {"negated_families": ["like"]})
+
+        result = asyncio.run(self.mod.ProactiveLikeTool().call(_wrap_event(event)))
+
+        self.assertIn("明确禁止", result)
+        self.assertEqual(event.get_extra("astrmai_pending_actions", []), [])
 
     def test_capability_lookup_records_exact_family_request(self):
         event = _FakeEvent(group_id="12345")
@@ -1121,7 +1175,7 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
 
         result = asyncio.run(dispatcher_mod.QQActionDispatcher().commit(event, "chat-1", send_key="send-2"))
 
-        self.assertEqual(result[-1]["status"], "success")
+        self.assertEqual(result[-1]["status"], "sent")
         segments = event.bot.api.calls[0][1]["message"]
         self.assertEqual(segments[0]["type"], "reply")
         self.assertEqual(segments[1]["data"]["text"], "收到")
@@ -1137,13 +1191,16 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
             {"expression_tag": "happy", "source": "explicit_tool", "force": True},
         )
 
-    def test_textual_reaction_does_not_create_fake_qq_action(self):
+    def test_legacy_reaction_alias_creates_canonical_qq_action(self):
         event = _FakeEvent(group_id="12345")
 
         result = asyncio.run(self.mod.MessageReactionTool().call(_wrap_event(event), reaction="赞同"))
 
-        self.assertIn("文字回复", result)
-        self.assertEqual(event.get_extra("astrmai_pending_actions", []), [])
+        self.assertIn("QQ 表情动作已提交", result)
+        actions = event.get_extra("astrmai_pending_actions", [])
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0]["action_type"], "message_emoji_reaction")
+        self.assertTrue(actions[0]["action_instance_id"])
 
     def test_space_transition_relays_to_real_bot_friend_and_records_summary(self):
         event = _FakeEvent(group_id="777", sender_id="123", sender_name="Alice")
@@ -1511,7 +1568,7 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
         self.assertIn("未授权", result)
         self.assertEqual(event.get_extra("astrmai_pending_actions", []), [])
 
-    def test_cognitive_allowed_family_cannot_authorize_meme(self):
+    def test_cognitive_allowed_family_allows_autonomous_meme(self):
         event = _FakeEvent(group_id="12345")
         event.set_extra(
             "astrmai_tool_call_policy",
@@ -1522,10 +1579,10 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
 
         result = asyncio.run(tool.call(_wrap_event(event), emotion_tag="happy"))
 
-        self.assertIn("未授权", result)
-        self.assertEqual(event.get_extra("astrmai_pending_actions", []), [])
+        self.assertIn("标签", result)
+        self.assertTrue(event.get_extra("astrmai_pending_actions", []))
 
-    def test_quote_action_requires_explicit_family(self):
+    def test_quote_action_allows_autonomous_family(self):
         event = _FakeEvent(group_id="12345")
         event.set_extra(
             "astrmai_tool_call_policy",
@@ -1535,8 +1592,8 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
 
         result = asyncio.run(tool.call(_wrap_event(event), text="收到"))
 
-        self.assertIn("未授权", result)
-        self.assertEqual(event.get_extra("astrmai_pending_actions", []), [])
+        self.assertIn("msg-1", result)
+        self.assertTrue(event.get_extra("astrmai_pending_actions", []))
 
     def test_negated_meme_text_does_not_queue_meme(self):
         event = _FakeEvent(group_id="12345")

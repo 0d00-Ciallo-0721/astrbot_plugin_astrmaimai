@@ -26,12 +26,15 @@ from ....multimodal.visual_cortex import VisionAnalysisCoolingDown
 from ....presentation.dto.message_scope import MessageScope
 from ....shared.emotion_tags import parse_emotion_mapping
 from ...vision_state import vision_analysis_observation_facts
-from ...contracts.qq_action import PendingQQAction
+from ...contracts.qq_action import PendingQQAction, canonical_action_type
 from ..tool_contracts import (
     FAMILY_TO_TOOL,
     TOOL_CAPABILITIES,
+    canonical_tool_name,
+    get_tool_capability,
     is_model_disclosure_requestable,
     record_tool_lifecycle,
+    requires_explicit_authorization,
     tool_display_name,
 )
 from ..tool_disclosure import (
@@ -94,9 +97,10 @@ def _record_tool_execution(
 ) -> None:
     trace = event.get_extra("astrmai_tool_execution_trace", [])
     trace = list(trace) if isinstance(trace, list) else []
-    spec = TOOL_CAPABILITIES.get(str(tool_name or ""))
+    canonical_name = canonical_tool_name(str(tool_name or ""))
+    spec = get_tool_capability(canonical_name)
     item = {
-        "tool_name": str(tool_name or ""),
+        "tool_name": canonical_name,
         "status": str(status or "success"),
         "family": str(getattr(spec, "family", "") or ""),
         "source_domain": str(source_domain or ""),
@@ -107,7 +111,7 @@ def _record_tool_execution(
     event.set_extra("astrmai_tool_execution_trace", trace[-32:])
     record_tool_lifecycle(
         event,
-        tool_name,
+        canonical_name,
         "tool_completed",
         source="model_tool_call",
         status=status,
@@ -121,34 +125,36 @@ def _append_pending_action(event, action: dict[str, Any]) -> None:
     _set_pending_actions(event, pending_actions)
 
 
-def _append_qq_action(event, action: PendingQQAction) -> bool:
+def _append_qq_action(event, action: PendingQQAction, *, dedupe: bool = False) -> bool:
     action_data = action.to_dict()
-    added = _append_once(
-        event,
-        matcher=lambda item: (
-            str(item.get("action_type") or item.get("action") or "") == action.action_type
+    # Each PendingQQAction carries its own instance identity.  Deliberate
+    # model calls are not deduplicated; only deterministic router fallbacks
+    # may opt into content dedupe to remain idempotent across correction
+    # passes. Transport retries are deduplicated later by the instance key.
+    if dedupe:
+        pending_actions = _get_pending_actions(event)
+        if any(
+            canonical_action_type(str(item.get("action_type") or item.get("action") or ""))
+            == canonical_action_type(action.action_type)
             and str(item.get("target_id") or "") == action.target_id
             and str(item.get("group_id") or "") == action.group_id
             and str(item.get("message_id") or "") == action.message_id
             and dict(item.get("payload") or {}) == action.payload
-        ),
-        action=action_data,
-        record_execution=False,
-    )
-    if added:
-        tool_name = {
-            "poke": "proactive_poke",
-            "message_emoji_like": "message_emoji_like_action",
-            "withdraw": "regret_and_withdraw_action",
-            "quote_reply": "quote_reply_action",
-        }.get(action.action_type, action.action_type)
-        record_tool_lifecycle(
-            event,
-            tool_name,
-            "action_queued",
-            status="pending",
-        )
-    return added
+            for item in pending_actions
+            if isinstance(item, dict)
+        ):
+            return False
+    _append_pending_action(event, action_data)
+    tool_name = {
+        "poke": "proactive_poke",
+        "message_emoji_like": "message_emoji_reaction_action",
+        "message_emoji_reaction": "message_emoji_reaction_action",
+        "like": "proactive_like_action",
+        "withdraw": "regret_and_withdraw_action",
+        "quote_reply": "quote_reply_action",
+    }.get(canonical_action_type(action.action_type), action.action_type)
+    record_tool_lifecycle(event, tool_name, "action_queued", status="pending")
+    return True
 
 
 def _append_once(event, *, matcher, action: dict[str, Any], record_execution: bool = True) -> bool:
@@ -162,26 +168,13 @@ def _append_once(event, *, matcher, action: dict[str, Any], record_execution: bo
         "meme": "proactive_meme",
         "terminal_reread": "meme_resonance_action",
         "withdraw": "regret_and_withdraw_action",
+        "message_emoji_reaction": "message_emoji_reaction_action",
+        "message_emoji_like": "message_emoji_reaction_action",
+        "like": "proactive_like_action",
     }.get(str(action.get("action") or ""), "")
     if tool_name and record_execution:
         _record_tool_execution(event, tool_name)
     return True
-
-
-_POLICY_GATED_TOOLS = frozenset(
-    {
-        "proactive_meme",
-        "proactive_poke",
-        "proactive_like_action",
-        "message_emoji_like_action",
-        "construct_at_event",
-        "meme_resonance_action",
-        "topic_hijack_action",
-        "quote_reply_action",
-        "regret_and_withdraw_action",
-        "space_transition_action",
-    }
-)
 
 
 def _check_tool_call_policy(event, tool_name: str) -> bool:
@@ -190,12 +183,8 @@ def _check_tool_call_policy(event, tool_name: str) -> bool:
     Planner filtering is advisory; direct/second-pass calls must be rejected
     here when the event explicitly disallows side effects.
     """
-    normalized_name = str(tool_name or "").strip()
-    spec = TOOL_CAPABILITIES.get(normalized_name)
-    if normalized_name not in _POLICY_GATED_TOOLS and not bool(
-        getattr(spec, "requires_explicit_authorization", False)
-    ):
-        return True
+    normalized_name = canonical_tool_name(str(tool_name or "").strip())
+    spec = get_tool_capability(normalized_name)
     getter = getattr(event, "get_extra", None)
     policy = getter("astrmai_tool_call_policy", None) if callable(getter) else None
     if not isinstance(policy, dict):
@@ -207,30 +196,52 @@ def _check_tool_call_policy(event, tool_name: str) -> bool:
             _record_tool_execution(event, tool_name, status="rejected", reason="missing_tool_call_policy")
             return False
         return True
-    policy_families = policy.get("families")
-    if isinstance(policy_families, (list, tuple, set)):
-        allowed_families = {
-            str(item or "").strip()
-            for item in policy_families
-            if str(item or "").strip()
-        }
-    else:
-        allowed_families = {
-            str(item or "").strip()
-            for item in (getter("astrmai_explicit_user_intent_families", []) or [])
-        }
     family = str(getattr(spec, "family", "") or "")
-    if (
-        bool(policy.get("side_effects_allowed", False))
-        and bool(policy.get("action_authorized", False))
-        and family in allowed_families
-    ):
+    negated = {
+        str(item or "").strip().lower()
+        for item in (policy.get("negated_families") or [])
+        if str(item or "").strip()
+    }
+    family_aliases = {family}
+    if family == "emoji_reaction":
+        family_aliases.update({"reaction", "qq_reaction"})
+    if family == "like":
+        family_aliases.add("qq_like")
+    stale = bool(getter("astrmai_turn_stale", False)) if callable(getter) else False
+    execution_status = str(getter("astrmai_execution_status", "") or "").strip().lower() if callable(getter) else ""
+    explicitly_denied = (
+        policy.get("side_effects_allowed") is False
+        or policy.get("action_authorized") is False
+        or bool(family_aliases & negated)
+        or stale
+        or execution_status in {"stale_drop", "shutdown_rejected"}
+    )
+    if not explicitly_denied:
         return True
-    reason = "explicit_authorization_required"
+    reason = (
+        "stale_turn"
+        if stale or execution_status == "stale_drop"
+        else "shutdown_rejected"
+        if execution_status == "shutdown_rejected"
+        else "policy_denied"
+    )
     _record_tool_execution(event, tool_name, status="rejected", reason=reason)
     if hasattr(event, "set_extra"):
-        event.set_extra("astrmai_tool_call_rejected", tool_name)
+        event.set_extra("astrmai_tool_call_rejected", normalized_name)
         event.set_extra("astrmai_tool_call_rejection_reason", reason)
+    return False
+
+
+def _check_outbound_action_admission(event, tool_name: str) -> bool:
+    """Common pre-enqueue gate for every side-effecting tool."""
+    if not _check_tool_call_policy(event, tool_name):
+        return False
+    if outbound_send_allowed(event):
+        return True
+    _record_tool_execution(event, tool_name, status="shutdown_rejected", reason="shutdown_rejected")
+    if hasattr(event, "set_extra"):
+        event.set_extra("astrmai_tool_call_rejected", canonical_tool_name(tool_name))
+        event.set_extra("astrmai_tool_call_rejection_reason", "shutdown_rejected")
     return False
 
 
@@ -762,7 +773,14 @@ async def prepare_explicit_tool_fallbacks(
     emotion_mapping: Optional[list[str]] = None,
 ) -> list[str]:
     """Queue unambiguous explicit actions without relying on model tool selection."""
-    required = set(required_tools or [])
+    # Compatibility callers may still provide legacy aliases.  Normalize once
+    # so fallback selection and lifecycle traces use the same canonical names
+    # as Planner/PFC execution.
+    required = {
+        canonical_tool_name(str(name or "").strip())
+        for name in (required_tools or [])
+        if str(name or "").strip()
+    }
     queued: list[str] = []
     message = str(
         event.get_extra("astrmai_tool_intent_text", getattr(event, "message_str", ""))
@@ -771,7 +789,7 @@ async def prepare_explicit_tool_fallbacks(
     ).strip().lower()
     group_id = str(event.get_group_id() or "").strip()
 
-    if "proactive_poke" in required:
+    if "proactive_poke" in required and _check_outbound_action_admission(event, "proactive_poke"):
         self_targeted = any(
             marker in message
             for marker in ("戳一下我", "戳一戳我", "戳戳我", "戳我", "poke me")
@@ -779,7 +797,7 @@ async def prepare_explicit_tool_fallbacks(
         if self_targeted:
             target_id = str(event.get_sender_id() or "").strip()
             if target_id and target_id != str(event.get_self_id() or "").strip():
-                if _append_qq_action(
+                if _check_outbound_action_admission(event, "proactive_poke") and _append_qq_action(
                     event,
                     PendingQQAction(
                         action_type="poke",
@@ -787,33 +805,36 @@ async def prepare_explicit_tool_fallbacks(
                         target_name=str(event.get_sender_name() or "当前用户"),
                         group_id=group_id,
                     ),
+                    dedupe=True,
                 ):
                     queued.append("proactive_poke")
 
-    if "message_emoji_like_action" in required:
+    if "message_emoji_reaction_action" in required and _check_outbound_action_admission(event, "message_emoji_reaction_action"):
         message_id = _current_message_id(event)
         pools = [item for values in QQ_MESSAGE_EMOJI_OPTIONS.values() for item in values]
         if message_id and pools:
-            if _append_qq_action(
+            if _check_outbound_action_admission(event, "message_emoji_reaction_action") and _append_qq_action(
                 event,
                 PendingQQAction(
-                    action_type="message_emoji_like",
+                    action_type="message_emoji_reaction",
                     message_id=message_id,
                     payload={"emoji_id": str(random.choice(pools)), "tone": "explicit"},
                 ),
+                dedupe=True,
             ):
-                queued.append("message_emoji_like_action")
+                queued.append("message_emoji_reaction_action")
 
-    if "regret_and_withdraw_action" in required:
+    if "regret_and_withdraw_action" in required and _check_outbound_action_admission(event, "regret_and_withdraw_action"):
         message_id = await _resolve_latest_bot_message_id(event)
-        if message_id:
+        if message_id and _check_outbound_action_admission(event, "regret_and_withdraw_action"):
             if _append_qq_action(
                 event,
                 PendingQQAction(action_type="withdraw", message_id=message_id),
+                dedupe=True,
             ):
                 queued.append("regret_and_withdraw_action")
 
-    if "proactive_meme" in required:
+    if "proactive_meme" in required and _check_outbound_action_admission(event, "proactive_meme"):
         tag_hints: list[tuple[str, list[str]]] = []
         for item in emotion_mapping or []:
             if not str(item or "").strip():
@@ -839,26 +860,27 @@ async def prepare_explicit_tool_fallbacks(
         emotion_tag = requested_tag or (mood_tag if mood_tag in non_neutral_tags else (
             non_neutral_tags[0] if non_neutral_tags else "happy"
         ))
-        event.set_extra(
-            "astrmai_bot_expression_decision",
-            {"expression_tag": emotion_tag, "source": "explicit_fallback", "force": True},
-        )
-        event.set_extra("astrmai_bot_expression_tag", emotion_tag)
-        event.set_extra("astrmai_bypass_mood_analysis", emotion_tag)
-        event.set_extra("astrmai_force_meme", True)
-        if _append_once(
-            event,
-            matcher=lambda item: item.get("action") == "meme",
-            action={"action": "meme", "tag": emotion_tag},
-            record_execution=False,
-        ):
-            record_tool_lifecycle(
-                event,
-                "proactive_meme",
-                "action_queued",
-                status="pending",
+        if _check_outbound_action_admission(event, "proactive_meme"):
+            event.set_extra(
+                "astrmai_bot_expression_decision",
+                {"expression_tag": emotion_tag, "source": "explicit_fallback", "force": True},
             )
-            queued.append("proactive_meme")
+            event.set_extra("astrmai_bot_expression_tag", emotion_tag)
+            event.set_extra("astrmai_bypass_mood_analysis", emotion_tag)
+            event.set_extra("astrmai_force_meme", True)
+            if _append_once(
+                event,
+                matcher=lambda item: item.get("action") == "meme",
+                action={"action": "meme", "tag": emotion_tag},
+                record_execution=False,
+            ):
+                record_tool_lifecycle(
+                    event,
+                    "proactive_meme",
+                    "action_queued",
+                    status="pending",
+                )
+                queued.append("proactive_meme")
 
     for tool_name in queued:
         record_tool_lifecycle(
@@ -1066,7 +1088,7 @@ class ConstructAtEventTool(FunctionTool[AstrAgentContext]):
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         target_name = str(kwargs.get("target_name", "") or "").strip()
         current_event = _get_current_event(context)
-        if not _check_tool_call_policy(current_event, self.name):
+        if not _check_outbound_action_admission(current_event, self.name):
             return "动作取消：当前消息未授权执行互动动作。"
         if not target_name:
             return "执行失败：target_name 不能为空。"
@@ -1169,8 +1191,7 @@ class ConstructAtEventTool(FunctionTool[AstrAgentContext]):
 class ProactivePokeTool(FunctionTool[AstrAgentContext]):
     name: str = "proactive_poke"
     description: str = (
-        "主动戳一戳目标用户。仅在用户明确要求或事件策略明确授权时使用；"
-        "普通图片消息、严肃问题、冲突或信息不明确时禁止调用。"
+        "主动戳一戳目标用户。机器人可根据上下文自主决定；用户明确否定、参数或平台状态不满足时不要调用。"
     )
     db_service: Any = Field(default=None, exclude=True)
     parameters: dict = Field(
@@ -1184,7 +1205,7 @@ class ProactivePokeTool(FunctionTool[AstrAgentContext]):
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         current_event = _get_current_event(context)
-        if not _check_tool_call_policy(current_event, self.name):
+        if not _check_outbound_action_admission(current_event, self.name):
             return "动作取消：当前消息未授权执行互动动作。"
         astr_ctx = context.context.context
         scope = MessageScope.from_event(current_event)
@@ -1264,6 +1285,8 @@ class ProactivePokeTool(FunctionTool[AstrAgentContext]):
         if target_id == str(current_event.get_self_id()):
             return "动作取消：不能戳自己。"
 
+        if not _check_outbound_action_admission(current_event, self.name):
+            return "动作取消：插件正在重载，未提交 QQ 戳一戳动作。"
         _append_qq_action(
             current_event,
             PendingQQAction(
@@ -1277,9 +1300,9 @@ class ProactivePokeTool(FunctionTool[AstrAgentContext]):
 
 
 @dataclass
-class MessageEmojiLikeTool(FunctionTool[AstrAgentContext]):
-    name: str = "message_emoji_like_action"
-    description: str = "为当前焦点消息设置 QQ 原生表情回复。只会从内置的小型表情集合里挑选。"
+class MessageEmojiReactionActionTool(FunctionTool[AstrAgentContext]):
+    name: str = "message_emoji_reaction_action"
+    description: str = "根据聊天语气，给当前焦点 QQ 消息添加原生表情回应。只会从内置表情集合中选择。"
     emoji_options: dict[str, list[str]] = Field(default_factory=lambda: dict(QQ_MESSAGE_EMOJI_OPTIONS), exclude=True)
     parameters: dict = Field(
         default_factory=lambda: {
@@ -1296,8 +1319,11 @@ class MessageEmojiLikeTool(FunctionTool[AstrAgentContext]):
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         current_event = _get_current_event(context)
-        if not _check_tool_call_policy(current_event, self.name):
-            return "动作取消：当前消息未授权执行互动动作。"
+        if not _check_outbound_action_admission(current_event, self.name):
+            return "动作取消：当前对话明确禁止给这条消息贴表情。"
+        if not outbound_send_allowed(current_event):
+            _record_tool_execution(current_event, self.name, status="shutdown_rejected", reason="shutdown_rejected")
+            return "动作取消：插件正在重载，未提交 QQ 表情动作。"
         message_id = _current_message_id(current_event)
         if not message_id:
             return json.dumps(
@@ -1315,10 +1341,12 @@ class MessageEmojiLikeTool(FunctionTool[AstrAgentContext]):
             selected_tone, selected_pool = random.choice(fallback_items)
         emoji_id = random.choice(selected_pool)
 
+        if not _check_outbound_action_admission(current_event, self.name):
+            return "动作取消：插件正在重载，未提交 QQ 表情动作。"
         _append_qq_action(
             current_event,
             PendingQQAction(
-                action_type="message_emoji_like",
+                action_type="message_emoji_reaction",
                 message_id=message_id,
                 payload={
                     "emoji_id": str(emoji_id),
@@ -1326,7 +1354,13 @@ class MessageEmojiLikeTool(FunctionTool[AstrAgentContext]):
                 },
             ),
         )
-        return "已将 QQ 原生消息表情回复加入待执行动作；不要声称已经成功，继续生成最终回复。"
+        return "QQ 表情动作已提交，等待发送结果。请继续生成正常文字回复，不要提前声称动作已成功。"
+
+
+@dataclass
+class MessageEmojiLikeTool(MessageEmojiReactionActionTool):
+    """Legacy constructor alias; canonical model name remains stable."""
+    name: str = "message_emoji_reaction_action"
 
 
 @dataclass
@@ -1343,7 +1377,7 @@ class ProactiveMemeTool(FunctionTool[AstrAgentContext]):
             f"- {tag}: {description}" for tag, description in configured_tags.items()
         ) or "- neutral: 平静"
         self.description = (
-            "选择一个表情包情绪标签。仅在用户明确要求表情包或事件策略授权时调用；普通图片消息不要调用。\n"
+            "根据当前对话气氛选择一个表情包情绪标签。机器人可自主决定是否调用；明确否定或资源不可用时不要调用。\n"
             f"可用标签:\n{available}"
         )
         self.parameters = {
@@ -1360,7 +1394,7 @@ class ProactiveMemeTool(FunctionTool[AstrAgentContext]):
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         current_event = _get_current_event(context)
-        if not _check_tool_call_policy(current_event, self.name):
+        if not _check_outbound_action_admission(current_event, self.name):
             return "动作取消：当前消息未授权执行互动动作。"
         emotion_tag = str(kwargs.get("emotion_tag", "neutral") or "neutral").strip().lower()
         valid_tags = set(parse_emotion_mapping(self.emotion_mapping))
@@ -2684,7 +2718,7 @@ class QuoteReplyActionTool(FunctionTool[AstrAgentContext]):
     name: str = "quote_reply_action"
     description: str = (
         "引用某条 QQ 消息并发送一条短回复。"
-        "当用户明确要求“引用那条回复”“回这条消息”时使用；message_id 为空时引用当前消息。"
+        "机器人可根据上下文自主决定；message_id 为空时引用当前消息。"
     )
     parameters: dict = Field(
         default_factory=lambda: {
@@ -2698,7 +2732,7 @@ class QuoteReplyActionTool(FunctionTool[AstrAgentContext]):
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         event = _get_current_event(context)
-        if not _check_tool_call_policy(event, self.name):
+        if not _check_outbound_action_admission(event, self.name):
             return "动作取消：当前消息未授权执行互动动作。"
         message_id = str(kwargs.get("message_id", "") or _current_message_id(event) or "").strip()
         text = str(kwargs.get("text", "") or "").strip()
@@ -2990,12 +3024,12 @@ class BotCapabilityLookupTool(FunctionTool[AstrAgentContext]):
         readonly = sorted(
             name
             for name in available_set
-            if TOOL_CAPABILITIES.get(name) and TOOL_CAPABILITIES[name].effect_type == "query"
+            if get_tool_capability(name) and get_tool_capability(name).effect_type == "query"
         )
         actions = sorted(
             name
             for name in available_set
-            if TOOL_CAPABILITIES.get(name) and TOOL_CAPABILITIES[name].effect_type != "query"
+            if get_tool_capability(name) and get_tool_capability(name).effect_type != "query"
         )
         unavailable = sorted(
             set(MODEL_REQUESTABLE_TOOL_NAMES) - set(hidden_requestable) - filtered_set
@@ -3511,7 +3545,7 @@ class SpaceTransitionTool(FunctionTool[AstrAgentContext]):
         delivery_mode = str(kwargs.get("delivery_mode", "relay") or "relay").strip().lower()
         origin_reply = str(kwargs.get("origin_reply", kwargs.get("cover_message", "")) or "").strip()
         current_event = _get_current_event(context)
-        if not _check_tool_call_policy(current_event, self.name):
+        if not _check_outbound_action_admission(current_event, self.name):
             return "动作取消：当前消息未授权执行互动动作。"
         if not target_name or not private_message or not context_summary:
             _record_tool_execution(current_event, self.name, status="failed")
@@ -3657,7 +3691,7 @@ class RegretAndWithdrawTool(FunctionTool[AstrAgentContext]):
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         current_event = _get_current_event(context)
-        if not _check_tool_call_policy(current_event, self.name):
+        if not _check_outbound_action_admission(current_event, self.name):
             return "动作取消：当前消息未授权执行互动动作。"
         message_id = await _resolve_latest_bot_message_id(current_event)
         if not message_id:
@@ -3665,6 +3699,8 @@ class RegretAndWithdrawTool(FunctionTool[AstrAgentContext]):
                 {"status": "not_found", "reason": "bot_message_not_found", "message": "没有找到可撤回的上一条机器人消息。"},
                 ensure_ascii=False,
             )
+        if not _check_outbound_action_admission(current_event, self.name):
+            return "动作取消：插件正在重载，未提交撤回动作。"
         pending_actions = _get_pending_actions(current_event)
         if not any(item.get("action") == "withdraw" for item in pending_actions):
             _append_qq_action(
@@ -3675,47 +3711,40 @@ class RegretAndWithdrawTool(FunctionTool[AstrAgentContext]):
 
 
 @dataclass
-class MessageReactionTool(FunctionTool[AstrAgentContext]):
+class MessageReactionTool(MessageEmojiReactionActionTool):
+    """Legacy alias that executes the canonical QQ emoji reaction action."""
     name: str = "message_reaction_action"
-    description: str = "只调整最终文字回复的互动语气，不执行 QQ 原生消息表情或点赞。"
-    parameters: dict = Field(
-        default_factory=lambda: {
-            "type": "object",
-            "properties": {
-                "reaction": {"type": "string", "description": "要在最终文字里体现的互动反应。", "minLength": 1, "maxLength": 80}
-            },
-            "required": ["reaction"],
-        }
-    )
-
-    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
-        reaction = str(kwargs.get("reaction", "") or "").strip()
-        if not reaction:
-            return "执行失败：reaction 不能为空。"
-        _record_tool_execution(_get_current_event(context), self.name)
-        return f"请在最终文字回复中自然体现“{reaction}”的互动语气，不要声称执行了 QQ 动作。"
-
+    description: str = "兼容旧调用名称；实际执行当前消息的 QQ 原生表情回应。"
 
 @dataclass
 class ProactiveLikeTool(FunctionTool[AstrAgentContext]):
     name: str = "proactive_like_action"
-    description: str = "只调整最终文字回复中的夸奖或好感表达，不执行 QQ 资料点赞。"
+    description: str = "给目标好友发送 QQ 点赞。目标可选，默认当前消息发送者；仅在 QQ API 成功后才可声称点赞成功。"
     db_service: Any = Field(default=None, exclude=True)
     parameters: dict = Field(
         default_factory=lambda: {
             "type": "object",
             "properties": {
-                "target_name": {"type": "string", "description": "要在文字中表达好感的目标，可为空。", "maxLength": 80}
+                "target_id": {"type": "string", "description": "目标好友 QQ 号，可为空，默认当前消息发送者。", "maxLength": 24},
+                "times": {"type": "integer", "description": "点赞次数，默认 1。", "minimum": 1, "maximum": 20},
             },
         }
     )
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         current_event = _get_current_event(context)
-        if not _check_tool_call_policy(current_event, self.name):
-            return "动作取消：当前消息未授权执行互动动作。"
-        target_name = str(kwargs.get("target_name", "") or "").strip()
-        target_id = str(current_event.get_sender_id())
+        if not _check_outbound_action_admission(current_event, self.name):
+            return "动作取消：当前对话明确禁止给目标点赞。"
+        if not outbound_send_allowed(current_event):
+            _record_tool_execution(current_event, self.name, status="shutdown_rejected", reason="shutdown_rejected")
+            return "动作取消：插件正在重载，未提交 QQ 点赞动作。"
+        target_id = str(kwargs.get("target_id", "") or "").strip()
+        target_name = ""
+        if target_id and not target_id.isdigit():
+            target_name = target_id
+            target_id = ""
+        if not target_id:
+            target_id = str(current_event.get_sender_id() or "").strip()
         if target_name:
             resolved = await _resolve_target(
                 self.db_service,
@@ -3723,11 +3752,26 @@ class ProactiveLikeTool(FunctionTool[AstrAgentContext]):
                 current_event=current_event,
                 astr_ctx=context.context.context,
             )
-            if resolved:
-                target_id, _ = resolved
-        display_name = target_name or (current_event.get_sender_name() or "对方")
-        _record_tool_execution(current_event, self.name)
-        return f"请在最终文字回复中自然表达对 {display_name} 的夸奖或好感，不要声称执行了 QQ 点赞。"
+            if not resolved:
+                return json.dumps({"status": "failed", "reason": "target_unresolved"}, ensure_ascii=False)
+            target_id, _ = resolved
+        if not target_id or not str(target_id).isdigit():
+            return json.dumps({"status": "failed", "reason": "target_missing"}, ensure_ascii=False)
+        try:
+            times = max(1, min(20, int(kwargs.get("times", 1) or 1)))
+        except (TypeError, ValueError):
+            times = 1
+        if not _check_outbound_action_admission(current_event, self.name):
+            return "动作取消：插件正在重载，未提交 QQ 点赞动作。"
+        _append_qq_action(
+            current_event,
+            PendingQQAction(
+                action_type="like",
+                target_id=str(target_id),
+                payload={"times": times},
+            ),
+        )
+        return "QQ 点赞动作已提交，等待发送结果。请继续生成正常文字回复，不要提前声称点赞成功。"
 
 
 @dataclass
@@ -3824,6 +3868,7 @@ __all__ = [
     "MemeResonanceTool",
     "MemoryWriteCorrectionTool",
     "MessageEmojiLikeTool",
+    "MessageEmojiReactionActionTool",
     "MessageReactionTool",
     "OmniPerceptionTool",
     "PersonaFactCheckTool",

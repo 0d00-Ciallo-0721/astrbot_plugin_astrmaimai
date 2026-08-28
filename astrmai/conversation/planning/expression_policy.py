@@ -10,6 +10,7 @@ from astrbot.api import logger
 from ...infrastructure.gateway import GlobalModelGateway
 from ...infrastructure.persistence import DatabaseService, ExpressionPattern
 from ...infrastructure.runtime.lane_manager import LaneKey
+from .tool_contracts import canonical_tool_name, is_autonomous_interaction
 
 
 class ActionModifier:
@@ -145,6 +146,10 @@ class ActionModifier:
     def _tool_names(tools: List[Any]) -> List[str]:
         return [str(getattr(tool, 'name', '') or '').strip() for tool in tools or [] if str(getattr(tool, 'name', '') or '').strip()]
 
+    @staticmethod
+    def _is_autonomous(tool: Any) -> bool:
+        return is_autonomous_interaction(str(getattr(tool, "name", "") or ""))
+
     def _trace_filter_step(self, trace, stage: str, before: List[Any], after: List[Any], reason: str, category: str = "") -> None:
         if trace is None:
             return
@@ -227,20 +232,20 @@ class ActionModifier:
         if normalized_tier == "chat":
             if state and hasattr(state, 'energy') and state.energy < self.ENERGY_EXHAUSTION:
                 before = list(filtered)
-                filtered = [tool for tool in filtered if getattr(tool, 'name', '') in self.CHAT_LOW_ENERGY_TOOLS]
+                filtered = [tool for tool in filtered if self._is_autonomous(tool) or getattr(tool, 'name', '') in self.CHAT_LOW_ENERGY_TOOLS]
                 reason = f'energy_exhausted({state.energy:.2f})'
                 reasons.append(reason)
                 self._trace_filter_step(trace, "action_modifier.energy", before, filtered, reason, "energy")
             elif profile or relationship_vec:
                 if score < self.HOSTILE_THRESHOLD:
                     before = list(filtered)
-                    filtered = [tool for tool in filtered if getattr(tool, 'name', '') in self.CHAT_HOSTILE_TOOLS]
+                    filtered = [tool for tool in filtered if self._is_autonomous(tool) or getattr(tool, 'name', '') in self.CHAT_HOSTILE_TOOLS]
                     reason = f'hostile({score:.0f})'
                     reasons.append(reason)
                     self._trace_filter_step(trace, "action_modifier.relationship", before, filtered, reason, "hostility")
                 elif score < self.INTIMATE_THRESHOLD:
                     before = list(filtered)
-                    filtered = [tool for tool in filtered if getattr(tool, 'name', '') not in self.INTIMATE_TOOLS]
+                    filtered = [tool for tool in filtered if self._is_autonomous(tool) or getattr(tool, 'name', '') not in self.INTIMATE_TOOLS]
                     reason = f'low_affection({score:.0f})'
                     reasons.append(reason)
                     self._trace_filter_step(trace, "action_modifier.relationship", before, filtered, reason, "hostility")
@@ -254,7 +259,7 @@ class ActionModifier:
         else:
             if state and hasattr(state, 'energy') and state.energy < self.ENERGY_EXHAUSTION:
                 before = list(filtered)
-                filtered = [tool for tool in filtered if getattr(tool, 'name', '') in self.ALWAYS_AVAILABLE_TOOLS]
+                filtered = [tool for tool in filtered if self._is_autonomous(tool) or getattr(tool, 'name', '') in self.ALWAYS_AVAILABLE_TOOLS]
                 reason = f'energy_exhausted({state.energy:.2f})'
                 reasons.append(reason)
                 self._trace_filter_step(trace, "action_modifier.energy", before, filtered, reason, "energy")
@@ -262,13 +267,13 @@ class ActionModifier:
                 if score < self.HOSTILE_THRESHOLD:
                     hostile_tools = self.HOSTILE_TOOLS | self.ALWAYS_AVAILABLE_TOOLS
                     before = list(filtered)
-                    filtered = [tool for tool in filtered if getattr(tool, 'name', '') in hostile_tools]
+                    filtered = [tool for tool in filtered if self._is_autonomous(tool) or getattr(tool, 'name', '') in hostile_tools]
                     reason = f'hostile({score:.0f})'
                     reasons.append(reason)
                     self._trace_filter_step(trace, "action_modifier.relationship", before, filtered, reason, "hostility")
                 elif score < self.INTIMATE_THRESHOLD:
                     before = list(filtered)
-                    filtered = [tool for tool in filtered if getattr(tool, 'name', '') not in self.INTIMATE_TOOLS]
+                    filtered = [tool for tool in filtered if self._is_autonomous(tool) or getattr(tool, 'name', '') not in self.INTIMATE_TOOLS]
                     reason = f'low_affection({score:.0f})'
                     reasons.append(reason)
                     self._trace_filter_step(trace, "action_modifier.relationship", before, filtered, reason, "hostility")
@@ -283,7 +288,7 @@ class ActionModifier:
         if state and hasattr(state, 'mood') and state.mood < -0.7:
             entertainment_tools = {'meme_resonance_action', 'proactive_meme'}
             before = list(filtered)
-            filtered = [tool for tool in filtered if getattr(tool, 'name', '') not in entertainment_tools]
+            filtered = [tool for tool in filtered if self._is_autonomous(tool) or getattr(tool, 'name', '') not in entertainment_tools]
             reason = f'low_mood({state.mood:.2f})'
             reasons.append(reason)
             self._trace_filter_step(trace, "action_modifier.mood", before, filtered, reason, "mood")
@@ -291,7 +296,7 @@ class ActionModifier:
         if patience < 0.25 or normalized_intent in {"boundary", "observe", "ignore"}:
             calm_tools = {'wait_and_listen', 'message_reaction_action', 'message_emoji_like_action'}
             before = list(filtered)
-            filtered = [tool for tool in filtered if getattr(tool, 'name', '') in calm_tools]
+            filtered = [tool for tool in filtered if self._is_autonomous(tool) or getattr(tool, 'name', '') in calm_tools]
             reason = f'low_patience_or_boundary({patience:.2f})'
             reasons.append(reason)
             self._trace_filter_step(trace, "action_modifier.patience", before, filtered, reason, "social_intent")
@@ -299,7 +304,7 @@ class ActionModifier:
         if caution > 0.7:
             intrusive_tools = {'proactive_poke', 'construct_at_event', 'space_transition_action'}
             before = list(filtered)
-            filtered = [tool for tool in filtered if getattr(tool, 'name', '') not in intrusive_tools]
+            filtered = [tool for tool in filtered if self._is_autonomous(tool) or getattr(tool, 'name', '') not in intrusive_tools]
             reason = f'caution({caution:.2f})'
             reasons.append(reason)
             self._trace_filter_step(trace, "action_modifier.caution", before, filtered, reason, "caution")
@@ -308,7 +313,7 @@ class ActionModifier:
             before = list(filtered)
             filtered = [
                 tool for tool in filtered
-                if getattr(tool, 'name', '') not in {'topic_hijack_action', 'space_transition_action', 'regret_and_withdraw_action'}
+                if self._is_autonomous(tool) or getattr(tool, 'name', '') not in {'topic_hijack_action', 'space_transition_action', 'regret_and_withdraw_action'}
             ]
             reason = f'query_intent_guard(curiosity={curiosity:.2f})'
             reasons.append(reason)
@@ -325,28 +330,16 @@ class ActionModifier:
                 'topic_hijack_action',
             }
             before = list(filtered)
-            filtered = [tool for tool in filtered if getattr(tool, 'name', '') not in stance_blocked_tools]
+            filtered = [tool for tool in filtered if self._is_autonomous(tool) or getattr(tool, 'name', '') not in stance_blocked_tools]
             reason = f'stance_{normalized_stance}_guard'
             reasons.append(reason)
             self._trace_filter_step(trace, "action_modifier.stance", before, filtered, reason, "stance")
 
-        cooldown_tools = {
-            'meme': {'proactive_meme', 'meme_resonance_action'},
-            'poke': {'proactive_poke'},
-            'at': {'construct_at_event'},
-            'like': {'proactive_like_action'},
-            'sharp_reply': {'proactive_meme', 'proactive_poke', 'construct_at_event', 'proactive_like_action'},
-            'long_reply': {'topic_hijack_action', 'space_transition_action', 'meme_resonance_action'},
-        }
-        blocked_by_cooldown = set()
-        for tag in cooldown_set:
-            blocked_by_cooldown.update(cooldown_tools.get(tag, set()))
-        if blocked_by_cooldown:
-            before = list(filtered)
-            filtered = [tool for tool in filtered if getattr(tool, 'name', '') not in blocked_by_cooldown]
-            reason = f'cooldown({",".join(sorted(cooldown_set))})'
-            reasons.append(reason)
-            self._trace_filter_step(trace, "action_modifier.cooldown", before, filtered, reason, "cooldown")
+        # Agency cooldowns remain observable context, but never remove
+        # autonomous interaction tools. Transport idempotency and platform
+        # rate limits are enforced by the execution layer instead.
+        if cooldown_set and trace is not None:
+            reasons.append(f'cooldown_advisory({",".join(sorted(cooldown_set))})')
 
         if trace is not None:
             filtered_names = self._tool_names(filtered)

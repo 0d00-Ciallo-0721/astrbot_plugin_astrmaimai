@@ -79,6 +79,12 @@ TOOL_PROTOCOL_MARKERS = (
     "[system_wait_signal]",
     "[terminal_yield]",
     "请调用 wait_and_listen",
+    "pendingqqaction",
+    "action_type=",
+    "message_emoji_reaction",
+    "send_like",
+    "set_msg_emoji_like",
+    "transport_idempotency_key",
 )
 
 MOJIBAKE_MARKERS = (
