@@ -17,6 +17,7 @@ from ...shared.emotion_tags import build_emotion_tag_catalog
 from ..contracts.prompt_envelope import PromptEnvelope
 from .tool_contracts import (
     AUTONOMOUS_INTERACTION_TOOLS,
+    TOOL_CAPABILITIES,
     build_explicit_invocation_plans,
     filter_tools_for_context,
     is_model_disclosure_requestable,
@@ -188,6 +189,117 @@ class PlannerSideInputMixin:
         "reaction": ("用文字回应", "用语气回应"),
         "like": ("夸夸我", "表扬我", "夸我一下"),
     }
+
+    _IMAGE_DEPENDENT_PHRASES = (
+        "看这个", "看看这个", "这个呢", "看图", "这是什么", "这张图", "那张图",
+        "图里", "图片里", "照片里", "截图里", "评价一下", "解释一下",
+    )
+    _SIDE_EFFECT_TOOL_NAMES = frozenset(
+        {
+            "proactive_meme",
+            "proactive_poke",
+            "proactive_like_action",
+            "message_emoji_like_action",
+            "construct_at_event",
+            "meme_resonance_action",
+            "topic_hijack_action",
+            "quote_reply_action",
+            "regret_and_withdraw_action",
+            "space_transition_action",
+        }
+    )
+    _AUTHORIZED_ACTION_FAMILIES = frozenset(
+        {
+            "meme", "poke", "at", "qq_reaction", "withdraw", "quote_reply",
+            "resonance", "topic", "private", "like", "reaction",
+        }
+    )
+
+    def _apply_event_tool_call_policy(self, event: AstrMessageEvent, tools: list) -> list:
+        """Attach deterministic modality policy and remove unauthorized side effects.
+
+        This is a planner-side defense only; the executor/tool implementations
+        must still enforce the same policy for direct or second-pass calls.
+        """
+        text = str(getattr(event, "message_str", "") or "").strip()
+        lowered = text.casefold()
+        has_image = bool(
+            event.get_extra("direct_image_refs", event.get_extra("direct_vision_urls", []))
+            or event.get_extra("extracted_image_refs", event.get_extra("extracted_image_urls", []))
+            or event.get_extra("astrmai_recent_media_candidates", [])
+            or self._event_has_component_hint(event, ("image",))
+        )
+        raw_explicit_families = event.get_extra("astrmai_explicit_user_intent_families", []) or []
+        if isinstance(raw_explicit_families, str):
+            raw_explicit_families = [raw_explicit_families]
+        explicit_families = {
+            str(family or "").strip().casefold()
+            for family in raw_explicit_families
+            if str(family or "").strip().casefold() in self._AUTHORIZED_ACTION_FAMILIES
+        }
+        # Derive executable authorization from deterministic user language,
+        # never from cognitive eligibility. Keep only action families here so
+        # read-only lookup intent cannot accidentally authorize side effects.
+        explicit_families.update(
+            set(self._explicit_tool_families(event))
+            & {
+                "meme", "poke", "at", "qq_reaction", "withdraw", "quote_reply",
+                "resonance", "topic", "private", "like", "reaction",
+            }
+        )
+        event.set_extra("astrmai_explicit_user_intent_families", sorted(explicit_families))
+        image_question = bool(has_image and any(phrase.casefold() in lowered for phrase in self._IMAGE_DEPENDENT_PHRASES))
+        if has_image and not text:
+            mode = "image_only"
+        elif has_image and image_question:
+            mode = "image_question"
+        elif has_image:
+            mode = "image_plus_text"
+        else:
+            mode = "text_only"
+        # Cognitive eligibility is advisory only.  Executable authorization
+        # comes from deterministic user-intent parsing (or an upstream system
+        # policy that explicitly writes this separate key).
+        allowed_families = set(explicit_families)
+        action_authorized = bool(explicit_families)
+        if not action_authorized:
+            allowed_families.difference_update({"meme", "poke", "like", "qq_reaction", "at", "resonance", "topic"})
+        policy = {
+            "mode": mode,
+            "families": sorted(explicit_families),
+            "allowed_families": sorted(allowed_families),
+            "side_effects_allowed": action_authorized,
+            "vision_requirement": "required" if image_question else ("optional" if has_image else "none"),
+            "action_authorized": action_authorized,
+            "authorization_source": "explicit_user_intent" if action_authorized else "",
+            "confidence": "high" if action_authorized else "none",
+            "negated_families": [],
+            "unknown_families": [],
+        }
+        event.set_extra("astrmai_tool_call_policy", policy)
+        event.set_extra("astrmai_action_authorized", action_authorized)
+        before = [self._canonical_tool_name(tool) for tool in tools or []]
+        filtered = []
+        for tool in tools or []:
+            tool_name = self._canonical_tool_name(tool)
+            spec = TOOL_CAPABILITIES.get(tool_name)
+            requires_auth = bool(getattr(spec, "requires_explicit_authorization", False))
+            if not requires_auth and tool_name not in self._SIDE_EFFECT_TOOL_NAMES:
+                filtered.append(tool)
+                continue
+            family = str(getattr(spec, "family", "") or "")
+            if family in explicit_families:
+                filtered.append(tool)
+        after = [self._canonical_tool_name(tool) for tool in filtered]
+        if before != after:
+            ensure_turn_context(event).tools.record_step(
+                "planner.event_modality_tool_guard",
+                before,
+                after,
+                f"mode({mode});side_effects_not_authorized",
+                category="tool_disclosure",
+            )
+        return filtered
     POKE_INTENT_KEYWORDS = {
         "戳一下",
         "戳我一下",
@@ -408,8 +520,7 @@ class PlannerSideInputMixin:
         msg = self._tool_intent_text(event)
         if not msg:
             return False
-        lowered = msg.lower()
-        if any(keyword in msg or keyword in lowered for keyword in self.TOOL_INTENT_KEYWORDS):
+        if any(self._contains_positive_keyword(msg, keyword) for keyword in self.TOOL_INTENT_KEYWORDS):
             return True
         return bool(self._explicit_tool_families(event))
 
@@ -428,7 +539,7 @@ class PlannerSideInputMixin:
         families.update(
             family
             for family, keywords in self.GENERAL_EXPLICIT_TOOL_KEYWORDS.items()
-            if any(keyword in message or keyword in lowered for keyword in keywords)
+            if any(self._contains_positive_keyword(message, keyword) for keyword in keywords)
         )
         if self._looks_like_cross_session_relay_request(message):
             families.add("private")
@@ -575,8 +686,18 @@ class PlannerSideInputMixin:
             r"^(?:(?:帮我|替我|麻烦你|请你|你去|去)[，, ]*)?(?:给|向|跟).{1,40}?(?:发(?:个|一条)?消息|问问|问一下|说一声|说|告诉|转告|带话)",
             r"^(?:帮我|替我|麻烦你|请你|你去|去)[，, ]*(?:问问|问一下|询问|联系)(?:你(?:的)?好友|好友|朋友|联系人|\d{5,12}|(?!我(?:们|的)?|你).{1,20})",
             r"^(?:帮我|替我|麻烦你|请你)[，, ]*(?:告诉|转告)(?!我(?:们|的)?|你).{1,30}",
+            r"^(?:帮我|替我|麻烦你|请你|请)[，, ]*联系我的(?:好友|朋友|联系人)\b",
         )
-        return any(re.search(pattern, text) for pattern in patterns)
+        if not any(re.search(pattern, text) for pattern in patterns):
+            return False
+        # Relay recognition must share the same negation-aware action matcher
+        # as every other side-effect family.  A relay-shaped sentence that
+        # negates its send verb is not authorization to contact anyone.
+        relay_verbs = (
+            "发消息", "发个消息", "发一条消息", "私聊", "私信", "转告",
+            "告诉", "带话", "问问", "问一下", "询问", "联系", "说一声", "说",
+        )
+        return any(PlannerSideInputMixin._contains_positive_keyword(text, verb) for verb in relay_verbs)
 
     def _explicit_qq_action_families(self, event: AstrMessageEvent) -> set[str]:
         message = self._tool_intent_text(event)
@@ -586,11 +707,37 @@ class PlannerSideInputMixin:
         families = {
             family
             for family, keywords in self.QQ_ACTION_INTENT_KEYWORDS.items()
-            if any(keyword in message or keyword in lowered for keyword in keywords)
+            if any(self._contains_positive_keyword(message, keyword) for keyword in keywords)
         }
         if self._looks_like_meme_request(message):
             families.add("meme")
         return families
+
+    @staticmethod
+    def _contains_positive_keyword(message: str, keyword: str) -> bool:
+        """Match an action keyword only outside a local negation scope."""
+        text = str(message or "")
+        needle = str(keyword or "")
+        if not text or not needle:
+            return False
+        lowered = text.casefold()
+        target = needle.casefold()
+        negation_re = re.compile(
+            r"(?:不要|别|不用|无需|不必|禁止|勿|不想|不需要|不希望|不愿意|don't|dont|do\s+not|no\s+need\s+to|never)",
+            re.IGNORECASE,
+        )
+        start = 0
+        while True:
+            index = lowered.find(target, start)
+            if index < 0:
+                return False
+            clause_start = max(
+                text.rfind(mark, 0, index) for mark in ("，", ",", "。", "！", "!", "？", "?", ";", "；", "\n")
+            ) + 1
+            prefix = text[clause_start:index].strip()
+            if not negation_re.search(prefix):
+                return True
+            start = index + max(1, len(target))
 
     @staticmethod
     def _looks_like_meme_request(message: str) -> bool:
@@ -598,7 +745,7 @@ class PlannerSideInputMixin:
         if not text:
             return False
         action_requested = any(
-            token in text
+            PlannerSideInputMixin._contains_positive_keyword(text, token)
             for token in (
                 "发",
                 "来一个",
@@ -978,6 +1125,7 @@ class PlannerSideInputMixin:
             turn_tools.available_tools = list(tool_names)
             turn_tools.family_filtered_tools = list(tool_names)
             turn_tools.filtered_tools = list(tool_names)
+            tools = self._apply_event_tool_call_policy(event, tools)
             logger.info(f"[{chat_id}] [TOOL_CALL 模式] 加载 Sys3 SubAgent 索引，工具总数: {len(tools)}")
             return tools
 
@@ -1398,12 +1546,18 @@ class PlannerSideInputMixin:
                 "global_progressive_disclosure_fallback",
                 category="tool_disclosure",
             )
+        # Apply modality/authorization policy after every restore path so a
+        # default-action compatibility fallback cannot re-enable side effects
+        # for an unqualified image event.
+        tools = self._apply_event_tool_call_policy(event, list(tools or []))
         tools = normalize_tool_schemas(tools)
-        turn_tools.filtered_tools = [
+        final_tool_names = [
             self._canonical_tool_name(tool)
             for tool in tools or []
             if self._canonical_tool_name(tool)
         ]
+        turn_tools.filtered_tools = final_tool_names
+        turn_tools.available_tools = list(final_tool_names)
         reliable_explicit_enabled = self._conversation_flag("explicit_tool_execution_enabled", True)
         contract_families = set(explicit_tool_families)
         if disclosure_plan is not None:

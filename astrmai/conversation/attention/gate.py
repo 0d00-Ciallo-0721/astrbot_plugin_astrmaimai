@@ -26,6 +26,7 @@ from ...infrastructure.runtime.background_task_budget import (
     BackgroundTaskQueueTimeout,
 )
 from ...infrastructure.runtime.trace_runtime import debug_trace, new_trace_id, preview_text
+from ...infrastructure.runtime.outbound_send_guard import outbound_send_allowed
 from ...infrastructure.runtime.turn_call_ledger import (
     attach_background_task_trace,
     begin_stage,
@@ -783,6 +784,9 @@ class AttentionGate:
                     budget_parameters = {}
                 supports_scope = "scope_id" in budget_parameters
                 supports_acquired_callback = "on_acquired" in budget_parameters
+                supports_wait_timeout = "wait_timeout_sec" in budget_parameters or any(
+                    item.kind is inspect.Parameter.VAR_KEYWORD for item in budget_parameters.values()
+                )
                 budget_wait_stage = None
                 budget_acquired = False
 
@@ -796,6 +800,14 @@ class AttentionGate:
                     )
 
                 run_kwargs = {"task_name": task_name}
+                # Background attention is non-critical to the primary reply;
+                # cap queue admission independently from the global 120s
+                # maintenance budget so saturation degrades quickly.
+                if str(task_name or "").startswith("attention.") and supports_wait_timeout:
+                    run_kwargs["wait_timeout_sec"] = min(
+                        15.0,
+                        max(0.1, float(getattr(budget, "wait_timeout_sec", 120.0) or 120.0)),
+                    )
                 if supports_scope:
                     run_kwargs["scope_id"] = scope_id
                 if supports_acquired_callback:
@@ -1544,6 +1556,8 @@ class AttentionGate:
                 or "（陷入了短暂的沉默...）"
             )
             try:
+                if not outbound_send_allowed(event):
+                    return
                 await event.send(event.plain_result(fallback_text))
                 event.set_extra("astrmai_reply_sent", True)
                 reply_sent = True
@@ -2479,6 +2493,9 @@ class AttentionGate:
         else:
             event.set_extra("astrmai_topic_confirmation_safe_fallback", False)
         try:
+            if not outbound_send_allowed(event):
+                event.set_extra("astrmai_topic_confirmation_send_rejected", True)
+                return False
             await event.send(event.plain_result(safe_text))
             event.set_extra("astrmai_reply_sent", True)
             event.set_extra("astrmai_topic_confirmation_sent", True)
@@ -2501,6 +2518,8 @@ class AttentionGate:
         if not hasattr(event, "send") or not hasattr(event, "plain_result"):
             return None
         try:
+            if not outbound_send_allowed(event):
+                return None
             await event.send(event.plain_result(text))
             event.set_extra("astrmai_reply_sent", True)
             event.set_extra("astrmai_vision_failure_notice_sent", True)

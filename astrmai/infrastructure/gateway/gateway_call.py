@@ -17,7 +17,9 @@ from ..runtime.turn_call_ledger import (
     record_llm_attempt,
 )
 from .gateway_exceptions import GatewayQueueTimeout, LLMCascadeFailureException
-from .output_guard import validate_visible_output_text
+from .gateway_exceptions import GatewayShutdownRejected
+from .output_guard import find_internal_tool_name, internal_tool_name_fingerprint, validate_visible_output_text
+from ..runtime.outbound_send_guard import provider_request_allowed
 
 
 _GATEWAY_SLOT_OWNERS: ContextVar[frozenset[tuple[int, int]]] = ContextVar(
@@ -27,6 +29,15 @@ _GATEWAY_SLOT_OWNERS: ContextVar[frozenset[tuple[int, int]]] = ContextVar(
 
 
 class GatewayCallMixin:
+    @staticmethod
+    def _assert_provider_request_allowed(event: Any) -> None:
+        if provider_request_allowed(event):
+            return
+        if event is not None and hasattr(event, "set_extra"):
+            event.set_extra("astrmai_provider_request_blocked", True)
+            event.set_extra("astrmai_provider_request_block_reason", "shutdown_rejected")
+        raise GatewayShutdownRejected()
+
     @staticmethod
     def _mark_turn_budget_exhausted(event: Any, *, provider_request_started: bool, provider_request_count: int) -> None:
         if event is None or not hasattr(event, "set_extra"):
@@ -515,6 +526,7 @@ class GatewayCallMixin:
                                 model_id=model_id,
                                 attempt=attempt,
                             ):
+                                self._assert_provider_request_allowed(event)
                                 provider_request_started = True
                                 provider_request_count += 1
                                 if event is not None and hasattr(event, "set_extra"):
@@ -732,6 +744,13 @@ class GatewayCallMixin:
                             ),
                         )
                         if failure_kind:
+                            if failure_kind == "internal_tool_name" and event is not None and hasattr(event, "set_extra"):
+                                event.set_extra("astrmai_tool_leak_blocked", True)
+                                event.set_extra(
+                                    "astrmai_tool_leak_fingerprint",
+                                    internal_tool_name_fingerprint(find_internal_tool_name(content)),
+                                )
+                                event.set_extra("astrmai_output_guard_action", "fallback_internal_tool_name")
                             raise ValueError(failure_kind)
 
                         self.router.report_success(report_pool, model_id)

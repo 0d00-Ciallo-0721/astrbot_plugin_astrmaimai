@@ -1485,6 +1485,73 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
             "516779421",
         )
 
+    def test_image_event_policy_rejects_default_poke(self):
+        event = _FakeEvent(group_id=None, sender_id="516779421", sender_name="恸")
+        event.set_extra(
+            "astrmai_tool_call_policy",
+            {"mode": "image_only", "side_effects_allowed": False},
+        )
+        tool = self.mod.ProactivePokeTool(db_service=None)
+
+        result = asyncio.run(tool.call(_wrap_event(event)))
+
+        self.assertIn("未授权", result)
+        self.assertEqual(event.get_extra("astrmai_pending_actions", []), [])
+
+    def test_image_event_policy_rejects_meme_without_explicit_authorization(self):
+        event = _FakeEvent(group_id=None)
+        event.set_extra(
+            "astrmai_tool_call_policy",
+            {"mode": "image_only", "side_effects_allowed": False},
+        )
+        tool = self.mod.ProactiveMemeTool(emotion_mapping=[{"tag": "happy", "description": "开心"}])
+
+        result = asyncio.run(tool.call(_wrap_event(event), emotion_tag="happy"))
+
+        self.assertIn("未授权", result)
+        self.assertEqual(event.get_extra("astrmai_pending_actions", []), [])
+
+    def test_cognitive_allowed_family_cannot_authorize_meme(self):
+        event = _FakeEvent(group_id="12345")
+        event.set_extra(
+            "astrmai_tool_call_policy",
+            {"mode": "image_only", "side_effects_allowed": True, "action_authorized": True},
+        )
+        event.set_extra("astrmai_allowed_action_families", ["meme"])
+        tool = self.mod.ProactiveMemeTool(emotion_mapping=[{"tag": "happy", "description": "开心"}])
+
+        result = asyncio.run(tool.call(_wrap_event(event), emotion_tag="happy"))
+
+        self.assertIn("未授权", result)
+        self.assertEqual(event.get_extra("astrmai_pending_actions", []), [])
+
+    def test_quote_action_requires_explicit_family(self):
+        event = _FakeEvent(group_id="12345")
+        event.set_extra(
+            "astrmai_tool_call_policy",
+            {"mode": "text_only", "side_effects_allowed": True, "action_authorized": True},
+        )
+        tool = self.mod.QuoteReplyActionTool()
+
+        result = asyncio.run(tool.call(_wrap_event(event), text="收到"))
+
+        self.assertIn("未授权", result)
+        self.assertEqual(event.get_extra("astrmai_pending_actions", []), [])
+
+    def test_negated_meme_text_does_not_queue_meme(self):
+        event = _FakeEvent(group_id="12345")
+        event.message_str = "不要发个表情包"
+        event.set_extra(
+            "astrmai_tool_call_policy",
+            {"mode": "text_only", "side_effects_allowed": True, "action_authorized": False},
+        )
+        tool = self.mod.ProactiveMemeTool(emotion_mapping=[{"tag": "happy", "description": "开心"}])
+
+        result = asyncio.run(tool.call(_wrap_event(event), emotion_tag="happy"))
+
+        self.assertIn("未授权", result)
+        self.assertEqual(event.get_extra("astrmai_pending_actions", []), [])
+
     def test_proactive_poke_rejects_private_arbitrary_numeric_target(self):
         event = _FakeEvent(group_id=None, sender_id="user-1", sender_name="Alice")
         api = _FakeApi()

@@ -16,6 +16,7 @@ class ToolCapabilitySpec:
     autonomous_allowed: bool = False
     deterministic_fallback: bool = False
     max_calls_per_turn: int = 1
+    requires_explicit_authorization: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,16 +59,16 @@ TOOL_CAPABILITIES: dict[str, ToolCapabilitySpec] = {
     "group_activity_snapshot_tool": ToolCapabilitySpec("group_activity_snapshot_tool", "group_activity", "query", contexts=("group",), explicit_policy="required", autonomous_allowed=True),
     "contact_route_suggest_tool": ToolCapabilitySpec("contact_route_suggest_tool", "route_suggest", "query", explicit_policy="required", autonomous_allowed=True),
     "cross_chat_memory_query": ToolCapabilitySpec("cross_chat_memory_query", "cross_memory", "query", explicit_policy="required", autonomous_allowed=True),
-    "construct_at_event": ToolCapabilitySpec("construct_at_event", "at", "message", contexts=("group",), explicit_policy="required", autonomous_allowed=True),
-    "proactive_poke": ToolCapabilitySpec("proactive_poke", "poke", "qq_side_effect", explicit_policy="required", autonomous_allowed=True, deterministic_fallback=True),
-    "proactive_meme": ToolCapabilitySpec("proactive_meme", "meme", "message", explicit_policy="required", autonomous_allowed=True, deterministic_fallback=True),
-    "meme_resonance_action": ToolCapabilitySpec("meme_resonance_action", "resonance", "control", contexts=("group",), explicit_policy="required", autonomous_allowed=True),
-    "topic_hijack_action": ToolCapabilitySpec("topic_hijack_action", "topic", "control", explicit_policy="required", autonomous_allowed=True),
-    "space_transition_action": ToolCapabilitySpec("space_transition_action", "private", "cross_session_message", explicit_policy="required", autonomous_allowed=True),
-    "regret_and_withdraw_action": ToolCapabilitySpec("regret_and_withdraw_action", "withdraw", "qq_side_effect", explicit_policy="required", deterministic_fallback=True),
+    "construct_at_event": ToolCapabilitySpec("construct_at_event", "at", "message", contexts=("group",), explicit_policy="required", autonomous_allowed=True, requires_explicit_authorization=True),
+    "proactive_poke": ToolCapabilitySpec("proactive_poke", "poke", "qq_side_effect", explicit_policy="required", autonomous_allowed=True, deterministic_fallback=True, requires_explicit_authorization=True),
+    "proactive_meme": ToolCapabilitySpec("proactive_meme", "meme", "message", explicit_policy="required", autonomous_allowed=True, deterministic_fallback=True, requires_explicit_authorization=True),
+    "meme_resonance_action": ToolCapabilitySpec("meme_resonance_action", "resonance", "control", contexts=("group",), explicit_policy="required", autonomous_allowed=True, requires_explicit_authorization=True),
+    "topic_hijack_action": ToolCapabilitySpec("topic_hijack_action", "topic", "control", explicit_policy="required", autonomous_allowed=True, requires_explicit_authorization=True),
+    "space_transition_action": ToolCapabilitySpec("space_transition_action", "private", "cross_session_message", explicit_policy="required", autonomous_allowed=True, requires_explicit_authorization=True),
+    "regret_and_withdraw_action": ToolCapabilitySpec("regret_and_withdraw_action", "withdraw", "qq_side_effect", explicit_policy="required", deterministic_fallback=True, requires_explicit_authorization=True),
     "message_reaction_action": ToolCapabilitySpec("message_reaction_action", "reaction", "text", explicit_policy="required", autonomous_allowed=True),
-    "message_emoji_like_action": ToolCapabilitySpec("message_emoji_like_action", "qq_reaction", "qq_side_effect", explicit_policy="required", autonomous_allowed=True, deterministic_fallback=True),
-    "proactive_like_action": ToolCapabilitySpec("proactive_like_action", "like", "text", explicit_policy="required", autonomous_allowed=True),
+    "message_emoji_like_action": ToolCapabilitySpec("message_emoji_like_action", "qq_reaction", "qq_side_effect", explicit_policy="required", autonomous_allowed=True, deterministic_fallback=True, requires_explicit_authorization=True),
+    "proactive_like_action": ToolCapabilitySpec("proactive_like_action", "like", "text", explicit_policy="required", autonomous_allowed=True, requires_explicit_authorization=True),
 }
 
 

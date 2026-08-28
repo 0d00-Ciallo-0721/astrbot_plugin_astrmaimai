@@ -11,6 +11,7 @@ from astrbot.api.event import MessageChain
 import astrbot.api.message_components as Comp
 
 from ..contracts.reread import RereadActionRequest, RereadDispatchResult
+from ...infrastructure.runtime.outbound_send_guard import outbound_send_allowed
 
 
 class RereadActionDispatcher:
@@ -426,6 +427,11 @@ class RereadActionDispatcher:
                         await self._rollback_send_claim(request.chat_id, send_key, "stale_turn")
                     await self._release_observer_claim(request.chat_id, observer_token)
                     return RereadDispatchResult("stale", detail="stale_turn")
+            if not outbound_send_allowed(event):
+                if claim_owned:
+                    await self._rollback_send_claim(request.chat_id, send_key, "shutdown_rejected")
+                await self._release_observer_claim(request.chat_id, observer_token)
+                return RereadDispatchResult("shutdown", detail="shutdown_rejected")
             chain = MessageChain()
             chain.chain.append(Comp.Plain(request.text))
             result = await context.send_message(getattr(event, "unified_msg_origin", request.chat_id), chain)

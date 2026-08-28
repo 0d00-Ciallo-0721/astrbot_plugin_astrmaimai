@@ -6,6 +6,7 @@ from pathlib import Path
 import astrbot.api.message_components as Comp
 from astrbot.api import logger
 from astrbot.api.event import MessageChain
+from ...infrastructure.runtime.outbound_send_guard import outbound_send_allowed
 
 
 async def send_meme(event, emotion_tag: str, probability: int, memes_dir: Path, context=None):
@@ -27,6 +28,9 @@ async def send_meme(event, emotion_tag: str, probability: int, memes_dir: Path, 
     try:
         if not emotion_tag or emotion_tag.lower() in {"neutral", "none"}:
             record("neutral")
+            return False
+        if not outbound_send_allowed(event):
+            record("shutdown_rejected")
             return False
         if random.randint(1, 100) > probability:
             record("probability_miss")

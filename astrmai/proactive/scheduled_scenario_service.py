@@ -41,6 +41,14 @@ DEFAULT_SCHEDULE = {
 }
 
 
+class ScheduleParseError(ValueError):
+    """Structured parse/schema failure with an auditable stage label."""
+
+    def __init__(self, stage: str, message: str):
+        self.stage = str(stage or "malformed_json")
+        super().__init__(message)
+
+
 @dataclass(slots=True)
 class WeatherSnapshot:
     text: str
@@ -425,6 +433,7 @@ class ScheduledScenarioService:
         self._generation_retry_at: dict[str, float] = {}
         self._generation_state: dict[str, str] = {}
         self._generation_last_error: dict[str, str] = {}
+        self._generation_parse_stage: dict[str, str] = {}
         self._shutdown_requested = False
         self._last_tick_at = 0.0
         self._last_report: dict[str, Any] = {}
@@ -537,12 +546,9 @@ class ScheduledScenarioService:
         try:
             async with asyncio.timeout(45.0):
                 raw = await self.call_background_lane("daily_schedule", plan_date, prompt)
-            start = str(raw or "").find("{")
-            end = str(raw or "").rfind("}") + 1
-            if start < 0 or end <= start:
-                raise ValueError("missing JSON object")
-            parsed = json.loads(str(raw)[start:end])
+            parsed = self._parse_schedule_response(raw)
             self._validate_schedule_payload(parsed)
+            self._generation_parse_stage[plan_date] = "valid"
             normalized = DailyScheduleStore._normalize(parsed)
             await self.schedule_store.save(plan_date, normalized, source="model")
             self._schedule_cache[plan_date] = (normalized, "model")
@@ -553,7 +559,12 @@ class ScheduledScenarioService:
             self._generation_started.discard(plan_date)
             logger.info(f"[ScheduledScenario] daily schedule generated date={plan_date}")
         except (asyncio.TimeoutError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            logger.warning(f"[ScheduledScenario] daily schedule degraded to fallback: {type(exc).__name__}: {exc}")
+            parse_stage = getattr(exc, "stage", "timeout" if isinstance(exc, asyncio.TimeoutError) else "unknown")
+            self._generation_parse_stage[plan_date] = str(parse_stage)
+            logger.warning(
+                f"[ScheduledScenario] daily schedule degraded to fallback: "
+                f"{type(exc).__name__}: {exc} parse_stage={parse_stage}"
+            )
             self._schedule_generation_failed(plan_date, exc)
         except Exception as exc:
             logger.warning(f"[ScheduledScenario] daily schedule model failure: {type(exc).__name__}: {exc}")
@@ -595,11 +606,33 @@ class ScheduledScenarioService:
             )
 
     @staticmethod
+    def _parse_schedule_response(raw: Any) -> dict[str, Any]:
+        text = str(raw or "").strip()
+        if not text:
+            raise ScheduleParseError("no_object", "missing JSON object")
+        decoder = json.JSONDecoder()
+        saw_object_start = False
+        for index, char in enumerate(text):
+            if char != "{":
+                continue
+            saw_object_start = True
+            try:
+                parsed, _ = decoder.raw_decode(text[index:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+        raise ScheduleParseError(
+            "malformed_json" if saw_object_start else "no_object",
+            "no valid JSON object" if saw_object_start else "missing JSON object",
+        )
+
+    @staticmethod
     def _validate_schedule_payload(payload: Any) -> None:
         if not isinstance(payload, dict) or set(payload) != set(SCHEDULE_SLOTS):
-            raise ValueError("schedule JSON must contain exactly the seven schedule slots")
+            raise ScheduleParseError("schema_invalid", "schedule JSON must contain exactly the seven schedule slots")
         if any(not isinstance(payload[slot], str) or not payload[slot].strip() for slot in SCHEDULE_SLOTS):
-            raise ValueError("schedule JSON slot values must be non-empty strings")
+            raise ScheduleParseError("schema_invalid", "schedule JSON slot values must be non-empty strings")
 
     def _scenario_for(self, now: datetime) -> str:
         life = getattr(self.config, "life", None)
@@ -792,6 +825,7 @@ class ScheduledScenarioService:
             "generation_retry_at": dict(self._generation_retry_at),
             "generation_state": dict(self._generation_state),
             "generation_last_error": dict(self._generation_last_error),
+            "generation_parse_stage": dict(self._generation_parse_stage),
             "cached_schedule_dates": sorted(self._schedule_cache)[-7:],
             "weather_cached": self.weather._cached is not None,
             "claim_persistence_mode": "sqlite" if self.delivery_store.db_path else "memory_process_local",
@@ -805,6 +839,7 @@ class ScheduledScenarioService:
 
 __all__ = [
     "DEFAULT_SCHEDULE",
+    "ScheduleParseError",
     "DailyScheduleStore",
     "FestivalProvider",
     "ScenarioDeliveryStore",

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from tests.helpers.astrbot_stubs import install_astrbot_stubs
+from astrmai.infrastructure.runtime.outbound_send_guard import OUTBOUND_SEND_GATE
 
 
 class _Coordinator:
@@ -59,10 +60,29 @@ class PluginFacadeTurnPrepareTests(unittest.TestCase):
         self.facade_mod = importlib.import_module("astrmai.app.plugin_facade")
 
     def tearDown(self):
+        OUTBOUND_SEND_GATE.close()
         try:
             self.temp_dir.cleanup()
         except Exception:
             pass
+
+    def test_ingress_does_not_reopen_closed_outbound_gate(self):
+        facade = self.facade_mod.PluginFacade.__new__(self.facade_mod.PluginFacade)
+        facade.lifecycle_manager = SimpleNamespace(begin_shutdown=lambda: None)
+        OUTBOUND_SEND_GATE.open()
+        OUTBOUND_SEND_GATE.close(enforce_provider=True)
+
+        async def _empty_handler(_facade, _event):
+            if False:
+                yield None
+
+        async def _run():
+            with patch.object(self.facade_mod, "handle_global_message", _empty_handler):
+                return [item async for item in facade.on_global_message(_Event())]
+
+        self.assertEqual(asyncio.run(_run()), [])
+        self.assertFalse(OUTBOUND_SEND_GATE.snapshot()[0])
+        self.assertTrue(OUTBOUND_SEND_GATE.provider_fence_enforced())
 
     def _facade(self, coordinator, *, group_thread_wait_enabled=True, generation_enabled=True):
         facade = self.facade_mod.PluginFacade.__new__(self.facade_mod.PluginFacade)

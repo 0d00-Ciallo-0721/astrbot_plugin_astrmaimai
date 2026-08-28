@@ -14,9 +14,14 @@ from astrmai.infrastructure.runtime.background_task_budget import (
 )
 from astrmai.conversation.attention.context_compaction import ContextCompactionEngine
 from astrmai.memory.persona.persona_summarizer import PersonaSummarizer
+from astrmai.infrastructure.runtime.outbound_send_guard import OUTBOUND_SEND_GATE
+from astrmai.infrastructure.gateway.gateway_exceptions import GatewayShutdownRejected
 
 
 class BackgroundTaskBudgetTests(unittest.TestCase):
+    def tearDown(self):
+        OUTBOUND_SEND_GATE.close()
+
     def test_persona_background_model_uses_shared_budget(self):
         async def run():
             budget = BackgroundTaskBudget(1)
@@ -99,6 +104,28 @@ class BackgroundTaskBudgetTests(unittest.TestCase):
             self.assertFalse(task.done())
             release.set()
             self.assertEqual(await task, "summary")
+
+        asyncio.run(run())
+
+    def test_compaction_provider_is_fenced_during_strict_shutdown(self):
+        async def run():
+            OUTBOUND_SEND_GATE.open()
+            OUTBOUND_SEND_GATE.close(enforce_provider=True)
+            engine = ContextCompactionEngine(None)
+            called = False
+
+            async def work():
+                nonlocal called
+                called = True
+                return "must not run"
+
+            with self.assertRaises(GatewayShutdownRejected):
+                await engine._run_compaction_model(work)
+            self.assertFalse(called)
+            self.assertEqual(
+                engine.compaction_provider_diagnostics["shutdown_rejected"],
+                1,
+            )
 
         asyncio.run(run())
 

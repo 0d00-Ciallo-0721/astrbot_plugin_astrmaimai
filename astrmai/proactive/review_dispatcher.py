@@ -4,6 +4,7 @@ import asyncio
 
 from astrbot.api import logger
 from astrbot.api.event import MessageChain
+from ..infrastructure.runtime.outbound_send_guard import outbound_send_allowed
 
 
 class ReviewDispatcher:
@@ -21,6 +22,8 @@ class ReviewDispatcher:
             pattern_id = str(item.get("pattern_id", "") or "")
             try:
                 umo = self._normalize_umo(item.get("umo") or item.get("group_id", ""))
+                if not outbound_send_allowed():
+                    raise RuntimeError("shutdown_rejected")
                 await self.context.send_message(umo, MessageChain().message(item["question"]))
                 if not uses_claim and hasattr(self.reflect_tracker, "mark_request_sent"):
                     await self.reflect_tracker.mark_request_sent(pattern_id)

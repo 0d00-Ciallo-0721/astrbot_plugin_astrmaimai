@@ -1,5 +1,6 @@
 import json
 import re
+import hashlib
 from typing import Iterable, List
 
 # ── 内容安全检测模式 ──────────────────────────────────────
@@ -97,6 +98,96 @@ REQUEST_ID_LINE_RE = re.compile(
     r"^\(?\s*request[_\s-]*id\s*[:：]\s*[\w.-]+\s*\)?$",
     re.IGNORECASE,
 )
+
+# Tool identifiers are implementation details and must never cross the user
+# visible boundary.  Keep detection derived from the canonical capability
+# registry rather than maintaining a second list here.
+_INTERNAL_TOOL_NAME_RE_CACHE: re.Pattern[str] | None = None
+_INTERNAL_TOOL_NAME_RE_SIGNATURE: tuple[str, ...] = ()
+
+
+def _internal_tool_name_pattern() -> re.Pattern[str]:
+    global _INTERNAL_TOOL_NAME_RE_CACHE, _INTERNAL_TOOL_NAME_RE_SIGNATURE
+    try:
+        from ...conversation.planning.tool_contracts import TOOL_CAPABILITIES
+
+        canonical = {
+            str(name or "").strip()
+            for name in TOOL_CAPABILITIES
+            if str(name or "").strip()
+        }
+        # Include the concrete class/registration spellings used by AstrBot's
+        # FunctionTool layer.  The signature is rebuilt when capabilities are
+        # dynamically registered, avoiding a permanently stale empty cache.
+        class_aliases = {
+            "ProactiveMemeTool",
+            "MemeResonanceTool",
+            "TopicHijackTool",
+            "SpaceTransitionTool",
+            "MessageReactionTool",
+            "MessageEmojiLikeTool",
+            "RegretAndWithdrawTool",
+            "ConstructAtEventTool",
+            "ProactivePokeTool",
+            "ProactiveLikeTool",
+            "VisionMessageAnalyzeTool",
+        }
+        try:
+            import inspect
+            from ...conversation.planning.tools import pfc_tools as planning_tools
+
+            class_aliases.update(
+                name
+                for name, value in vars(planning_tools).items()
+                if name.endswith("Tool") and inspect.isclass(value)
+            )
+        except Exception:
+            # The static aliases above remain available during partial import.
+            pass
+        aliases = set(canonical) | class_aliases
+        for name in canonical:
+            parts = [part for part in name.split("_") if part]
+            if parts:
+                aliases.add("".join(part.capitalize() for part in parts) + "Tool")
+        signature = tuple(sorted(aliases))
+    except Exception:
+        signature = ()
+    if _INTERNAL_TOOL_NAME_RE_CACHE is None or signature != _INTERNAL_TOOL_NAME_RE_SIGNATURE:
+        try:
+            names = sorted(signature, key=len, reverse=True)
+        except Exception:
+            names = []
+        if names:
+            alternatives = "|".join(re.escape(name) for name in names)
+            _INTERNAL_TOOL_NAME_RE_CACHE = re.compile(
+                rf"(?<![A-Za-z0-9_])(?:{alternatives})(?![A-Za-z0-9_])",
+                re.IGNORECASE,
+            )
+        else:
+            _INTERNAL_TOOL_NAME_RE_CACHE = re.compile(r"(?!x)x")
+        _INTERNAL_TOOL_NAME_RE_SIGNATURE = signature
+    return _INTERNAL_TOOL_NAME_RE_CACHE
+
+
+def find_internal_tool_name(text: str) -> str:
+    """Return the first leaked internal tool identifier, if any."""
+    normalized = normalize_guard_text(text)
+    if not normalized:
+        return ""
+    match = _internal_tool_name_pattern().search(normalized)
+    return str(match.group(0) or "") if match else ""
+
+
+def internal_tool_name_fingerprint(tool_name: str) -> str:
+    """Stable short hash for diagnostics without persisting the raw name."""
+    normalized = str(tool_name or "").strip().lower()
+    if not normalized:
+        return ""
+    return hashlib.sha256(normalized.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+
+def looks_like_internal_tool_name(text: str) -> bool:
+    return bool(find_internal_tool_name(text))
 STATUS_LINE_RE = re.compile(
     r"^\(?\s*(http\s*)?status\s*code\s*[:：]\s*[1-5]\d{2}\s*\)?$",
     re.IGNORECASE,
@@ -285,6 +376,7 @@ def sanitize_visible_reply_text(text: str, fallback_text: str = "", speaker_name
     if (
         looks_like_provider_failure_text(normalized)
         or looks_like_tool_protocol_text(normalized)
+        or looks_like_internal_tool_name(normalized)
         or looks_like_internal_event_envelope(normalized)
         or looks_like_internal_media_context(normalized)
     ):
@@ -303,7 +395,11 @@ def sanitize_visible_reply_text(text: str, fallback_text: str = "", speaker_name
 
     candidate = "\n".join(line for line in lines if line).strip()
     if candidate:
-        if looks_like_provider_failure_text(candidate) or looks_like_tool_protocol_text(candidate):
+        if (
+            looks_like_provider_failure_text(candidate)
+            or looks_like_tool_protocol_text(candidate)
+            or looks_like_internal_tool_name(candidate)
+        ):
             return fallback_text.strip()
         return candidate
 
@@ -321,6 +417,8 @@ def validate_visible_output_text(
         return "", "empty_response"
     if looks_like_provider_failure_text(normalized):
         return "", "provider_failure_text"
+    if looks_like_internal_tool_name(normalized):
+        return "", "internal_tool_name"
     if looks_like_internal_event_envelope(normalized):
         return "", "internal_event_envelope"
     if looks_like_internal_media_context(normalized):

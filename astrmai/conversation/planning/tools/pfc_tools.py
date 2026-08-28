@@ -20,6 +20,7 @@ from sqlmodel import select
 
 from ....infrastructure.persistence.orm_models import VisualAsset, VisualMessageBinding
 from ....infrastructure.runtime.cross_session_handoff_store import CrossSessionHandoff
+from ....infrastructure.runtime.outbound_send_guard import outbound_send_allowed
 from ....infrastructure.runtime.turn_call_ledger import record_vision_observation
 from ....multimodal.visual_cortex import VisionAnalysisCoolingDown
 from ....presentation.dto.message_scope import MessageScope
@@ -165,6 +166,72 @@ def _append_once(event, *, matcher, action: dict[str, Any], record_execution: bo
     if tool_name and record_execution:
         _record_tool_execution(event, tool_name)
     return True
+
+
+_POLICY_GATED_TOOLS = frozenset(
+    {
+        "proactive_meme",
+        "proactive_poke",
+        "proactive_like_action",
+        "message_emoji_like_action",
+        "construct_at_event",
+        "meme_resonance_action",
+        "topic_hijack_action",
+        "quote_reply_action",
+        "regret_and_withdraw_action",
+        "space_transition_action",
+    }
+)
+
+
+def _check_tool_call_policy(event, tool_name: str) -> bool:
+    """Second-line executable gate for side-effect tools.
+
+    Planner filtering is advisory; direct/second-pass calls must be rejected
+    here when the event explicitly disallows side effects.
+    """
+    normalized_name = str(tool_name or "").strip()
+    spec = TOOL_CAPABILITIES.get(normalized_name)
+    if normalized_name not in _POLICY_GATED_TOOLS and not bool(
+        getattr(spec, "requires_explicit_authorization", False)
+    ):
+        return True
+    getter = getattr(event, "get_extra", None)
+    policy = getter("astrmai_tool_call_policy", None) if callable(getter) else None
+    if not isinstance(policy, dict):
+        # Real ingress events are always generation-bound.  Missing policy on
+        # such an event is an unsafe direct/second-pass invocation; synthetic
+        # unit events retain legacy behavior for isolated tool tests.
+        bound_generation = getter("astrmai_outbound_generation", None) if callable(getter) else None
+        if bound_generation not in (None, ""):
+            _record_tool_execution(event, tool_name, status="rejected", reason="missing_tool_call_policy")
+            return False
+        return True
+    policy_families = policy.get("families")
+    if isinstance(policy_families, (list, tuple, set)):
+        allowed_families = {
+            str(item or "").strip()
+            for item in policy_families
+            if str(item or "").strip()
+        }
+    else:
+        allowed_families = {
+            str(item or "").strip()
+            for item in (getter("astrmai_explicit_user_intent_families", []) or [])
+        }
+    family = str(getattr(spec, "family", "") or "")
+    if (
+        bool(policy.get("side_effects_allowed", False))
+        and bool(policy.get("action_authorized", False))
+        and family in allowed_families
+    ):
+        return True
+    reason = "explicit_authorization_required"
+    _record_tool_execution(event, tool_name, status="rejected", reason=reason)
+    if hasattr(event, "set_extra"):
+        event.set_extra("astrmai_tool_call_rejected", tool_name)
+        event.set_extra("astrmai_tool_call_rejection_reason", reason)
+    return False
 
 
 def _current_message_id(event) -> str:
@@ -998,9 +1065,11 @@ class ConstructAtEventTool(FunctionTool[AstrAgentContext]):
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         target_name = str(kwargs.get("target_name", "") or "").strip()
+        current_event = _get_current_event(context)
+        if not _check_tool_call_policy(current_event, self.name):
+            return "动作取消：当前消息未授权执行互动动作。"
         if not target_name:
             return "执行失败：target_name 不能为空。"
-        current_event = _get_current_event(context)
         current_group_id = str(current_event.get_group_id() or "").strip()
         if not current_group_id:
             _record_tool_execution(current_event, self.name, status="failed")
@@ -1100,21 +1169,23 @@ class ConstructAtEventTool(FunctionTool[AstrAgentContext]):
 class ProactivePokeTool(FunctionTool[AstrAgentContext]):
     name: str = "proactive_poke"
     description: str = (
-        "主动戳一戳目标用户。适合轻互动、调皮回戳、提醒对方看消息、或在群聊中自然拉某人回到话题。"
-        "未指定目标时默认戳当前触发用户；不要在严肃、冲突或信息不明确时滥用。"
+        "主动戳一戳目标用户。仅在用户明确要求或事件策略明确授权时使用；"
+        "普通图片消息、严肃问题、冲突或信息不明确时禁止调用。"
     )
     db_service: Any = Field(default=None, exclude=True)
     parameters: dict = Field(
         default_factory=lambda: {
             "type": "object",
             "properties": {
-                "target_name": {"type": "string", "description": "要戳的用户名或 ID；留空时使用当前发送者。", "maxLength": 80}
+                "target_name": {"type": "string", "description": "要戳的用户名或 ID；仅在 peer_poke 或私聊明确授权时可留空。", "maxLength": 80}
             },
         }
     )
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         current_event = _get_current_event(context)
+        if not _check_tool_call_policy(current_event, self.name):
+            return "动作取消：当前消息未授权执行互动动作。"
         astr_ctx = context.context.context
         scope = MessageScope.from_event(current_event)
         target_name = str(kwargs.get("target_name", "") or "").strip()
@@ -1225,6 +1296,8 @@ class MessageEmojiLikeTool(FunctionTool[AstrAgentContext]):
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         current_event = _get_current_event(context)
+        if not _check_tool_call_policy(current_event, self.name):
+            return "动作取消：当前消息未授权执行互动动作。"
         message_id = _current_message_id(current_event)
         if not message_id:
             return json.dumps(
@@ -1270,7 +1343,7 @@ class ProactiveMemeTool(FunctionTool[AstrAgentContext]):
             f"- {tag}: {description}" for tag, description in configured_tags.items()
         ) or "- neutral: 平静"
         self.description = (
-            "选择一个表情包情绪标签，系统会在最终回复后自动按该标签补发表情包。\n"
+            "选择一个表情包情绪标签。仅在用户明确要求表情包或事件策略授权时调用；普通图片消息不要调用。\n"
             f"可用标签:\n{available}"
         )
         self.parameters = {
@@ -1287,6 +1360,8 @@ class ProactiveMemeTool(FunctionTool[AstrAgentContext]):
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         current_event = _get_current_event(context)
+        if not _check_tool_call_policy(current_event, self.name):
+            return "动作取消：当前消息未授权执行互动动作。"
         emotion_tag = str(kwargs.get("emotion_tag", "neutral") or "neutral").strip().lower()
         valid_tags = set(parse_emotion_mapping(self.emotion_mapping))
         if valid_tags and emotion_tag not in valid_tags:
@@ -1330,6 +1405,8 @@ class MemeResonanceTool(FunctionTool[AstrAgentContext]):
         if not target_message:
             return "执行失败：target_message 不能为空。"
         current_event = _get_current_event(context)
+        if not _check_tool_call_policy(current_event, self.name):
+            return "动作取消：当前消息未授权执行互动动作。"
         if not getattr(current_event, "get_group_id", lambda: "")():
             return "执行失败：主动复读只适用于群聊。"
         current_message = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", str(getattr(current_event, "message_str", "") or ""))
@@ -1375,7 +1452,10 @@ class TopicHijackTool(FunctionTool[AstrAgentContext]):
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         fake_status = str(kwargs.get("fake_status", "") or "").strip() or "正忙着"
-        _record_tool_execution(_get_current_event(context), self.name)
+        current_event = _get_current_event(context)
+        if not _check_tool_call_policy(current_event, self.name):
+            return "动作取消：当前消息未授权执行互动动作。"
+        _record_tool_execution(current_event, self.name)
         return (
             "[SYSTEM OVERRIDE] 立刻停止回答原话题。"
             f"请以“我现在{fake_status}”为现实前提，简短、口语化地把话题拐开。"
@@ -2618,6 +2698,8 @@ class QuoteReplyActionTool(FunctionTool[AstrAgentContext]):
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         event = _get_current_event(context)
+        if not _check_tool_call_policy(event, self.name):
+            return "动作取消：当前消息未授权执行互动动作。"
         message_id = str(kwargs.get("message_id", "") or _current_message_id(event) or "").strip()
         text = str(kwargs.get("text", "") or "").strip()
         if not message_id:
@@ -3429,6 +3511,8 @@ class SpaceTransitionTool(FunctionTool[AstrAgentContext]):
         delivery_mode = str(kwargs.get("delivery_mode", "relay") or "relay").strip().lower()
         origin_reply = str(kwargs.get("origin_reply", kwargs.get("cover_message", "")) or "").strip()
         current_event = _get_current_event(context)
+        if not _check_tool_call_policy(current_event, self.name):
+            return "动作取消：当前消息未授权执行互动动作。"
         if not target_name or not private_message or not context_summary:
             _record_tool_execution(current_event, self.name, status="failed")
             return "发送失败：target_name、message 和 context_summary 都不能为空，消息未发送。"
@@ -3485,6 +3569,10 @@ class SpaceTransitionTool(FunctionTool[AstrAgentContext]):
             if not is_current:
                 _record_tool_execution(current_event, self.name, status="failed")
                 return "发送取消：当前请求已经过期或插件正在重载，消息未发送。"
+
+        if not outbound_send_allowed(current_event):
+            _record_tool_execution(current_event, self.name, status="shutdown_rejected")
+            return "发送取消：插件正在重载，消息未发送。"
 
         try:
             send_result = await astr_ctx.send_message(
@@ -3569,6 +3657,8 @@ class RegretAndWithdrawTool(FunctionTool[AstrAgentContext]):
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         current_event = _get_current_event(context)
+        if not _check_tool_call_policy(current_event, self.name):
+            return "动作取消：当前消息未授权执行互动动作。"
         message_id = await _resolve_latest_bot_message_id(current_event)
         if not message_id:
             return json.dumps(
@@ -3622,6 +3712,8 @@ class ProactiveLikeTool(FunctionTool[AstrAgentContext]):
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         current_event = _get_current_event(context)
+        if not _check_tool_call_policy(current_event, self.name):
+            return "动作取消：当前消息未授权执行互动动作。"
         target_name = str(kwargs.get("target_name", "") or "").strip()
         target_id = str(current_event.get_sender_id())
         if target_name:

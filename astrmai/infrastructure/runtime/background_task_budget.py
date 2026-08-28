@@ -117,6 +117,7 @@ class BackgroundTaskBudget:
         execution_timeout_sec: float | None = None,
         on_acquired: Callable[[], None] | None = None,
         defer_release_on_timeout: bool = False,
+        wait_timeout_sec: float | None = None,
     ) -> T:
         task_name = str(task_name or "unknown").strip() or "unknown"
         active_leases = _ACTIVE_BUDGET_LEASES.get()
@@ -132,7 +133,7 @@ class BackgroundTaskBudget:
         self._touch_scope(scope_key)
         queue_started_at = time.monotonic()
         try:
-            await self._acquire(task_name, scope_key)
+            await self._acquire(task_name, scope_key, wait_timeout_sec=wait_timeout_sec)
         except (BackgroundTaskQueueFull, BackgroundTaskQueueTimeout):
             if task_name != "unknown":
                 samples = self._queue_wait_samples_by_kind.setdefault(task_name, [])
@@ -437,7 +438,13 @@ class BackgroundTaskBudget:
             self._accepting = True
             return True
 
-    async def _acquire(self, task_name: str, scope_key: str = "") -> None:
+    async def _acquire(
+        self,
+        task_name: str,
+        scope_key: str = "",
+        *,
+        wait_timeout_sec: float | None = None,
+    ) -> None:
         if self._active < self.limit and not self._waiters:
             self._active += 1
             if task_name != "unknown":
@@ -459,7 +466,8 @@ class BackgroundTaskBudget:
         self._waiters.append(waiter)
         self._peak_queued = max(self._peak_queued, queued + 1)
         try:
-            await asyncio.wait_for(waiter, timeout=self.wait_timeout_sec)
+            queue_timeout = self.wait_timeout_sec if wait_timeout_sec is None else max(0.1, float(wait_timeout_sec))
+            await asyncio.wait_for(waiter, timeout=queue_timeout)
         except asyncio.TimeoutError as exc:
             self._timed_out += 1
             self._timed_out_by_kind[task_name] = self._timed_out_by_kind.get(task_name, 0) + 1
@@ -472,7 +480,7 @@ class BackgroundTaskBudget:
                 except ValueError:
                     pass
             raise BackgroundTaskQueueTimeout(
-                f"background task queue wait timed out after {self.wait_timeout_sec:.1f}s"
+                f"background task queue wait timed out after {queue_timeout:.1f}s"
             ) from exc
         except asyncio.CancelledError:
             if waiter.done() and not waiter.cancelled():

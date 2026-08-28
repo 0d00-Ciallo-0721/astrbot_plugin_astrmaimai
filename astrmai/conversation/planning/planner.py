@@ -44,6 +44,7 @@ from .planning_input_loader import PlanningInputLoader
 from .planner_prompt_context import PlannerPromptContextMixin
 from .planner_side_inputs import PlannerSideInputMixin
 from .think_level_policy import ThinkLevelPolicy
+from .tool_contracts import tool_display_name
 from ...proactive.dispatcher import append_proactive_stage
 
 
@@ -71,6 +72,20 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         "message_emoji_like_action": "消息表情回复",
         "proactive_like_action": "表达好感",
         "vision_message_analyze_tool": "按需查看图片内容",
+    }
+    TOOL_CAPABILITY_CARDS = {
+        "vision_message_analyze_tool": "查看图片事实；仅在回答依赖图片内容时使用；只读，不发送消息，结果只能作为内部事实。",
+        "proactive_meme": "用途：为最终回复附加表情包；触发：用户明确要求表情包/梗图；必填：合法 emotion_tag；禁止：仅图片无动作；失败：说明未完成且不重复调用；每轮最多1次。",
+        "proactive_poke": "用途：戳一戳目标；触发：用户明确要求戳人；必填：唯一合法 target_id；禁止：目标不明或仅凭上下文猜测；失败：拒绝执行并说明原因；每轮最多1次。",
+        "proactive_like_action": "用途：在文字中表达好感；触发：明确社交意图；必填：表达内容；禁止：冒充 QQ 点赞；失败：退回普通文字回复；每轮最多1次。",
+        "construct_at_event": "用途：确认当前群成员并追加 @；触发：明确 @ 请求；必填：当前群与唯一目标；禁止：空目标或多目标未确认；失败：先澄清，不发送；每轮最多1次。",
+        "quote_reply_action": "用途：引用指定 QQ 消息并发送短回复；触发：明确引用/回这条消息；必填：合法 message_id 与正文；禁止：引用不存在时退化普通发送；失败：说明未完成且不重试；每轮最多1次。",
+        "meme_resonance_action": "用途：复读或共鸣指定群消息；触发：明确原样复读请求；必填：可确认目标消息；禁止：目标不明时猜测；失败：说明未完成且不重复调用；每轮最多1次。",
+        "topic_hijack_action": "用途：生成话题切换指令；触发：明确要求换话题；必填：新的话题方向；禁止：悄悄打断正常问答；失败：改为自然询问；每轮最多1次。",
+        "space_transition_action": "用途：向已确认的机器人好友跨会话发私聊；触发：明确传话请求；必填：目标会话与非空正文；禁止：查询意图、目标不明；失败：拒绝发送并说明缺失信息；每轮最多1次。",
+        "regret_and_withdraw_action": "用途：排队撤回上一条机器人消息；触发：明确撤回请求；必填：可定位 message_id；禁止：无法定位时猜测；失败：说明未撤回且不重复调用；每轮最多1次。",
+        "message_reaction_action": "用途：把互动反应融入最终文字；触发：明确文字互动意图；必填：自然语言回复内容；禁止：声称执行 QQ 原生动作；失败：退回普通文字回复；每轮最多1次。",
+        "message_emoji_like_action": "用途：给指定 QQ 消息添加表情回应；触发：明确消息表情/点赞请求；必填：合法 message_id；禁止：消息 ID 不明；失败：拒绝执行并说明原因；每轮最多1次。",
     }
 
     def __init__(
@@ -704,7 +719,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             }
             pending_required = [name for name in required_tools if name not in prepared_tools]
             if pending_required:
-                labels = [self.TOOL_HINT_LABELS.get(name, name) for name in pending_required]
+                labels = [self.TOOL_HINT_LABELS.get(name, tool_display_name(name) or "相关能力") for name in pending_required]
                 guidance_lines.append(
                     "用户本轮明确要求执行以下能力："
                     + "、".join(labels)
@@ -736,25 +751,40 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                     )
             prepared_required = [name for name in required_tools if name in prepared_tools]
             if prepared_required:
-                labels = [self.TOOL_HINT_LABELS.get(name, name) for name in prepared_required]
+                labels = [self.TOOL_HINT_LABELS.get(name, tool_display_name(name) or "相关能力") for name in prepared_required]
                 guidance_lines.append(
                     "系统已根据用户明确请求准备好以下动作："
                     + "、".join(labels)
                     + "。不要重复调用同一动作，也不要声称动作已经成功；请生成自然的配套回复。"
                 )
         if tool_tier == "chat":
-            guidance = "如果气氛合适，可以顺手发表情包、轻轻互动或点个赞；这不是必须动作，普通闲聊直接自然回复即可。"
+            policy = event.get_extra("astrmai_tool_call_policy", {}) if event is not None and hasattr(event, "get_extra") else {}
+            if isinstance(policy, dict) and policy.get("mode") in {"image_only", "image_plus_text", "image_question"} and not policy.get("action_authorized", False):
+                guidance = "当前消息包含图片但没有明确动作授权。默认只回答用户文字或图片事实；不要调用表情包、戳一戳、点赞、@成员、复读或话题切换等副作用动作。"
+            else:
+                guidance = "只有在用户明确要求或本轮动作策略已授权时才使用表情包、轻互动或点赞；普通闲聊直接自然回复即可。"
             if any(name in {"proactive_poke", "construct_at_event"} for name in tool_names):
-                guidance += "戳人或@别人只在非常自然、明确相关时使用。"
+                guidance += "戳人或@别人必须有明确目标和本轮授权。"
+            cards = [
+                f"{name}: {self.TOOL_CAPABILITY_CARDS[name]}"
+                for name in tool_names
+                if name in self.TOOL_CAPABILITY_CARDS
+            ]
+            if cards:
+                guidance += "工具能力卡：" + "；".join(cards)
             guidance_lines.append(guidance)
             prompt_envelope.guidance_lines = self._dedupe_guidance_lines(guidance_lines)
             return
 
         labels: list[str] = []
+        cards: list[str] = []
         for tool_name in tool_names:
-            label = self.TOOL_HINT_LABELS.get(tool_name)
+            label = self.TOOL_HINT_LABELS.get(tool_name, tool_display_name(tool_name))
             if label and label not in labels:
                 labels.append(label)
+            card = self.TOOL_CAPABILITY_CARDS.get(tool_name)
+            if card:
+                cards.append(f"{tool_name}: {card}")
         if not labels:
             prompt_envelope.guidance_lines = self._dedupe_guidance_lines(guidance_lines)
             return
@@ -762,6 +792,8 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             f"本轮可用动作：{'、'.join(labels)}。只有确实合适时才使用，普通闲聊直接回复。"
             "等待只在对方明显没说完、或当前确实不该回复时使用；撤回只在用户明确要求或上一条回复确实需要撤回时使用。"
         )
+        if cards:
+            guidance += "工具能力卡：" + "；".join(cards)
         social_intent = ""
         if event is not None and hasattr(event, "get_extra"):
             social_intent = str(event.get_extra("astrmai_social_intent", "") or "")

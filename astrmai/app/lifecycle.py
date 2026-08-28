@@ -9,6 +9,7 @@ from astrbot.api import logger
 
 from ..multimodal import init_meme_storage
 from ..shared.helpers.plugin_helpers import cleanup_stale_focus_pools, collect_background_tasks, safe_create_task
+from ..infrastructure.runtime.outbound_send_guard import OUTBOUND_SEND_GATE
 from .runtime_context import PluginRuntimeContext
 
 
@@ -417,6 +418,7 @@ class PluginLifecycleManager:
 
         self.runtime.status.lifecycle_started = True
         self.runtime.status.accepting_events = True
+        OUTBOUND_SEND_GATE.open()
         self.runtime.set_boot_phase("runtime.running")
         logger.info("[AstrMai] boot complete — runtime running")
 
@@ -834,6 +836,9 @@ class PluginLifecycleManager:
             return
         self._terminated = True
         self._shutdown_requested = True
+        # Close outbound side effects synchronously.  Late cleanup callbacks
+        # may finish internal work, but must not send after unload begins.
+        OUTBOUND_SEND_GATE.close(enforce_provider=True)
         self.runtime.status.accepting_events = False
         self.runtime.status.is_running = False
         attention_gate = getattr(self.runtime, "attention_gate", None)

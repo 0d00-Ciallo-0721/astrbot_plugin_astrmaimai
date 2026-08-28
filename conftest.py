@@ -14,3 +14,13 @@ if str(_project_root) not in sys.path:
 @pytest.fixture(scope="session")
 def after_nonebot_init() -> None:
     """Override nonebug's no-op async fixture, which leaks under pytest 8."""
+
+
+@pytest.fixture(autouse=True)
+def reset_outbound_gate_between_tests():
+    """Keep process-wide lifecycle state from leaking between isolated tests."""
+    from astrmai.infrastructure.runtime.outbound_send_guard import OUTBOUND_SEND_GATE
+
+    OUTBOUND_SEND_GATE.close()
+    yield
+    OUTBOUND_SEND_GATE.close()

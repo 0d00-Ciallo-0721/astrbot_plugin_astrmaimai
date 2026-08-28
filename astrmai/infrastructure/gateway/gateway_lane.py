@@ -20,11 +20,21 @@ from ..runtime.turn_call_ledger import (
     record_llm_attempt,
     remaining_turn_budget,
 )
-from .gateway_exceptions import GatewayQueueTimeout, LLMCascadeFailureException
-from .output_guard import validate_visible_output_text
+from .gateway_exceptions import GatewayQueueTimeout, LLMCascadeFailureException, GatewayShutdownRejected
+from .output_guard import find_internal_tool_name, internal_tool_name_fingerprint, validate_visible_output_text
+from ..runtime.outbound_send_guard import provider_request_allowed
 
 
 class GatewayLaneMixin:
+    @staticmethod
+    def _assert_provider_request_allowed(event: Any) -> None:
+        if provider_request_allowed(event):
+            return
+        if event is not None and hasattr(event, "set_extra"):
+            event.set_extra("astrmai_provider_request_blocked", True)
+            event.set_extra("astrmai_provider_request_block_reason", "shutdown_rejected")
+        raise GatewayShutdownRejected()
+
     def _lane_prepare_timeout(self, event: Any) -> float:
         timing = getattr(getattr(self, "config", None), "timing", None)
         try:
@@ -355,6 +365,7 @@ class GatewayLaneMixin:
                 stage="gateway.tool_semaphore_wait",
                 propagate_queue_timeout_status=propagate_queue_timeout_status,
             ):
+                self._assert_provider_request_allowed(event)
                 return await self.context.tool_loop_agent(
                     event=event,
                     chat_provider_id=chat_provider_id,
@@ -403,6 +414,7 @@ class GatewayLaneMixin:
                         attempt=attempt,
                         tool_mode=True,
                     ):
+                        self_gateway._assert_provider_request_allowed(event)
                         return await self._wrapped_provider.text_chat(**request_kwargs)
 
             def text_chat_stream(self, **request_kwargs: Any):
@@ -420,6 +432,7 @@ class GatewayLaneMixin:
                             attempt=attempt,
                             tool_mode=True,
                         ):
+                            self_gateway._assert_provider_request_allowed(event)
                             async for item in self._wrapped_provider.text_chat_stream(
                                 **request_kwargs
                             ):
@@ -1197,6 +1210,13 @@ class GatewayLaneMixin:
                     ),
                 )
                 if failure_kind:
+                    if failure_kind == "internal_tool_name" and event is not None and hasattr(event, "set_extra"):
+                        event.set_extra("astrmai_tool_leak_blocked", True)
+                        event.set_extra(
+                            "astrmai_tool_leak_fingerprint",
+                            internal_tool_name_fingerprint(find_internal_tool_name(reply_text)),
+                        )
+                        event.set_extra("astrmai_output_guard_action", "fallback_internal_tool_name")
                     raise ValueError(failure_kind)
 
                 self.router.report_success(report_pool, model_id)

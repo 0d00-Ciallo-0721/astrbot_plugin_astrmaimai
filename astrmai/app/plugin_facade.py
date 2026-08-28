@@ -18,6 +18,7 @@ from ..presentation.events.message_entry import handle_global_message
 from ..presentation.events.result_sniffer import sniff_external_plugin_results
 from ..presentation.events.startup_hooks import on_program_start as run_startup_hook
 from ..infrastructure.runtime.lane_manager import LaneKey
+from ..infrastructure.runtime.outbound_send_guard import bind_event_generation
 from ..shared.helpers.plugin_helpers import format_model_pool
 from .lifecycle import PluginLifecycleManager
 from .runtime_context import PluginRuntimeContext
@@ -769,6 +770,7 @@ class PluginFacade(RuntimeFacadeProtocol):
             return
 
         task_query = event.message_str.replace("/work", "").strip()
+        bind_event_generation(event)
         if not task_query:
             yield event.plain_result(
                 "❌ 请告诉我需要执行什么任务。\n"

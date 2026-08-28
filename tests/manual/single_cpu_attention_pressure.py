@@ -789,6 +789,11 @@ async def run_pressure(options: PressureOptions) -> dict[str, Any]:
 
         gate.reset_runtime_state()
         budget_resumed = budget.resume_if_idle()
+        # A reload represents a successful lifecycle startup and must reopen
+        # the process-wide outbound/provider gate before accepting messages.
+        from astrmai.infrastructure.runtime.outbound_send_guard import OUTBOUND_SEND_GATE
+
+        OUTBOUND_SEND_GATE.open()
         reload_runtime, reload_lifecycle = _build_runtime(
             config,
             provider,

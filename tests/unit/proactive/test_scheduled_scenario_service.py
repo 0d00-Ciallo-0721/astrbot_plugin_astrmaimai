@@ -1,6 +1,7 @@
 import asyncio
 from datetime import datetime
 import importlib
+import json
 import sqlite3
 import sys
 import tempfile
@@ -116,6 +117,20 @@ class ScheduledScenarioServiceTests(unittest.TestCase):
             call_background_lane=lambda *args, **kwargs: asyncio.sleep(0, result="{}"),
             task_launcher=lambda factory: factory().close(),
         )
+
+    def test_schedule_parser_accepts_markdown_and_trailing_text(self):
+        payload = {slot: f"计划-{slot}" for slot in self.module.SCHEDULE_SLOTS}
+        raw = "说明文字\n```json\n" + json.dumps(payload, ensure_ascii=False) + "\n```\n结束"
+        parsed = self.module.ScheduledScenarioService._parse_schedule_response(raw)
+        self.assertEqual(parsed, payload)
+
+    def test_schedule_parser_reports_no_object_and_schema_stage(self):
+        with self.assertRaises(self.module.ScheduleParseError) as ctx:
+            self.module.ScheduledScenarioService._parse_schedule_response("暂时没有结果")
+        self.assertEqual(ctx.exception.stage, "no_object")
+        with self.assertRaises(self.module.ScheduleParseError) as ctx:
+            self.module.ScheduledScenarioService._validate_schedule_payload({"morning": "x"})
+        self.assertEqual(ctx.exception.stage, "schema_invalid")
 
     def test_morning_candidate_is_persisted_and_not_repeated_after_restart(self):
         timestamp = datetime(2026, 5, 11, 8, 15).timestamp()

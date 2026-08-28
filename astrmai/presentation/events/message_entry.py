@@ -20,6 +20,7 @@ from ...infrastructure.runtime.turn_call_ledger import (
 )
 from ...presentation.dto.message_scope import IngressDecision, MessageScope
 from ...shared.helpers.plugin_helpers import is_direct_call_event
+from ...infrastructure.runtime.outbound_send_guard import bind_event_generation
 
 if TYPE_CHECKING:
     from ...app.runtime_facade_protocol import RuntimeFacadeProtocol
@@ -171,6 +172,7 @@ async def handle_global_message(facade: RuntimeFacadeProtocol, event):
     if callable(is_accepting_events) and not is_accepting_events():
         debug_trace(event, "ingress.shutdown_rejected")
         return
+    bind_event_generation(event)
     event_route, notice_payload = _classify_event_route(event)
     if event_route == "recall_notice":
         # G3/ID-08: 给热区里对应消息打墓碑（内容替换为 [已撤回]，speaker 与时序保留），

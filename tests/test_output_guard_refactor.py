@@ -2,6 +2,7 @@ import importlib
 import sys
 import tempfile
 import unittest
+from astrmai.conversation.planning.tool_contracts import ToolCapabilitySpec, TOOL_CAPABILITIES
 
 from tests.helpers.astrbot_stubs import install_astrbot_stubs
 
@@ -87,6 +88,55 @@ class OutputGuardRefactorTests(unittest.TestCase):
 
         self.assertEqual(safe_text, "")
         self.assertEqual(failure_kind, "internal_media_context")
+
+    def test_validate_visible_output_text_blocks_internal_tool_identifier(self):
+        safe_text, failure_kind = self.guard_mod.validate_visible_output_text(
+            "我将调用 qq_user_identity_lookup 查询一下。"
+        )
+        self.assertEqual(safe_text, "")
+        self.assertEqual(failure_kind, "internal_tool_name")
+        self.assertTrue(self.guard_mod.looks_like_internal_tool_name("proactive_meme()"))
+
+    def test_internal_tool_identifier_detection_does_not_match_longer_word(self):
+        safe_text, failure_kind = self.guard_mod.validate_visible_output_text(
+            "这是一段正常的工具调用说明，但不会暴露内部实现。"
+        )
+        self.assertTrue(safe_text)
+        self.assertEqual(failure_kind, "")
+
+    def test_internal_tool_identifier_detects_registered_class_alias(self):
+        safe_text, failure_kind = self.guard_mod.validate_visible_output_text(
+            "我会调用 ProactiveMemeTool。"
+        )
+        self.assertEqual(safe_text, "")
+        self.assertEqual(failure_kind, "internal_tool_name")
+
+    def test_internal_tool_identifier_detects_all_core_class_aliases(self):
+        aliases = (
+            "WaitTool",
+            "OmniPerceptionTool",
+            "MemoryWriteCorrectionTool",
+            "UnverifiedReportRecordTool",
+            "PersonaFactCheckTool",
+            "GroupActivitySnapshotTool",
+            "ContactRouteSuggestTool",
+        )
+        for alias in aliases:
+            with self.subTest(alias=alias):
+                self.assertTrue(self.guard_mod.looks_like_internal_tool_name(alias))
+
+    def test_internal_tool_pattern_refreshes_after_capability_registration(self):
+        name = "temporary_side_effect"
+        TOOL_CAPABILITIES[name] = ToolCapabilitySpec(
+            name=name,
+            family="temporary",
+            effect_type="message",
+        )
+        try:
+            self.assertTrue(self.guard_mod.looks_like_internal_tool_name("temporary_side_effect"))
+            self.assertTrue(self.guard_mod.looks_like_internal_tool_name("TemporarySideEffectTool"))
+        finally:
+            TOOL_CAPABILITIES.pop(name, None)
 
 
 if __name__ == "__main__":

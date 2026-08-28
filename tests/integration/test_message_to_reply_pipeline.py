@@ -310,6 +310,9 @@ class MessageToReplyPipelineIntegrationTests(unittest.TestCase):
         runtime.status.accepting_events = True
         runtime.status.persona_state = "core_ready"
         facade = PluginFacade(runtime)
+        from astrmai.infrastructure.runtime.outbound_send_guard import OUTBOUND_SEND_GATE
+
+        OUTBOUND_SEND_GATE.open()
         event = _Event(text="Mai")
 
         async def run():

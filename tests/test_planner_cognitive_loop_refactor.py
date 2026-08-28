@@ -1522,8 +1522,9 @@ class PlannerCognitiveLoopRefactorTests(unittest.TestCase):
 
         envelope = event.get_extra("astrmai_prompt_envelope")
         guidance_text = "\n".join(envelope.guidance_lines)
-        self.assertIn("如果气氛合适，可以顺手发表情包、轻轻互动或点个赞", guidance_text)
-        self.assertIn("戳人或@别人只在非常自然、明确相关时使用", guidance_text)
+        self.assertIn("用户明确要求", guidance_text)
+        self.assertIn("proactive_poke", guidance_text)
+        self.assertNotIn("如果气氛合适，可以顺手发表情包", guidance_text)
         self.assertNotIn("等待只在对方明显没说完", guidance_text)
         self.assertNotIn("撤回只在用户明确要求", guidance_text)
         self.assertNotIn("本轮可用动作：", guidance_text)

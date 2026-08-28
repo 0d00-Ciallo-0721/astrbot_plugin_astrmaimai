@@ -9,6 +9,7 @@ from astrmai.learning.review.jargon_auto_check_task import JargonAutoCheckTask
 from astrmai.learning.review.reflect_tracker import ReflectTracker
 from astrmai.proactive.review_dispatcher import ReviewDispatcher
 from astrmai.infrastructure.runtime.background_task_budget import BackgroundTaskBudget
+from astrmai.infrastructure.runtime.outbound_send_guard import OUTBOUND_SEND_GATE
 
 
 class FakeGateway:
@@ -154,6 +155,8 @@ class ExpressionGovernancePortedTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(db.updated[0][1]["review_status"], "approved")
 
     async def test_review_dispatcher_normalizes_bare_group_id_and_marks_sent_after_success(self):
+        OUTBOUND_SEND_GATE.open()
+
         class _Context:
             def __init__(self):
                 self.sent = []

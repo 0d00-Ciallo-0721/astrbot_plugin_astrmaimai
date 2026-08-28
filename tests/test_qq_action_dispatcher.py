@@ -6,6 +6,7 @@ import unittest
 from types import SimpleNamespace
 
 from tests.helpers.astrbot_stubs import install_astrbot_stubs
+from astrmai.infrastructure.runtime.outbound_send_guard import OUTBOUND_SEND_GATE
 
 
 class _Api:
@@ -55,7 +56,21 @@ class QQActionDispatcherTests(unittest.TestCase):
         )
 
     def tearDown(self):
+        OUTBOUND_SEND_GATE.close()
         self.temp_dir.cleanup()
+
+    def test_shutdown_gate_rejects_deferred_actions_before_napcat(self):
+        event = _Event()
+        event.set_extra("astrmai_pending_actions", [{"action": "poke", "target_id": "123"}])
+        OUTBOUND_SEND_GATE.open()
+        OUTBOUND_SEND_GATE.close(enforce_provider=True)
+        dispatcher = self.mod.QQActionDispatcher(self.config, _Coordinator())
+
+        result = asyncio.run(dispatcher.commit(event, "ff:FriendMessage:123", send_key="turn-shutdown"))
+
+        self.assertEqual(event.bot.api.calls, [])
+        self.assertEqual(result[-1]["status"], "skipped")
+        self.assertEqual(result[-1]["detail"], "shutdown_rejected")
 
     def test_commits_native_actions_once_after_reply(self):
         event = _Event()

@@ -11,6 +11,8 @@ from ...infrastructure.context_economy.models import WorkloadTrace
 from ...infrastructure.gateway.output_guard import looks_like_provider_failure_text
 from ...infrastructure.gateway.provider_capabilities import resolve_provider_capabilities
 from ...infrastructure.runtime.lane_manager import LaneKey
+from ...infrastructure.runtime.outbound_send_guard import provider_request_allowed
+from ...infrastructure.gateway.gateway_exceptions import GatewayShutdownRejected
 from ...infrastructure.runtime.turn_call_ledger import (
     begin_llm_call,
     finish_llm_call,
@@ -20,6 +22,22 @@ from ...infrastructure.runtime.turn_call_ledger import (
 
 class CompactionProviderMixin:
     """Provider-calling methods extracted from ContextCompactionEngine."""
+
+    def _record_provider_shutdown_rejection(self) -> None:
+        diagnostics = getattr(self, "compaction_provider_diagnostics", None)
+        if not isinstance(diagnostics, dict):
+            diagnostics = {}
+            self.compaction_provider_diagnostics = diagnostics
+        diagnostics["shutdown_rejected"] = int(diagnostics.get("shutdown_rejected", 0) or 0) + 1
+        gateway = getattr(self, "gateway", None)
+        runtime = getattr(gateway, "runtime", None) if gateway is not None else None
+        if runtime is not None:
+            runtime_diag = getattr(runtime, "diagnostics", None)
+            if isinstance(runtime_diag, dict):
+                blocked = runtime_diag.setdefault("provider_request_blocked_by_reason", {})
+                if isinstance(blocked, dict):
+                    blocked["shutdown_rejected"] = int(blocked.get("shutdown_rejected", 0) or 0) + 1
+        logger.info("[Compaction] provider request blocked reason=shutdown_rejected stage=compaction")
 
     async def _run_compaction_model(self, awaitable_factory):
         budget = getattr(self, "background_task_budget", None)
@@ -33,7 +51,13 @@ class CompactionProviderMixin:
                     event=None,
                     stage="gateway.compaction_semaphore_wait",
                 ):
+                    if not provider_request_allowed():
+                        self._record_provider_shutdown_rejection()
+                        raise GatewayShutdownRejected()
                     return await awaitable_factory()
+            if not provider_request_allowed():
+                self._record_provider_shutdown_rejection()
+                raise GatewayShutdownRejected()
             return await awaitable_factory()
 
         if budget is None:

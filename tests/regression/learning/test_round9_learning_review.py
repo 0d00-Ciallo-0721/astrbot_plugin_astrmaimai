@@ -17,6 +17,7 @@ from astrmai.memory.contracts.memory_query import MemoryCandidate
 from astrmai.memory.services.expression_pattern_service import ExpressionPatternService
 from astrmai.proactive.review_dispatcher import ReviewDispatcher
 from astrmai.proactive.dream_scheduler import DreamScheduler
+from astrmai.infrastructure.runtime.outbound_send_guard import OUTBOUND_SEND_GATE
 
 
 def _config(**evolution_overrides):
@@ -203,6 +204,8 @@ class Round9LearningReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(result.weight, 1.15)
 
     async def test_review_dispatch_claims_once_and_requeues_failed_send(self):
+        OUTBOUND_SEND_GATE.open()
+
         pattern = SimpleNamespace(id="p1", group_id="group-1", situation="chat", expression="hello")
         tracker = ReflectTracker(SimpleNamespace(), _Gateway())
         tracker.queue_review_request(pattern)
@@ -290,6 +293,8 @@ class Round9LearningReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tracker._pending, {})
 
     async def test_sent_human_review_is_not_requeued_by_duplicate_auto_result(self):
+        OUTBOUND_SEND_GATE.open()
+
         sent = []
 
         class _Context:

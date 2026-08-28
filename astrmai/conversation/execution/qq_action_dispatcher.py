@@ -7,6 +7,7 @@ from astrbot.api import logger
 
 from ..contracts.qq_action import PendingQQAction
 from ..planning.tool_contracts import TOOL_CAPABILITIES, record_tool_lifecycle
+from ...infrastructure.runtime.outbound_send_guard import outbound_send_allowed
 
 
 class QQActionDispatcher:
@@ -168,6 +169,8 @@ class QQActionDispatcher:
         chat_id: str,
         send_key: str,
     ) -> None:
+        if not outbound_send_allowed(event):
+            raise RuntimeError("shutdown_rejected")
         action_type = action.action_type
         if action_type == "poke":
             kwargs = {"user_id": self._coerce_identifier(action.target_id)}
@@ -225,6 +228,18 @@ class QQActionDispatcher:
         ]
         if not actions:
             return []
+        if not outbound_send_allowed(event):
+            for action in actions:
+                self._append_result(event, action, "skipped", "shutdown_rejected")
+                record_tool_lifecycle(
+                    event,
+                    self._tool_name(action.action_type),
+                    "action_commit",
+                    source="deferred_dispatcher",
+                    status="skipped",
+                    reason="shutdown_rejected",
+                )
+            return list(event.get_extra("astrmai_qq_action_results", []) or [])
         if not await self._is_current_turn(event):
             for action in actions:
                 self._append_result(event, action, "skipped", "stale_turn")
@@ -259,6 +274,17 @@ class QQActionDispatcher:
         inbound_message_id = str(getattr(message_obj, "message_id", "") or "")
         turn_key = send_key or trace_id or inbound_message_id or f"{chat_id}:{id(event)}"
         for action in actions:
+            if not outbound_send_allowed(event):
+                self._append_result(event, action, "skipped", "shutdown_rejected")
+                record_tool_lifecycle(
+                    event,
+                    self._tool_name(action.action_type),
+                    "action_commit",
+                    source="deferred_dispatcher",
+                    status="skipped",
+                    reason="shutdown_rejected",
+                )
+                continue
             key = action.idempotency_key(turn_key)
             if key in self._executed_keys:
                 self._append_result(event, action, "skipped", "duplicate")

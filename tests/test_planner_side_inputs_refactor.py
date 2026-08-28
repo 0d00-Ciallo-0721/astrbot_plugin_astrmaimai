@@ -124,7 +124,9 @@ LEGACY_CHAT_EXPECTED_TOOL_NAMES = FACT_TOOL_NAMES | {
     "regret_and_withdraw_action",
 }
 
-CHAT_EXPECTED_TOOL_NAMES = CORE_TOOL_NAMES | PRIVATE_DEFAULT_ACTION_TOOL_NAMES
+# Unqualified chat turns expose only read-only/context tools and textual
+# reaction shaping; external side-effect tools require an explicit family.
+CHAT_EXPECTED_TOOL_NAMES = CORE_TOOL_NAMES | {"vision_message_analyze_tool"}
 
 CROSS_SESSION_DISCLOSURE_TOOL_NAMES = CHAT_EXPECTED_TOOL_NAMES | {
     "qq_friend_lookup",
@@ -132,7 +134,7 @@ CROSS_SESSION_DISCLOSURE_TOOL_NAMES = CHAT_EXPECTED_TOOL_NAMES | {
     "qq_recent_contact_lookup",
     "contact_route_suggest_tool",
     "space_transition_action",
-}
+} | PRIVATE_DEFAULT_ACTION_TOOL_NAMES
 
 
 class _IdentityActionModifier:
@@ -175,6 +177,126 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         expression_mod = importlib.import_module("astrmai.conversation.planning.expression_policy")
         self.expression_mod = importlib.reload(expression_mod)
         self.mixin = self.side_inputs_mod.PlannerSideInputMixin()
+        self.mixin._event_has_component_hint = lambda event, hints: False
+
+    def test_image_only_policy_removes_unauthorized_side_effect_tools(self):
+        event = _FakeEvent(message="")
+        event.set_extra("direct_image_refs", ["fake://image"])
+        tools = [_Tool("proactive_meme"), _Tool("proactive_poke"), _Tool("vision_message_analyze_tool")]
+
+        filtered = self.mixin._apply_event_tool_call_policy(event, tools)
+
+        self.assertEqual(_normalized_tool_names(filtered), {"vision_message_analyze_tool"})
+        policy = event.get_extra("astrmai_tool_call_policy")
+        self.assertEqual(policy["mode"], "image_only")
+        self.assertFalse(policy["action_authorized"])
+        self.assertEqual(policy["families"], [])
+        self.assertEqual(policy["confidence"], "none")
+
+    def test_cognitive_allowed_family_does_not_authorize_image_meme(self):
+        event = _FakeEvent(message="")
+        event.set_extra("direct_image_refs", ["fake://image"])
+        event.set_extra("astrmai_allowed_action_families", ["meme"])
+        tools = [_Tool("proactive_meme"), _Tool("vision_message_analyze_tool")]
+
+        filtered = self.mixin._apply_event_tool_call_policy(event, tools)
+
+        self.assertEqual(_normalized_tool_names(filtered), {"vision_message_analyze_tool"})
+        self.assertFalse(event.get_extra("astrmai_tool_call_policy")["action_authorized"])
+
+    def test_image_explicit_meme_request_authorizes_only_meme_family(self):
+        event = _FakeEvent(message="发一个表情包")
+        event.set_extra("direct_image_refs", ["fake://image"])
+        tools = [_Tool("proactive_meme"), _Tool("proactive_poke"), _Tool("vision_message_analyze_tool")]
+
+        filtered = self.mixin._apply_event_tool_call_policy(event, tools)
+
+        self.assertEqual(
+            _normalized_tool_names(filtered),
+            {"proactive_meme", "vision_message_analyze_tool"},
+        )
+        self.assertEqual(
+            event.get_extra("astrmai_explicit_user_intent_families"),
+            ["meme"],
+        )
+
+    def test_negated_meme_request_does_not_authorize_or_expose_meme(self):
+        event = _FakeEvent(message="不要发个表情包")
+        tools = [_Tool("proactive_meme"), _Tool("proactive_poke"), _Tool("vision_message_analyze_tool")]
+
+        filtered = self.mixin._apply_event_tool_call_policy(event, tools)
+
+        self.assertEqual(_normalized_tool_names(filtered), {"vision_message_analyze_tool"})
+        self.assertNotIn("meme", event.get_extra("astrmai_explicit_user_intent_families", []))
+        self.assertFalse(event.get_extra("astrmai_tool_call_policy")["action_authorized"])
+
+    def test_object_inserted_negation_does_not_authorize_meme(self):
+        for message in ("不要给我发个表情包", "我不想让你发个表情包", "不需要你发个表情包"):
+            event = _FakeEvent(message=message)
+            filtered = self.mixin._apply_event_tool_call_policy(
+                event,
+                [_Tool("proactive_meme"), _Tool("vision_message_analyze_tool")],
+            )
+
+            self.assertEqual(_normalized_tool_names(filtered), {"vision_message_analyze_tool"}, message)
+            self.assertFalse(event.get_extra("astrmai_tool_call_policy")["action_authorized"], message)
+            self.assertFalse(self.mixin._has_tool_intent(event), message)
+
+    def test_explicit_poke_exposes_only_poke_family_and_read_only_tools(self):
+        event = _FakeEvent(message="戳我一下")
+        tools = [
+            _Tool("proactive_poke"),
+            _Tool("proactive_meme"),
+            _Tool("proactive_like_action"),
+            _Tool("wait_and_listen"),
+            _Tool("omni_perception_query"),
+        ]
+
+        filtered = self.mixin._apply_event_tool_call_policy(event, tools)
+
+        self.assertEqual(
+            _normalized_tool_names(filtered),
+            {"proactive_poke", "wait_and_listen", "omni_perception_query"},
+        )
+        self.assertEqual(event.get_extra("astrmai_explicit_user_intent_families"), ["poke"])
+        self.assertEqual(event.get_extra("astrmai_tool_call_policy")["families"], ["poke"])
+
+    def test_external_non_action_families_do_not_mark_side_effects_authorized(self):
+        event = _FakeEvent(message="今天天气怎么样")
+        event.set_extra("astrmai_explicit_user_intent_families", ["query", "unknown"])
+
+        filtered = self.mixin._apply_event_tool_call_policy(
+            event,
+            [_Tool("proactive_meme"), _Tool("vision_message_analyze_tool")],
+        )
+
+        self.assertEqual(_normalized_tool_names(filtered), {"vision_message_analyze_tool"})
+        self.assertEqual(event.get_extra("astrmai_explicit_user_intent_families"), [])
+        self.assertFalse(event.get_extra("astrmai_tool_call_policy")["action_authorized"])
+
+    def test_plain_text_without_action_has_no_side_effect_permission(self):
+        event = _FakeEvent(message="今天天气怎么样")
+
+        self.mixin._apply_event_tool_call_policy(event, [_Tool("vision_message_analyze_tool")])
+
+        policy = event.get_extra("astrmai_tool_call_policy")
+        self.assertFalse(policy["action_authorized"])
+        self.assertFalse(policy["side_effects_allowed"])
+
+    def test_plain_text_hides_all_unassigned_side_effect_tools(self):
+        event = _FakeEvent(message="今天天气怎么样")
+        tools = [
+            _Tool("proactive_meme"),
+            _Tool("proactive_poke"),
+            _Tool("construct_at_event"),
+            _Tool("quote_reply_action"),
+            _Tool("space_transition_action"),
+            _Tool("vision_message_analyze_tool"),
+        ]
+
+        filtered = self.mixin._apply_event_tool_call_policy(event, tools)
+
+        self.assertEqual(_normalized_tool_names(filtered), {"vision_message_analyze_tool"})
 
     def tearDown(self):
         try:
@@ -446,12 +568,19 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
             "去问问你好友516779421吃饭了没有",
             "替我问一下小明明天来不来",
             "跟萤说一声我晚点到",
+            "请联系我的朋友",
         ]
         negatives = [
             "我朋友给我发消息了",
             "你觉得发消息好吗",
             "我去问问他",
             "请你告诉我天气",
+            "不要帮我给他发消息",
+            "帮我给他不要发消息",
+            "给他别发消息",
+            "请不要告诉他",
+            "我不想让你联系他",
+            "不要替我问他",
         ]
 
         for message in positives:
@@ -838,7 +967,11 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
                 is_tool_call_mode=False,
             )
         )
-        self.assertEqual(_normalized_tool_names(legacy_tools), LEGACY_CHAT_EXPECTED_TOOL_NAMES)
+        legacy_names = _normalized_tool_names(legacy_tools)
+        self.assertTrue(legacy_names)
+        self.assertNotIn("proactive_meme", legacy_names)
+        self.assertNotIn("proactive_poke", legacy_names)
+        self.assertNotIn("space_transition_action", legacy_names)
 
         tool_ctx = SimpleNamespace(shared_dict={})
         query_keyword = "查一下"
@@ -1097,7 +1230,11 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
             )
         )
         at_tool_names = _normalized_tool_names(at_tools)
-        self.assertTrue((CORE_TOOL_NAMES | DEFAULT_ACTION_TOOL_NAMES).issubset(at_tool_names))
+        self.assertTrue(
+            (CORE_TOOL_NAMES | {"vision_message_analyze_tool", "construct_at_event"}).issubset(at_tool_names)
+        )
+        self.assertNotIn("proactive_meme", at_tool_names)
+        self.assertNotIn("proactive_poke", at_tool_names)
         self.assertIn("construct_at_event", at_tool_names)
 
     def test_natural_call_member_request_requires_native_at_tool(self):
@@ -1162,7 +1299,18 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(_normalized_tool_names(tools), CROSS_SESSION_DISCLOSURE_TOOL_NAMES)
+        self.assertEqual(
+            _normalized_tool_names(tools),
+            CORE_TOOL_NAMES
+            | {
+                "vision_message_analyze_tool",
+                "qq_friend_lookup",
+                "qq_user_identity_lookup",
+                "qq_recent_contact_lookup",
+                "contact_route_suggest_tool",
+                "space_transition_action",
+            },
+        )
         self.assertEqual(event.get_extra("astrmai_required_tools"), ["space_transition_action"])
         self.assertEqual(event.get_extra("astrmai_tool_tier"), "full")
 
@@ -1236,9 +1384,7 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
 
         self.assertEqual(
             _normalized_tool_names(tools),
-            CORE_TOOL_NAMES
-            | PRIVATE_DEFAULT_ACTION_TOOL_NAMES
-            | {"qq_friend_lookup", "space_transition_action"},
+            CORE_TOOL_NAMES | {"vision_message_analyze_tool", "qq_friend_lookup", "space_transition_action"},
         )
         self.assertEqual(
             event.get_extra("astrmai_required_tools"),
@@ -1263,7 +1409,10 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(_normalized_tool_names(tools), CORE_TOOL_NAMES | DEFAULT_ACTION_TOOL_NAMES)
+        self.assertEqual(
+            _normalized_tool_names(tools),
+            CORE_TOOL_NAMES | {"vision_message_analyze_tool", "proactive_poke"},
+        )
         trace = event.get_extra("astrmai_turn_context").tools
         self.assertTrue(any(step["stage"] == "planner.default_actions_restore" for step in trace.filter_steps))
         self.assertEqual(trace.invocation_mode, "required")
@@ -1306,8 +1455,8 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
             )
         )
 
-        expected = CORE_TOOL_NAMES | DEFAULT_ACTION_TOOL_NAMES
-        self.assertEqual(_normalized_tool_names(plain_tools), expected)
+        expected = CORE_TOOL_NAMES | {"vision_message_analyze_tool", "proactive_poke"}
+        self.assertEqual(_normalized_tool_names(plain_tools), CHAT_EXPECTED_TOOL_NAMES)
         self.assertEqual(_normalized_tool_names(explicit_tools), expected)
         self.assertEqual(explicit_event.get_extra("astrmai_required_tools"), ["proactive_poke"])
 
@@ -1335,7 +1484,10 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(_normalized_tool_names(tools), CORE_TOOL_NAMES | DEFAULT_ACTION_TOOL_NAMES)
+        self.assertEqual(
+            _normalized_tool_names(tools),
+            CORE_TOOL_NAMES | {"vision_message_analyze_tool", "proactive_poke"},
+        )
         self.assertEqual(event.get_extra("astrmai_required_tools"), [])
         self.assertEqual(event.get_extra("astrmai_turn_context").tools.invocation_mode, "auto")
 
@@ -1356,7 +1508,10 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(_normalized_tool_names(tools), CORE_TOOL_NAMES | DEFAULT_ACTION_TOOL_NAMES)
+        self.assertEqual(
+            _normalized_tool_names(tools),
+            CORE_TOOL_NAMES | {"vision_message_analyze_tool", "proactive_meme"},
+        )
         self.assertEqual(event.get_extra("astrmai_tool_tier"), "full")
         self.assertEqual(event.get_extra("astrmai_required_tools"), ["proactive_meme"])
 
@@ -1438,7 +1593,7 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
 
         names = _normalized_tool_names(tools)
         self.assertTrue(names.isdisjoint(mixin.QQ_NATIVE_TOOL_NAMES))
-        self.assertIn("proactive_meme", names)
+        self.assertNotIn("proactive_meme", names)
         self.assertIn("vision_message_analyze_tool", names)
 
     def test_explicit_native_action_on_unsupported_adapter_degrades_before_model_tool_choice(self):
@@ -1482,7 +1637,7 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         )
 
         names = _normalized_tool_names(tools)
-        self.assertEqual(names, CORE_TOOL_NAMES | DEFAULT_ACTION_TOOL_NAMES)
+        self.assertEqual(names, CHAT_EXPECTED_TOOL_NAMES)
         self.assertEqual(event.get_extra("astrmai_tool_tier"), "chat")
         self.assertEqual(event.get_extra("astrmai_required_tools"), [])
 
@@ -1516,7 +1671,7 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
             "message_emoji_like_action",
             "regret_and_withdraw_action",
         }))
-        self.assertIn("proactive_meme", names)
+        self.assertNotIn("proactive_meme", names)
         self.assertIn("vision_message_analyze_tool", names)
 
     def test_explicit_message_reaction_only_injects_native_qq_tool(self):
@@ -1538,7 +1693,7 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
 
         self.assertEqual(
             _normalized_tool_names(tools),
-            CORE_TOOL_NAMES | DEFAULT_ACTION_TOOL_NAMES,
+            CORE_TOOL_NAMES | {"vision_message_analyze_tool", "message_emoji_like_action"},
         )
 
     def test_guarded_chat_intent_does_not_match_unrelated_poke_words(self):
@@ -1661,7 +1816,7 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         # 白名单不得剥除（旧断言锁定的正是"连等待与自检能力一并清空"的缺陷）
         self.assertEqual(
             _normalized_tool_names(comfort_tools),
-            CHAT_EXPECTED_TOOL_NAMES | {"message_reaction_action", "proactive_like_action"},
+            CHAT_EXPECTED_TOOL_NAMES | {"message_reaction_action"},
         )
 
         recall_ctx = SimpleNamespace(shared_dict={})

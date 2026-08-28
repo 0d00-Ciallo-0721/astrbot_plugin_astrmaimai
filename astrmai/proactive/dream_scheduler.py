@@ -7,6 +7,7 @@ from pathlib import Path
 
 from astrbot.api import logger
 from astrbot.api.event import MessageChain
+from ..infrastructure.runtime.outbound_send_guard import outbound_send_allowed
 
 
 class DreamScheduler:
@@ -246,6 +247,16 @@ class DreamScheduler:
             if not pending["visible_send_done"]:
                 target = getattr(self.config.life, "dream_send_target", "") or session_id
                 try:
+                    if not outbound_send_allowed():
+                        failures.append("visible_send_shutdown_rejected")
+                        return {
+                            "performed": False,
+                            "degraded": True,
+                            "reason": "shutdown_rejected",
+                            "failures": failures,
+                            "session_id": session_id,
+                            "throttle_scope": "global",
+                        }
                     await self.context.send_message(target, MessageChain().message(dream_text))
                     pending["visible_send_done"] = True
                 except Exception as exc:

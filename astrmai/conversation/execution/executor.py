@@ -32,7 +32,12 @@ except ImportError:  # pragma: no cover
 from ...infrastructure.runtime.lane_manager import LaneKey
 from ...infrastructure.runtime.dialog_lane_identity import resolve_dialog_lane_identity
 from ...infrastructure.runtime.trace_runtime import debug_trace, preview_text
-from ...infrastructure.gateway.output_guard import validate_visible_output_text
+from ...infrastructure.gateway.output_guard import (
+    find_internal_tool_name,
+    internal_tool_name_fingerprint,
+    validate_visible_output_text,
+)
+from ...infrastructure.runtime.outbound_send_guard import outbound_send_allowed
 from ...infrastructure.gateway.gateway_exceptions import LLMCascadeFailureException
 from ...multimodal.vision_prompt import (
     VISION_SYSTEM_PROMPT,
@@ -56,6 +61,7 @@ from ..planning.tool_contracts import (
     TOOL_CAPABILITIES,
     is_model_disclosure_requestable,
     record_tool_lifecycle,
+    tool_display_name,
 )
 from ..planning.tool_disclosure import (
     FAMILY_TO_PACKAGES,
@@ -109,6 +115,19 @@ class ConcurrentExecutor:
         self._chat_pending_count = {}
         self._global_lock = asyncio.Lock()
         self._native_vision_breakers: dict[str, float] = {}
+
+    @staticmethod
+    def _validate_visible_output(event: AstrMessageEvent, text: Any) -> tuple[str, str]:
+        safe_text, failure_kind = validate_visible_output_text(text)
+        if failure_kind == "internal_tool_name":
+            leaked = find_internal_tool_name(text)
+            try:
+                event.set_extra("astrmai_tool_leak_blocked", True)
+                event.set_extra("astrmai_tool_leak_fingerprint", internal_tool_name_fingerprint(leaked))
+                event.set_extra("astrmai_output_guard_action", "blocked_internal_tool_name")
+            except Exception:
+                pass
+        return safe_text, failure_kind
 
     def refresh_config(self, config) -> None:
         self.config = config
@@ -540,7 +559,14 @@ class ConcurrentExecutor:
             "qq_friend_lookup": "读取机器人 QQ 好友事实",
             "self_lore_query": "查询角色设定人物",
         }
-        tool_labels = [labels.get(name, name) for name in missing_tools]
+        tool_labels = [labels.get(name, tool_display_name(name) or "相关能力") for name in missing_tools]
+        # Unknown identifiers are implementation details.  Do not echo them
+        # into a user-visible clarification even when a dynamically disclosed
+        # tool is missing from the local label table.
+        tool_labels = [
+            label if label and label not in missing_tools else "相关能力"
+            for label in tool_labels
+        ]
         if "space_transition_action" in missing_tools:
             return "我还没能确认要发给谁、具体转达什么，所以没有发送。你把目标和要说的话都告诉我，我再帮你传达。"
         if "construct_at_event" in missing_tools:
@@ -1729,6 +1755,9 @@ class ConcurrentExecutor:
             return text
         sent = False
         try:
+            if not outbound_send_allowed(event):
+                event.set_extra("astrmai_execution_status", "shutdown_rejected")
+                return None
             artifact = await self.reply_engine.handle_reply(event, text, chat_id)
             sent = bool(getattr(artifact, "sent", False)) if artifact is not None else True
         except Exception as exc:
@@ -1741,6 +1770,9 @@ class ConcurrentExecutor:
         return text if sent else None
 
     async def _finalize_reply(self, event: AstrMessageEvent, chat_id: str, bot_id: str, reply_text: str, *, trace_mode: str, model: str) -> Optional[str]:
+        if not outbound_send_allowed(event):
+            event.set_extra("astrmai_execution_status", "shutdown_rejected")
+            return None
         valid_image_context = has_valid_image_context(event)
         mentions_image = reply_mentions_image(reply_text)
         guard_enabled = bool(
@@ -1868,6 +1900,9 @@ class ConcurrentExecutor:
                 return None
             attempted_models.append(provider_id)
             try:
+                if not outbound_send_allowed(event):
+                    event.set_extra("astrmai_execution_status", "shutdown_rejected")
+                    return None
                 result = await self.gateway.chat_in_lane_result(
                     event=event,
                     lane_key=runtime["dialog_lane_key"],
@@ -1881,7 +1916,7 @@ class ConcurrentExecutor:
                     raw_user_text=runtime["raw_user_text"],
                 )
                 reply_text = result.text
-                safe_reply_text, failure_kind = validate_visible_output_text(reply_text)
+                safe_reply_text, failure_kind = self._validate_visible_output(event, reply_text)
                 if failure_kind:
                     raise ValueError(failure_kind)
                 return await self._finalize_reply(
@@ -1976,6 +2011,9 @@ class ConcurrentExecutor:
                 return None
             attempted_models.append(provider_id)
             try:
+                if not outbound_send_allowed(event):
+                    event.set_extra("astrmai_execution_status", "shutdown_rejected")
+                    return None
                 result = await self.gateway.tool_chat_in_lane_result(
                     lane_key=runtime["dialog_lane_key"],
                     base_origin=runtime["dialog_base_origin"],
@@ -2041,6 +2079,9 @@ class ConcurrentExecutor:
                         selected_tools=self._executed_tool_names(event),
                     )
                     self._sync_execution_event_trace(event, execution_event)
+                    if not outbound_send_allowed(event):
+                        event.set_extra("astrmai_execution_status", "shutdown_rejected")
+                        return None
                     result = await self.gateway.tool_chat_in_lane_result(
                         lane_key=runtime["dialog_lane_key"],
                         base_origin=runtime["dialog_base_origin"],
@@ -2137,7 +2178,7 @@ class ConcurrentExecutor:
                             return None
                     idx = reply_text.find("[TERMINAL_YIELD]:")
                     terminal_content = reply_text[idx + len("[TERMINAL_YIELD]:"):].strip()
-                    safe_content, failure_kind = validate_visible_output_text(terminal_content)
+                    safe_content, failure_kind = self._validate_visible_output(event, terminal_content)
                     if failure_kind:
                         raise ValueError(failure_kind)
                     return await self._finalize_reply(
@@ -2148,7 +2189,7 @@ class ConcurrentExecutor:
                         trace_mode="tool_terminal_yield",
                         model=provider_id,
                     )
-                safe_reply_text, failure_kind = validate_visible_output_text(reply_text)
+                safe_reply_text, failure_kind = self._validate_visible_output(event, reply_text)
                 if failure_kind:
                     raise ValueError(failure_kind)
                 return await self._finalize_reply(
@@ -2458,6 +2499,9 @@ class ConcurrentExecutor:
 
         for admin_id in admin_ids:
             try:
+                if not outbound_send_allowed(event):
+                    logger.info("[Executor] admin alert suppressed by outbound lifecycle gate")
+                    break
                 admin_umo = f"{platform_id}:FriendMessage:{admin_id}"
                 await self.context.send_message(admin_umo, chain)
                 logger.debug(f"[Executor] pushed alert to admin {admin_id}")

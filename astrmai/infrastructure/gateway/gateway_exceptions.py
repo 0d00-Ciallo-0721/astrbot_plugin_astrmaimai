@@ -13,6 +13,14 @@ class GatewayQueueTimeout(asyncio.TimeoutError):
         super().__init__(f"{self.stage} exceeded {self.timeout_sec:.3f}s")
 
 
+class GatewayShutdownRejected(asyncio.CancelledError):
+    """Provider work rejected because the runtime generation is no longer live."""
+
+    def __init__(self, reason: str = "shutdown_rejected") -> None:
+        self.reason = str(reason or "shutdown_rejected")
+        super().__init__(self.reason)
+
+
 class LLMCascadeFailureException(Exception):
     """Raised when every model candidate in the cascade fails."""
 

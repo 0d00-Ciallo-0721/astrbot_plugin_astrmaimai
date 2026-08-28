@@ -28,6 +28,7 @@ except ImportError:  # pragma: no cover
 from ...infrastructure.compat.legacy_compat import emit_legacy_reply_runtime_extras
 from ...infrastructure.gateway.output_guard import is_sendable_segment, sanitize_visible_reply_text
 from ...infrastructure.runtime.trace_runtime import debug_trace
+from ...infrastructure.runtime.outbound_send_guard import outbound_send_allowed
 from ..concurrency.controls import (
     record_conversation_concurrency_trace,
     resolve_conversation_concurrency_flags,
@@ -560,6 +561,10 @@ class ReplyArtifactMixin:
                             chain.chain.append(_at_component(uid))
                         chain.chain.append(_plain_component(" "))
                     chain.chain.append(_plain_component(segment_text))
+                    if not outbound_send_allowed(event):
+                        artifact.metadata["send_status"] = "shutdown_rejected"
+                        artifact.metadata["send_failure_reason"] = "outbound_send_guard"
+                        break
                     sent_result = await context.send_message(event.unified_msg_origin, chain)
                     if sent_result is not None and not isinstance(sent_result, bool):
                         outbound_message_ids.append(str(sent_result))
@@ -599,13 +604,18 @@ class ReplyArtifactMixin:
                             tts_payload = None
                         if tts_payload:
                             try:
-                                sent_result = await context.send_message(event.unified_msg_origin, chain)
-                                artifact.metadata["tts_sent"] = True
-                                artifact.sent = True
-                                if not send_text_segments:
-                                    sent_segment_count = len(artifact.segments)
-                                    if not event.get_extra("astrmai_reply_sent", False):
-                                        emit_legacy_reply_runtime_extras(event, artifact=artifact, reply_sent=True)
+                                if not outbound_send_allowed(event):
+                                    artifact.metadata["tts_sent"] = False
+                                    artifact.metadata["tts_skip_reason"] = "shutdown_rejected"
+                                    tts_payload = None
+                                if tts_payload:
+                                    sent_result = await context.send_message(event.unified_msg_origin, chain)
+                                    artifact.metadata["tts_sent"] = True
+                                    artifact.sent = True
+                                    if not send_text_segments:
+                                        sent_segment_count = len(artifact.segments)
+                                        if not event.get_extra("astrmai_reply_sent", False):
+                                            emit_legacy_reply_runtime_extras(event, artifact=artifact, reply_sent=True)
                             except Exception as exc:
                                 artifact.metadata["tts_sent"] = False
                                 logger.debug(f"[ReplyService] optional TTS send degraded for {chat_id}: {exc}")
