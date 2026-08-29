@@ -7,11 +7,14 @@ import os
 import threading
 import time
 import uuid
+from urllib.parse import urlparse
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, List
+
+import numpy as np
 
 from astrbot.api import logger
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
@@ -32,6 +35,7 @@ except ImportError:
 from ..retrieval.bm25 import BM25Retriever
 from ..retrieval.hybrid_retriever import HybridRetriever
 from ..retrieval.vector_store import VectorRetriever
+from ..retrieval.embedding import invoke_embedding
 from ..contracts.memory_query import MemoryQuery, MemoryWriteRequest
 from .expression_pattern_service import ExpressionPatternService
 from .cognitive_feedback import (
@@ -67,6 +71,40 @@ class CognitiveFeedbackSignal:
     payload: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class VectorIndexDescriptor:
+    """Published vector index metadata, including the physical dimension."""
+
+    generation: int
+    index_file: str
+    embedding_models: tuple[str, ...]
+    provider_source_id: str = ""
+    api_base_fingerprint: str = ""
+    dimension: int | None = None
+    metric: str = "cosine"
+    document_count: int | None = None
+    vector_count: int | None = None
+    created_at: float = 0.0
+    status: str = "published"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "generation": int(self.generation),
+            "file_name": self.index_file,
+            "index_file": self.index_file,
+            "embedding_models": list(self.embedding_models),
+            "provider_source_id": self.provider_source_id,
+            "api_base_fingerprint": self.api_base_fingerprint,
+            "dimension": self.dimension,
+            "metric": self.metric,
+            "document_count": self.document_count,
+            "vector_count": self.vector_count,
+            "created_at": self.created_at,
+            "published_at": self.created_at,
+            "status": self.status,
+        }
+
+
 class MemoryEngine:
     """Refactored memory engine with lazy vector bootstrap and stable facade methods."""
 
@@ -81,6 +119,13 @@ class MemoryEngine:
             self.embedding_models = self.config.provider.embedding_models
         else:
             self.embedding_models = embedding_models or []
+        self._configured_vector_dimension = self._configured_embedding_dimension(self.config)
+        self._vector_configuration_error = (
+            "multiple_embedding_models_not_supported"
+            if len(list(dict.fromkeys(self.embedding_models))) > 1
+            else ""
+        )
+        self._embedding_config_fingerprint = self._embedding_runtime_fingerprint(self.config)
 
         self.data_path = Path(get_astrbot_data_path()) / "plugin_data" / "astrmai" / "memory"
         os.makedirs(self.data_path, exist_ok=True)
@@ -129,6 +174,30 @@ class MemoryEngine:
         self._vector_shutdown_generation = 0
         self._accepting_vector_work = True
         self._vector_index_path = ""
+        self._vector_index_descriptor: dict[str, Any] = {}
+        self._vector_dimension_probe_task: asyncio.Task | None = None
+        self._accepting_dimension_probe = True
+        self._vector_dimension_probe_cache: dict[str, Any] = {}
+        self._vector_dimension_probe_cache_ttl_sec = 30.0
+        self._vector_dimension_check_status = "unknown"
+        self._vector_dimension_source = "unknown"
+        self._vector_query_dimension: int | None = None
+        self._configured_vector_dimension = self._configured_embedding_dimension(self.config)
+        self._vector_configuration_error = (
+            "multiple_embedding_models_not_supported"
+            if len(list(dict.fromkeys(self.embedding_models))) > 1
+            else ""
+        )
+        self._vector_dimension_mismatch_total = 0
+        self._vector_dimension_probe_failed_total = 0
+        self._vector_dimension_probe_timeout_total = 0
+        self._vector_dimension_probe_invalid_total = 0
+        self._vector_dimension_probe_unavailable_total = 0
+        self._vector_dimension_probe_provider_error_total = 0
+        self._vector_rebuild_started_total = 0
+        self._vector_rebuild_succeeded_total = 0
+        self._vector_rebuild_failed_total = 0
+        self._vector_old_retriever_blocked_total = 0
         self._init_failures = 0
         self._next_retry_time = 0.0
         self._index_consistency_repaired = False
@@ -149,8 +218,59 @@ class MemoryEngine:
             configured = fallback
         return [str(item).strip() for item in configured if str(item).strip()]
 
+    @staticmethod
+    def _configured_embedding_dimension(config: Any) -> int | None:
+        provider = getattr(config, "provider", None)
+        for source in (provider, config):
+            for name in ("embedding_dimension", "embedding_dim", "dimension"):
+                value = getattr(source, name, None) if source is not None else None
+                try:
+                    parsed = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if parsed > 0:
+                    return parsed
+        return None
+
+    @classmethod
+    def _embedding_configuration_fingerprint(cls, config: Any) -> str:
+        provider = getattr(config, "provider", None)
+        models = tuple(cls._configured_embedding_models(config))
+        source = cls._provider_source_id(provider, "")
+        base = cls._api_base_fingerprint(provider, config)
+        return hashlib.sha256(repr((models, source, base)).encode("utf-8")).hexdigest()[:16]
+
+    def _resolve_embedding_provider(self, model_id: str) -> Any:
+        context = getattr(self, "context", None)
+        if context is None:
+            return None
+        for name in ("get_provider_by_id", "get_provider"):
+            resolver = getattr(context, name, None)
+            if callable(resolver):
+                try:
+                    provider = resolver(model_id)
+                except Exception:
+                    provider = None
+                if inspect.isawaitable(provider):
+                    provider = None
+                if provider is not None:
+                    return provider
+        return None
+
+    def _embedding_runtime_fingerprint(self, config: Any) -> str:
+        models = tuple(self._configured_embedding_models(config))
+        provider = self._resolve_embedding_provider(models[0]) if models else None
+        source = self._provider_source_id(provider, "") if provider is not None else ""
+        base = self._api_base_fingerprint(provider, config)
+        return hashlib.sha256(repr((models, source, base)).encode("utf-8")).hexdigest()[:16]
+
     def refresh_config(self, config):
         old_embedding_models = list(self.embedding_models or [])
+        old_embedding_fingerprint = getattr(
+            self,
+            "_embedding_config_fingerprint",
+            self._embedding_runtime_fingerprint(self.config),
+        )
         self.config = config
         if getattr(self, "injection_service", None) is not None:
             self.injection_service.refresh_config(config)
@@ -176,9 +296,19 @@ class MemoryEngine:
             if callable(refresh):
                 refresh(config)
         self.embedding_models = self._configured_embedding_models(config)
-        if self.embedding_models != old_embedding_models:
-            self._vector_generation += 1
-            bootstrap_task = self._vector_bootstrap_task
+        self._configured_vector_dimension = self._configured_embedding_dimension(config)
+        self._vector_configuration_error = (
+            "multiple_embedding_models_not_supported"
+            if len(list(dict.fromkeys(self.embedding_models))) > 1
+            else ""
+        )
+        self._embedding_config_fingerprint = self._embedding_runtime_fingerprint(config)
+        if (
+            self.embedding_models != old_embedding_models
+            or self._embedding_config_fingerprint != old_embedding_fingerprint
+        ):
+            self._vector_generation = int(getattr(self, "_vector_generation", 0) or 0) + 1
+            bootstrap_task = getattr(self, "_vector_bootstrap_task", None)
             if bootstrap_task is not None and not bootstrap_task.done():
                 bootstrap_task.cancel()
             previous_retriever = self.vec_retriever
@@ -214,7 +344,158 @@ class MemoryEngine:
     def _vector_manifest_path(self) -> Path:
         return self.data_path / "vector_index_manifest.json"
 
-    def _load_published_vector_index(self, embedding_models: list[str]) -> Path | None:
+    @staticmethod
+    def _index_dimension(index_or_db: Any) -> tuple[int | None, str]:
+        """Read physical Faiss dimension using compatible storage shapes."""
+        candidates = [index_or_db]
+        storage = getattr(index_or_db, "embedding_storage", None)
+        if storage is not None:
+            candidates.extend((storage, getattr(storage, "index", None)))
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            for name in ("d", "dimension", "dim"):
+                try:
+                    value = getattr(candidate, name, None)
+                    if value is not None:
+                        value = int(value)
+                        if value > 0:
+                            return value, f"{type(candidate).__name__}.{name}"
+                except (TypeError, ValueError):
+                    continue
+        return None, "unknown"
+
+    @classmethod
+    def _index_file_dimension(cls, index_path: Path) -> tuple[int | None, str]:
+        try:
+            import faiss
+
+            index = faiss.read_index(str(index_path))
+            return cls._index_dimension(index)
+        except Exception:
+            return None, "unknown"
+
+    @staticmethod
+    def _provider_source_id(provider: Any, fallback: str = "") -> str:
+        for candidate in (
+            getattr(provider, "id", None),
+            getattr(provider, "provider_id", None),
+            getattr(getattr(provider, "meta", None), "name", None),
+            fallback,
+        ):
+            value = str(candidate or "").strip()
+            if value:
+                return value
+        return "unknown"
+
+    @staticmethod
+    def _normalize_api_base(value: Any) -> str:
+        raw = str(value or "").strip().rstrip("/")
+        if not raw:
+            return ""
+        parsed = urlparse(raw)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return ""
+        return f"{parsed.scheme.lower()}://{parsed.netloc}{parsed.path.rstrip('/') or ''}"
+
+    @staticmethod
+    def _api_base_fingerprint(provider: Any, config: Any = None) -> str:
+        raw = ""
+        for source in (provider, config):
+            for name in ("api_base", "base_url", "endpoint", "url"):
+                value = getattr(source, name, None) if source is not None else None
+                if value:
+                    raw = MemoryEngine._normalize_api_base(value)
+                    break
+            if raw:
+                break
+        if not raw:
+            return ""
+        return hashlib.sha256(raw.encode("utf-8", "ignore")).hexdigest()[:12]
+
+    async def _probe_embedding_dimension(self, provider: Any, model_id: str) -> dict[str, Any]:
+        if not getattr(self, "_accepting_dimension_probe", True):
+            return {
+                "query_dimension": None,
+                "dimension_probe_status": "shutdown_rejected",
+                "dimension_probe_error": "vector dimension probe admission is closed",
+            }
+        source_id = self._provider_source_id(provider, model_id)
+        fingerprint = f"{source_id}:{self._api_base_fingerprint(provider, self.config)}"
+        cached = self._vector_dimension_probe_cache
+        cached_at = float(cached.get("cached_at", 0.0) or 0.0)
+        if (
+            cached.get("fingerprint") == fingerprint
+            and cached.get("dimension_probe_status") == "ok"
+            and time.monotonic() - cached_at < self._vector_dimension_probe_cache_ttl_sec
+        ):
+            return dict(cached)
+        task = self._vector_dimension_probe_task
+        if task is None or task.done():
+            async def _probe() -> dict[str, Any]:
+                started = time.monotonic()
+                timeout = max(0.1, self._timing_value("embedding_timeout_sec", 30.0))
+                try:
+                    vector = await invoke_embedding(
+                        provider,
+                        "dimension probe",
+                        timeout_sec=timeout,
+                    )
+                    return {
+                        "query_dimension": len(vector),
+                        "dimension_probe_status": "ok",
+                        "dimension_probe_error": "",
+                        "provider_latency_ms": round((time.monotonic() - started) * 1000.0, 1),
+                    }
+                except Exception as exc:
+                    if isinstance(exc, asyncio.TimeoutError):
+                        status = "timeout"
+                    elif "method unavailable" in str(exc):
+                        status = "unavailable"
+                    elif "invalid_embedding" in repr(exc):
+                        status = "invalid"
+                    else:
+                        status = "failed"
+                    return {
+                        "query_dimension": None,
+                        "dimension_probe_status": status,
+                        "dimension_probe_error": f"{type(exc).__name__}: {exc!r}"[:240],
+                        "provider_latency_ms": round((time.monotonic() - started) * 1000.0, 1),
+                    }
+            task = asyncio.create_task(_probe(), name="astrmai-embedding-dimension-probe")
+            self._vector_dimension_probe_task = task
+        result = dict(await asyncio.shield(task))
+        result.update({"fingerprint": fingerprint, "provider_source_id": source_id})
+        if not getattr(self, "_accepting_dimension_probe", True):
+            return {
+                **result,
+                "query_dimension": None,
+                "dimension_probe_status": "shutdown_rejected",
+                "dimension_probe_error": "vector dimension probe completed after shutdown",
+            }
+        if result.get("dimension_probe_status") == "ok":
+            result["cached_at"] = time.monotonic()
+            self._vector_dimension_probe_cache = result
+        else:
+            self._vector_dimension_probe_cache = {}
+        self._vector_query_dimension = result.get("query_dimension")
+        self._vector_dimension_source = "provider_probe" if result.get("query_dimension") else "unknown"
+        if result.get("dimension_probe_status") == "failed":
+            self._vector_dimension_probe_failed_total += 1
+            self._vector_dimension_probe_provider_error_total += 1
+        elif result.get("dimension_probe_status") == "timeout":
+            self._vector_dimension_probe_timeout_total += 1
+        elif result.get("dimension_probe_status") == "invalid":
+            self._vector_dimension_probe_invalid_total += 1
+        elif result.get("dimension_probe_status") == "unavailable":
+            self._vector_dimension_probe_unavailable_total += 1
+        return result
+
+    def _load_published_vector_index(
+        self,
+        embedding_models: list[str],
+        expected_dimension: int | None = None,
+    ) -> Path | None:
         try:
             payload = json.loads(self._vector_manifest_path.read_text(encoding="utf-8"))
             if list(payload.get("embedding_models") or []) != list(embedding_models):
@@ -223,8 +504,73 @@ class MemoryEngine:
             if not file_name or Path(file_name).name != file_name:
                 return None
             index_path = self.data_path / file_name
-            return index_path if index_path.is_file() else None
+            if not index_path.is_file():
+                return None
+            manifest_dimension = payload.get("dimension")
+            actual_dimension, source = self._index_file_dimension(index_path)
+            if actual_dimension is None:
+                if expected_dimension is not None:
+                    self._vector_dimension_check_status = "unknown"
+                    return None
+                actual_dimension = manifest_dimension if isinstance(manifest_dimension, int) and manifest_dimension > 0 else None
+                source = "manifest" if actual_dimension else "unknown"
+            if actual_dimension is None:
+                self._vector_dimension_check_status = "unknown"
+                # Preserve the legacy helper's discovery-only behaviour when
+                # no expected provider dimension was supplied.  Bootstrap
+                # always supplies the probed dimension (or deliberately skips
+                # this path), so an unknown physical dimension is never used
+                # for runtime retrieval.
+                return index_path if expected_dimension is None else None
+            if expected_dimension is not None and int(actual_dimension) != int(expected_dimension):
+                self._vector_dimension_mismatch_total += 1
+                self._vector_dimension_check_status = "mismatch"
+                self._vector_state = "dimension_mismatch_detected"
+                return None
+            self._vector_dimension_source = source
+            self._vector_dimension_check_status = "matched"
+            if (
+                payload.get("dimension") != actual_dimension
+                or not payload.get("provider_source_id")
+                or not payload.get("api_base_fingerprint")
+                or payload.get("generation") is None
+                or not payload.get("status")
+            ):
+                try:
+                    payload["dimension"] = int(actual_dimension)
+                    provider = self._resolve_embedding_provider(
+                        embedding_models[0] if embedding_models else ""
+                    )
+                    if not payload.get("provider_source_id"):
+                        payload["provider_source_id"] = self._provider_source_id(
+                            provider, embedding_models[0] if embedding_models else ""
+                        )
+                    if not payload.get("api_base_fingerprint"):
+                        payload["api_base_fingerprint"] = self._api_base_fingerprint(
+                            provider, self.config
+                        )
+                    payload.setdefault("generation", int(getattr(self, "_vector_generation", 0) or 0))
+                    payload.setdefault("document_count", None)
+                    payload.setdefault("vector_count", None)
+                    payload.setdefault("status", "published")
+                    payload.setdefault("created_at", time.time())
+                    payload.setdefault("published_at", payload["created_at"])
+                    temporary_path = self._vector_manifest_path.with_name(
+                        f"{self._vector_manifest_path.name}.{uuid.uuid4().hex}.tmp"
+                    )
+                    temporary_path.write_text(
+                        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                        encoding="utf-8",
+                    )
+                    os.replace(temporary_path, self._vector_manifest_path)
+                except Exception as exc:
+                    logger.warning(
+                        f"[AstrMai] descriptor_backfill_failed: {type(exc).__name__}: {exc!r}"
+                    )
+            self._vector_index_descriptor = dict(payload)
+            return index_path
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            self._vector_dimension_check_status = "unknown"
             return None
 
     def _new_vector_index_path(self, generation: int) -> Path:
@@ -234,12 +580,28 @@ class MemoryEngine:
         self,
         index_path: Path,
         embedding_models: list[str],
+        *,
+        dimension: int | None = None,
+        provider_source_id: str = "",
+        api_base_fingerprint: str = "",
+        document_count: int | None = None,
+        vector_count: int | None = None,
+        generation: int | None = None,
+        status: str = "published",
     ) -> None:
-        payload = {
-            "file_name": index_path.name,
-            "embedding_models": list(embedding_models),
-            "published_at": time.time(),
-        }
+        created_at = time.time()
+        payload = VectorIndexDescriptor(
+            generation=int(self._vector_generation if generation is None else generation),
+            index_file=index_path.name,
+            embedding_models=tuple(embedding_models),
+            provider_source_id=str(provider_source_id or ""),
+            api_base_fingerprint=str(api_base_fingerprint or ""),
+            dimension=int(dimension) if dimension is not None else None,
+            document_count=document_count,
+            vector_count=vector_count,
+            created_at=created_at,
+            status=status,
+        ).to_dict()
         manifest_path = self._vector_manifest_path
         temporary_path = manifest_path.with_name(
             f"{manifest_path.name}.{uuid.uuid4().hex}.tmp"
@@ -249,6 +611,7 @@ class MemoryEngine:
             encoding="utf-8",
         )
         os.replace(temporary_path, manifest_path)
+        self._vector_index_descriptor = dict(payload)
 
     def _cleanup_stale_vector_indexes(
         self,
@@ -1372,6 +1735,8 @@ class MemoryEngine:
             await self._build_and_publish_vector_index(lifecycle)
         finally:
             self._projection_rebuild_active = False
+            if not lifecycle.published and lifecycle.index_path is not None and lifecycle.discard_index:
+                self._vector_rebuild_failed_total += 1
             if not lifecycle.published:
                 closed = await self._await_vector_stack_close(
                     lifecycle.retriever,
@@ -1414,16 +1779,44 @@ class MemoryEngine:
         provider_instance = None
         clean_models = [m.strip() for m in self.embedding_models if m and m.strip()]
         unique_models = list(dict.fromkeys(clean_models))
+        if len(unique_models) > 1:
+            self._vector_configuration_error = "multiple_embedding_models_not_supported"
+            self._vector_dimension_check_status = "configuration_error"
+            self._vector_state = "degraded"
+            raise RuntimeError(self._vector_configuration_error)
         for model_id in unique_models:
-            if hasattr(self.context, "get_provider_by_id"):
-                provider_instance = self.context.get_provider_by_id(model_id)
-            if not provider_instance and hasattr(self.context, "get_provider"):
-                provider_instance = self.context.get_provider(model_id)
+            provider_instance = self._resolve_embedding_provider(model_id)
             if provider_instance:
                 break
+        if provider_instance is None and not unique_models:
+            providers = getattr(self.context, "get_all_embedding_providers", None)
+            if callable(providers):
+                try:
+                    available = providers() or []
+                    provider_instance = available[0] if available else None
+                    if provider_instance is not None:
+                        unique_models = [self._provider_source_id(provider_instance, "default")]
+                except Exception:
+                    provider_instance = None
         if not provider_instance:
             models_str = ", ".join(unique_models) if unique_models else "unconfigured"
             raise RuntimeError(f"no valid embedding model found [{models_str}]")
+
+        probe = await self._probe_embedding_dimension(
+            provider_instance,
+            self._provider_source_id(provider_instance, unique_models[0] if unique_models else ""),
+        )
+        query_dimension = probe.get("query_dimension")
+        if probe.get("dimension_probe_status") in {
+            "failed", "unavailable", "invalid", "timeout", "shutdown_rejected"
+        }:
+            self._vector_dimension_check_status = probe.get("dimension_probe_status") or "probe_failed"
+            self._vector_state = "degraded"
+            raise RuntimeError(
+                f"dimension probe failed: {probe.get('dimension_probe_error') or 'unknown'}"
+            )
+        elif query_dimension:
+            self._vector_dimension_check_status = "checking"
 
         async with self._faiss_lock:
             if generation != self._vector_generation:
@@ -1434,9 +1827,21 @@ class MemoryEngine:
             published_index_path = (
                 None
                 if self._force_index_rebuild
-                else self._load_published_vector_index(unique_models)
+                else (
+                    await asyncio.to_thread(
+                        self._load_published_vector_index,
+                        unique_models,
+                        query_dimension,
+                    )
+                    if query_dimension is not None
+                    else None
+                )
             )
             rebuild_required = self._force_index_rebuild or not migration_applied or published_index_path is None
+            if published_index_path is None and not self._force_index_rebuild:
+                self._vector_state = "dimension_mismatch_detected" if self._vector_dimension_check_status == "mismatch" else "degraded"
+            if rebuild_required:
+                self._vector_rebuild_started_total += 1
             projection_retry_snapshot = getattr(self.v2_store, "projection_retry_snapshot_with_revisions", None)
             candidate_outbox_candidates = set()
             candidate_outbox_watermarks = {}
@@ -1526,6 +1931,18 @@ class MemoryEngine:
             )
             lifecycle.faiss_db = candidate_db
             lifecycle.retriever = candidate_retriever
+            candidate_dimension, candidate_dimension_source = self._index_dimension(candidate_db)
+            if query_dimension is not None and candidate_dimension is None:
+                self._vector_dimension_check_status = "unknown"
+                raise RuntimeError("candidate vector dimension is unavailable")
+            if query_dimension is not None and candidate_dimension is not None and int(candidate_dimension) != int(query_dimension):
+                self._vector_dimension_mismatch_total += 1
+                self._vector_dimension_check_status = "mismatch"
+                raise RuntimeError(
+                    f"candidate vector dimension mismatch: index_dim={candidate_dimension} query_dim={query_dimension}"
+                )
+            if candidate_dimension is not None:
+                self._vector_dimension_source = candidate_dimension_source
             self._projection_rebuild_active = True
             self._vector_state = "rebuilding"
             if rebuild_required:
@@ -1669,7 +2086,15 @@ class MemoryEngine:
                 previous_faiss_db = self.faiss_db
                 previous_index_path = self._vector_index_path
                 if rebuild_required:
-                    self._publish_vector_index_manifest(candidate_index_path, unique_models)
+                    self._publish_vector_index_manifest(
+                        candidate_index_path,
+                        unique_models,
+                        dimension=candidate_dimension or query_dimension,
+                        provider_source_id=probe.get("provider_source_id", ""),
+                        api_base_fingerprint=self._api_base_fingerprint(provider_instance, self.config),
+                        vector_count=report.get("faiss_index_count_observed"),
+                        generation=generation,
+                    )
                 self.faiss_db = candidate_db
                 self.vec_retriever = candidate_retriever
                 self.retriever = candidate_hybrid
@@ -1681,6 +2106,9 @@ class MemoryEngine:
                 self._next_retry_time = 0.0
                 self._is_ready = True
                 self._vector_state = "ready"
+                self._vector_dimension_check_status = "matched" if query_dimension is not None else "unknown"
+                if rebuild_required:
+                    self._vector_rebuild_succeeded_total += 1
                 self._vector_bootstrap_completed_at = time.time()
                 lifecycle.published = True
                 lifecycle.discard_index = False
@@ -1739,6 +2167,7 @@ class MemoryEngine:
 
     async def _ensure_faiss_initialized(self):
         if self._projection_rebuild_active or self._vector_state == "rebuilding":
+            self._vector_old_retriever_blocked_total += 1
             return False
         if self._is_ready:
             self._vector_state = "ready"
@@ -1749,12 +2178,26 @@ class MemoryEngine:
                     RuntimeError("faiss is unavailable in current environment")
                 )
             return False
-        if not [str(item).strip() for item in self.embedding_models or [] if str(item).strip()]:
-            if time.time() >= self._next_retry_time:
-                self._mark_vector_bootstrap_failed(
-                    RuntimeError("no embedding model configured")
-                )
+        configured_models = list(dict.fromkeys(
+            str(item).strip() for item in self.embedding_models or [] if str(item).strip()
+        ))
+        if len(configured_models) > 1:
+            self._vector_configuration_error = "multiple_embedding_models_not_supported"
+            self._vector_state = "degraded"
+            self._vector_dimension_check_status = "configuration_error"
             return False
+        if not configured_models:
+            providers_fn = getattr(self.context, "get_all_embedding_providers", None)
+            try:
+                available_providers = list(providers_fn() or []) if callable(providers_fn) else []
+            except Exception:
+                available_providers = []
+            if not available_providers:
+                if time.time() >= self._next_retry_time:
+                    self._mark_vector_bootstrap_failed(
+                        RuntimeError("no embedding model or default provider configured")
+                    )
+                return False
         self._schedule_vector_bootstrap()
         return False
 
@@ -1793,6 +2236,8 @@ class MemoryEngine:
             ]
             candidate_path_count = len(self._vector_candidate_paths)
             retired_stacks = [dict(stack) for stack in self._retired_vector_stacks.values()]
+        dimension_probe_task = getattr(self, "_vector_dimension_probe_task", None)
+        dimension_probe_count = int(_running(dimension_probe_task))
 
         owner_names = {
             *(
@@ -1809,6 +2254,7 @@ class MemoryEngine:
                 _owner_name(owner, "memory.vector_close_owner")
                 for owner in close_owners
             ),
+            *("memory.vector_dimension_probe" for _ in range(dimension_probe_count)),
         }
         retirement_statuses = {
             str(stack.get("status") or "pending") for stack in retired_stacks
@@ -1820,6 +2266,7 @@ class MemoryEngine:
             "vector_candidate_path_count": candidate_path_count,
             "vector_sync_retirement_count": len(sync_retirement_futures),
             "vector_close_owner_count": len(close_owners),
+            "vector_dimension_probe_count": dimension_probe_count,
             "retired_vector_stack_count": len(retired_stacks),
             "owner_task_names": sorted(owner_names),
             "vector_retirement_by_status": {
@@ -1890,7 +2337,39 @@ class MemoryEngine:
                 "vector_physical_timeout_exceeded_total": int(
                     getattr(self, "_vector_physical_timeout_exceeded_total", 0) or 0
                 ),
+                "index_dimension": self._index_dimension(self.faiss_db)[0],
+                "physical_index_dimension": self._index_dimension(self.faiss_db)[0],
+                "query_dimension": self._vector_query_dimension,
+                "measured_query_dimension": self._vector_query_dimension,
+                "configured_dimension": self._configured_vector_dimension,
+                "dimension_source": self._vector_dimension_source,
+                "dimension_check_status": self._vector_dimension_check_status,
+                "configuration_error": self._vector_configuration_error,
+                "migration_state": self._vector_state,
+                "migration_generation": int(self._vector_generation),
+                "dimension_mismatch_total": int(self._vector_dimension_mismatch_total),
+                "dimension_probe_failed_total": int(self._vector_dimension_probe_failed_total),
+                "dimension_probe_timeout_total": int(
+                    getattr(self, "_vector_dimension_probe_timeout_total", 0) or 0
+                ),
+                "dimension_probe_invalid_vector_total": int(
+                    getattr(self, "_vector_dimension_probe_invalid_total", 0) or 0
+                ),
+                "dimension_probe_unavailable_total": int(
+                    getattr(self, "_vector_dimension_probe_unavailable_total", 0) or 0
+                ),
+                "dimension_probe_provider_error_total": int(
+                    getattr(self, "_vector_dimension_probe_provider_error_total", 0) or 0
+                ),
+                "rebuild_started_total": int(self._vector_rebuild_started_total),
+                "rebuild_succeeded_total": int(self._vector_rebuild_succeeded_total),
+                "rebuild_failed_total": int(self._vector_rebuild_failed_total),
+                "old_retriever_blocked_total": int(self._vector_old_retriever_blocked_total),
+                "index_descriptor": dict(self._vector_index_descriptor),
                 "vector_close_owner_task_count": shutdown_owners["vector_close_owner_count"],
+                "vector_dimension_probe_count": shutdown_owners[
+                    "vector_dimension_probe_count"
+                ],
                 "retired_vector_stack_count": shutdown_owners["retired_vector_stack_count"],
                 "vector_close_state": str(getattr(self, "_vector_close_state", "idle")),
                 "last_projector_shutdown": dict(
@@ -2475,6 +2954,7 @@ class MemoryEngine:
 
     async def start_background_tasks(self):
         self._accepting_vector_work = True
+        self._accepting_dimension_probe = True
         projector = getattr(self, "index_projector", None)
         if projector is not None:
             await projector.start()
@@ -2512,6 +2992,8 @@ class MemoryEngine:
         if callable(begin_pipeline_shutdown):
             begin_pipeline_shutdown()
         bootstrap_task = self._vector_bootstrap_task
+        probe_task = getattr(self, "_vector_dimension_probe_task", None)
+        await self._cancel_background_task_safely(probe_task, "vector dimension probe")
         await self._cancel_background_task_safely(bootstrap_task, "vector bootstrap")
         if self._vector_bootstrap_task is bootstrap_task and bootstrap_task is not None and bootstrap_task.done():
             self._vector_bootstrap_task = None
@@ -2550,6 +3032,10 @@ class MemoryEngine:
         if not getattr(self, "_accepting_vector_work", True):
             return
         self._accepting_vector_work = False
+        self._accepting_dimension_probe = False
+        probe_task = getattr(self, "_vector_dimension_probe_task", None)
+        if probe_task is not None and not probe_task.done():
+            probe_task.cancel()
         self._vector_shutdown_generation = int(
             getattr(self, "_vector_shutdown_generation", 0) or 0
         ) + 1

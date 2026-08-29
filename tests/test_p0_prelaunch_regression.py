@@ -230,6 +230,8 @@ class P0PrelaunchRegressionTests(unittest.TestCase):
                 return [1.0, 0.0]
 
         class _Index:
+            d = 2
+
             def search(self, vector, k):
                 search_threads.append(threading.current_thread().name)
                 return [[0.1]], [[7]]

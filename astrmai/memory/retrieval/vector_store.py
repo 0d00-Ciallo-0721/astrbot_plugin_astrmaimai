@@ -13,6 +13,7 @@ from astrbot.api import logger
 from astrbot.core.db.vec_db.faiss_impl.vec_db import FaissVecDB
 from ...infrastructure.runtime.turn_call_ledger import clamp_timeout_to_turn_budget
 from ..utils import SearchResult, TextProcessor
+from .embedding import invoke_embedding
 
 
 class _QueryQueueTimeout(asyncio.TimeoutError):
@@ -27,6 +28,24 @@ class _VectorStageTimeout(asyncio.TimeoutError):
 
 class _VectorClosedError(RuntimeError):
     """Raised when vector work arrives after shutdown admission is fenced."""
+
+
+class _VectorDimensionMismatch(ValueError):
+    """Raised when a query/vector dimension cannot match the physical index."""
+
+    def __init__(self, index_dim: int | None, query_dim: int | None):
+        self.index_dim = index_dim
+        self.query_dim = query_dim
+        super().__init__(f"index_dim={index_dim} query_dim={query_dim}")
+
+
+class _VectorDimensionUnknown(ValueError):
+    """Raised when the physical index dimension cannot be established safely."""
+
+    def __init__(self, query_dim: int | None, source: str = "unknown"):
+        self.query_dim = query_dim
+        self.source = source
+        super().__init__(f"index_dim=unknown query_dim={query_dim} source={source}")
 
 class VectorRetriever:
     """
@@ -78,6 +97,10 @@ class VectorRetriever:
         self._storage_metrics_refreshed_at = 0.0
         self._storage_metrics_refreshed_mono = 0.0
         self._storage_metrics_task: asyncio.Task | None = None
+        self._dimension_mismatch_total = 0
+        self._dimension_unknown_total = 0
+        self._last_dimension_error = ""
+        self._last_query_dimension: int | None = None
 
     def _timing_value(self, name: str, default: float) -> float:
         timing = getattr(self.config, "timing", None)
@@ -169,6 +192,35 @@ class VectorRetriever:
             getattr(self.faiss_db, name, None) is not None
             for name in ("embedding_provider", "embedding_storage", "document_storage")
         ) and getattr(getattr(self.faiss_db, "embedding_storage", None), "index", None) is not None
+
+    def _get_index_dimension(self) -> tuple[int | None, str]:
+        storage = getattr(self.faiss_db, "embedding_storage", None)
+        for candidate in (getattr(storage, "index", None), storage, self.faiss_db):
+            if candidate is None:
+                continue
+            for name in ("d", "dimension", "dim"):
+                try:
+                    value = getattr(candidate, name, None)
+                    if value is not None and int(value) > 0:
+                        return int(value), f"{type(candidate).__name__}.{name}"
+                except (TypeError, ValueError):
+                    continue
+        return None, "unknown"
+
+    def _validate_vector_dimension(self, vector: Any) -> None:
+        array = np.asarray(vector, dtype=np.float32)
+        self._last_query_dimension = int(array.shape[0]) if array.ndim == 1 else None
+        if array.ndim != 1 or array.size <= 0 or not np.isfinite(array).all():
+            raise _VectorDimensionMismatch(self._get_index_dimension()[0], None)
+        index_dim, _ = self._get_index_dimension()
+        if index_dim is None:
+            self._dimension_unknown_total += 1
+            self._last_dimension_error = f"index_dim=unknown query_dim={array.shape[0]}"
+            raise _VectorDimensionUnknown(int(array.shape[0]), self._get_index_dimension()[1])
+        if int(array.shape[0]) != int(index_dim):
+            self._dimension_mismatch_total += 1
+            self._last_dimension_error = f"index_dim={index_dim} query_dim={array.shape[0]}"
+            raise _VectorDimensionMismatch(index_dim, int(array.shape[0]))
 
     @staticmethod
     def _remaining_timeout(deadline: float, stage: str) -> float:
@@ -301,7 +353,11 @@ class VectorRetriever:
         embedding_started = time.monotonic()
         try:
             embedding = await self._await_stage(
-                self.faiss_db.embedding_provider.get_embedding(query),
+                invoke_embedding(
+                    self.faiss_db.embedding_provider,
+                    query,
+                    timeout_sec=max(0.1, self._timing_value("embedding_timeout_sec", 30.0)),
+                ),
                 deadline=deadline,
                 stage="embedding",
                 timings=timings,
@@ -316,7 +372,9 @@ class VectorRetriever:
             timings["embedding_total_ms"] = round(
                 max(0.0, time.monotonic() - embedding_started) * 1000.0, 1
             )
-        vector = np.array([embedding], dtype=np.float32)
+        vector = np.asarray(embedding, dtype=np.float32)
+        self._validate_vector_dimension(vector)
+        vector = np.array([vector], dtype=np.float32)
         index_started = time.monotonic()
         index_task = asyncio.create_task(
                 self._run_index_job(
@@ -436,6 +494,14 @@ class VectorRetriever:
                         background_task.add_done_callback(self._finish_background_index_task)
                     raise
             else:
+                provider = getattr(self.faiss_db, "embedding_provider", None)
+                if provider is not None:
+                    preflight_vector = await invoke_embedding(
+                        provider,
+                        kwargs["query"],
+                        timeout_sec=max(0.1, self._timing_value("embedding_timeout_sec", 30.0)),
+                    )
+                    self._validate_vector_dimension(preflight_vector)
                 stage_started = time.monotonic()
                 try:
                     results = await asyncio.wait_for(
@@ -567,6 +633,12 @@ class VectorRetriever:
             ),
             "storage_metrics_refreshed_at": self._storage_metrics_refreshed_at or None,
             "last_stage_timings": dict(self._last_stage_timings),
+            "index_dimension": self._get_index_dimension()[0],
+            "index_dimension_source": self._get_index_dimension()[1],
+            "dimension_mismatch_total": int(self._dimension_mismatch_total),
+            "dimension_unknown_total": int(self._dimension_unknown_total),
+            "last_dimension_error": self._last_dimension_error,
+            "query_dimension": self._last_query_dimension,
         }
 
     def _index_count(self) -> int | None:
@@ -677,21 +749,23 @@ class VectorRetriever:
                 metadata["last_access_time"] = time.time()
 
             if not self._supports_phased_retrieval():
+                provider = getattr(self.faiss_db, "embedding_provider", None)
+                if provider is not None:
+                    vector = await invoke_embedding(
+                        provider,
+                        content,
+                        timeout_sec=max(0.1, self._timing_value("embedding_timeout_sec", 30.0)),
+                    )
+                    self._validate_vector_dimension(vector)
                 return await self.faiss_db.insert(content=content, metadata=metadata)
 
-            embedding = await asyncio.wait_for(
-                self.faiss_db.embedding_provider.get_embedding(content),
-                timeout=max(0.1, self._timing_value("embedding_timeout_sec", 30.0)),
+            embedding = await invoke_embedding(
+                self.faiss_db.embedding_provider,
+                content,
+                timeout_sec=max(0.1, self._timing_value("embedding_timeout_sec", 30.0)),
             )
             vector = np.asarray(embedding, dtype=np.float32)
-            expected_dimension = int(
-                getattr(self.faiss_db.embedding_storage, "dimension", vector.shape[0])
-                or vector.shape[0]
-            )
-            if vector.shape[0] != expected_dimension:
-                raise ValueError(
-                    f"embedding dimension mismatch: expected={expected_dimension} actual={vector.shape[0]}"
-                )
+            self._validate_vector_dimension(vector)
             doc_id = await self.faiss_db.document_storage.insert_document(
                 str(uuid.uuid4()),
                 content,
@@ -820,6 +894,9 @@ class VectorRetriever:
                 "cooldown_remaining_sec": round(cooldown_remaining, 3),
                 "error_type": str(error_type or ""),
                 "error_detail": str(error_detail or "")[:240],
+                "index_dimension": self._get_index_dimension()[0],
+                "query_dimension": self._last_query_dimension,
+                "dimension_source": self._get_index_dimension()[1],
                 "query_concurrency": int(self._query_limit),
                 "active_queries": int(self._active_queries),
                 "faiss_thread_count": int(self._faiss_thread_count()),
@@ -945,6 +1022,44 @@ class VectorRetriever:
                 fallback_source="canonical_fts",
             )
             return []
+        except _VectorDimensionMismatch as exc:
+            self._half_open_probe_active = False
+            self._last_dimension_error = repr(exc)
+            self._record_observation(
+                observation,
+                status="dimension_mismatch",
+                started_at=started_at,
+                timeout_sec=timeout_sec,
+                configured_timeout_sec=configured_timeout_sec,
+                error_type=type(exc).__name__,
+                error_detail=repr(exc),
+                requested_k=k,
+                fetch_k=fetch_k,
+                metadata_filter_count=metadata_filter_count,
+                retrieval_id=retrieval_id,
+                circuit_state_before=circuit_state_before,
+                fallback_source="canonical_fts",
+            )
+            return []
+        except _VectorDimensionUnknown as exc:
+            self._half_open_probe_active = False
+            self._last_dimension_error = repr(exc)
+            self._record_observation(
+                observation,
+                status="dimension_unknown",
+                started_at=started_at,
+                timeout_sec=timeout_sec,
+                configured_timeout_sec=configured_timeout_sec,
+                error_type=type(exc).__name__,
+                error_detail=repr(exc),
+                requested_k=k,
+                fetch_k=fetch_k,
+                metadata_filter_count=metadata_filter_count,
+                retrieval_id=retrieval_id,
+                circuit_state_before=circuit_state_before,
+                fallback_source="canonical_fts",
+            )
+            return []
         except _VectorStageTimeout as exc:
             self._mark_failure("timeout")
             logger.warning(
@@ -970,7 +1085,15 @@ class VectorRetriever:
             return []
         except Exception as e:
             self._mark_failure(type(e).__name__)
-            logger.error(f"[VectorStore] Faiss 原生检索异常: {e}")
+            index_dim, dimension_source = self._get_index_dimension()
+            logger.error(
+                "[VectorStore] Faiss 原生检索异常 "
+                f"retrieval_id={retrieval_id} index_dim={index_dim} "
+                f"query_dim={self._last_query_dimension} "
+                f"dimension_source={dimension_source} "
+                f"error_type={type(e).__name__} error={e!r} "
+                "fallback_source=canonical_fts"
+            )
             self._record_observation(
                 observation,
                 status="error",
@@ -978,7 +1101,7 @@ class VectorRetriever:
                 timeout_sec=timeout_sec,
                 configured_timeout_sec=configured_timeout_sec,
                 error_type=type(e).__name__,
-                error_detail=str(e),
+                error_detail=repr(e),
                 requested_k=k,
                 fetch_k=fetch_k,
                 metadata_filter_count=metadata_filter_count,

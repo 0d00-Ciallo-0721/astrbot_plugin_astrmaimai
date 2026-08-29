@@ -607,7 +607,11 @@ class MemoryGapCoverageTests(unittest.TestCase):
             memory=SimpleNamespace(recall_top_k=5),
             timing=SimpleNamespace(faiss_bootstrap_timeout_sec=60),
         )
-        provider = object()
+        class _Provider:
+            async def get_embedding(self, _text):
+                return [0.1, 0.2]
+
+        provider = _Provider()
         engine = memory_engine_mod.MemoryEngine(
             SimpleNamespace(get_provider_by_id=lambda _model_id: provider),
             SimpleNamespace(config=config),
@@ -627,6 +631,7 @@ class MemoryGapCoverageTests(unittest.TestCase):
         class _Faiss:
             def __init__(self, **kwargs):
                 self.closed = False
+                self.embedding_storage = SimpleNamespace(index=SimpleNamespace(d=2))
 
             async def initialize(self):
                 return None

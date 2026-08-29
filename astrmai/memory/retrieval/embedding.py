@@ -1,8 +1,79 @@
 import numpy as np
 import asyncio
+import inspect
 from typing import List, Optional, Any
 from astrbot.api.star import Context
 from astrbot.api import logger
+
+
+def normalize_embedding_result(result: Any) -> Optional[List[float]]:
+    if result is None:
+        return None
+    if isinstance(result, dict):
+        for key in ("embedding", "embeddings", "vector", "data"):
+            if key in result:
+                result = result[key]
+                break
+    if isinstance(result, (list, tuple)) and result and isinstance(result[0], (list, tuple)):
+        result = result[0]
+    if hasattr(result, "tolist") and not isinstance(result, list):
+        result = result.tolist()
+    if isinstance(result, (list, tuple)) and result and isinstance(result[0], (list, tuple)):
+        result = result[0]
+    if not isinstance(result, (list, tuple)):
+        return None
+    values = list(result)
+    array = np.asarray(values, dtype=np.float32)
+    if array.ndim != 1 or array.size <= 0 or not np.isfinite(array).all():
+        return None
+    return [float(value) for value in array]
+
+
+async def invoke_embedding(provider: Any, text: str, *, timeout_sec: float = 30.0) -> List[float]:
+    """Call one embedding provider across AstrBot's supported API shapes."""
+    methods = ("get_embeddings", "embeddings", "text_embedding", "get_embedding", "embedding")
+    timeout = max(0.1, float(timeout_sec or 30.0))
+    deadline = asyncio.get_running_loop().time() + timeout
+    last_error: Exception | None = None
+    for method_name in methods:
+        method = getattr(provider, method_name, None)
+        if not callable(method):
+            continue
+        for payload in ([text], text):
+            try:
+                async def _call() -> Any:
+                    is_async = inspect.iscoroutinefunction(method) or inspect.iscoroutinefunction(
+                        getattr(method, "__call__", None)
+                    )
+                    if is_async:
+                        result = method(payload)
+                    else:
+                        result = await asyncio.to_thread(method, payload)
+                    if inspect.isawaitable(result):
+                        return await result
+                    return result
+
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0.0:
+                    raise asyncio.TimeoutError
+                result = await asyncio.wait_for(_call(), timeout=remaining)
+                vector = normalize_embedding_result(result)
+                if vector is not None:
+                    return vector
+                last_error = ValueError("invalid_embedding")
+            except asyncio.TimeoutError as exc:
+                last_error = exc
+                break
+            except Exception as exc:
+                last_error = exc
+                continue
+        if isinstance(last_error, asyncio.TimeoutError):
+            break
+    raise RuntimeError(
+        f"embedding provider call failed: {type(last_error).__name__}: {last_error!r}"
+        if last_error is not None
+        else "embedding provider method unavailable"
+    )
 
 class EmbeddingClient:
     """
@@ -34,38 +105,18 @@ class EmbeddingClient:
             if not provider:
                 continue
 
-            # 动态探测兼容的方法名
-            candidate_methods = [
-                'get_embeddings', 
-                'embeddings',     
-                'text_embedding', 
-                'get_embedding',  
-                'embedding'
-            ]
-
-            for method_name in candidate_methods:
-                if hasattr(provider, method_name):
-                    method = getattr(provider, method_name)
-                    try:
-                        # 优先尝试批处理格式，并使用统一时间配置防止 provider 卡死。
-                        try:
-                            result = await asyncio.wait_for(method([text]), timeout=self._timeout_sec)
-                        except (TypeError, ValueError, asyncio.TimeoutError):
-                            # 回退单文本格式
-                            result = await asyncio.wait_for(method(text), timeout=self._timeout_sec)
-
-                        # 结果标准化
-                        if result:
-                            if isinstance(result, list) and len(result) > 0 and isinstance(result[0], list):
-                                return result[0]
-                            elif isinstance(result, list):
-                                return result
-                            elif hasattr(result, 'tolist'):
-                                return result.tolist()
-                                
-                    except Exception as e:
-                        logger.debug(f"[Embedding] 尝试方法 {method_name} 失败: {e}")
-                        continue
+            try:
+                return await invoke_embedding(
+                    provider,
+                    text,
+                    timeout_sec=self._timeout_sec,
+                )
+            except Exception as e:
+                logger.debug(
+                    f"[Embedding] Provider 调用失败: "
+                    f"{type(e).__name__}: {e!r}"
+                )
+                continue
         
         # 严格确保它失败后直接 return None，不与 LLM 总模型池 (fallback_models) 产生任何交集
         logger.error("[Embedding] 🚨 所有可用的 Embedding 模型尝试失败，已放弃向量化。")
