@@ -4,6 +4,11 @@
 /astrmai/webui/data/
 /astrmai/webui/venv/
 /.agent/
+/plan/
+/specs/
+/docs/optimization/
+/tests/manual/*.md
+/tests/manual/risk_audit/*.md
 /.tmp_*/
 __pycache__/
 *.py[cod]
