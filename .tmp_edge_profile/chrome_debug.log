@@ -1,8 +1,0 @@
-[5228:9092:0519/214719.398:ERROR:chrome\installer\util\google_update_settings_win.cc:517] Failed opening key Software\Microsoft\EdgeUpdate\ClientStateMedium\{56EB18F8-B008-4CBD-B6D2-8C97FE7E9062} to set usagestats; result: 5
-[5228:9092:0519/214719.398:ERROR:chrome\installer\util\google_update_settings_win.cc:550] Failed opening key Software\Microsoft\EdgeUpdate\ClientStateMedium\{56EB18F8-B008-4CBD-B6D2-8C97FE7E9062} to set urlstats; result: 5
-[5228:18724:0519/214719.433:WARNING:chrome\browser\extensions\activity_log\activity_log_policy.cc:71] Scheduling init
-[5228:18724:0519/214719.433:WARNING:chrome\browser\extensions\activity_log\activity_log_policy.cc:71] Scheduling init
-[22508:7700:0519/214719.464:ERROR:ui\gl\direct_composition_support.cc:243] GetGpuDriverOverlayInfo: Failed to retrieve video device
-[5228:22488:0519/214719.550:ERROR:chrome\installer\util\google_update_settings_win.cc:517] Failed opening key Software\Microsoft\EdgeUpdate\ClientStateMedium\{56EB18F8-B008-4CBD-B6D2-8C97FE7E9062} to set usagestats; result: 5
-[5228:22488:0519/214719.562:INFO:chrome\common\importer\edge_chrome_importer_utils_win.cc:34] Google chrome user data path not found.
-[5228:22488:0519/214719.564:ERROR:chrome\browser\importer\edge_china_browsers\edge_qqbrowser_importer_utils_win.cc:164] QQBrowser user data path not found.

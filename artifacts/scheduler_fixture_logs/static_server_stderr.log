@@ -1,6 +1,0 @@
-127.0.0.1 - - [19/May/2026 22:50:39] "GET /artifacts/scheduler_fixture/direct_open_plugin_page.html HTTP/1.1" 200 -
-127.0.0.1 - - [19/May/2026 22:50:48] "GET /artifacts/scheduler_fixture/direct_open_plugin_page.html HTTP/1.1" 200 -
-127.0.0.1 - - [19/May/2026 22:51:06] "GET /artifacts/scheduler_fixture/direct_open_plugin_page.html HTTP/1.1" 200 -
-127.0.0.1 - - [19/May/2026 22:51:06] "GET /pages/admin/style.css HTTP/1.1" 200 -
-127.0.0.1 - - [19/May/2026 22:51:06] "GET /pages/admin/app.js HTTP/1.1" 200 -
-127.0.0.1 - - [19/May/2026 22:57:56] "GET /artifacts/scheduler_fixture/direct_open_plugin_page.html HTTP/1.1" 200 -

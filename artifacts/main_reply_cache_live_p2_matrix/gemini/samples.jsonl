@@ -1,1 +1,0 @@
-{"case_id": "dry_run_capability_only", "provider_family": "gemini", "model": "kimi-k2.6", "endpoint_kind": "gemini_generate_content", "provider_supports_cache_hint": false, "provider_supports_usage_reporting": false, "provider_supports_session_id": false, "blocking_reason": "missing_api_key", "request_execution_possible": false}
