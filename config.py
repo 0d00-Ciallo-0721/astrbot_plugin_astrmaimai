@@ -140,6 +140,12 @@ class AttentionConfig(BaseModel):
     # 为功能重构后的死配置（防抖硬编码分档、限流改能量驱动、复读阈值硬编码 3），
     # 已随 schema 一并删除——UI 不再展示无效承诺
     judge_timeout: float = Field(default=20.0, ge=0.1, description="System1 Judge attention gate timeout in seconds")
+    startup_warmup_sec: float = Field(
+        default=120.0,
+        ge=0.0,
+        le=1800.0,
+        description="启动预热窗口（秒）；仅抑制未明确指向机器人的群聊后台 attention 任务",
+    )
     bg_pool_size: int = Field(default=20, ge=1)
     accumulation_pool_max_events: int = Field(
         default=100,

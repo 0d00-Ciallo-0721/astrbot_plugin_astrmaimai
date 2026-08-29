@@ -5,6 +5,7 @@ import importlib
 import tempfile
 import time
 import unittest
+from unittest import mock
 from types import SimpleNamespace
 
 from tests.helpers.astrbot_stubs import install_astrbot_stubs
@@ -380,6 +381,68 @@ class AttentionDeferredQueueTests(unittest.TestCase):
         calls, failures = asyncio.run(run())
         self.assertEqual(calls, ["run"])
         self.assertEqual(failures, 1)
+
+    def test_startup_warmup_skips_ambient_group_background_task(self):
+        async def run():
+            self.gate.config.attention.startup_warmup_sec = 120.0
+            self.gate.mark_runtime_started()
+            event = _Event()
+            calls = []
+
+            async def work():
+                calls.append("run")
+
+            result = await self.gate._run_background_task(
+                asyncio.sleep(0), event, task_name="attention.system2", retry_factory=work
+            )
+            return result, calls, event.get_extra("astrmai_execution_status")
+
+        result, calls, status = asyncio.run(run())
+        self.assertIsNone(result)
+        self.assertEqual(calls, [])
+        self.assertEqual(status, "startup_warmup_skipped")
+
+    def test_startup_warmup_keeps_direct_group_background_task(self):
+        async def run():
+            self.gate.config.attention.startup_warmup_sec = 120.0
+            self.gate.mark_runtime_started()
+            event = _Event()
+            event.set_extra("astrmai_group_direct_wakeup", True)
+            calls = []
+
+            async def work():
+                calls.append("run")
+                return "ok"
+
+            result = await self.gate._run_background_task(
+                work(), event, task_name="attention.system2", retry_factory=work
+            )
+            return result, calls
+
+        result, calls = asyncio.run(run())
+        self.assertEqual(result, "ok")
+        self.assertEqual(calls, ["run"])
+
+    def test_queue_admission_errors_are_warning_only(self):
+        async def run():
+            async def fail():
+                raise self.gate_mod.BackgroundTaskQueueTimeout("probe")
+
+            task = asyncio.create_task(fail())
+            try:
+                await task
+            except self.gate_mod.BackgroundTaskQueueTimeout:
+                pass
+            task._astrmai_task_name = "attention.system2"
+            with mock.patch.object(self.gate_mod.logger, "warning") as warning, mock.patch.object(
+                self.gate_mod.logger, "error"
+            ) as error:
+                self.gate._handle_task_result(task)
+            return warning.call_count, error.call_count
+
+        warnings, errors = asyncio.run(run())
+        self.assertEqual(warnings, 1)
+        self.assertEqual(errors, 0)
 
 
 if __name__ == "__main__":

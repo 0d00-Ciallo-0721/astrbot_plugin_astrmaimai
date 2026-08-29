@@ -765,6 +765,14 @@
     "type": "object",
     "description": "群聊注意力与触发控制",
     "items": {
+      "startup_warmup_sec": {
+        "description": "启动预热窗口（秒）",
+        "type": "float",
+        "default": 120.0,
+        "minimum": 0,
+        "maximum": 1800,
+        "hint": "启动后的短窗口内仅抑制未明确指向机器人的群聊后台注意力任务，私聊、@、回复和强唤醒不受影响。设置为 0 可关闭。"
+      },
       "bg_pool_size": {
         "description": "后台观察缓存条数",
         "type": "int",

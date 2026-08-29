@@ -418,6 +418,10 @@ class PluginLifecycleManager:
 
         self.runtime.status.lifecycle_started = True
         self.runtime.status.accepting_events = True
+        attention_gate = getattr(self.runtime, "attention_gate", None)
+        mark_attention_started = getattr(attention_gate, "mark_runtime_started", None)
+        if callable(mark_attention_started):
+            mark_attention_started()
         OUTBOUND_SEND_GATE.open()
         self.runtime.set_boot_phase("runtime.running")
         logger.info("[AstrMai] boot complete — runtime running")

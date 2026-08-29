@@ -170,6 +170,9 @@ class AttentionGate:
         self._deferred_attention_dispatcher: asyncio.Task | None = None
         self._deferred_attention_sequence = 0
         self._deferred_attention_counts: collections.Counter[str] = collections.Counter()
+        self._queue_degradation_counts: collections.Counter[str] = collections.Counter()
+        self._queue_degradation_last_log = 0.0
+        self._runtime_started_monotonic: float | None = None
         # Platform IDs persist until FIFO eviction; content fallbacks use a short TTL.
         self._global_message_cache = collections.OrderedDict()
         self.perception_builder = PerceptionBuilder(self)
@@ -335,6 +338,8 @@ class AttentionGate:
             "worker_invariant_violation": worker_invariant_violation,
             "shutdown_generation": self._shutdown_generation,
             "workers_shutdown": self._workers_shutdown,
+            "startup_warmup_remaining_sec": round(self._startup_warmup_remaining(), 3),
+            "startup_warmup_active": self._startup_warmup_remaining() > 0.0,
             "session_count": len(self.focus_pools),
             "attention_deferred_current": len(deferred),
             "attention_deferred_oldest_age_ms": round(max(0.0, now - oldest_deferred) * 1000.0, 3) if deferred else 0.0,
@@ -367,9 +372,71 @@ class AttentionGate:
             self._workers_shutdown = True
             self._shutdown_generation += 1
 
+    def mark_runtime_started(self) -> None:
+        """Record the successful runtime transition used by startup warmup."""
+        self._runtime_started_monotonic = time.monotonic()
+
+    def _startup_warmup_remaining(self) -> float:
+        started = self._runtime_started_monotonic
+        if started is None:
+            return 0.0
+        attention_cfg = getattr(self.config, "attention", None)
+        try:
+            window = max(0.0, float(getattr(attention_cfg, "startup_warmup_sec", 120.0) or 0.0))
+        except (TypeError, ValueError):
+            window = 120.0
+        return max(0.0, window - (time.monotonic() - started))
+
+    def _should_skip_startup_warmup(self, event: Any, task_name: str, *, replay: bool = False) -> bool:
+        if replay or self._startup_warmup_remaining() <= 0.0:
+            return False
+        if str(task_name or "") not in {"attention.system2", "attention.compaction"}:
+            return False
+        if event is None:
+            return str(task_name or "") == "attention.compaction"
+        get_extra = getattr(event, "get_extra", None)
+        if callable(get_extra):
+            if any(
+                bool(get_extra(key, False))
+                for key in (
+                    "astrmai_group_direct_wakeup",
+                    "astrmai_force_engage",
+                    "astrmai_is_strong_wakeup",
+                    "astrmai_is_proactive_event",
+                )
+            ):
+                return False
+            if str(get_extra("astrmai_attention_prefilter_action", "") or "").strip().lower() == "force_pass":
+                return False
+        group_id = ""
+        get_group_id = getattr(event, "get_group_id", None)
+        if callable(get_group_id):
+            try:
+                group_id = str(get_group_id() or "")
+            except Exception:
+                group_id = ""
+        if not group_id:
+            group_id = str(getattr(event, "unified_msg_origin", "") or "")
+        return "GroupMessage" in group_id or ":Group" in group_id
+
+    def _record_queue_degradation(self, task: asyncio.Task, exc: BaseException) -> None:
+        task_name = str(getattr(task, "_astrmai_task_name", "attention.background") or "attention.background")
+        kind = "queue_full" if isinstance(exc, BackgroundTaskQueueFull) else "queue_timeout"
+        key = f"{task_name}:{kind}"
+        self._queue_degradation_counts[key] += 1
+        count = self._queue_degradation_counts[key]
+        now = time.monotonic()
+        if count == 1 or count % 10 == 0 or now - self._queue_degradation_last_log >= 30.0:
+            self._queue_degradation_last_log = now
+            logger.warning(
+                "[AttentionGate] background admission degraded "
+                f"task={task_name} reason={kind} count={count}; deferred or skipped without fallback"
+            )
+
     def reset_runtime_state(self) -> None:
         self._workers_shutdown = False
         self._shutdown_generation += 1
+        self._runtime_started_monotonic = None
         for session in self.focus_pools.values():
             session.closed = False
             session.worker_generation += 1
@@ -1282,6 +1349,15 @@ class AttentionGate:
             return await _execute()
 
         try:
+            if self._should_skip_startup_warmup(event, task_name, replay=_deferred_replay):
+                if event is not None and hasattr(event, "set_extra"):
+                    event.set_extra("astrmai_execution_status", "startup_warmup_skipped")
+                    event.set_extra("astrmai_startup_warmup_skipped", True)
+                logger.debug(
+                    "[AttentionGate] startup warmup skipped background task "
+                    f"task={task_name} remaining_sec={self._startup_warmup_remaining():.1f}"
+                )
+                return None
             configured_admission_timeout = 30.0
             try:
                 configured_admission_timeout = max(
@@ -1356,6 +1432,7 @@ class AttentionGate:
             self._run_background_task(coro, event, task_name=task_name, retry_factory=retry_factory)
         )
         task._astrmai_inner_coro = coro
+        task._astrmai_task_name = task_name
         self._background_tasks.add(task)
         attach_background_task_trace(
             task,
@@ -1373,6 +1450,7 @@ class AttentionGate:
         managed_coro = self._run_managed_system2_task(coro, event) if event is not None else coro
         task = asyncio.create_task(managed_coro)
         task._astrmai_inner_coro = coro
+        task._astrmai_task_name = "attention.priority"
         self._background_tasks.add(task)
         attach_background_task_trace(
             task,
@@ -1393,6 +1471,9 @@ class AttentionGate:
         try:
             task.result()
         except Exception as exc:
+            if isinstance(exc, (BackgroundTaskQueueTimeout, BackgroundTaskQueueFull)):
+                self._record_queue_degradation(task, exc)
+                return
             logger.error(f"[Attention Task Error] {exc}", exc_info=exc)
 
     def _spawn_session_worker(
@@ -1556,6 +1637,9 @@ class AttentionGate:
             return
         exc = task.exception()
         if exc is not None:
+            if isinstance(exc, (BackgroundTaskQueueTimeout, BackgroundTaskQueueFull)):
+                self._record_queue_degradation(task, exc)
+                return
             logger.error(f"[AttentionGate] background task failed: {exc}", exc_info=(type(exc), exc, exc.__traceback__))
 
     def _schedule_compaction_task(self, chat_id: str, focus_context) -> asyncio.Task | None:

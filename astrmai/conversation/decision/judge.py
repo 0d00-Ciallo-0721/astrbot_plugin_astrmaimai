@@ -1,5 +1,6 @@
 # astrmai/Heart/judge.py
 from ...infrastructure.gateway import GlobalModelGateway
+from ...infrastructure.gateway.gateway_exceptions import GatewayQueueTimeout
 from ...infrastructure.runtime.lane_manager import LaneKey
 from ...state.chat_state_service import StateEngine
 import datetime
@@ -656,10 +657,16 @@ class Judge:
                     if must_reply
                     else "ambient_group_judge_failure_fail_closed"
                 )
-                logger.exception(
-                    f"[{chat_id}] Judge LLM failed; deterministic fallback={plan.action} "
-                    f"reason={fallback_reason}: {e}"
-                )
+                if isinstance(e, GatewayQueueTimeout) or type(e).__name__ == "GatewayQueueTimeout":
+                    logger.warning(
+                        f"[{chat_id}] Judge gateway admission timeout; deterministic fallback={plan.action} "
+                        f"reason={fallback_reason}"
+                    )
+                else:
+                    logger.exception(
+                        f"[{chat_id}] Judge LLM failed; deterministic fallback={plan.action} "
+                        f"reason={fallback_reason}: {e}"
+                    )
                 if focus_event is not None and hasattr(focus_event, "set_extra"):
                     focus_event.set_extra("astrmai_judge_outcome", f"fallback_{plan.action.lower()}")
                     focus_event.set_extra("astrmai_judge_fallback_reason", fallback_reason)
