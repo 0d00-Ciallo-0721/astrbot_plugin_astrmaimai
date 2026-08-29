@@ -737,10 +737,10 @@ class TimingConfig(BaseModel):
     sys2_lock_wait_timeout_sec: float = Field(default=20.0, ge=0.1, le=600.0)
     executor_lock_wait_timeout_sec: float = Field(default=15.0, ge=0.1, le=600.0)
     attention_background_slot_wait_timeout_sec: float = Field(
-        default=15.0,
+        default=30.0,
         ge=0.1,
         le=600.0,
-        description="群聊回复后台执行槽位的最长等待时间（秒）",
+        description="群聊回复后台执行槽位的最长等待时间（秒），默认 30 秒",
     )
     lane_prepare_timeout_sec: float = Field(default=20.0, ge=0.1, le=600.0)
     energy_prepare_timeout_sec: float = Field(

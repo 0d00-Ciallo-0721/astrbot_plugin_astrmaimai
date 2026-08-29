@@ -47,7 +47,7 @@ class ConfigStandaloneRefactorTests(unittest.TestCase):
         self.assertEqual(config.timing.reply_max_age_sec, 0.0)
         self.assertEqual(config.timing.sys2_lock_wait_timeout_sec, 20.0)
         self.assertEqual(config.timing.executor_lock_wait_timeout_sec, 15.0)
-        self.assertEqual(config.timing.attention_background_slot_wait_timeout_sec, 15.0)
+        self.assertEqual(config.timing.attention_background_slot_wait_timeout_sec, 30.0)
         self.assertEqual(config.timing.energy_prepare_timeout_sec, 5.0)
         self.assertEqual(config.timing.lane_prepare_timeout_sec, 20.0)
         self.assertEqual(config.timing.lane_persist_timeout_sec, 5.0)
@@ -243,6 +243,7 @@ class ConfigStandaloneRefactorTests(unittest.TestCase):
         timing_items = schema["timing"]["items"]
         self.assertEqual(timing_items["sys2_lock_wait_timeout_sec"]["default"], 20.0)
         self.assertEqual(timing_items["executor_lock_wait_timeout_sec"]["default"], 15.0)
+        self.assertEqual(timing_items["attention_background_slot_wait_timeout_sec"]["default"], 30.0)
         self.assertEqual(timing_items["lane_prepare_timeout_sec"]["default"], 20.0)
         self.assertEqual(timing_items["lane_persist_timeout_sec"]["default"], 5.0)
         memory_items = schema["memory"]["items"]

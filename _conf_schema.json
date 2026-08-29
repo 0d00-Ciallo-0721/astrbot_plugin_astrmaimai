@@ -1799,10 +1799,10 @@
       "attention_background_slot_wait_timeout_sec": {
         "description": "回复后台槽位最长等待（秒）",
         "type": "float",
-        "default": 15.0,
+        "default": 30.0,
         "minimum": 0.1,
         "maximum": 600,
-        "hint": "群聊回复等待后台执行槽位超过该时间后放弃本轮；该时间不计入后台任务获得槽位后的执行时间。"
+        "hint": "群聊回复等待后台执行槽位超过该时间后放弃本轮；默认等待 30 秒，该时间不计入后台任务获得槽位后的执行时间。"
       },
       "energy_prepare_timeout_sec": {
         "description": "状态能量准备最长等待（秒）",
