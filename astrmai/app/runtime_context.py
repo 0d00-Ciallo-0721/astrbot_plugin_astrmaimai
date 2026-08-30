@@ -189,6 +189,14 @@ class PluginRuntimeContext:
     interaction: InteractionServices = field(default_factory=InteractionServices)
     lifecycle: LifecycleServices = field(default_factory=LifecycleServices)
     status: RuntimeStatus = field(default_factory=RuntimeStatus)
+    # Cross-instance hot-reload registration.  These fields intentionally live
+    # on the slotted runtime context because LifecycleManager consumes them to
+    # gate shared-resource initialization.
+    runtime_generation: int = 0
+    runtime_previous_termination: Any = None
+    runtime_facade: Any = None
+    runtime_registration: Any = None
+    runtime_registration_error: str = ""
     system2_callback: System2Callback | None = None
     host_plugin_ref: Any = None
     diagnostics_history: list[dict[str, Any]] = field(default_factory=list)

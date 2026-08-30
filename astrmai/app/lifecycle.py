@@ -387,7 +387,43 @@ class PluginLifecycleManager:
         generation = int(getattr(self.runtime, "runtime_generation", 0) or 0)
         facade = getattr(self.runtime, "runtime_facade", None)
         status = self.runtime.status
+        registration_error = str(getattr(self.runtime, "runtime_registration_error", "") or "").strip()
+        registration = getattr(self.runtime, "runtime_registration", None)
         status.runtime_generation = generation
+        if registration_error:
+            status.accepting_events = False
+            status.is_running = False
+            status.lifecycle_started = False
+            status.startup_blocked_reason = "runtime_registration_failed"
+            status.reload_wait_error = registration_error
+            self.runtime.set_boot_phase("lifecycle.reload_deferred")
+            self.runtime.mark_degraded("runtime.reload_fence", registration_error)
+            logger.warning("[AstrMai] startup deferred: runtime registration failed: %s", registration_error)
+            return False
+        if facade is not None and registration is None:
+            reason = "runtime registration metadata is missing"
+            status.accepting_events = False
+            status.is_running = False
+            status.lifecycle_started = False
+            status.startup_blocked_reason = "runtime_registration_unknown"
+            status.reload_wait_error = reason
+            self.runtime.set_boot_phase("lifecycle.reload_deferred")
+            self.runtime.mark_degraded("runtime.reload_fence", reason)
+            logger.warning("[AstrMai] startup deferred: %s", reason)
+            return False
+        if registration is not None:
+            try:
+                generation = int(getattr(registration, "generation", generation) or generation)
+                handle = getattr(registration, "previous_termination", handle)
+                status.runtime_generation = generation
+            except (TypeError, ValueError):
+                reason = "runtime registration generation is invalid"
+                status.accepting_events = False
+                status.startup_blocked_reason = "runtime_registration_unknown"
+                status.reload_wait_error = reason
+                self.runtime.set_boot_phase("lifecycle.reload_deferred")
+                self.runtime.mark_degraded("runtime.reload_fence", reason)
+                return False
         if handle is not None:
             timeout = self._shutdown_timing("hot_reload_startup_wait_sec", 10.0)
             previous_meta = RUNTIME_INSTANCE_COORDINATOR.describe().get("terminations", [])

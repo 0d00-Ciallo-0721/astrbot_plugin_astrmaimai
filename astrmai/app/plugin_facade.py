@@ -36,15 +36,23 @@ class PluginFacade(RuntimeFacadeProtocol):
         # reports 404 after boot.
         try:
             from ..webui.backend.adapters.plugin_api import set_active_facade
-
-            registration = set_active_facade(self)
-            self._runtime_registration = registration
-            self._runtime_generation = registration.generation
-            self.runtime.runtime_generation = registration.generation
-            self.runtime.runtime_previous_termination = registration.previous_termination
-            self.runtime.runtime_facade = self
         except Exception as exc:
-            logger.warning(f"[AstrMai] Failed to register WebUI facade adapter: {exc}")
+            self.runtime.runtime_registration_error = str(exc)
+            logger.warning(f"[AstrMai] Failed to load WebUI facade adapter: {exc}")
+        else:
+            try:
+                registration = set_active_facade(self)
+            except Exception as exc:
+                self.runtime.runtime_registration_error = str(exc)
+                logger.warning(f"[AstrMai] Failed to register runtime facade: {exc}")
+            else:
+                self._runtime_registration = registration
+                self._runtime_generation = registration.generation
+                self.runtime.runtime_generation = registration.generation
+                self.runtime.runtime_previous_termination = registration.previous_termination
+                self.runtime.runtime_facade = self
+                self.runtime.runtime_registration = registration
+                self.runtime.runtime_registration_error = ""
 
     async def list_pending_expression_reviews(self, group_id: str = "", limit: int = 50):
         return await self.runtime.review_service.list_pending_reviews(group_id=group_id or None, limit=limit)

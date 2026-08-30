@@ -62,6 +62,7 @@ class CrossInstanceReloadFenceTests(unittest.IsolatedAsyncioTestCase):
             runtime_previous_termination=registration.previous_termination,
             runtime_generation=registration.generation,
             runtime_facade=new,
+            runtime_registration=registration,
             status=SimpleNamespace(
                 accepting_events=True,
                 is_running=True,
@@ -131,6 +132,48 @@ class CrossInstanceReloadFenceTests(unittest.IsolatedAsyncioTestCase):
         store.runtime_resource_guard = lambda: False
         self.assertFalse(await store.persist_snapshot())
         self.assertFalse((store.snapshot_path()).exists())
+
+    async def test_slotted_runtime_context_accepts_registration_metadata(self):
+        from astrmai.app.runtime_context import PluginRuntimeContext
+
+        runtime = PluginRuntimeContext(
+            host_context=None,
+            raw_config={},
+            config=None,
+            runtime_coordinator=None,
+            host_bridge=None,
+        )
+        runtime.runtime_generation = 7
+        runtime.runtime_previous_termination = object()
+        runtime.runtime_facade = object()
+        self.assertEqual(runtime.runtime_generation, 7)
+        self.assertIsNotNone(runtime.runtime_previous_termination)
+
+    async def test_missing_registration_metadata_fails_closed(self):
+        from astrmai.app.lifecycle import PluginLifecycleManager
+
+        runtime = SimpleNamespace(
+            runtime_previous_termination=None,
+            runtime_generation=0,
+            runtime_facade=object(),
+            runtime_registration=None,
+            runtime_registration_error="",
+            status=SimpleNamespace(
+                accepting_events=True,
+                is_running=True,
+                lifecycle_started=True,
+                startup_blocked_reason="",
+                startup_retry_at=0.0,
+                runtime_generation=0,
+                reload_wait_error="",
+            ),
+            set_boot_phase=lambda phase: setattr(runtime, "boot_phase", phase),
+            mark_degraded=lambda component, reason: setattr(runtime, "degraded", (component, reason)),
+        )
+        manager = PluginLifecycleManager.__new__(PluginLifecycleManager)
+        manager.runtime = runtime
+        self.assertFalse(await manager._await_runtime_reload_fence())
+        self.assertEqual(runtime.status.startup_blocked_reason, "runtime_registration_unknown")
 
     async def test_three_reload_generations_terminate_in_order(self):
         from astrmai.app.runtime_instance_coordinator import RuntimeInstanceCoordinator
