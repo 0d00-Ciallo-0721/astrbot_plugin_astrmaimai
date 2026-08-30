@@ -1122,6 +1122,8 @@ class MemoryIndexProjector:
             for candidate in await self.engine.v2_store.list_projectable():
                 await self._project_locked(candidate.id)
                 count += 1
+                if count % max(1, int(getattr(self.engine, "STARTUP_BATCH_SIZE", 32))) == 0:
+                    await asyncio.sleep(0.001)
             return count
         finally:
             self._get_projection_lock().release()
@@ -1239,7 +1241,7 @@ class MemoryIndexProjector:
             projection_rows = await self._projection_rows()
             report["projection_count"] = len(projection_rows)
             document_ids = {int(doc_id) for doc_id, _ in projection_rows}
-            faiss_ids = self._faiss_id_set()
+            faiss_ids = await self._faiss_id_set()
             if faiss_ids is not None:
                 report["faiss_id_set_observed"] = True
                 report["faiss_ids_missing_from_documents"] = sorted(faiss_ids - document_ids)
@@ -1393,7 +1395,7 @@ class MemoryIndexProjector:
                 continue
         return result
 
-    def _faiss_id_set(self) -> set[int] | None:
+    def _faiss_id_set_sync(self) -> set[int] | None:
         faiss_db = getattr(self.engine, "faiss_db", None)
         if faiss_db is None:
             faiss_db = getattr(getattr(self.engine, "vec_retriever", None), "faiss_db", None)
@@ -1416,6 +1418,19 @@ class MemoryIndexProjector:
             return {int(value) for value in values.tolist()}
         except (ImportError, AttributeError, RuntimeError, TypeError, ValueError):
             return None
+
+    async def _faiss_id_set(self) -> set[int] | None:
+        """Read the physical Faiss ID map off-loop without racing index writes."""
+        retriever = getattr(self.engine, "vec_retriever", None)
+        index_lock = getattr(retriever, "_index_lock", None)
+
+        def _read() -> set[int] | None:
+            if index_lock is None:
+                return self._faiss_id_set_sync()
+            with index_lock:
+                return self._faiss_id_set_sync()
+
+        return await asyncio.to_thread(_read)
 
     async def projection_count(self) -> int:
         return len(await self._projection_rows())

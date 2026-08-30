@@ -109,6 +109,9 @@ class MemoryEngine:
     """Refactored memory engine with lazy vector bootstrap and stable facade methods."""
 
     DISABLE_TTL_SEC = 7 * 86400  # ponytail: 7-day TTL for disabled feedback keys
+    STARTUP_CPU_SLICE_MS = 25.0
+    STARTUP_BATCH_SIZE = 32
+    STARTUP_YIELD_SEC = 0.001
 
     def __init__(self, context, gateway, embedding_models: list = None, config=None):
         self.context = context
@@ -149,6 +152,7 @@ class MemoryEngine:
         self._is_ready = False
         self._vector_state = "uninitialized"
         self._vector_bootstrap_task: asyncio.Task | None = None
+        self._vector_bootstrap_delay_task: asyncio.Task | None = None
         self._projection_ready_replay_task: asyncio.Task | None = None
         self._vector_retirement_tasks: set[asyncio.Task] = set()
         self._vector_sync_retirement_executor: ThreadPoolExecutor | None = None
@@ -179,6 +183,8 @@ class MemoryEngine:
         self._accepting_dimension_probe = True
         self._vector_dimension_probe_cache: dict[str, Any] = {}
         self._vector_dimension_probe_cache_ttl_sec = 30.0
+        self._startup_last_yield = time.monotonic()
+        self._startup_yield_count = 0
         self._vector_dimension_check_status = "unknown"
         self._vector_dimension_source = "unknown"
         self._vector_query_dimension: int | None = None
@@ -759,7 +765,10 @@ class MemoryEngine:
         return "\n".join(f"- {item.content}" for item in results)
 
     async def initialize(self):
+        self._startup_last_yield = time.monotonic()
+        self._startup_yield_count = 0
         await self.v2_store.initialize()
+        await self._startup_checkpoint(force=True)
         self.index_projector = MemoryIndexProjector(self)
         self.v2_store.index_projector = self.index_projector
         self.write_service = MemoryWriteService(self.v2_store, self.index_projector, self.config)
@@ -774,16 +783,33 @@ class MemoryEngine:
             engine=self,
         )
         await self.v2_store.import_legacy_documents()
+        await self._startup_checkpoint(force=True)
         await self.v2_store.import_persona_cache()
+        await self._startup_checkpoint(force=True)
         await self.import_legacy_memory_events()
+        await self._startup_checkpoint(force=True)
         await self.import_legacy_jargons()
+        await self._startup_checkpoint(force=True)
         await self.import_legacy_expression_patterns()
+        await self._startup_checkpoint(force=True)
         await self._migrate_learning_scope_v3()
+        await self._startup_checkpoint(force=True)
         await self.migrate_legacy_cognitive_feedback()
+        await self._startup_checkpoint(force=True)
         await self._cleanup_cognitive_feedback_records(force=True)
+        await self._startup_checkpoint(force=True)
         self.bm25_retriever = BM25Retriever(self.db_path)
         await self.bm25_retriever.initialize()
         logger.info("[AstrMai] memory skeleton initialized; vector store will be lazy-loaded.")
+
+    async def _startup_checkpoint(self, *, force: bool = False) -> None:
+        """Yield between startup batches so the shared event loop stays responsive."""
+        now = time.monotonic()
+        last_yield = float(getattr(self, "_startup_last_yield", now) or now)
+        if force or (now - last_yield) * 1000.0 >= self.STARTUP_CPU_SLICE_MS:
+            self._startup_last_yield = now
+            self._startup_yield_count = int(getattr(self, "_startup_yield_count", 0) or 0) + 1
+            await asyncio.sleep(self.STARTUP_YIELD_SEC)
 
     @staticmethod
     def _merge_learning_metadata(primary: dict[str, Any], secondary: dict[str, Any]) -> dict[str, Any]:
@@ -826,6 +852,7 @@ class MemoryEngine:
             return
         changed_ids: set[str] = set()
         removed_ids: list[str] = []
+        processed = 0
         try:
             jargons = await self.v2_store.list_candidates(
                 kinds=["jargon"],
@@ -834,6 +861,7 @@ class MemoryEngine:
                 include_inactive=True,
             )
             for item in jargons:
+                processed += 1
                 target_key = jargon_fingerprint(item.content)
                 metadata = dict(item.metadata or {})
                 metadata["source_groups"] = list(
@@ -867,6 +895,8 @@ class MemoryEngine:
                     metadata=metadata,
                 )
                 changed_ids.add(str(item.id))
+                if processed % self.STARTUP_BATCH_SIZE == 0:
+                    await self._startup_checkpoint(force=True)
 
             patterns = await self.v2_store.list_candidates(
                 kinds=["expression_pattern"],
@@ -875,6 +905,7 @@ class MemoryEngine:
                 include_inactive=True,
             )
             for item in patterns:
+                processed += 1
                 metadata = dict(item.metadata or {})
                 group_id = str(item.session_id or metadata.get("group_id") or "")
                 situation = str(metadata.get("situation") or "日常回应")
@@ -907,6 +938,8 @@ class MemoryEngine:
                     metadata=metadata,
                 )
                 changed_ids.add(str(item.id))
+                if processed % self.STARTUP_BATCH_SIZE == 0:
+                    await self._startup_checkpoint(force=True)
 
             if self.index_projector:
                 for memory_id in changed_ids:
@@ -2983,7 +3016,24 @@ class MemoryEngine:
             background_task_budget=getattr(self, "background_task_budget", None),
         )
         await self.memory_pipeline.start()
-        self._schedule_vector_bootstrap()
+
+    def schedule_vector_bootstrap_after_startup(self, *, delay_sec: float = 0.25) -> None:
+        """Start vector bootstrap only after the basic runtime is accepting events."""
+        existing = self._vector_bootstrap_delay_task
+        if existing is not None and not existing.done():
+            return
+
+        async def _delayed_start() -> None:
+            await asyncio.sleep(max(0.0, float(delay_sec or 0.0)))
+            if getattr(self, "_accepting_vector_work", True):
+                self._schedule_vector_bootstrap()
+
+        try:
+            self._vector_bootstrap_delay_task = asyncio.create_task(
+                _delayed_start(), name="astrmai-vector-bootstrap-delay"
+            )
+        except RuntimeError:
+            self._vector_bootstrap_delay_task = None
 
     async def stop_background_producers(self):
         self.begin_shutdown()
@@ -2992,6 +3042,10 @@ class MemoryEngine:
         if callable(begin_pipeline_shutdown):
             begin_pipeline_shutdown()
         bootstrap_task = self._vector_bootstrap_task
+        delay_task = self._vector_bootstrap_delay_task
+        await self._cancel_background_task_safely(delay_task, "vector bootstrap delay")
+        if self._vector_bootstrap_delay_task is delay_task:
+            self._vector_bootstrap_delay_task = None
         probe_task = getattr(self, "_vector_dimension_probe_task", None)
         await self._cancel_background_task_safely(probe_task, "vector dimension probe")
         await self._cancel_background_task_safely(bootstrap_task, "vector bootstrap")
@@ -3188,6 +3242,7 @@ class MemoryEngine:
                         )
                     )
                     imported += int(bool(memory_id))
+                    await self._startup_checkpoint()
                 offset += len(events)
                 if len(events) < page_size:
                     break
@@ -3254,6 +3309,7 @@ class MemoryEngine:
                         )
                     )
                     imported += int(bool(memory_id))
+                    await self._startup_checkpoint()
                 offset += len(rows)
                 if len(rows) < page_size:
                     break
@@ -3323,6 +3379,7 @@ class MemoryEngine:
                         source="legacy_expression_pattern",
                     )
                     imported += int(bool(memory_id))
+                    await self._startup_checkpoint()
                 offset += len(rows)
                 if len(rows) < page_size:
                     break

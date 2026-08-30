@@ -54,11 +54,21 @@ class PluginLifecycleManager:
 
     async def initialize_memory(self) -> None:
         self.runtime.set_boot_phase("lifecycle.memory")
+        started = time.monotonic()
         try:
             await self.runtime.memory_engine.initialize()
             await self.runtime.memory_engine.start_background_tasks()
             self.runtime.status.memory_initialized = True
+            self.runtime.status.startup_stage_timings["memory_initialize_ms"] = round(
+                (time.monotonic() - started) * 1000.0, 1
+            )
+            self.runtime.status.startup_yield_count = int(
+                getattr(self.runtime.memory_engine, "_startup_yield_count", 0) or 0
+            )
         except Exception as exc:
+            self.runtime.status.startup_stage_timings["memory_initialize_ms"] = round(
+                (time.monotonic() - started) * 1000.0, 1
+            )
             self.runtime.mark_degraded("memory.engine", str(exc))
             logger.warning(f"[AstrMai] Memory engine start degraded: {exc}")
 
@@ -521,6 +531,9 @@ class PluginLifecycleManager:
             mark_attention_started()
         OUTBOUND_SEND_GATE.open()
         self.runtime.set_boot_phase("runtime.running")
+        schedule_vector = getattr(getattr(self.runtime, "memory_engine", None), "schedule_vector_bootstrap_after_startup", None)
+        if callable(schedule_vector):
+            schedule_vector(delay_sec=0.25)
         logger.info("[AstrMai] boot complete — runtime running")
 
     async def _initialize_persona_core_until_ready(self) -> bool:

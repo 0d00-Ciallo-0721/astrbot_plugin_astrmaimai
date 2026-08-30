@@ -94,6 +94,11 @@ class RuntimeStatus:
     reload_wait_ms: float = 0.0
     reload_wait_timeout: bool = False
     reload_wait_error: str = ""
+    startup_stage_timings: dict[str, float] = field(default_factory=dict)
+    startup_yield_count: int = 0
+    startup_loop_lag_max_ms: float = 0.0
+    startup_loop_lag_p95_ms: float = 0.0
+    startup_loop_lag_p99_ms: float = 0.0
     foreign_commands_loaded: bool = False
     proactive_started: bool = False
     visual_started: bool = False
@@ -144,6 +149,11 @@ class RuntimeStatus:
             "reload_wait_ms": self.reload_wait_ms,
             "reload_wait_timeout": self.reload_wait_timeout,
             "reload_wait_error": self.reload_wait_error,
+            "startup_stage_timings": dict(self.startup_stage_timings),
+            "startup_yield_count": self.startup_yield_count,
+            "startup_loop_lag_max_ms": self.startup_loop_lag_max_ms,
+            "startup_loop_lag_p95_ms": self.startup_loop_lag_p95_ms,
+            "startup_loop_lag_p99_ms": self.startup_loop_lag_p99_ms,
             "foreign_commands_loaded": self.foreign_commands_loaded,
             "proactive_started": self.proactive_started,
             "visual_started": self.visual_started,

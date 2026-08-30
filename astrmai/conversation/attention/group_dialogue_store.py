@@ -1205,8 +1205,12 @@ class GroupDialogueStore:
         path = self.snapshot_path()
         if path is None or not path.exists():
             return 0
+
+        def _read_snapshot() -> dict[str, Any]:
+            return json.loads(path.read_text(encoding="utf-8"))
+
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = await asyncio.to_thread(_read_snapshot)
         except Exception as exc:
             logger.warning(f"[DialogueStore] context snapshot unreadable; ignored: {exc}")
             return 0
@@ -1257,6 +1261,8 @@ class GroupDialogueStore:
                     thread.cold_summary = cold_summary
             restored += 1
             restored_chat_ids.add(key)
+            if restored % 16 == 0:
+                await asyncio.sleep(0.001)
         restored_social = 0
         for chat_id, items_payload in dict(payload.get("social_states", {}) or {}).items():
             try:
@@ -1278,6 +1284,8 @@ class GroupDialogueStore:
                 self._social_states[key] = list(existing.values())[-80:]
             restored_social += 1
             restored_chat_ids.add(key)
+            if restored_social % 16 == 0:
+                await asyncio.sleep(0.001)
         restored_causal = 0
         causal_specs = (
             ("pending_direct", self._pending_direct, self._deserialize_pending_direct),
@@ -1320,6 +1328,8 @@ class GroupDialogueStore:
                     target[key] = list(existing.values())[-80:]
                 restored_causal += 1
                 restored_chat_ids.add(key)
+                if restored_causal % 16 == 0:
+                    await asyncio.sleep(0.001)
         async with self._lock:
             for chat_id, sequence in dict(payload.get("sequence_by_chat", {}) or {}).items():
                 try:
