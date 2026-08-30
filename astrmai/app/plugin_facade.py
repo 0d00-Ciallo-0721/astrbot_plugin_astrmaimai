@@ -37,7 +37,12 @@ class PluginFacade(RuntimeFacadeProtocol):
         try:
             from ..webui.backend.adapters.plugin_api import set_active_facade
 
-            set_active_facade(self)
+            registration = set_active_facade(self)
+            self._runtime_registration = registration
+            self._runtime_generation = registration.generation
+            self.runtime.runtime_generation = registration.generation
+            self.runtime.runtime_previous_termination = registration.previous_termination
+            self.runtime.runtime_facade = self
         except Exception as exc:
             logger.warning(f"[AstrMai] Failed to register WebUI facade adapter: {exc}")
 

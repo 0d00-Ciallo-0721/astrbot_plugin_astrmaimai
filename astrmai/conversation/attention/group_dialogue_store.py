@@ -174,6 +174,10 @@ class GroupDialogueStore:
         self._social_incidents: dict[str, list[GroupSocialIncident]] = {}
         self._sequence_by_chat: dict[str, int] = {}
         self._lock = asyncio.Lock()
+        # Bound by PluginLifecycleManager after the runtime generation claims
+        # the shared-resource lease.  Kept optional for standalone stores/tests.
+        self.runtime_generation: int = 0
+        self.runtime_resource_guard: Any = None
 
     def _get_thread(self, chat_id: str) -> DialogueThread:
         thread = self._threads.get(chat_id)
@@ -1143,6 +1147,7 @@ class GroupDialogueStore:
         return {
             "schema_version": self.SNAPSHOT_SCHEMA_VERSION,
             "saved_at": now,
+            "writer_generation": int(self.runtime_generation or 0),
             "chats": chats,
             "social_states": social_states,
             "pending_direct": pending_direct,
@@ -1156,6 +1161,15 @@ class GroupDialogueStore:
         path = self.snapshot_path()
         if path is None:
             return False
+        guard = self.runtime_resource_guard
+        if callable(guard):
+            try:
+                if not guard():
+                    logger.debug("[DialogueStore] snapshot persist deferred: runtime lease is not owned")
+                    return False
+            except Exception as exc:
+                logger.warning(f"[DialogueStore] snapshot persist lease check degraded: {exc}")
+                return False
         payload = await self.export_snapshot()
         if not any(
             payload.get(key)
@@ -1203,6 +1217,17 @@ class GroupDialogueStore:
                 f"current={self.SNAPSHOT_SCHEMA_VERSION}; discarded"
             )
             return 0
+        writer_generation = payload.get("writer_generation", 0)
+        if writer_generation not in (None, ""):
+            try:
+                writer_generation = int(writer_generation)
+            except (TypeError, ValueError):
+                writer_generation = 0
+        logger.debug(
+            "[DialogueStore] restoring snapshot writer_generation=%s current_generation=%s",
+            writer_generation,
+            int(self.runtime_generation or 0),
+        )
         now = time.time()
         restored = 0
         restored_chat_ids: set[str] = set()

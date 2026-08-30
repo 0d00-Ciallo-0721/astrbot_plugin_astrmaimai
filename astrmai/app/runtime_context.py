@@ -89,6 +89,11 @@ class RuntimeStatus:
     persona_last_error: str = ""
     startup_blocked_reason: str = ""
     startup_retry_at: float = 0.0
+    runtime_generation: int = 0
+    previous_runtime_generation: int = 0
+    reload_wait_ms: float = 0.0
+    reload_wait_timeout: bool = False
+    reload_wait_error: str = ""
     foreign_commands_loaded: bool = False
     proactive_started: bool = False
     visual_started: bool = False
@@ -134,6 +139,11 @@ class RuntimeStatus:
             "persona_last_error": self.persona_last_error,
             "startup_blocked_reason": self.startup_blocked_reason,
             "startup_retry_at": self.startup_retry_at,
+            "runtime_generation": self.runtime_generation,
+            "previous_runtime_generation": self.previous_runtime_generation,
+            "reload_wait_ms": self.reload_wait_ms,
+            "reload_wait_timeout": self.reload_wait_timeout,
+            "reload_wait_error": self.reload_wait_error,
             "foreign_commands_loaded": self.foreign_commands_loaded,
             "proactive_started": self.proactive_started,
             "visual_started": self.visual_started,

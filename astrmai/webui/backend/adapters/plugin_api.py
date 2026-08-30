@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 from ..paths import default_config_path, default_persona_cache_path, default_schema_path
-from ....shared.helpers.plugin_helpers import safe_create_task
+from ....app.runtime_instance_coordinator import RUNTIME_INSTANCE_COORDINATOR
 
 ACTIVE_FACADE: Any = None
 _FACADE_UNSET = object()
@@ -32,44 +32,15 @@ APPLY_STATUS: dict[str, Any] = {
 _apply_lock = threading.Lock()
 
 
-def set_active_facade(facade: Any) -> None:
+def set_active_facade(facade: Any) -> Any:
     global ACTIVE_FACADE
-    previous = ACTIVE_FACADE
-    if previous is not None and previous is not facade:
+    registration = RUNTIME_INSTANCE_COORDINATOR.register_facade(facade)
+    if ACTIVE_FACADE is not None and ACTIVE_FACADE is not facade:
         _logger.warning(
-            "ACTIVE_FACADE is being overwritten 閳?old facade (%r) may leak resources. "
-            "Attempting graceful termination of the previous facade.",
-            previous,
+            "ACTIVE_FACADE replaced; previous facade termination is fenced before shared-resource startup."
         )
-        try:
-            begin_shutdown = getattr(previous, "begin_shutdown", None)
-            if callable(begin_shutdown):
-                begin_shutdown()
-            term = getattr(previous, "terminate", None)
-            if callable(term):
-                import asyncio as _asyncio
-
-                try:
-                    loop = _asyncio.get_running_loop()
-                except RuntimeError:
-                    loop = None
-                if loop is not None and loop.is_running():
-                    safe_create_task(term())
-                else:
-                    def _terminate_previous() -> None:
-                        try:
-                            _asyncio.run(term())
-                        except Exception as thread_exc:
-                            _logger.warning("Failed to terminate previous ACTIVE_FACADE: %s", thread_exc)
-
-                    threading.Thread(
-                        target=_terminate_previous,
-                        name="astrmai-old-facade-shutdown",
-                        daemon=True,
-                    ).start()
-        except Exception as exc:
-            _logger.warning("Failed to terminate previous ACTIVE_FACADE: %s", exc)
     ACTIVE_FACADE = facade
+    return registration
 
 
 def get_active_facade() -> Any:

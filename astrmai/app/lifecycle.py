@@ -10,6 +10,7 @@ from astrbot.api import logger
 from ..multimodal import init_meme_storage
 from ..shared.helpers.plugin_helpers import cleanup_stale_focus_pools, collect_background_tasks, safe_create_task
 from ..infrastructure.runtime.outbound_send_guard import OUTBOUND_SEND_GATE
+from .runtime_instance_coordinator import RUNTIME_INSTANCE_COORDINATOR
 from .runtime_context import PluginRuntimeContext
 
 
@@ -99,6 +100,10 @@ class PluginLifecycleManager:
         self.runtime.status.persona_state = "pending"
         self.runtime.status.startup_blocked_reason = ""
         self.runtime.status.startup_retry_at = 0.0
+        self.runtime.status.previous_runtime_generation = 0
+        self.runtime.status.reload_wait_ms = 0.0
+        self.runtime.status.reload_wait_timeout = False
+        self.runtime.status.reload_wait_error = ""
         self.runtime.set_boot_phase("lifecycle.starting")
         attention_gate = getattr(self.runtime, "attention_gate", None)
         reset_attention = getattr(attention_gate, "reset_runtime_state", None)
@@ -376,6 +381,60 @@ class PluginLifecycleManager:
         except Exception as exc:
             logger.warning(f"[AstrMai] dialogue snapshot restore degraded: {exc}")
 
+    async def _await_runtime_reload_fence(self) -> bool:
+        """Wait for the previous facade before touching shared resources."""
+        handle = getattr(self.runtime, "runtime_previous_termination", None)
+        generation = int(getattr(self.runtime, "runtime_generation", 0) or 0)
+        facade = getattr(self.runtime, "runtime_facade", None)
+        status = self.runtime.status
+        status.runtime_generation = generation
+        if handle is not None:
+            timeout = self._shutdown_timing("hot_reload_startup_wait_sec", 10.0)
+            previous_meta = RUNTIME_INSTANCE_COORDINATOR.describe().get("terminations", [])
+            if previous_meta:
+                try:
+                    status.previous_runtime_generation = int(previous_meta[-1].get("generation", 0) or 0)
+                except (TypeError, ValueError):
+                    status.previous_runtime_generation = 0
+            wait_started = time.monotonic()
+            ok, reason = await RUNTIME_INSTANCE_COORDINATOR.wait_for_previous_termination(
+                handle,
+                timeout_sec=timeout,
+            )
+            status.reload_wait_ms = round((time.monotonic() - wait_started) * 1000, 3)
+            if not ok:
+                status.accepting_events = False
+                status.is_running = False
+                status.lifecycle_started = False
+                status.reload_wait_timeout = "timed out" in reason.lower()
+                status.reload_wait_error = reason
+                status.startup_blocked_reason = "previous_facade_termination_pending"
+                status.startup_retry_at = time.time() + max(1.0, timeout)
+                self.runtime.set_boot_phase("lifecycle.reload_deferred")
+                self.runtime.mark_degraded("runtime.reload_fence", reason)
+                logger.warning("[AstrMai] startup deferred until previous facade terminates: %s", reason)
+                return False
+            status.reload_wait_timeout = False
+            status.reload_wait_error = ""
+        if facade is not None and generation:
+            if not RUNTIME_INSTANCE_COORDINATOR.claim_resource_owner(facade, generation):
+                self.runtime.status.accepting_events = False
+                self.runtime.status.startup_blocked_reason = "runtime_generation_not_current"
+                self.runtime.set_boot_phase("lifecycle.reload_deferred")
+                self.runtime.mark_degraded("runtime.reload_fence", "facade generation was superseded")
+                return False
+            store = getattr(self.runtime, "dialogue_store", None)
+            if store is not None:
+                try:
+                    store.runtime_generation = generation
+                    store.runtime_resource_guard = lambda: RUNTIME_INSTANCE_COORDINATOR.can_use_shared_resources(
+                        facade, generation
+                    )
+                except Exception as exc:
+                    self.runtime.mark_degraded("runtime.reload_fence", f"dialogue store lease bind failed: {exc}")
+                    return False
+        return True
+
     async def _persist_dialogue_snapshot(self) -> None:
         store = getattr(self.runtime, "dialogue_store", None)
         persist = getattr(store, "persist_snapshot", None) if store is not None else None
@@ -388,6 +447,8 @@ class PluginLifecycleManager:
 
     async def _complete_startup(self) -> None:
         logger.info("[AstrMai] Initializing Memory Engine...")
+        if not await self._await_runtime_reload_fence():
+            return
         await self._restore_dialogue_snapshot()
         await self.initialize_memory()
         if self._shutdown_requested:
