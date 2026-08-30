@@ -17,9 +17,12 @@ class _Event:
 
     def __init__(self):
         self._extra = {}
+        self.terminal_event = asyncio.Event()
 
     def set_extra(self, key, value):
         self._extra[key] = value
+        if key == "deferred_terminal_status":
+            self.terminal_event.set()
 
     def get_extra(self, key, default=None):
         return self._extra.get(key, default)
@@ -90,6 +93,7 @@ class AttentionDeferredQueueTests(unittest.TestCase):
 
             async def work():
                 calls.append("run")
+                event.terminal_event.set()
 
             blocker_task = asyncio.create_task(
                 budget.run(blocker, task_name="test.blocker", scope_id="global")
@@ -105,10 +109,7 @@ class AttentionDeferredQueueTests(unittest.TestCase):
             self.assertEqual(event.get_extra("attention_deferred"), True)
             release.set()
             await blocker_task
-            for _ in range(40):
-                if calls:
-                    break
-                await asyncio.sleep(0.02)
+            await asyncio.wait_for(event.terminal_event.wait(), timeout=1.5)
             await self.gate.shutdown_workers()
             return calls, event.get_extra("deferred_terminal_status")
 
@@ -139,10 +140,7 @@ class AttentionDeferredQueueTests(unittest.TestCase):
             self.assertEqual(event.get_extra("attention_deferred"), True)
             self.assertNotEqual(event.get_extra("astrmai_system2_failure_handled"), True)
             self.gate._background_task_semaphore.release()
-            for _ in range(80):
-                if formal_calls:
-                    break
-                await asyncio.sleep(0.02)
+            await asyncio.wait_for(event.terminal_event.wait(), timeout=1.5)
             await self.gate.shutdown_workers()
             return formal_calls, event.sent, event.get_extra("deferred_terminal_status")
 
@@ -203,10 +201,7 @@ class AttentionDeferredQueueTests(unittest.TestCase):
             self.assertEqual(event.get_extra("deferred_reason"), "queue_full")
             release.set()
             await blocker_task
-            for _ in range(50):
-                if formal_calls:
-                    break
-                await asyncio.sleep(0.02)
+            await asyncio.wait_for(event.terminal_event.wait(), timeout=1.5)
             await self.gate.shutdown_workers()
             return formal_calls, event.sent, event.get_extra("deferred_terminal_status")
 
@@ -232,10 +227,7 @@ class AttentionDeferredQueueTests(unittest.TestCase):
                 "max_attempts": 3,
             }
             self.gate._ensure_deferred_attention_dispatcher()
-            for _ in range(20):
-                if not self.gate._deferred_attention_work:
-                    break
-                await asyncio.sleep(0.01)
+            await asyncio.wait_for(event.terminal_event.wait(), timeout=1.5)
             await self.gate.shutdown_workers()
             return event.get_extra("deferred_terminal_status"), event.sent
 
@@ -330,10 +322,7 @@ class AttentionDeferredQueueTests(unittest.TestCase):
             }
             self.gate._ensure_deferred_attention_dispatcher()
             self.gate._deferred_attention_event.set()
-            for _ in range(20):
-                if not self.gate._deferred_attention_work:
-                    break
-                await asyncio.sleep(0.01)
+            await asyncio.wait_for(event.terminal_event.wait(), timeout=1.5)
             await self.gate.shutdown_workers()
             return event.get_extra("deferred_terminal_status")
 
@@ -347,6 +336,7 @@ class AttentionDeferredQueueTests(unittest.TestCase):
 
             async def work():
                 calls.append("run")
+                event.terminal_event.set()
 
             self.gate._deferred_attention_work["pending"] = {
                 "work_id": "pending",
@@ -371,16 +361,129 @@ class AttentionDeferredQueueTests(unittest.TestCase):
 
             self.gate._dispatch_deferred_attention_work = fail_once
             self.gate._ensure_deferred_attention_dispatcher()
+            await asyncio.wait_for(event.terminal_event.wait(), timeout=1.5)
+            await self.gate.shutdown_workers()
+            status = self.gate.describe_status()
+            return calls, status["attention_deferred_dispatcher_failed_total"], status
+
+        calls, failures, status = asyncio.run(run())
+        self.assertEqual(calls, ["run"])
+        self.assertEqual(failures, 1)
+        self.assertGreaterEqual(status["attention_deferred_dispatcher_started_total"], 2)
+        self.assertGreaterEqual(status["attention_deferred_dispatcher_restart_total"], 1)
+
+    def test_deferred_observability_distinguishes_depth_from_cumulative_counts(self):
+        async def run():
+            event = _Event()
+
+            async def work():
+                return "ok"
+
+            accepted = self.gate._defer_attention_work(
+                event=event,
+                task_name="attention.system2",
+                retry_factory=work,
+                reason="queue_timeout",
+            )
+            self.assertTrue(accepted)
+            status = self.gate.describe_status()
+            await self.gate.shutdown_workers()
+            return status
+
+        status = asyncio.run(run())
+        self.assertEqual(status["attention_deferred_current"], 1)
+        self.assertEqual(status["attention_deferred_enqueued_total"], 1)
+        self.assertEqual(status["attention_deferred_total"], 1)
+        self.assertEqual(status["attention_deferred_current_by_kind"], {"attention.system2": 1})
+        self.assertTrue(status["attention_deferred_dispatcher_running"])
+        self.assertGreater(status["attention_deferred_dispatcher_started_total"], 0)
+        self.assertGreater(status["attention_deferred_last_enqueued_at"], 0)
+
+    def test_deferred_terminal_transition_is_idempotent(self):
+        event = _Event()
+        item = {
+            "work_id": "terminal-once",
+            "task_name": "attention.system2",
+            "event": event,
+            "_terminal_status": None,
+        }
+
+        self.gate._set_deferred_terminal(item, "expired", reason="ttl_expired")
+        self.gate._set_deferred_terminal(item, "expired", reason="duplicate")
+
+        status = self.gate.describe_status()
+        self.assertEqual(event.get_extra("deferred_terminal_status"), "expired")
+        self.assertEqual(event.get_extra("deferred_terminal_reason"), "ttl_expired")
+        self.assertEqual(status["attention_deferred_expired_total"], 1)
+        self.assertGreater(status["attention_deferred_last_terminal_at"], 0)
+
+    def test_replay_attempt_and_success_are_reported_separately(self):
+        async def run():
+            event = _Event()
+            calls = []
+
+            async def work():
+                calls.append("run")
+
+            self.gate._deferred_attention_work["success"] = {
+                "work_id": "success",
+                "chat_id": event.unified_msg_origin,
+                "task_name": "attention.system2",
+                "retry_factory": work,
+                "event": event,
+                "enqueued_at": time.time(),
+                "next_retry_at": 0.0,
+                "expires_at": time.time() + 5.0,
+                "attempts": 0,
+                "max_attempts": 3,
+                "_terminal_status": None,
+            }
+            self.gate._ensure_deferred_attention_dispatcher()
             for _ in range(50):
                 if calls:
                     break
                 await asyncio.sleep(0.01)
+            status = self.gate.describe_status()
             await self.gate.shutdown_workers()
-            return calls, self.gate.describe_status()["attention_deferred_dispatcher_failed_total"]
+            return calls, status
 
-        calls, failures = asyncio.run(run())
+        calls, status = asyncio.run(run())
         self.assertEqual(calls, ["run"])
-        self.assertEqual(failures, 1)
+        self.assertEqual(status["attention_deferred_current"], 0)
+        self.assertEqual(status["attention_deferred_replay_attempt_total"], 1)
+        self.assertEqual(status["attention_deferred_replayed_total"], 1)
+        self.assertEqual(status["attention_deferred_replay_succeeded_total"], 1)
+
+    def test_replay_timeout_reaches_exhausted_terminal_state(self):
+        async def run():
+            event = _Event()
+
+            async def work():
+                raise self.gate_mod.BackgroundTaskQueueTimeout("still full")
+
+            self.gate._deferred_attention_work["exhausted"] = {
+                "work_id": "exhausted",
+                "chat_id": event.unified_msg_origin,
+                "task_name": "attention.system2",
+                "retry_factory": work,
+                "event": event,
+                "enqueued_at": time.time(),
+                "next_retry_at": 0.0,
+                "expires_at": time.time() + 5.0,
+                "attempts": 0,
+                "max_attempts": 1,
+                "_terminal_status": None,
+            }
+            self.gate._ensure_deferred_attention_dispatcher()
+            await asyncio.wait_for(event.terminal_event.wait(), timeout=1.5)
+            status = self.gate.describe_status()
+            await self.gate.shutdown_workers()
+            return event.get_extra("deferred_terminal_status"), status
+
+        terminal, status = asyncio.run(run())
+        self.assertEqual(terminal, "exhausted")
+        self.assertEqual(status["attention_deferred_replay_attempt_total"], 1)
+        self.assertEqual(status["attention_deferred_exhausted_total"], 1)
 
     def test_startup_warmup_skips_ambient_group_background_task(self):
         async def run():

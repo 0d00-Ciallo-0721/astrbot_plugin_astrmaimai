@@ -170,6 +170,27 @@ class AttentionGate:
         self._deferred_attention_dispatcher: asyncio.Task | None = None
         self._deferred_attention_sequence = 0
         self._deferred_attention_counts: collections.Counter[str] = collections.Counter()
+        self._deferred_attention_terminal_statuses = frozenset(
+            {
+                "replayed",
+                "expired",
+                "exhausted",
+                "rejected",
+                "shutdown",
+                "stale",
+                "superseded",
+                "cancelled",
+                "failed",
+                "skipped_already_terminal",
+            }
+        )
+        self._deferred_attention_dispatcher_started_total = 0
+        self._deferred_attention_dispatcher_restart_total = 0
+        self._deferred_attention_dispatcher_last_started_at = 0.0
+        self._deferred_attention_dispatcher_last_progress_at = 0.0
+        self._deferred_attention_dispatcher_last_error = ""
+        self._deferred_attention_last_enqueued_at = 0.0
+        self._deferred_attention_last_terminal_at = 0.0
         self._queue_degradation_counts: collections.Counter[str] = collections.Counter()
         self._queue_degradation_last_log = 0.0
         self._runtime_started_monotonic: float | None = None
@@ -365,6 +386,30 @@ class AttentionGate:
             "attention_deferred_cancelled_total": int(self._deferred_attention_counts.get("cancelled", 0)),
             "attention_deferred_superseded_total": int(self._deferred_attention_counts.get("superseded", 0)),
             "attention_deferred_skipped_terminal_total": int(self._deferred_attention_counts.get("skipped_already_terminal", 0)),
+            "attention_deferred_enqueued_total": int(self._deferred_attention_counts.get("total", 0)),
+            "attention_deferred_replay_attempt_total": int(self._deferred_attention_counts.get("replay_attempts", 0)),
+            "attention_deferred_delayed_total": int(self._deferred_attention_counts.get("delayed", 0)),
+            "attention_deferred_dispatcher_running": bool(
+                self._deferred_attention_dispatcher is not None
+                and not self._deferred_attention_dispatcher.done()
+            ),
+            "attention_deferred_dispatcher_started_total": int(
+                self._deferred_attention_dispatcher_started_total
+            ),
+            "attention_deferred_dispatcher_restart_total": int(
+                self._deferred_attention_dispatcher_restart_total
+            ),
+            "attention_deferred_dispatcher_last_started_at": float(
+                self._deferred_attention_dispatcher_last_started_at
+            ),
+            "attention_deferred_dispatcher_last_progress_at": float(
+                self._deferred_attention_dispatcher_last_progress_at
+            ),
+            "attention_deferred_dispatcher_last_error": self._deferred_attention_dispatcher_last_error,
+            "attention_deferred_last_enqueued_at": float(self._deferred_attention_last_enqueued_at),
+            "attention_deferred_last_terminal_at": float(self._deferred_attention_last_terminal_at),
+            "attention_queue_degradation_total": int(sum(self._queue_degradation_counts.values())),
+            "attention_queue_degradation_by_kind": dict(self._queue_degradation_counts),
         }
 
     def request_shutdown(self) -> None:
@@ -463,11 +508,8 @@ class AttentionGate:
             except asyncio.CancelledError:
                 pass
         self._deferred_attention_dispatcher = None
-        self._deferred_attention_counts["shutdown"] += len(self._deferred_attention_work)
-        for item in self._deferred_attention_work.values():
-            event = item.get("event")
-            if event is not None and hasattr(event, "set_extra"):
-                event.set_extra("deferred_terminal_status", "shutdown")
+        for item in list(self._deferred_attention_work.values()):
+            self._record_deferred_transition(item, "shutdown", reason="workers_shutdown")
         self._deferred_attention_work.clear()
         self._deferred_messages.clear()
         self._proactive_dispatching.clear()
@@ -582,7 +624,6 @@ class AttentionGate:
             for work_id in deferred_ids:
                 item = self._deferred_attention_work.pop(work_id, None)
                 if item is not None:
-                    self._deferred_attention_counts["stale"] += 1
                     self._set_deferred_terminal(item, "stale")
             removed = bool(deferred_ids) or removed
         removed = bool(
@@ -940,6 +981,16 @@ class AttentionGate:
         except RuntimeError:
             return
         self._deferred_attention_dispatcher = task
+        self._deferred_attention_dispatcher_started_total += 1
+        if self._deferred_attention_dispatcher_started_total > 1:
+            self._deferred_attention_dispatcher_restart_total += 1
+        self._deferred_attention_dispatcher_last_started_at = time.time()
+        self._deferred_attention_dispatcher_last_progress_at = self._deferred_attention_dispatcher_last_started_at
+        logger.info(
+            "[Attention] deferred dispatcher started "
+            f"restart={self._deferred_attention_dispatcher_restart_total} "
+            f"queue_depth={len(self._deferred_attention_work)}"
+        )
 
         def _consume(completed: asyncio.Task) -> None:
             if self._deferred_attention_dispatcher is completed:
@@ -952,6 +1003,9 @@ class AttentionGate:
                 failure = exc
             if failure is not None:
                 self._deferred_attention_counts["dispatcher_failed"] += 1
+                self._deferred_attention_dispatcher_last_error = (
+                    f"{type(failure).__name__}: {failure}"[:500]
+                )
                 logger.error(f"[Attention] deferred dispatcher failed: {failure!r}")
                 # A dispatcher failure must not strand deferred work.  Restart
                 # on the same loop after the done callback has released the
@@ -967,6 +1021,18 @@ class AttentionGate:
 
         task.add_done_callback(_consume)
 
+    def _record_deferred_rejection(self, event: Any, *, reason: str) -> None:
+        self._deferred_attention_counts["rejected"] += 1
+        self._deferred_attention_last_terminal_at = time.time()
+        self._deferred_attention_dispatcher_last_progress_at = self._deferred_attention_last_terminal_at
+        if event is not None and hasattr(event, "set_extra"):
+            event.set_extra("deferred_terminal_status", "rejected")
+            event.set_extra("deferred_reason", str(reason))
+        logger.warning(
+            "[Attention] deferred work rejected "
+            f"reason={reason} queue_depth={len(self._deferred_attention_work)}"
+        )
+
     def _defer_attention_work(
         self,
         *,
@@ -981,20 +1047,14 @@ class AttentionGate:
             return False
         limit = max(1, int(self._deferred_attention_config("attention_deferred_queue_max", 128)))
         if len(self._deferred_attention_work) >= limit:
-            self._deferred_attention_counts["rejected"] += 1
-            if event is not None and hasattr(event, "set_extra"):
-                event.set_extra("deferred_terminal_status", "rejected")
-                event.set_extra("deferred_reason", "deferred_queue_full")
+            self._record_deferred_rejection(event, reason="deferred_queue_full")
             return False
         chat_id = str(getattr(event, "unified_msg_origin", "") or "")
         session = self.focus_pools.get(chat_id) if chat_id else None
         turn = event.get_extra("astrmai_turn_identity", None) if event is not None and hasattr(event, "get_extra") else None
         per_chat_limit = max(1, int(self._deferred_attention_config("attention_deferred_per_chat_max", 4)))
         if sum(1 for item in self._deferred_attention_work.values() if item.get("chat_id") == chat_id) >= per_chat_limit:
-            self._deferred_attention_counts["rejected"] += 1
-            if event is not None and hasattr(event, "set_extra"):
-                event.set_extra("deferred_terminal_status", "rejected")
-                event.set_extra("deferred_reason", "deferred_chat_limit")
+            self._record_deferred_rejection(event, reason="deferred_chat_limit")
             return False
         self._deferred_attention_sequence += 1
         work_id = f"attention-deferred-{self._deferred_attention_sequence}"
@@ -1016,10 +1076,12 @@ class AttentionGate:
             "shutdown_generation": int(self._shutdown_generation),
             "turn_thread_id": str(getattr(turn, "thread_id", "") or "") if turn is not None else "",
             "turn_generation": int(getattr(turn, "generation", 0) or 0) if turn is not None else 0,
+            "_terminal_status": None,
         }
         self._deferred_attention_work[work_id] = item
         self._deferred_attention_counts["total"] += 1
         self._deferred_attention_counts[f"kind:{item['task_name']}"] += 1
+        self._deferred_attention_last_enqueued_at = now
         if event is not None and hasattr(event, "set_extra"):
             event.set_extra("attention_deferred", True)
             event.set_extra("deferred_work_id", work_id)
@@ -1028,13 +1090,56 @@ class AttentionGate:
         self._ensure_deferred_attention_dispatcher()
         if self._deferred_attention_event is not None:
             self._deferred_attention_event.set()
+        logger.info(
+            "[Attention] deferred work enqueued "
+            f"work_id={work_id} chat_id={chat_id} task={item['task_name']} "
+            f"reason={item['reason']} queue_depth={len(self._deferred_attention_work)}"
+        )
         return True
 
-    @staticmethod
-    def _set_deferred_terminal(item: Any, status: str) -> None:
+    def _record_deferred_transition(
+        self,
+        item: Any,
+        status: str,
+        *,
+        reason: str | None = None,
+    ) -> bool:
+        status = str(status or "failed")
+        if status not in self._deferred_attention_terminal_statuses:
+            status = "failed"
+        if isinstance(item, dict):
+            previous = item.get("_terminal_status")
+            if previous:
+                return False
+            item["_terminal_status"] = status
+        self._deferred_attention_counts[status] += 1
+        self._deferred_attention_last_terminal_at = time.time()
         event = item.get("event") if isinstance(item, dict) else None
         if event is not None and hasattr(event, "set_extra"):
-            event.set_extra("deferred_terminal_status", str(status))
+            event.set_extra("deferred_terminal_status", status)
+            if reason:
+                event.set_extra("deferred_terminal_reason", str(reason))
+        self._deferred_attention_dispatcher_last_progress_at = time.time()
+        task_name = str(item.get("task_name", "attention.misc") or "attention.misc") if isinstance(item, dict) else "attention.misc"
+        work_id = str(item.get("work_id", "") or "") if isinstance(item, dict) else ""
+        level = logger.info if status in {"replayed", "skipped_already_terminal"} else logger.warning
+        if status in {"failed", "exhausted"}:
+            level = logger.error
+        level(
+            "[Attention] deferred work terminal "
+            f"work_id={work_id} task={task_name} status={status} "
+            f"reason={reason or ''} queue_depth={len(self._deferred_attention_work)}"
+        )
+        return True
+
+    def _set_deferred_terminal(
+        self,
+        item: Any,
+        status: str,
+        *,
+        reason: str | None = None,
+    ) -> None:
+        self._record_deferred_transition(item, status, reason=reason)
 
     @staticmethod
     def _deferred_enqueued_value(item: Any, default: float) -> float:
@@ -1063,7 +1168,13 @@ class AttentionGate:
         if event is not None and hasattr(event, "get_extra"):
             status = str(event.get_extra("astrmai_execution_status", "") or "")
             if status in {"sent", "completed", "stale_drop", "shutdown_rejected", "cancelled"}:
-                return "skipped_already_terminal" if status in {"sent", "completed"} else status
+                if status in {"sent", "completed"}:
+                    return "skipped_already_terminal"
+                if status == "stale_drop":
+                    return "stale"
+                if status == "shutdown_rejected":
+                    return "shutdown"
+                return "cancelled"
             if bool(event.get_extra("astrmai_reply_sent", False)):
                 return "skipped_already_terminal"
             if bool(event.get_extra("astrmai_system2_failure_handled", False)):
@@ -1115,7 +1226,6 @@ class AttentionGate:
                 # record must not terminate the dispatcher and strand all
                 # following deferred work.
                 self._deferred_attention_work.pop(item_key, None)
-                self._deferred_attention_counts["failed"] += 1
                 self._set_deferred_terminal(item, "failed")
                 continue
             try:
@@ -1125,7 +1235,6 @@ class AttentionGate:
                 replay_status = "failed"
             if replay_status is not None:
                 self._deferred_attention_work.pop(item_key, None)
-                self._deferred_attention_counts[replay_status] += 1
                 self._set_deferred_terminal(item, replay_status)
                 continue
             try:
@@ -1135,8 +1244,7 @@ class AttentionGate:
                 item["expires_at"] = now
             if now >= expires_at:
                 self._deferred_attention_work.pop(item_key, None)
-                self._deferred_attention_counts["expired"] += 1
-                self._set_deferred_terminal(item, "expired")
+                self._set_deferred_terminal(item, "expired", reason="ttl_expired")
                 continue
             try:
                 next_retry_at = float(item.get("next_retry_at", 0.0) or 0.0)
@@ -1145,6 +1253,14 @@ class AttentionGate:
                 item["next_retry_at"] = 0.0
             delay = max(0.0, next_retry_at - time.monotonic())
             if delay > 0:
+                if not item.get("_delay_observed"):
+                    item["_delay_observed"] = True
+                    self._deferred_attention_counts["delayed"] += 1
+                    logger.debug(
+                        "[Attention] deferred replay delayed "
+                        f"work_id={work_id} delay_sec={delay:.3f} "
+                        f"queue_depth={len(self._deferred_attention_work)}"
+                    )
                 try:
                     await asyncio.sleep(min(delay, 1.0))
                 except asyncio.CancelledError:
@@ -1157,7 +1273,15 @@ class AttentionGate:
                 item["attempts"] = 1
                 max_attempts = 1
                 item["max_attempts"] = 1
-            self._deferred_attention_counts["replayed"] += 1
+            self._deferred_attention_counts["replay_attempts"] += 1
+            self._deferred_attention_dispatcher_last_progress_at = time.time()
+            logger.info(
+                "[Attention] deferred replay started "
+                f"work_id={work_id} chat_id={item.get('chat_id', '')} "
+                f"task={item.get('task_name', 'attention.misc')} "
+                f"attempt={item['attempts']} max_attempts={max_attempts} "
+                f"queue_depth={len(self._deferred_attention_work)}"
+            )
             try:
                 await self._run_background_task(
                     retry_factory(),
@@ -1171,21 +1295,29 @@ class AttentionGate:
                 event = item.get("event")
                 if event is not None and hasattr(event, "set_extra"):
                     event.set_extra("deferred_replayed_at", time.time())
-                    event.set_extra("deferred_terminal_status", "replayed")
+                self._set_deferred_terminal(item, "replayed", reason="replay_succeeded")
             except (BackgroundTaskQueueTimeout, asyncio.TimeoutError):
                 if item["attempts"] >= max_attempts:
                     self._deferred_attention_work.pop(item_key, None)
-                    self._deferred_attention_counts["exhausted"] += 1
-                    self._set_deferred_terminal(item, "exhausted")
+                    self._set_deferred_terminal(item, "exhausted", reason="replay_attempts_exhausted")
                 else:
                     backoff = min(15.0, 1.0 * (2 ** (item["attempts"] - 1)))
                     item["next_retry_at"] = time.monotonic() + backoff
+                    self._deferred_attention_dispatcher_last_progress_at = time.time()
+                    logger.warning(
+                        "[Attention] deferred replay delayed after queue admission failure "
+                        f"work_id={work_id} attempt={item['attempts']} max_attempts={max_attempts} "
+                        f"queue_depth={len(self._deferred_attention_work)}"
+                    )
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 self._deferred_attention_work.pop(item_key, None)
-                self._deferred_attention_counts["failed"] += 1
-                self._set_deferred_terminal(item, "failed")
+                self._set_deferred_terminal(
+                    item,
+                    "failed",
+                    reason=f"{type(exc).__name__}: {exc}"[:500],
+                )
 
     async def _run_background_task(
         self,

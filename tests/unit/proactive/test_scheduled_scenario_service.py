@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 from tests.helpers.astrbot_stubs import install_astrbot_stubs
 
@@ -131,6 +132,112 @@ class ScheduledScenarioServiceTests(unittest.TestCase):
         with self.assertRaises(self.module.ScheduleParseError) as ctx:
             self.module.ScheduledScenarioService._validate_schedule_payload({"morning": "x"})
         self.assertEqual(ctx.exception.stage, "schema_invalid")
+
+    def test_schedule_normalizer_reports_code_fence_and_embedded_stages(self):
+        payload = {slot: f"计划-{slot}" for slot in self.module.SCHEDULE_SLOTS}
+        fenced = "```json\n" + json.dumps(payload, ensure_ascii=False) + "\n```"
+        parsed, stage = self.module.ScheduledScenarioService._normalize_schedule_response(fenced)
+        self.assertEqual(parsed, payload)
+        self.assertEqual(stage, "code_fence_normalized")
+
+        embedded = "这是日程：" + json.dumps(payload, ensure_ascii=False) + "，请参考。"
+        parsed, stage = self.module.ScheduledScenarioService._normalize_schedule_response(embedded)
+        self.assertEqual(parsed, payload)
+        self.assertEqual(stage, "embedded_object")
+
+    def test_json_repair_is_called_once_and_repaired_schedule_is_persisted(self):
+        payload = {slot: f"修复-{slot}" for slot in self.module.SCHEDULE_SLOTS}
+        service = self._service(
+            _Dispatcher(),
+            _config(daily_schedule_ai_enabled=True),
+        )
+        service.call_background_lane = lambda *args, **kwargs: asyncio.sleep(
+            0,
+            result="{'morning': 'broken'",
+        )
+
+        repair_calls = []
+
+        def repair_once(_raw, *, return_objects=False):
+            repair_calls.append(_raw)
+            self.assertTrue(return_objects)
+            return payload
+
+        with mock.patch.object(self.module, "repair_json", new=repair_once):
+            asyncio.run(service._generate_schedule("2026-05-11"))
+
+        self.assertEqual(len(repair_calls), 1)
+        loaded = asyncio.run(service.schedule_store.load("2026-05-11"))
+        self.assertEqual(loaded, (payload, "model_repaired"))
+        status = service.describe_status()
+        self.assertEqual(status["generation_state"]["2026-05-11"], "succeeded")
+        self.assertEqual(status["generation_json_repair_total"], 1)
+        self.assertEqual(status["generation_json_repair_success_total"], 1)
+        self.assertEqual(status["generation_json_repair_failed_total"], 0)
+
+    def test_failed_json_repair_uses_default_and_remains_retryable(self):
+        service = self._service(
+            _Dispatcher(),
+            _config(daily_schedule_ai_enabled=True, daily_schedule_retry_base_sec=30),
+        )
+        service.call_background_lane = lambda *args, **kwargs: asyncio.sleep(
+            0,
+            result="{'morning': 'broken'",
+        )
+        with mock.patch.object(
+            self.module,
+            "repair_json",
+            side_effect=ValueError("cannot repair"),
+        ) as repair:
+            asyncio.run(service._generate_schedule("2026-05-11"))
+
+        self.assertEqual(repair.call_count, 1)
+        status = service.describe_status()
+        self.assertEqual(status["generation_state"]["2026-05-11"], "retry_scheduled")
+        self.assertEqual(status["generation_parse_stage"]["2026-05-11"], "malformed_json")
+        self.assertEqual(status["generation_json_repair_total"], 1)
+        self.assertEqual(status["generation_json_repair_failed_total"], 1)
+        self.assertEqual(status["generation_fallback_total"], 1)
+        self.assertEqual(status["generation_last_fallback_source"]["2026-05-11"], "default")
+        self.assertEqual(service._schedule_cache["2026-05-11"], (self.module.DEFAULT_SCHEDULE, "default"))
+
+    def test_schema_failure_preserves_previous_valid_schedule(self):
+        previous = {slot: f"旧日程-{slot}" for slot in self.module.SCHEDULE_SLOTS}
+        service = self._service(
+            _Dispatcher(),
+            _config(daily_schedule_ai_enabled=True, daily_schedule_retry_base_sec=30),
+        )
+        service._schedule_cache["2026-05-11"] = (previous, "model")
+        service.call_background_lane = lambda *args, **kwargs: asyncio.sleep(0, result="{}")
+
+        asyncio.run(service._generate_schedule("2026-05-11"))
+
+        status = service.describe_status()
+        self.assertEqual(service._schedule_cache["2026-05-11"], (previous, "previous_valid"))
+        self.assertEqual(status["generation_schema_failure_total"], 1)
+        self.assertEqual(status["generation_fallback_total"], 1)
+        self.assertEqual(status["generation_last_fallback_source"]["2026-05-11"], "previous_valid")
+        self.assertEqual(status["generation_state"]["2026-05-11"], "retry_scheduled")
+
+    def test_no_object_and_empty_response_have_distinct_diagnostics(self):
+        service = self._service(
+            _Dispatcher(),
+            _config(daily_schedule_ai_enabled=True, daily_schedule_retry_base_sec=30),
+        )
+        responses = iter(("暂时没有结果", ""))
+        service.call_background_lane = lambda *args, **kwargs: asyncio.sleep(
+            0,
+            result=next(responses),
+        )
+
+        asyncio.run(service._generate_schedule("2026-05-11"))
+        asyncio.run(service._generate_schedule("2026-05-12"))
+
+        status = service.describe_status()
+        self.assertEqual(status["generation_no_object_total"], 1)
+        self.assertEqual(status["generation_empty_response_total"], 1)
+        self.assertEqual(status["generation_json_repair_total"], 0)
+        self.assertEqual(status["generation_fallback_total"], 2)
 
     def test_morning_candidate_is_persisted_and_not_repeated_after_restart(self):
         timestamp = datetime(2026, 5, 11, 8, 15).timestamp()

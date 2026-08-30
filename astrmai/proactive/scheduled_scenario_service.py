@@ -24,6 +24,11 @@ try:
 except ImportError:  # Optional at import time so plugin startup can degrade cleanly.
     LunarDate = None
 
+try:
+    from json_repair import repair_json
+except ImportError:  # Optional at import time; strict parsing remains available.
+    repair_json = None
+
 from ..infrastructure.persistence.sqlite_helpers import connect_aiosqlite
 from ..infrastructure.runtime.background_task_budget import BackgroundTaskQueueFull
 from .dispatcher import ProactiveMessageIntent
@@ -44,8 +49,15 @@ DEFAULT_SCHEDULE = {
 class ScheduleParseError(ValueError):
     """Structured parse/schema failure with an auditable stage label."""
 
-    def __init__(self, stage: str, message: str):
+    def __init__(
+        self,
+        stage: str,
+        message: str,
+        *,
+        repair_attempted: bool = False,
+    ):
         self.stage = str(stage or "malformed_json")
+        self.repair_attempted = bool(repair_attempted)
         super().__init__(message)
 
 
@@ -434,6 +446,15 @@ class ScheduledScenarioService:
         self._generation_state: dict[str, str] = {}
         self._generation_last_error: dict[str, str] = {}
         self._generation_parse_stage: dict[str, str] = {}
+        self._generation_parse_attempts: dict[str, int] = {}
+        self._generation_json_repair_total = 0
+        self._generation_json_repair_success_total = 0
+        self._generation_json_repair_failed_total = 0
+        self._generation_schema_failure_total = 0
+        self._generation_no_object_total = 0
+        self._generation_empty_response_total = 0
+        self._generation_fallback_total = 0
+        self._generation_last_fallback_source: dict[str, str] = {}
         self._shutdown_requested = False
         self._last_tick_at = 0.0
         self._last_report: dict[str, Any] = {}
@@ -543,32 +564,89 @@ class ScheduledScenarioService:
             "afternoon、dinner、evening、night 七个键。每项用一句简短中文描述角色当时在做什么；"
             "日程只作为聊天背景，不要替任何用户安排事务，也不要包含发送消息的指令。"
         )
+        parse_stage = "not_started"
         try:
             async with asyncio.timeout(45.0):
                 raw = await self.call_background_lane("daily_schedule", plan_date, prompt)
-            parsed = self._parse_schedule_response(raw)
+            self._generation_parse_attempts[plan_date] = int(
+                self._generation_parse_attempts.get(plan_date, 0) or 0
+            ) + 1
+            parsed, parse_stage = self._normalize_schedule_response(raw)
+            if parse_stage == "json_repaired":
+                self._generation_json_repair_total += 1
             self._validate_schedule_payload(parsed)
-            self._generation_parse_stage[plan_date] = "valid"
+            if parse_stage == "json_repaired":
+                self._generation_json_repair_success_total += 1
+            self._generation_parse_stage[plan_date] = parse_stage
             normalized = DailyScheduleStore._normalize(parsed)
-            await self.schedule_store.save(plan_date, normalized, source="model")
-            self._schedule_cache[plan_date] = (normalized, "model")
+            source = "model_repaired" if parse_stage == "json_repaired" else "model"
+            await self.schedule_store.save(plan_date, normalized, source=source)
+            self._schedule_cache[plan_date] = (normalized, source)
             self._generation_attempts.pop(plan_date, None)
+            self._generation_parse_attempts.pop(plan_date, None)
             self._generation_retry_at.pop(plan_date, None)
             self._generation_state[plan_date] = "succeeded"
             self._generation_last_error.pop(plan_date, None)
             self._generation_started.discard(plan_date)
             logger.info(f"[ScheduledScenario] daily schedule generated date={plan_date}")
         except (asyncio.TimeoutError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            parse_stage = getattr(exc, "stage", "timeout" if isinstance(exc, asyncio.TimeoutError) else "unknown")
-            self._generation_parse_stage[plan_date] = str(parse_stage)
+            failure_stage = getattr(exc, "stage", "timeout" if isinstance(exc, asyncio.TimeoutError) else "unknown")
+            self._generation_parse_stage[plan_date] = str(failure_stage)
+            if bool(getattr(exc, "repair_attempted", False)):
+                self._generation_json_repair_total += 1
+                self._generation_json_repair_failed_total += 1
+            if str(failure_stage) == "schema_invalid":
+                self._generation_schema_failure_total += 1
+                if parse_stage == "json_repaired":
+                    self._generation_json_repair_failed_total += 1
+            elif str(failure_stage) == "no_object":
+                self._generation_no_object_total += 1
+            elif str(failure_stage) == "empty_response":
+                self._generation_empty_response_total += 1
             logger.warning(
                 f"[ScheduledScenario] daily schedule degraded to fallback: "
-                f"{type(exc).__name__}: {exc} parse_stage={parse_stage}"
+                f"{type(exc).__name__}: {exc} parse_stage={failure_stage}"
             )
+            if isinstance(exc, ScheduleParseError):
+                await self._apply_schedule_fallback(plan_date, reason=str(failure_stage))
             self._schedule_generation_failed(plan_date, exc)
         except Exception as exc:
             logger.warning(f"[ScheduledScenario] daily schedule model failure: {type(exc).__name__}: {exc}")
             self._schedule_generation_failed(plan_date, exc)
+
+    async def _apply_schedule_fallback(self, plan_date: str, *, reason: str) -> None:
+        """Keep a usable schedule when a model response violates the JSON contract."""
+        existing = self._schedule_cache.get(plan_date)
+        if existing is None:
+            try:
+                existing = await self.schedule_store.load(plan_date)
+            except Exception:
+                existing = None
+        if existing:
+            plan, source = existing
+            if source in {"fallback", "default"}:
+                fallback_source = source
+            else:
+                fallback_source = "previous_valid"
+        else:
+            plan = dict(DEFAULT_SCHEDULE)
+            fallback_source = "default"
+        normalized = DailyScheduleStore._normalize(plan)
+        self._schedule_cache[plan_date] = (normalized, fallback_source)
+        self._generation_fallback_total += 1
+        self._generation_last_fallback_source[plan_date] = fallback_source
+        self._generation_last_error[plan_date] = f"{reason}: fallback_source={fallback_source}"
+        try:
+            await self.schedule_store.save(plan_date, normalized, source=fallback_source)
+        except Exception as exc:
+            logger.warning(
+                f"[ScheduledScenario] schedule fallback persistence degraded "
+                f"date={plan_date} source={fallback_source} error={type(exc).__name__}: {exc}"
+            )
+        logger.warning(
+            f"[ScheduledScenario] daily schedule fallback applied date={plan_date} "
+            f"source={fallback_source} reason={reason}"
+        )
 
     def _schedule_generation_failed(self, plan_date: str, exc: Exception) -> None:
         if self._shutdown_requested or isinstance(exc, BackgroundTaskQueueFull):
@@ -605,33 +683,93 @@ class ScheduledScenarioService:
                 f"attempt={attempts} reason={type(exc).__name__}"
             )
 
-    @staticmethod
-    def _parse_schedule_response(raw: Any) -> dict[str, Any]:
+    @classmethod
+    def _normalize_schedule_response(cls, raw: Any) -> tuple[dict[str, Any], str]:
+        if isinstance(raw, dict):
+            return dict(raw), "valid"
         text = str(raw or "").strip()
         if not text:
-            raise ScheduleParseError("no_object", "missing JSON object")
+            raise ScheduleParseError("empty_response", "missing JSON object")
+
+        candidates: list[tuple[str, str]] = [(text, "valid")]
+        if text.startswith("```"):
+            lines = text.splitlines()
+            if lines and lines[0].lstrip().startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip().startswith("```"):
+                lines = lines[:-1]
+            fenced = "\n".join(lines).strip()
+            if fenced and fenced != text:
+                candidates.insert(0, (fenced, "code_fence_normalized"))
+
         decoder = json.JSONDecoder()
         saw_object_start = False
-        for index, char in enumerate(text):
-            if char != "{":
-                continue
-            saw_object_start = True
+        malformed_candidate = ""
+        for candidate, stage in candidates:
+            for index, char in enumerate(candidate):
+                if char != "{":
+                    continue
+                saw_object_start = True
+                if not malformed_candidate:
+                    malformed_candidate = candidate[index:]
+                try:
+                    parsed, _ = decoder.raw_decode(candidate[index:])
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, dict):
+                    return parsed, "embedded_object" if index else stage
+
+        repair_input = malformed_candidate or candidates[0][0]
+        if not saw_object_start:
+            raise ScheduleParseError("no_object", "missing JSON object")
+        if repair_json is not None:
             try:
-                parsed, _ = decoder.raw_decode(text[index:])
-            except json.JSONDecodeError:
-                continue
-            if isinstance(parsed, dict):
-                return parsed
+                repair_kwargs = {"return_objects": True}
+                try:
+                    repair_parameters = inspect.signature(repair_json).parameters
+                except (TypeError, ValueError):
+                    repair_parameters = {}
+                if repair_parameters:
+                    supports_kwargs = any(
+                        parameter.kind is inspect.Parameter.VAR_KEYWORD
+                        for parameter in repair_parameters.values()
+                    )
+                    if "strict" in repair_parameters or supports_kwargs:
+                        repair_kwargs["strict"] = True
+                repaired = repair_json(repair_input, **repair_kwargs)
+            except Exception as exc:
+                raise ScheduleParseError(
+                    "malformed_json",
+                    f"JSON repair failed: {exc}",
+                    repair_attempted=True,
+                ) from exc
+            if isinstance(repaired, dict):
+                return repaired, "json_repaired"
+            raise ScheduleParseError(
+                "malformed_json",
+                "JSON repair did not produce an object",
+                repair_attempted=True,
+            )
         raise ScheduleParseError(
             "malformed_json" if saw_object_start else "no_object",
             "no valid JSON object" if saw_object_start else "missing JSON object",
         )
 
+    @classmethod
+    def _parse_schedule_response(cls, raw: Any) -> dict[str, Any]:
+        parsed, _stage = cls._normalize_schedule_response(raw)
+        return parsed
+
     @staticmethod
     def _validate_schedule_payload(payload: Any) -> None:
         if not isinstance(payload, dict) or set(payload) != set(SCHEDULE_SLOTS):
             raise ScheduleParseError("schema_invalid", "schedule JSON must contain exactly the seven schedule slots")
-        if any(not isinstance(payload[slot], str) or not payload[slot].strip() for slot in SCHEDULE_SLOTS):
+        if any(
+            not isinstance(payload[slot], str)
+            or not payload[slot].strip()
+            or len(payload[slot].strip()) > 240
+            for slot in SCHEDULE_SLOTS
+        ):
             raise ScheduleParseError("schema_invalid", "schedule JSON slot values must be non-empty strings")
 
     def _scenario_for(self, now: datetime) -> str:
@@ -826,6 +964,15 @@ class ScheduledScenarioService:
             "generation_state": dict(self._generation_state),
             "generation_last_error": dict(self._generation_last_error),
             "generation_parse_stage": dict(self._generation_parse_stage),
+            "generation_parse_attempts": dict(self._generation_parse_attempts),
+            "generation_json_repair_total": int(self._generation_json_repair_total),
+            "generation_json_repair_success_total": int(self._generation_json_repair_success_total),
+            "generation_json_repair_failed_total": int(self._generation_json_repair_failed_total),
+            "generation_schema_failure_total": int(self._generation_schema_failure_total),
+            "generation_no_object_total": int(self._generation_no_object_total),
+            "generation_empty_response_total": int(self._generation_empty_response_total),
+            "generation_fallback_total": int(self._generation_fallback_total),
+            "generation_last_fallback_source": dict(self._generation_last_fallback_source),
             "cached_schedule_dates": sorted(self._schedule_cache)[-7:],
             "weather_cached": self.weather._cached is not None,
             "claim_persistence_mode": "sqlite" if self.delivery_store.db_path else "memory_process_local",
