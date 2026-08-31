@@ -312,25 +312,38 @@ class ChatRuntimeCoordinator:
                 self._increment_metric_locked("send_claim_exists")
                 return False
             if len(state.send_claims) >= self.MAX_SEND_CLAIMS_PER_CHAT:
-                state.send_claims.pop(next(iter(state.send_claims)), None)
+                terminal_key = next(
+                    (
+                        key
+                        for key, claim in state.send_claims.items()
+                        if claim.status in {"committed", "failed"}
+                    ),
+                    None,
+                )
+                if terminal_key is None:
+                    self._increment_metric_locked("send_claim_capacity_rejected")
+                    return False
+                state.send_claims.pop(terminal_key, None)
+                self._increment_metric_locked("send_claim_terminal_evicted")
             state.send_claims[normalized_send_key] = SendClaimState()
             self._increment_metric_locked("send_claimed")
             return True
 
-    async def commit_send(self, chat_id: str, send_key: str, outbound_message_ids: List[str] | None = None) -> None:
+    async def commit_send(self, chat_id: str, send_key: str, outbound_message_ids: List[str] | None = None) -> bool:
         normalized_chat_id = str(chat_id or "").strip()
         normalized_send_key = str(send_key or "").strip()
         if not normalized_send_key:
-            return
+            return False
         async with self._lock:
             if self._shutdown:
-                return
+                return False
             state = self._states.setdefault(normalized_chat_id, ChatRuntimeState())
             claim = state.send_claims.setdefault(normalized_send_key, SendClaimState())
             claim.status = "committed"
             claim.outbound_message_ids = list(dict.fromkeys(str(item) for item in (outbound_message_ids or []) if str(item)))
             claim.committed_at = time.time()
             self._increment_metric_locked("send_committed")
+            return True
 
     async def mark_send_failed(self, chat_id: str, send_key: str, error: str = "") -> bool:
         normalized_chat_id = str(chat_id or "").strip()

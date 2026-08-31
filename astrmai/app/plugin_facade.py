@@ -12,7 +12,7 @@ from ..conversation.concurrency.controls import (
 )
 from ..conversation.contracts.turn_identity import TurnIdentity, build_p0_thread_id
 from ..conversation.threading.group_thread_resolver import resolve_group_thread
-from ..presentation.dto.message_scope import IngressDecision
+from ..presentation.dto.message_scope import IngressDecision, MessageScope
 from ..presentation.events.error_interceptor import intercept_and_notify_errors
 from ..presentation.events.message_entry import handle_global_message
 from ..presentation.events.result_sniffer import sniff_external_plugin_results
@@ -412,11 +412,83 @@ class PluginFacade(RuntimeFacadeProtocol):
         request = await observer.observe(event)
         if request is None:
             return False
+        already_recorded = bool(
+            event.get_extra("astrmai_incoming_recorded", False)
+            if hasattr(event, "get_extra")
+            else False
+        )
+        if not already_recorded:
+            recorder = getattr(self, "record_incoming_without_reply", None)
+            record_succeeded = False
+            if callable(recorder):
+                try:
+                    record_succeeded = bool(await recorder(event))
+                except Exception as exc:
+                    if hasattr(event, "set_extra"):
+                        event.set_extra("astrmai_incoming_record_failed", type(exc).__name__)
+                    logger.debug("[AstrMai] inbound record raised during reread admission", exc_info=True)
+            if not record_succeeded:
+                incoming_recorded = bool(
+                    event.get_extra("astrmai_incoming_recorded", False)
+                    if hasattr(event, "get_extra")
+                    else False
+                )
+                if incoming_recorded:
+                    abandon = getattr(observer, "abandon_pending", None)
+                    if callable(abandon):
+                        try:
+                            await abandon(request.chat_id)
+                        except Exception:
+                            logger.debug("[AstrMai] failed to abandon reread pending after evolution record failure", exc_info=True)
+                else:
+                    restore = getattr(observer, "restore_pending", None)
+                    if callable(restore):
+                        try:
+                            await restore(request.chat_id)
+                        except Exception:
+                            logger.debug("[AstrMai] failed to restore reread pending after inbound record failure", exc_info=True)
+                if hasattr(event, "set_extra"):
+                    event.set_extra("astrmai_group_reread_status", "record_failed")
+                    event.set_extra("astrmai_group_reread_detail", "inbound_record_unavailable")
+                return False
         result = await dispatcher.dispatch(event, request)
         if hasattr(event, "set_extra"):
             event.set_extra("astrmai_group_reread_status", result.status)
             event.set_extra("astrmai_group_reread_detail", result.detail)
         return bool(result.sent)
+
+    async def record_incoming_without_reply(self, event) -> bool:
+        """Persist an inbound event without starting the normal reply pipeline."""
+        if hasattr(event, "get_extra") and event.get_extra("astrmai_incoming_recorded", False):
+            return False
+        gate = getattr(self.runtime, "attention_gate", None)
+        if gate is None:
+            return False
+        try:
+            scope = MessageScope.from_event(event)
+        except Exception:
+            scope = None
+        recorder = getattr(gate, "record_incoming_without_reply", None)
+        if not callable(recorder):
+            return False
+        result = await recorder(event)
+        if result and hasattr(event, "set_extra"):
+            event.set_extra("astrmai_incoming_recorded", True)
+            event.set_extra("astrmai_incoming_record_mode", "without_reply")
+        if result and scope is not None and not getattr(scope, "is_anonymous_sender", False):
+            evolution = getattr(self.runtime, "evolution", None)
+            evolution_recorder = getattr(evolution, "record_user_message", None)
+            if callable(evolution_recorder):
+                try:
+                    await evolution_recorder(event)
+                    if hasattr(event, "set_extra"):
+                        event.set_extra("astrmai_evolution_recorded", True)
+                except Exception as exc:
+                    if hasattr(event, "set_extra"):
+                        event.set_extra("astrmai_evolution_record_failed", type(exc).__name__)
+                    logger.debug("[AstrMai] inbound evolution record deferred", exc_info=True)
+                    return False
+        return bool(result)
 
     async def handle_group_reply_wait(self, event, scope) -> str:
         if not event.get_group_id() or not self.runtime.group_reply_wait_manager:
@@ -498,8 +570,14 @@ class PluginFacade(RuntimeFacadeProtocol):
         return None
 
     async def record_and_dispatch_attention(self, event, scope) -> str:
-        if not getattr(scope, "is_anonymous_sender", False):
+        incoming_recorded = bool(event.get_extra("astrmai_incoming_recorded", False))
+        evolution_recorded = bool(event.get_extra("astrmai_evolution_recorded", False))
+        if not getattr(scope, "is_anonymous_sender", False) and (
+            not incoming_recorded or not evolution_recorded
+        ):
             await self.runtime.evolution.record_user_message(event)
+            if hasattr(event, "set_extra"):
+                event.set_extra("astrmai_evolution_recorded", True)
         if getattr(self.runtime, "chat_loop_kernel", None) is not None:
             tick_result = await self.runtime.chat_loop_kernel.tick(
                 chat_id=scope.chat_id,

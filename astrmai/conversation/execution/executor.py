@@ -415,17 +415,27 @@ class ConcurrentExecutor:
         dispatcher = event.get_extra("astrmai_reread_action_dispatcher", None) or self.reread_action_dispatcher
         if dispatcher is None or not hasattr(dispatcher, "dispatch"):
             raise RuntimeError("reread_dispatcher_unavailable")
-        text = str(raw.get("text", "") or "").strip()
+        display_text = str(raw.get("text", "") or "")
+        comparison_text = re.sub(r"\s+", " ", display_text).strip()
         chat_id = str(raw.get("chat_id", "") or getattr(event, "unified_msg_origin", "") or "").strip()
-        if not text or not chat_id:
+        if not comparison_text or not chat_id:
             raise ValueError("invalid_reread_request")
+        source_event_ids = tuple(str(item) for item in raw.get("source_event_ids", []) or [] if str(item))
+        if not source_event_ids:
+            message_obj = getattr(event, "message_obj", None)
+            fallback_event_id = str(
+                getattr(message_obj, "message_id", "") or getattr(event, "message_id", "") or ""
+            ).strip()
+            if fallback_event_id:
+                source_event_ids = (fallback_event_id,)
         request = RereadActionRequest(
             chat_id=chat_id,
-            text=text,
-            fingerprint=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            text=display_text,
+            fingerprint=hashlib.sha256(comparison_text.encode("utf-8")).hexdigest(),
             trigger_kind=str(raw.get("trigger_kind", "group_reread_active") or "group_reread_active"),
-            source_event_ids=tuple(str(item) for item in raw.get("source_event_ids", []) or [] if str(item)),
+            source_event_ids=source_event_ids,
             explanation=str(raw.get("explanation", "") or ""),
+            source_identity=source_event_ids[-1] if source_event_ids else "",
         )
         result = await dispatcher.dispatch(event, request)
         event.set_extra("astrmai_reread_dispatch_status", result.status)

@@ -172,6 +172,23 @@ class ChatRuntimeGenerationTests(unittest.TestCase):
         self.assertEqual(metrics["send_claim_exists"], 1)
         self.assertEqual(metrics["stale_generation"], 1)
 
+    def test_active_send_claims_are_not_evicted_at_capacity(self):
+        coordinator = ChatRuntimeCoordinator()
+        coordinator.MAX_SEND_CLAIMS_PER_CHAT = 2
+
+        async def _run():
+            first = await coordinator.claim_send("chat-1", "send-a")
+            second = await coordinator.claim_send("chat-1", "send-b")
+            rejected = await coordinator.claim_send("chat-1", "send-c")
+            state = await coordinator.get_send_claim("chat-1", "send-a")
+            return first, second, rejected, state
+
+        first, second, rejected, state = asyncio.run(_run())
+        self.assertTrue(first)
+        self.assertTrue(second)
+        self.assertFalse(rejected)
+        self.assertEqual(state["status"], "claimed")
+
     def test_advancing_generation_cancels_registered_task_for_same_thread(self):
         coordinator = ChatRuntimeCoordinator()
 

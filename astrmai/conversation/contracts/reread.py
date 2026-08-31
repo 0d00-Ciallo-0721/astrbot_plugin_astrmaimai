@@ -12,6 +12,8 @@ class RereadActionRequest:
     source_event_ids: tuple[str, ...] = field(default_factory=tuple)
     participant_ids: tuple[str, ...] = field(default_factory=tuple)
     explanation: str = ""
+    # Stable source identity used for retries when platform event ids are absent.
+    source_identity: str = ""
 
 
 @dataclass(frozen=True, slots=True)

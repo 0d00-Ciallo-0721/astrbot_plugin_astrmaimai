@@ -152,6 +152,43 @@ class MessageEntryGapCoverageTests(unittest.TestCase):
         self.assertNotIn("group_wait", facade.calls)
         self.assertNotIn("attention", facade.calls)
 
+    def test_group_reread_does_not_pre_record_before_facade_dispatch(self):
+        facade = _Facade()
+        order = []
+
+        async def _record(_event):
+            order.append("record")
+            return True
+
+        async def _dispatch(_event):
+            order.append("reread")
+            return True
+
+        facade.record_incoming_without_reply = _record
+        facade.try_dispatch_group_reread = _dispatch
+        event = _Event()
+
+        self._collect(facade, event)
+
+        self.assertEqual(order, ["reread"])
+        self.assertTrue(event.stopped)
+        self.assertNotIn("attention", facade.calls)
+
+    def test_non_reread_group_message_does_not_call_inbound_record(self):
+        facade = _Facade()
+        recorded = []
+
+        async def _record(_event):
+            recorded.append(True)
+            return True
+
+        facade.record_incoming_without_reply = _record
+        event = _Event()
+
+        self._collect(facade, event)
+
+        self.assertEqual(recorded, [])
+
     def test_duplicate_message_stops_event_before_facade_guards(self):
         facade = _Facade()
         event = _Event()

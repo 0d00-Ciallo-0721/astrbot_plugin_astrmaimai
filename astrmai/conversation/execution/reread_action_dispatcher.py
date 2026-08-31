@@ -33,6 +33,8 @@ class RereadActionDispatcher:
         self._retry_release_exhausted: set[str] = set()
         self._pending_dispatch_shutdown = False
         self._retry_cleanup_tasks: set[asyncio.Task] = set()
+        self._release_retry_tasks: dict[str, asyncio.Task] = {}
+        self._release_retry_exhausted: set[str] = set()
         self._settlement_retry_stats = {"retry_pending": 0, "retry_exhausted": 0, "retry_rejected": 0}
         self._claim_rollback_degraded = 0
         self._shutting_down = False
@@ -50,31 +52,107 @@ class RereadActionDispatcher:
             reason,
         )
 
-    async def _release_observer_claim(self, chat_id: str, token: str | None = None, *, strict: bool = False) -> None:
+    async def _release_observer_claim(self, chat_id: str, token: str | None = None, *, strict: bool = False) -> bool:
         observer = self.reread_observer
-        if observer is not None and hasattr(observer, "release_dispatch"):
+        if observer is None or not hasattr(observer, "release_dispatch"):
+            return True
+        # A missing token cannot identify the lease owned by this dispatch.
+        # Never release a newer concurrent lease through a legacy fallback.
+        if not token:
+            if strict:
+                raise RuntimeError("observer release requires lease token")
+            return False
+        try:
+            parameters = inspect.signature(observer.release_dispatch).parameters
+            supports_token = "token" in parameters or any(
+                item.kind is inspect.Parameter.VAR_KEYWORD
+                for item in parameters.values()
+            )
+            positional = [
+                item for item in parameters.values()
+                if item.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+            ]
+            supports_token = supports_token or len(positional) >= 2 or any(
+                item.kind is inspect.Parameter.VAR_POSITIONAL
+                for item in parameters.values()
+            )
+            if supports_token:
+                released = await observer.release_dispatch(chat_id, token)
+            else:
+                released = await observer.release_dispatch(chat_id)
+            if released is False and strict:
+                raise RuntimeError("observer release rejected")
+            return released is not False
+        except Exception:
+            logger.debug("[RereadAction] cooldown release degraded", exc_info=True)
+            if strict:
+                raise
+            self._schedule_release_retry(chat_id, token)
+            return False
+
+    def _schedule_release_retry(self, chat_id: str, token: str | None) -> None:
+        if not chat_id or not token or self._shutting_down:
+            return
+        key = f"{chat_id}\x1f{token}"
+        existing = self._release_retry_tasks.get(key)
+        if existing is not None and not existing.done():
+            return
+
+        async def _retry() -> None:
+            for attempt in range(3):
+                try:
+                    if await self._release_observer_claim(chat_id, token, strict=True):
+                        if key in self._release_retry_exhausted:
+                            self._release_retry_exhausted.discard(key)
+                            self._settlement_retry_stats["release_exhausted"] = max(
+                                0,
+                                self._settlement_retry_stats.get("release_exhausted", 0) - 1,
+                            )
+                        return
+                except BaseException:
+                    if attempt < 2:
+                        await asyncio.sleep(0.1 * (attempt + 1))
+            self._release_retry_exhausted.add(key)
+            self._settlement_retry_stats["release_exhausted"] = (
+                self._settlement_retry_stats.get("release_exhausted", 0) + 1
+            )
+
+        task = asyncio.create_task(_retry())
+        self._release_retry_tasks[key] = task
+        self._background_tasks.add(task)
+
+        def _forget(done: asyncio.Task) -> None:
+            self._release_retry_tasks.pop(key, None)
+            self._background_tasks.discard(done)
+
+        task.add_done_callback(_forget)
+
+    async def _restore_observer_pending(self, chat_id: str, token: str | None = None) -> bool:
+        observer = self.reread_observer
+        restore = getattr(observer, "restore_pending", None) if observer is not None else None
+        if not callable(restore):
+            return False
+        try:
+            return bool(await restore(chat_id, token))
+        except TypeError:
             try:
-                parameters = inspect.signature(observer.release_dispatch).parameters
-                supports_token = "token" in parameters or any(
-                    item.kind is inspect.Parameter.VAR_KEYWORD
-                    for item in parameters.values()
-                )
-                positional = [
-                    item for item in parameters.values()
-                    if item.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-                ]
-                supports_token = supports_token or len(positional) >= 2 or any(
-                    item.kind is inspect.Parameter.VAR_POSITIONAL
-                    for item in parameters.values()
-                )
-                if supports_token:
-                    await observer.release_dispatch(chat_id, token)
-                else:
-                    await observer.release_dispatch(chat_id)
+                return bool(await restore(chat_id))
             except Exception:
-                logger.debug("[RereadAction] cooldown release degraded", exc_info=True)
-                if strict:
-                    raise
+                logger.debug("[RereadAction] pending observation restore degraded", exc_info=True)
+        except Exception:
+            logger.debug("[RereadAction] pending observation restore degraded", exc_info=True)
+        return False
+
+    async def _abandon_observer_pending(self, chat_id: str, token: str | None = None) -> bool:
+        observer = self.reread_observer
+        abandon = getattr(observer, "abandon_pending", None) if observer is not None else None
+        if not callable(abandon):
+            return await self._release_observer_claim(chat_id, token)
+        try:
+            return bool(await abandon(chat_id, token))
+        except Exception:
+            logger.debug("[RereadAction] sent pending abandonment degraded", exc_info=True)
+            return False
 
     async def _claim_observer(self, chat_id: str, trigger_kind: str):
         observer = self.reread_observer
@@ -184,6 +262,7 @@ class RereadActionDispatcher:
         observer_token: str | None,
         coordinator,
     ) -> bool:
+        coordinator_ok = True
         if coordinator is not None and hasattr(coordinator, "commit_send"):
             already_committed = False
             get_claim = getattr(coordinator, "get_send_claim", None)
@@ -191,8 +270,18 @@ class RereadActionDispatcher:
                 claim = await get_claim(request.chat_id, send_key)
                 already_committed = bool(claim and claim.get("status") == "committed")
             if not already_committed:
-                await coordinator.commit_send(request.chat_id, send_key, list(outbound_ids))
-        return await self._commit_observer(request.chat_id, observer_token, request.trigger_kind)
+                commit_result = await coordinator.commit_send(
+                    request.chat_id, send_key, list(outbound_ids)
+                )
+                if commit_result is False:
+                    coordinator_ok = False
+                elif commit_result is None and callable(get_claim):
+                    claim = await get_claim(request.chat_id, send_key)
+                    coordinator_ok = bool(claim and claim.get("status") == "committed")
+        if not coordinator_ok:
+            return False
+        observer_ok = await self._commit_observer(request.chat_id, observer_token, request.trigger_kind)
+        return observer_ok
 
     async def _schedule_settlement_retry(
         self,
@@ -204,14 +293,14 @@ class RereadActionDispatcher:
     ) -> None:
         if self._shutting_down:
             self._settlement_retry_stats["retry_rejected"] += 1
-            await self._release_observer_claim(request.chat_id, observer_token)
+            await self._abandon_observer_pending(request.chat_id, observer_token)
             return
         existing = self._settlement_retry_tasks.get(send_key)
         if existing is not None and not existing.done():
             return
         if len(self._settlement_retry_tasks) >= self.MAX_SETTLEMENT_RETRY_TASKS:
             self._settlement_retry_stats["retry_rejected"] += 1
-            await self._release_observer_claim(request.chat_id, observer_token)
+            await self._abandon_observer_pending(request.chat_id, observer_token)
             return
 
         async def _retry() -> None:
@@ -273,8 +362,11 @@ class RereadActionDispatcher:
         released = settled
         try:
             if not settled:
-                await asyncio.shield(self._release_observer_claim(chat_id, observer_token, strict=True))
-                released = True
+                released = await asyncio.shield(
+                    self._abandon_observer_pending(chat_id, observer_token)
+                )
+                if not released:
+                    raise RuntimeError("observer pending abandonment failed")
         except BaseException:
             attempts = self._retry_release_attempts.get(send_key, 0) + 1
             self._retry_release_attempts[send_key] = attempts
@@ -337,7 +429,11 @@ class RereadActionDispatcher:
         cleanup_tasks = [task for task in self._retry_cleanup_tasks if not task.done()]
         if cleanup_tasks:
             await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+        release_tasks = [task for task in self._release_retry_tasks.values() if not task.done()]
+        if release_tasks:
+            await asyncio.gather(*release_tasks, return_exceptions=True)
         self._settlement_retry_tasks.clear()
+        self._release_retry_tasks.clear()
         self._active_dispatches.clear()
         if not self._retry_release_exhausted:
             self._retry_leases.clear()
@@ -376,13 +472,16 @@ class RereadActionDispatcher:
             "retry_exhausted": self._settlement_retry_stats["retry_exhausted"],
             "retry_rejected": self._settlement_retry_stats["retry_rejected"],
             "release_exhausted": self._settlement_retry_stats.get("release_exhausted", 0),
+            "release_retry_exhausted": len(self._release_retry_exhausted),
+            "release_retry_pending": len(self._release_retry_tasks),
             "claim_rollback_degraded": self._claim_rollback_degraded,
             "pending_dispatch_shutdown": self._pending_dispatch_shutdown,
         }
 
     @staticmethod
     def _send_key(request: RereadActionRequest) -> str:
-        payload = "\x1f".join((request.chat_id, request.trigger_kind, request.fingerprint, *request.source_event_ids))
+        source_identity = request.source_identity or "\x1f".join(request.source_event_ids)
+        payload = "\x1f".join((request.chat_id, request.trigger_kind, request.fingerprint, source_identity))
         return "reread:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
 
     async def dispatch(self, event: Any, request: RereadActionRequest) -> RereadDispatchResult:
@@ -402,6 +501,7 @@ class RereadActionDispatcher:
             return RereadDispatchResult("shutdown", detail="dispatcher_shutdown")
         context = self.context
         if context is None or not hasattr(context, "send_message"):
+            await self._restore_observer_pending(request.chat_id)
             return RereadDispatchResult("failed", detail="context_unavailable")
         coordinator = self.runtime_coordinator
         send_key = self._send_key(request)
@@ -419,18 +519,23 @@ class RereadActionDispatcher:
                 if not observer_token:
                     if claim_owned:
                         await self._rollback_send_claim(request.chat_id, send_key, "reread_cooldown")
+                    await self._restore_observer_pending(request.chat_id, observer_token)
                     return RereadDispatchResult("cooldown", detail="group_reread_cooldown")
             turn = event.get_extra("astrmai_turn_identity", None) if hasattr(event, "get_extra") else None
             if turn is not None and coordinator is not None and hasattr(coordinator, "is_current_turn"):
                 if not await coordinator.is_current_turn(turn):
                     if claim_owned:
                         await self._rollback_send_claim(request.chat_id, send_key, "stale_turn")
-                    await self._release_observer_claim(request.chat_id, observer_token)
+                    restored = await self._restore_observer_pending(request.chat_id, observer_token)
+                    if not restored:
+                        await self._release_observer_claim(request.chat_id, observer_token)
                     return RereadDispatchResult("stale", detail="stale_turn")
             if not outbound_send_allowed(event):
                 if claim_owned:
                     await self._rollback_send_claim(request.chat_id, send_key, "shutdown_rejected")
-                await self._release_observer_claim(request.chat_id, observer_token)
+                restored = await self._restore_observer_pending(request.chat_id, observer_token)
+                if not restored:
+                    await self._release_observer_claim(request.chat_id, observer_token)
                 return RereadDispatchResult("shutdown", detail="shutdown_rejected")
             chain = MessageChain()
             chain.chain.append(Comp.Plain(request.text))
@@ -463,7 +568,9 @@ class RereadActionDispatcher:
             if not send_completed:
                 if claim_owned:
                     await self._rollback_send_claim(request.chat_id, send_key, "cancelled")
-                await self._release_observer_claim(request.chat_id, observer_token)
+                restored = await self._restore_observer_pending(request.chat_id, observer_token)
+                if not restored:
+                    await self._release_observer_claim(request.chat_id, observer_token)
                 raise
             settlement_ok = False
             settlement_failed = False
@@ -476,9 +583,13 @@ class RereadActionDispatcher:
                 logger.error("[RereadAction] post-send settlement failed after cancellation", exc_info=True)
             if settlement_failed or not settlement_ok:
                 try:
-                    await asyncio.shield(self._release_observer_claim(request.chat_id, observer_token))
+                    await asyncio.shield(
+                        self._schedule_settlement_retry(
+                            request, send_key, outbound_ids, observer_token, coordinator
+                        )
+                    )
                 except BaseException:
-                    logger.error("[RereadAction] cooldown release failed after degraded settlement", exc_info=True)
+                    logger.error("[RereadAction] settlement retry scheduling failed after cancellation", exc_info=True)
             return RereadDispatchResult(
                 "sent",
                 outbound_ids,
@@ -498,7 +609,9 @@ class RereadActionDispatcher:
                 return RereadDispatchResult("sent", outbound_ids, detail="settlement_degraded")
             if claim_owned:
                 await self._rollback_send_claim(request.chat_id, send_key, str(exc))
-            await self._release_observer_claim(request.chat_id, observer_token)
+            restored = await self._restore_observer_pending(request.chat_id, observer_token)
+            if not restored:
+                await self._release_observer_claim(request.chat_id, observer_token)
             logger.warning("[RereadAction] send failed: %s", exc)
             return RereadDispatchResult("failed", detail=str(exc))
 
@@ -506,7 +619,10 @@ class RereadActionDispatcher:
         store = self.dialogue_store
         if store is None or not hasattr(store, "append_segment"):
             return
-        event_id = "reread_" + hashlib.sha256((request.chat_id + request.fingerprint + str(time.time())).encode("utf-8")).hexdigest()[:20]
+        stable_identity = request.source_identity or "\x1f".join(request.source_event_ids)
+        event_id = "reread_" + hashlib.sha256(
+            (request.chat_id + request.fingerprint + stable_identity).encode("utf-8")
+        ).hexdigest()[:20]
         if outbound_ids:
             event_id = outbound_ids[0]
         try:

@@ -2358,6 +2358,29 @@ class AttentionGate:
         message_cache[message_key] = current_time
         while len(message_cache) > 256:
             message_cache.popitem(last=False)
+        if hasattr(event, "set_extra"):
+            event.set_extra("astrmai_message_dedup_key", message_key)
+            event.set_extra("astrmai_message_dedup_claimed_at", current_time)
+        return True
+
+    def _release_message_claim(self, event: AstrMessageEvent) -> bool:
+        message_cache = self._ensure_global_msg_cache()
+        message_key = str(
+            event.get_extra("astrmai_message_dedup_key", "")
+            if hasattr(event, "get_extra")
+            else ""
+        )
+        claimed_at = (
+            event.get_extra("astrmai_message_dedup_claimed_at", None)
+            if hasattr(event, "get_extra")
+            else None
+        )
+        if not message_key or claimed_at is None:
+            return False
+        current = message_cache.get(message_key)
+        if current is None or float(current) != float(claimed_at):
+            return False
+        message_cache.pop(message_key, None)
         return True
 
     async def _append_dialogue_segment(self, event: AstrMessageEvent) -> None:
@@ -2408,36 +2431,80 @@ class AttentionGate:
                 create_pending_direct=create_pending_direct,
             )
             event.set_extra("astrmai_conversation_event_write_status", "stored")
-            if ":GroupMessage:" in chat_id:
-                social_signal = classify_group_social_signal(content)
-                is_direct_to_bot = bool(
-                    create_pending_direct
-                    or event.get_extra("astrmai_group_direct_wakeup", False)
-                    or event.get_extra("astrmai_force_engage", False)
-                )
-                if social_signal in {"apology", "reconciliation"} and is_direct_to_bot:
-                    await store.resolve_social_incidents(
-                        chat_id,
-                        actor_id=sender_id,
-                        resolution_event_id=event_id,
-                        resolution_kind=social_signal,
+            try:
+                if ":GroupMessage:" in chat_id:
+                    social_signal = classify_group_social_signal(content)
+                    is_direct_to_bot = bool(
+                        create_pending_direct
+                        or event.get_extra("astrmai_group_direct_wakeup", False)
+                        or event.get_extra("astrmai_force_engage", False)
                     )
-                elif social_signal and is_direct_to_bot:
-                    await store.observe_social_incident(
-                        chat_id,
-                        kind=social_signal,
-                        actor_id=sender_id,
-                        actor_name=str(event.get_sender_name() or ""),
-                        target_id=bot_id if is_at_bot or is_reply_to_bot else "",
-                        target_name="Bot" if is_at_bot or is_reply_to_bot else "",
-                        evidence_event_id=event_id,
-                        topic_epoch=topic_epoch,
-                    )
-                event.set_extra("astrmai_group_social_signal", social_signal)
+                    if social_signal in {"apology", "reconciliation"} and is_direct_to_bot:
+                        await store.resolve_social_incidents(
+                            chat_id,
+                            actor_id=sender_id,
+                            resolution_event_id=event_id,
+                            resolution_kind=social_signal,
+                        )
+                    elif social_signal and is_direct_to_bot:
+                        await store.observe_social_incident(
+                            chat_id,
+                            kind=social_signal,
+                            actor_id=sender_id,
+                            actor_name=str(event.get_sender_name() or ""),
+                            target_id=bot_id if is_at_bot or is_reply_to_bot else "",
+                            target_name="Bot" if is_at_bot or is_reply_to_bot else "",
+                            evidence_event_id=event_id,
+                            topic_epoch=topic_epoch,
+                        )
+                    event.set_extra("astrmai_group_social_signal", social_signal)
+            except Exception as exc:
+                event.set_extra("astrmai_conversation_postprocess_status", "degraded")
+                event.set_extra("astrmai_conversation_postprocess_error", type(exc).__name__)
+                logger.debug(f"[AttentionGate] dialogue postprocess degraded: {exc}")
         except Exception as exc:
-            event.set_extra("astrmai_conversation_event_write_status", "degraded")
-            event.set_extra("astrmai_conversation_event_write_error", type(exc).__name__)
+            if event.get_extra("astrmai_conversation_event_write_status", "") != "stored":
+                event.set_extra("astrmai_conversation_event_write_status", "degraded")
+                event.set_extra("astrmai_conversation_event_write_error", type(exc).__name__)
             logger.debug(f"[AttentionGate] dialogue segment append degraded: {exc}")
+
+    async def record_incoming_without_reply(self, event: AstrMessageEvent) -> bool:
+        """Persist one inbound event while bypassing the normal reply scheduler."""
+        if hasattr(event, "get_extra") and event.get_extra("astrmai_incoming_recorded", False):
+            return False
+        if not self._claim_message(event):
+            return False
+        chat_id = str(getattr(event, "unified_msg_origin", "") or "")
+        sender_id = str(getattr(event, "get_sender_id", lambda: "")() or "")
+        if not chat_id or not sender_id:
+            self._release_message_claim(event)
+            return False
+        try:
+            await self._record_event_activity(chat_id, event, sender_id)
+            await self._append_dialogue_segment(event)
+        except Exception as exc:
+            self._release_message_claim(event)
+            if hasattr(event, "set_extra"):
+                event.set_extra("astrmai_incoming_record_failed", True)
+                event.set_extra("astrmai_incoming_record_error", type(exc).__name__)
+            logger.debug(f"[AttentionGate] inbound record failed: {exc}")
+            return False
+        dialogue_store = getattr(self, "dialogue_store", None)
+        write_status = str(
+            event.get_extra("astrmai_conversation_event_write_status", "")
+            if hasattr(event, "get_extra")
+            else ""
+        )
+        if dialogue_store is not None and write_status == "degraded":
+            self._release_message_claim(event)
+            if hasattr(event, "set_extra"):
+                event.set_extra("astrmai_incoming_record_failed", True)
+                event.set_extra("astrmai_incoming_record_error", str(event.get_extra("astrmai_conversation_event_write_error", "dialogue_write_failed")))
+            return False
+        if hasattr(event, "set_extra"):
+            event.set_extra("astrmai_incoming_recorded", True)
+            event.set_extra("astrmai_incoming_record_mode", "without_reply")
+        return True
 
     def _compute_debounce_delay(self, session: SessionContext, is_private: bool, is_strong_wakeup: bool) -> float:
         return self.window_buffer.compute_debounce_delay(session, is_private, is_strong_wakeup)
@@ -2852,7 +2919,8 @@ class AttentionGate:
             )
             return "PROACTIVE_BLOCKED"
 
-        if not self._claim_message(event):
+        incoming_pre_recorded = bool(event.get_extra("astrmai_incoming_recorded", False))
+        if not incoming_pre_recorded and not self._claim_message(event):
             is_proactive_event = bool(event.get_extra("astrmai_is_proactive_event", False))
             if is_proactive_event:
                 append_proactive_stage(event, "proactive.sensor", "blocked", "duplicate_event")
@@ -3072,9 +3140,9 @@ class AttentionGate:
             now = time.time()
             event.set_extra("astrmai_timestamp", now)
             ensure_turn_context(event).perception.timestamp = now
-        else:
+        elif not incoming_pre_recorded:
             await self._record_event_activity(chat_id, event, sender_id)
-        if not defer_private_context and not is_proactive_event:
+        if not defer_private_context and not is_proactive_event and not incoming_pre_recorded:
             await self._append_dialogue_segment(event)
 
         async with session.lock:

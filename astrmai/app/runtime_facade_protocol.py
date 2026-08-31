@@ -211,6 +211,10 @@ class RuntimeFacadeProtocol(Protocol):
     async def try_dispatch_group_reread(self, event: Any) -> bool:
         ...
 
+    async def record_incoming_without_reply(self, event: Any) -> bool:
+        """Persist an inbound event without scheduling a reply."""
+        ...
+
     async def handle_group_reply_wait(self, event: Any, scope: Any) -> str:
         ...
 

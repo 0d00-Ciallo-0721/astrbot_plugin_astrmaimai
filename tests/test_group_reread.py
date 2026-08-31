@@ -1,7 +1,9 @@
 import asyncio
+import collections
 import importlib
 import sys
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -75,6 +77,14 @@ class _Store:
         self.calls.append((chat_id, kwargs))
 
 
+async def _raise_record_failure(*_args, **_kwargs):
+    raise RuntimeError("record unavailable")
+
+
+async def _noop_async(*_args, **_kwargs):
+    return None
+
+
 class GroupRereadTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
@@ -116,7 +126,7 @@ class GroupRereadTests(unittest.TestCase):
 
         decision = asyncio.run(_run())
         self.assertIsNotNone(decision)
-        self.assertEqual(decision.text, "早")
+        self.assertEqual(decision.text, "  早\u200b ")
         self.assertEqual(decision.trigger_kind, "group_reread_passive")
         self.assertEqual(len(decision.participant_ids), 5)
 
@@ -213,7 +223,7 @@ class GroupRereadTests(unittest.TestCase):
         self.assertEqual(store.calls[0][1]["provenance"], "group_reread_passive")
         self.assertIn("不表示事实认可", store.calls[0][1]["internal_note"])
 
-    def test_active_and_passive_reread_share_group_cooldown(self):
+    def test_active_reread_is_not_blocked_by_passive_cooldown(self):
         self.config.conversation.group_reread_cooldown_sec = 60
         observer = self.observer_mod.GroupRereadObserver(config=self.config)
         contract_mod = importlib.import_module("astrmai.conversation.contracts.reread")
@@ -246,8 +256,8 @@ class GroupRereadTests(unittest.TestCase):
 
         first, second = asyncio.run(_run())
         self.assertTrue(first.sent)
-        self.assertEqual(second.status, "cooldown")
-        self.assertEqual(len(context.sent), 1)
+        self.assertTrue(second.sent)
+        self.assertEqual(len(context.sent), 2)
 
     def test_cooldown_rejection_releases_send_claim_for_retry(self):
         contract_mod = importlib.import_module("astrmai.conversation.contracts.reread")
@@ -532,7 +542,7 @@ class GroupRereadTests(unittest.TestCase):
 
         second = asyncio.run(_run())
         self.assertTrue(second)
-        self.assertGreater(observer.describe_status()["cooldown_groups"], 0)
+        self.assertEqual(observer.describe_status()["cooldown_groups"], 0)
 
     def test_cancelled_dispatch_releases_inflight_lease(self):
         self.config.conversation.group_reread_cooldown_sec = 60
@@ -607,8 +617,8 @@ class GroupRereadTests(unittest.TestCase):
         observer = self.observer_mod.GroupRereadObserver(config=self.config)
 
         async def _run():
-            token = await observer.claim_dispatch("default:GroupMessage:group-1", trigger_kind="group_reread_active")
-            await observer.commit_dispatch("default:GroupMessage:group-1", token, trigger_kind="group_reread_active")
+            token = await observer.claim_dispatch("default:GroupMessage:group-1", trigger_kind="group_reread_passive")
+            await observer.commit_dispatch("default:GroupMessage:group-1", token, trigger_kind="group_reread_passive")
             for index in range(4):
                 result = await observer.observe(_Event("早", sender_id=f"u-{index}", message_id=f"m-{index}"))
                 self.assertIsNone(result)
@@ -765,6 +775,7 @@ class GroupRereadTests(unittest.TestCase):
             task.cancel()
             gate.set()
             result = await task
+            await dispatcher.drain_settlement_retries()
             state = observer._states[request.chat_id]
             return result, state.inflight_token
 
@@ -1037,6 +1048,354 @@ class GroupRereadTests(unittest.TestCase):
         self.assertNotIn("lease-key", dispatcher._retry_release_exhausted)
         self.assertEqual(dispatcher.describe_status()["release_exhausted"], 0)
         self.assertTrue(dispatcher.resume())
+
+    def test_pending_request_survives_threshold_until_commit(self):
+        observer = self.observer_mod.GroupRereadObserver(config=self.config)
+
+        async def _run():
+            request = None
+            for index in range(5):
+                request = await observer.observe(
+                    _Event("早", sender_id=f"pending-{index}", message_id=f"pending-{index}")
+                )
+            state = observer._states[request.chat_id]
+            pending_before = state.pending_request
+            token = await observer.claim_dispatch(request.chat_id)
+            restored = await observer.restore_pending(request.chat_id, token)
+            return request, pending_before, restored
+
+        request, pending_before, restored = asyncio.run(_run())
+        self.assertIsNotNone(request)
+        self.assertIsNotNone(pending_before)
+        self.assertTrue(restored)
+        self.assertEqual(observer.describe_status()["pending_groups"], 0)
+        self.assertEqual(len(observer._states[request.chat_id].records), 5)
+
+    def test_original_display_text_is_preserved_while_fingerprint_is_normalized(self):
+        observer = self.observer_mod.GroupRereadObserver(config=self.config)
+
+        async def _run():
+            result = None
+            for index in range(5):
+                result = await observer.observe(
+                    _Event("  早\u200b  晚 ", sender_id=f"raw-{index}", message_id=f"raw-{index}")
+                )
+            return result
+
+        request = asyncio.run(_run())
+        self.assertEqual(request.text, "  早\u200b  晚 ")
+        self.assertEqual(request.fingerprint, observer.fingerprint("早 晚"))
+
+    def test_other_bot_messages_do_not_count_as_reread_members(self):
+        observer = self.observer_mod.GroupRereadObserver(config=self.config)
+        bot_event = _Event("早", sender_id="other-bot", message_id="bot-event")
+        bot_event.is_bot = True
+
+        async def _run():
+            self.assertIsNone(await observer.observe(bot_event))
+            result = None
+            for index in range(4):
+                result = await observer.observe(
+                    _Event("早", sender_id=f"human-{index}", message_id=f"human-{index}")
+                )
+            return result
+
+        self.assertIsNone(asyncio.run(_run()))
+
+    def test_nested_bot_sender_is_not_overridden_by_top_level_false(self):
+        observer = self.observer_mod.GroupRereadObserver(config=self.config)
+        bot_event = _Event("早", sender_id="nested-bot", message_id="nested-bot")
+        bot_event.is_bot = False
+        bot_event.message_obj.sender = SimpleNamespace(is_bot=True)
+
+        self.assertIsNone(asyncio.run(observer.observe(bot_event)))
+
+    def test_missing_event_id_gets_stable_per_event_identity(self):
+        observer = self.observer_mod.GroupRereadObserver(config=self.config)
+        first = _Event("早", sender_id="identity-1", message_id="")
+        second = _Event("早", sender_id="identity-1", message_id="")
+        first.message_obj.message_id = ""
+        second.message_obj.message_id = ""
+
+        async def _run():
+            first_id = observer._stable_event_identity(
+                first, first.unified_msg_origin, first.get_sender_id(), "早"
+            )
+            first_retry_id = observer._stable_event_identity(
+                first, first.unified_msg_origin, first.get_sender_id(), "早"
+            )
+            second_id = observer._stable_event_identity(
+                second, second.unified_msg_origin, second.get_sender_id(), "早"
+            )
+            return first_id, first_retry_id, second_id
+
+        first_id, first_retry_id, second_id = asyncio.run(_run())
+        self.assertEqual(first_id, first_retry_id)
+        self.assertNotEqual(first_id, second_id)
+
+    def test_coordinator_commit_false_does_not_commit_observer(self):
+        contract_mod = importlib.import_module("astrmai.conversation.contracts.reread")
+        request = contract_mod.RereadActionRequest(
+            chat_id="default:GroupMessage:group-1", text="早", fingerprint="commit-false",
+            trigger_kind="group_reread_active", source_event_ids=("commit-false",),
+        )
+
+        class _FalseCoordinator(_Coordinator):
+            async def commit_send(self, *_args):
+                return False
+
+        class _Observer:
+            def __init__(self):
+                self.committed = False
+
+            async def claim_dispatch(self, _chat_id, *, trigger_kind):
+                return "token"
+
+            async def commit_dispatch(self, *_args, **_kwargs):
+                self.committed = True
+                return True
+
+            async def release_dispatch(self, *_args):
+                return True
+
+        observer = _Observer()
+        dispatcher = self.dispatcher_mod.RereadActionDispatcher(
+            context=_Context(), runtime_coordinator=_FalseCoordinator(), reread_observer=observer
+        )
+        result = asyncio.run(dispatcher.dispatch(_Event("早", sender_id="u1", message_id="commit-false"), request))
+        self.assertTrue(result.sent)
+        self.assertEqual(result.detail, "settlement_degraded")
+        self.assertFalse(observer.committed)
+
+    def test_facade_record_incoming_without_reply_is_idempotent(self):
+        facade_mod = importlib.import_module("astrmai.app.plugin_facade")
+        calls = []
+
+        class _Gate:
+            async def record_incoming_without_reply(self, event):
+                calls.append("gate")
+                return True
+
+        class _Evolution:
+            async def record_user_message(self, event):
+                calls.append("evolution")
+
+        facade = object.__new__(facade_mod.PluginFacade)
+        facade.runtime = SimpleNamespace(attention_gate=_Gate(), evolution=_Evolution())
+        event = _Event("早", sender_id="u1", message_id="facade-record")
+
+        async def _run():
+            first = await facade.record_incoming_without_reply(event)
+            second = await facade.record_incoming_without_reply(event)
+            return first, second
+
+        first, second = asyncio.run(_run())
+        self.assertTrue(first)
+        self.assertFalse(second)
+        self.assertEqual(calls, ["gate", "evolution"])
+
+    def test_observer_release_failure_is_retried_in_background(self):
+        released = []
+
+        class _FlakyObserver:
+            def __init__(self):
+                self.attempts = 0
+
+            async def release_dispatch(self, _chat_id, _token):
+                self.attempts += 1
+                if self.attempts < 2:
+                    raise RuntimeError("temporary release failure")
+                released.append(self.attempts)
+                return True
+
+        async def _run():
+            observer = _FlakyObserver()
+            dispatcher = self.dispatcher_mod.RereadActionDispatcher(reread_observer=observer)
+            self.assertFalse(await dispatcher._release_observer_claim("chat", "lease"))
+            await asyncio.sleep(0.2)
+            return dispatcher.describe_status()
+
+        status = asyncio.run(_run())
+        self.assertEqual(released, [2])
+        self.assertEqual(status["release_retry_pending"], 0)
+
+    def test_release_without_owned_token_cannot_clear_concurrent_lease(self):
+        released = []
+
+        class _Observer:
+            async def release_dispatch(self, chat_id, token):
+                released.append((chat_id, token))
+                return True
+
+        dispatcher = self.dispatcher_mod.RereadActionDispatcher(reread_observer=_Observer())
+        self.assertFalse(asyncio.run(dispatcher._release_observer_claim("chat-1")))
+        self.assertEqual(released, [])
+
+    def test_lease_expiry_restores_passive_pending_before_new_claim(self):
+        observer = self.observer_mod.GroupRereadObserver(config=self.config)
+
+        async def _run():
+            request = None
+            for index in range(5):
+                request = await observer.observe(
+                    _Event("早", sender_id=f"lease-{index}", message_id=f"lease-{index}")
+                )
+            first_token = await observer.claim_dispatch(request.chat_id)
+            state = observer._states[request.chat_id]
+            state.inflight_started_at = time.monotonic() - 120.0
+            second_token = await observer.claim_dispatch(request.chat_id)
+            return request, first_token, second_token, state
+
+        request, first_token, second_token, state = asyncio.run(_run())
+        self.assertTrue(first_token)
+        self.assertTrue(second_token)
+        self.assertNotEqual(first_token, second_token)
+        self.assertIsNone(state.pending_request)
+        self.assertEqual(len(state.records), 5)
+        self.assertGreaterEqual(
+            observer.describe_status()["stats"].get("pending_restored_after_lease_expired", 0),
+            1,
+        )
+
+    def test_facade_group_reread_records_after_observe_before_dispatch(self):
+        facade_mod = importlib.import_module("astrmai.app.plugin_facade")
+        contract_mod = importlib.import_module("astrmai.conversation.contracts.reread")
+        order = []
+        request = contract_mod.RereadActionRequest(
+            chat_id="default:GroupMessage:group-1",
+            text="早",
+            fingerprint="facade-order",
+            trigger_kind="group_reread_passive",
+        )
+
+        class _Observer:
+            async def observe(self, _event):
+                order.append("observe")
+                return request
+
+            async def restore_pending(self, _chat_id):
+                order.append("restore")
+                return True
+
+        class _Dispatcher:
+            async def dispatch(self, _event, _request):
+                order.append("dispatch")
+                return contract_mod.RereadDispatchResult("sent")
+
+        class _Gate:
+            async def record_incoming_without_reply(self, _event):
+                order.append("record")
+                return True
+
+        facade = object.__new__(facade_mod.PluginFacade)
+        facade.runtime = SimpleNamespace(
+            group_reread_observer=_Observer(),
+            reread_action_dispatcher=_Dispatcher(),
+            attention_gate=_Gate(),
+            evolution=None,
+        )
+        event = _Event("早", sender_id="facade-user", message_id="facade-order")
+        self.assertTrue(asyncio.run(facade.try_dispatch_group_reread(event)))
+        self.assertEqual(order, ["observe", "record", "dispatch"])
+
+    def test_facade_evolution_record_failure_abandons_reread_and_allows_normal_retry(self):
+        facade_mod = importlib.import_module("astrmai.app.plugin_facade")
+        contract_mod = importlib.import_module("astrmai.conversation.contracts.reread")
+        request = contract_mod.RereadActionRequest(
+            chat_id="default:GroupMessage:group-1",
+            text="早",
+            fingerprint="evolution-failure",
+            trigger_kind="group_reread_passive",
+        )
+        calls = []
+
+        class _Observer:
+            async def observe(self, _event):
+                return request
+
+            async def abandon_pending(self, chat_id):
+                calls.append(("abandon", chat_id))
+                return True
+
+        class _Gate:
+            async def record_incoming_without_reply(self, event):
+                event.set_extra("astrmai_incoming_recorded", True)
+                return True
+
+        class _Evolution:
+            async def record_user_message(self, _event):
+                raise RuntimeError("learning store unavailable")
+
+        class _Dispatcher:
+            async def dispatch(self, *_args):
+                calls.append(("dispatch",))
+                return contract_mod.RereadDispatchResult("sent")
+
+        facade = object.__new__(facade_mod.PluginFacade)
+        facade.runtime = SimpleNamespace(
+            group_reread_observer=_Observer(),
+            reread_action_dispatcher=_Dispatcher(),
+            attention_gate=_Gate(),
+            evolution=_Evolution(),
+        )
+        event = _Event("早", sender_id="evolution-failure", message_id="evolution-failure")
+
+        result = asyncio.run(facade.try_dispatch_group_reread(event))
+        self.assertFalse(result)
+        self.assertEqual(calls, [("abandon", request.chat_id)])
+        self.assertFalse(event.get_extra("astrmai_evolution_recorded", False))
+        self.assertEqual(event.get_extra("astrmai_evolution_record_failed"), "RuntimeError")
+
+    def test_facade_inbound_record_exception_restores_pending(self):
+        facade_mod = importlib.import_module("astrmai.app.plugin_facade")
+        contract_mod = importlib.import_module("astrmai.conversation.contracts.reread")
+        request = contract_mod.RereadActionRequest(
+            chat_id="default:GroupMessage:group-1",
+            text="早",
+            fingerprint="record-raises",
+            trigger_kind="group_reread_passive",
+        )
+        calls = []
+
+        class _Observer:
+            async def observe(self, _event):
+                return request
+
+            async def restore_pending(self, chat_id):
+                calls.append(("restore", chat_id))
+                return True
+
+        class _Gate:
+            async def record_incoming_without_reply(self, _event):
+                raise RuntimeError("database unavailable")
+
+        facade = object.__new__(facade_mod.PluginFacade)
+        facade.runtime = SimpleNamespace(
+            group_reread_observer=_Observer(),
+            reread_action_dispatcher=SimpleNamespace(),
+            attention_gate=_Gate(),
+            evolution=None,
+        )
+        event = _Event("早", sender_id="record-raises", message_id="record-raises")
+
+        result = asyncio.run(facade.try_dispatch_group_reread(event))
+        self.assertFalse(result)
+        self.assertEqual(calls, [("restore", request.chat_id)])
+        self.assertEqual(event.get_extra("astrmai_group_reread_status"), "record_failed")
+
+    def test_inbound_record_failure_releases_message_claim(self):
+        gate_mod = importlib.import_module("astrmai.conversation.attention.gate")
+        gate = object.__new__(gate_mod.AttentionGate)
+        gate._global_message_cache = collections.OrderedDict()
+        gate._record_event_activity = _raise_record_failure
+        gate._append_dialogue_segment = _noop_async
+        event = _Event("早", sender_id="record-failure", message_id="record-failure")
+
+        result = asyncio.run(gate.record_incoming_without_reply(event))
+        self.assertFalse(result)
+        self.assertFalse(event.get_extra("astrmai_incoming_recorded", False))
+        self.assertTrue(event.get_extra("astrmai_incoming_record_failed", False))
+        self.assertEqual(len(gate._global_message_cache), 0)
 
 
 if __name__ == "__main__":
