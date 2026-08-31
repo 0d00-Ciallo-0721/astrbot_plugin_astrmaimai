@@ -15,6 +15,30 @@ def new_trace_id() -> str:
     return uuid4().hex[:12]
 
 
+def ensure_external_result_id(event: Any) -> str:
+    """Return a stable, privacy-safe id for one external result hook call."""
+    key = "astrmai_external_result_id"
+    value = ""
+    if hasattr(event, "get_extra"):
+        try:
+            value = str(event.get_extra(key, "") or "").strip()
+        except Exception:
+            value = ""
+    elif isinstance(event, dict):
+        value = str(event.get(key, "") or "").strip()
+    if value:
+        return value
+    value = f"ext-{new_trace_id()}"
+    if hasattr(event, "set_extra"):
+        try:
+            event.set_extra(key, value)
+        except Exception:
+            pass
+    elif isinstance(event, dict):
+        event[key] = value
+    return value
+
+
 def preview_text(text: str, limit: int = 120) -> str:
     if not isinstance(text, str):
         text = str(text or "")
@@ -59,10 +83,14 @@ def ensure_trace_id(event: Any) -> str:
     trace_id = ""
     if hasattr(event, "get_extra"):
         trace_id = str(event.get_extra("astrmai_trace_id", "") or "")
+    elif isinstance(event, dict):
+        trace_id = str(event.get("astrmai_trace_id", "") or "")
     if not trace_id:
         trace_id = new_trace_id()
         if hasattr(event, "set_extra"):
             event.set_extra("astrmai_trace_id", trace_id)
+        elif isinstance(event, dict):
+            event["astrmai_trace_id"] = trace_id
     return trace_id
 
 
@@ -71,6 +99,8 @@ def append_trace_stage(event: Any, stage: str, **fields: Any) -> str:
     trace_log = []
     if hasattr(event, "get_extra"):
         trace_log = list(event.get_extra("astrmai_trace_log", []) or [])
+    elif isinstance(event, dict):
+        trace_log = list(event.get("astrmai_trace_log", []) or [])
     record = {"trace_id": trace_id, "stage": stage}
     for key, value in fields.items():
         if value is None:
@@ -82,6 +112,8 @@ def append_trace_stage(event: Any, stage: str, **fields: Any) -> str:
     trace_log.append(record)
     if hasattr(event, "set_extra"):
         event.set_extra("astrmai_trace_log", trace_log)
+    elif isinstance(event, dict):
+        event["astrmai_trace_log"] = trace_log
     return trace_id
 
 
@@ -104,6 +136,7 @@ __all__ = [
     "ReplySnapshot",
     "append_trace_stage",
     "debug_trace",
+    "ensure_external_result_id",
     "ensure_trace_id",
     "new_trace_id",
     "preview_text",

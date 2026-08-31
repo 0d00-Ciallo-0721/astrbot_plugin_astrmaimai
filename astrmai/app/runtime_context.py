@@ -68,6 +68,7 @@ class LifecycleServices:
     auto_check_task: Any = None
     expression_governance_runner: Any = None
     proactive_task: Any = None
+    external_result_dispatcher: Any = None
     manager: Any = None
 
 
@@ -414,6 +415,10 @@ class PluginRuntimeContext:
         return self.lifecycle.proactive_task
 
     @property
+    def external_result_dispatcher(self) -> Any:
+        return self.lifecycle.external_result_dispatcher
+
+    @property
     def chat_loop_kernel_with_fallback(self) -> Any:
         """Return the chat loop kernel, falling back to proactive_task's copy.
 
@@ -438,6 +443,7 @@ class PluginRuntimeContext:
             self.group_social_feedback_observer,
             self.group_reread_observer,
             self.reread_action_dispatcher,
+            self.external_result_dispatcher,
             self.event_bus,
         )
 
@@ -520,6 +526,14 @@ class PluginRuntimeContext:
             if self.background_task_budget is not None and hasattr(self.background_task_budget, "status")
             else lambda: {"limit": 0, "active": 0, "available_slots": 0},
             {"limit": 0, "active": 0, "available_slots": 0},
+        )
+        external_result_status = safe_component(
+            "external_result_dispatcher",
+            self.external_result_dispatcher.describe_status
+            if self.external_result_dispatcher is not None
+            and hasattr(self.external_result_dispatcher, "describe_status")
+            else lambda: {"available": False},
+            {"available": False},
         )
         chat_loop_status = safe_component(
             "chat_loop",
@@ -675,6 +689,7 @@ class PluginRuntimeContext:
                 "dialogue_store": self.dialogue_store is not None,
                 "context_compaction": self.context_compaction is not None,
                 "chat_loop_kernel": self.chat_loop_kernel is not None,
+                "external_result_dispatcher": self.external_result_dispatcher is not None,
             },
             "chat_loop": chat_loop_status,
             "memory": {
@@ -683,6 +698,7 @@ class PluginRuntimeContext:
             "attention": attention_status,
             "proactive": proactive_status,
             "group_reread_observer": reread_status,
+            "external_result": external_result_status,
             "long_turn": long_turn_status,
         }
         history_sample = {

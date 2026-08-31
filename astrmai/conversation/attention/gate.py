@@ -2864,6 +2864,15 @@ class AttentionGate:
 
     async def inject_external_event(self, chat_id: str, event_data: dict):
         event = _SyntheticExternalEvent(dict(event_data or {}, unified_msg_origin=chat_id))
+        external_result_id = str(event.get_extra("astrmai_external_result_id", "") or "")
+        process_started = time.monotonic()
+        if external_result_id:
+            debug_trace(
+                event,
+                "external_result.attention_process_start",
+                external_result_id=external_result_id,
+                chat_id=chat_id,
+            )
         source = str(event.get_extra("astrmai_loop_source", "") or "").strip()
         if not source:
             if event.get_extra("astrmai_is_proactive_event", False):
@@ -2873,9 +2882,46 @@ class AttentionGate:
         if source:
             event.set_extra("astrmai_loop_source", source)
         if self.chat_loop_kernel is not None and hasattr(self.chat_loop_kernel, "tick"):
-            tick = await self.chat_loop_kernel.tick(chat_id=chat_id, trigger="external", event=event)
+            try:
+                tick = await self.chat_loop_kernel.tick(chat_id=chat_id, trigger="external", event=event)
+            except Exception as exc:
+                if external_result_id:
+                    debug_trace(
+                        event,
+                        "external_result.attention_process_failed",
+                        external_result_id=external_result_id,
+                        elapsed_ms=round((time.monotonic() - process_started) * 1000.0, 1),
+                        error_type=type(exc).__name__,
+                    )
+                raise
+            if external_result_id:
+                debug_trace(
+                    event,
+                    "external_result.attention_process_end",
+                    external_result_id=external_result_id,
+                    elapsed_ms=round((time.monotonic() - process_started) * 1000.0, 1),
+                )
             return tick.dispatch_result
-        return await self.process_event(event)
+        try:
+            result = await self.process_event(event)
+        except Exception as exc:
+            if external_result_id:
+                debug_trace(
+                    event,
+                    "external_result.attention_process_failed",
+                    external_result_id=external_result_id,
+                    elapsed_ms=round((time.monotonic() - process_started) * 1000.0, 1),
+                    error_type=type(exc).__name__,
+                )
+            raise
+        if external_result_id:
+            debug_trace(
+                event,
+                "external_result.attention_process_end",
+                external_result_id=external_result_id,
+                elapsed_ms=round((time.monotonic() - process_started) * 1000.0, 1),
+            )
+        return result
 
     async def _format_and_filter_messages(self, events: List[AstrMessageEvent]):
         filtered = []

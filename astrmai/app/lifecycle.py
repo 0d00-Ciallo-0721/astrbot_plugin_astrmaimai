@@ -119,6 +119,10 @@ class PluginLifecycleManager:
         reset_attention = getattr(attention_gate, "reset_runtime_state", None)
         if callable(reset_attention):
             reset_attention()
+        external_result_dispatcher = getattr(self.runtime, "external_result_dispatcher", None)
+        resume_external_dispatcher = getattr(external_result_dispatcher, "resume", None)
+        if callable(resume_external_dispatcher):
+            resume_external_dispatcher()
         self._startup_task = self.track_task(self._complete_startup())
 
     async def _prepare_reinitialize(self) -> bool:
@@ -964,6 +968,10 @@ class PluginLifecycleManager:
         request_scenario_shutdown = getattr(scheduled_scenarios, "request_shutdown", None)
         if callable(request_scenario_shutdown):
             request_scenario_shutdown()
+        external_result_dispatcher = getattr(self.runtime, "external_result_dispatcher", None)
+        request_external_shutdown = getattr(external_result_dispatcher, "request_shutdown", None)
+        if callable(request_external_shutdown):
+            request_external_shutdown()
         self._apply_shutdown_fences()
         self.runtime.status.shutdown_generation = int(
             getattr(self.runtime.status, "shutdown_generation", 0) or 0
@@ -1897,6 +1905,14 @@ class PluginLifecycleManager:
                 await shutdown_attention()
             except Exception as exc:
                 logger.warning(f"[AstrMai] Attention worker shutdown degraded: {exc}")
+
+        external_result_dispatcher = getattr(self.runtime, "external_result_dispatcher", None)
+        shutdown_external_results = getattr(external_result_dispatcher, "shutdown", None)
+        if callable(shutdown_external_results):
+            try:
+                await shutdown_external_results()
+            except Exception as exc:
+                logger.warning(f"[AstrMai] external result dispatcher shutdown degraded: {exc}")
 
         reread_dispatcher = getattr(self.runtime, "reread_action_dispatcher", None)
         shutdown_reread = getattr(reread_dispatcher, "shutdown", None)

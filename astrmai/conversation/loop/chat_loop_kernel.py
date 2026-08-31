@@ -9,6 +9,7 @@ from typing import Any, Awaitable, Callable
 from astrbot.api import logger
 
 from ...infrastructure.runtime.observability import RuntimeObservabilityHub
+from ...infrastructure.runtime.trace_runtime import debug_trace, ensure_external_result_id
 from ...proactive.rhythm import evaluate_proactive_rhythm
 from ...shared.helpers.plugin_helpers import safe_create_task
 from .models import ChatLoopDecision, ChatLoopSnapshot, ChatLoopState, ChatLoopTickResult
@@ -533,6 +534,16 @@ class ChatLoopKernel:
     async def tick(self, *, chat_id: str, trigger: str, event: Any = None) -> ChatLoopTickResult:
         chat_id = str(chat_id or "")
         trigger = str(trigger or "").strip().lower() or "heartbeat"
+        external_result_id = ""
+        tick_started = monotonic()
+        if trigger == "external" and event is not None:
+            external_result_id = ensure_external_result_id(event)
+            debug_trace(
+                event,
+                "external_result.kernel_tick_enter",
+                external_result_id=external_result_id,
+                chat_id=chat_id,
+            )
         state = await self._state_store.get_or_create(chat_id)
         pre_state_summary = self._summarize_state(state)
         snapshot = await self._build_snapshot(state, chat_id, trigger, event)
@@ -552,7 +563,23 @@ class ChatLoopKernel:
                 "dispatch_error_reason": str(exc or ""),
             }
             self._trace_tick(state, snapshot, decision, dispatch_result, pre_state_summary)
+            if external_result_id:
+                debug_trace(
+                    event,
+                    "external_result.kernel_tick_failed",
+                    external_result_id=external_result_id,
+                    elapsed_ms=round((monotonic() - tick_started) * 1000.0, 1),
+                    error_type=type(exc).__name__,
+                )
             raise
+        if external_result_id:
+            debug_trace(
+                event,
+                "external_result.kernel_tick_after_dispatch",
+                external_result_id=external_result_id,
+                action=decision.action,
+                elapsed_ms=round((monotonic() - tick_started) * 1000.0, 1),
+            )
         self._apply_post_dispatch_state(state, decision, dispatch_result)
         if (
             trigger == "message"
@@ -562,6 +589,15 @@ class ChatLoopKernel:
             await self._sync_wait_from_adapters(state, chat_id, event)
         await self._state_store.save(state)
         self._trace_tick(state, snapshot, decision, dispatch_result, pre_state_summary)
+        if external_result_id:
+            debug_trace(
+                event,
+                "external_result.kernel_tick_return",
+                external_result_id=external_result_id,
+                action=decision.action,
+                elapsed_ms=round((monotonic() - tick_started) * 1000.0, 1),
+                next_tick_delay=float(decision.next_tick_delay or 0.0),
+            )
         return ChatLoopTickResult(state=state, snapshot=snapshot, decision=decision, dispatch_result=dispatch_result)
 
     async def select_due_chats(

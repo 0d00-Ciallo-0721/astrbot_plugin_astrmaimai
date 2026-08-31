@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import re
+import time
 from typing import Any, List, Sequence
 
 from astrbot.api import logger
@@ -543,6 +544,16 @@ class ReplyArtifactMixin:
         send_text_segments = True if not try_tts else bool(tts_bridge.should_send_text())
         outbound_message_ids: list[str] = []
         sent_segment_count = 0
+        external_result_id = str(event.get_extra("astrmai_external_result_id", "") or "")
+        external_send_started = time.monotonic()
+        if external_result_id:
+            debug_trace(
+                event,
+                "external_result.prepare_to_send",
+                external_result_id=external_result_id,
+                chat_id=chat_id,
+                segment_count=len(artifact.segments),
+            )
         try:
             if send_text_segments:
                 for index, seg in enumerate(artifact.segments):
@@ -566,6 +577,14 @@ class ReplyArtifactMixin:
                         artifact.metadata["send_failure_reason"] = "outbound_send_guard"
                         break
                     sent_result = await context.send_message(event.unified_msg_origin, chain)
+                    if external_result_id:
+                        debug_trace(
+                            event,
+                            "external_result.host_send_done",
+                            external_result_id=external_result_id,
+                            segment_index=index,
+                            elapsed_ms=round((time.monotonic() - external_send_started) * 1000.0, 1),
+                        )
                     if sent_result is not None and not isinstance(sent_result, bool):
                         outbound_message_ids.append(str(sent_result))
                     artifact.sent = True
