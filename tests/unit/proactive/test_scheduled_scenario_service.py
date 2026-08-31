@@ -125,6 +125,53 @@ class ScheduledScenarioServiceTests(unittest.TestCase):
         parsed = self.module.ScheduledScenarioService._parse_schedule_response(raw)
         self.assertEqual(parsed, payload)
 
+    def test_schedule_parser_repairs_naked_key_value_pairs(self):
+        payload = {slot: f"裸键-{slot}" for slot in self.module.SCHEDULE_SLOTS}
+        naked = ",\n".join(
+            f"{json.dumps(slot)}: {json.dumps(value, ensure_ascii=False)}"
+            for slot, value in payload.items()
+        )
+
+        parsed, stage = self.module.ScheduledScenarioService._normalize_schedule_response(naked)
+
+        self.assertEqual(parsed, payload)
+        self.assertEqual(stage, "json_repaired")
+
+    def test_schedule_parser_repairs_fenced_naked_key_value_pairs(self):
+        payload = {slot: f"代码块-{slot}" for slot in self.module.SCHEDULE_SLOTS}
+        naked = ",\n".join(
+            f"{json.dumps(slot)}: {json.dumps(value, ensure_ascii=False)}"
+            for slot, value in payload.items()
+        )
+        raw = "```json\n" + naked + ",\n```"
+
+        parsed = self.module.ScheduledScenarioService._parse_schedule_response(raw)
+
+        self.assertEqual(parsed, payload)
+
+    def test_naked_schedule_generation_is_persisted_as_repaired_model_output(self):
+        payload = {slot: f"生成-{slot}" for slot in self.module.SCHEDULE_SLOTS}
+        naked = ",\n".join(
+            f"{json.dumps(slot)}: {json.dumps(value, ensure_ascii=False)}"
+            for slot, value in payload.items()
+        )
+        service = self._service(
+            _Dispatcher(),
+            _config(daily_schedule_ai_enabled=True),
+        )
+        service.call_background_lane = lambda *args, **kwargs: asyncio.sleep(0, result=naked)
+
+        asyncio.run(service._generate_schedule("2026-05-11"))
+
+        self.assertEqual(
+            asyncio.run(service.schedule_store.load("2026-05-11")),
+            (payload, "model_repaired"),
+        )
+        status = service.describe_status()
+        self.assertEqual(status["generation_state"]["2026-05-11"], "succeeded")
+        self.assertEqual(status["generation_json_repair_total"], 1)
+        self.assertEqual(status["generation_json_repair_success_total"], 1)
+
     def test_schedule_parser_reports_no_object_and_schema_stage(self):
         with self.assertRaises(self.module.ScheduleParseError) as ctx:
             self.module.ScheduledScenarioService._parse_schedule_response("暂时没有结果")

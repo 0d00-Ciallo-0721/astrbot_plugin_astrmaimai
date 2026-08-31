@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 import inspect
 import json
+import re
 import time
 import uuid
 from typing import Any, Awaitable, Callable
@@ -560,8 +561,13 @@ class ScheduledScenarioService:
 
     async def _generate_schedule(self, plan_date: str) -> None:
         prompt = (
-            "请为角色生成今天的生活日程。只返回一个 JSON 对象，必须恰好包含 morning、forenoon、lunch、"
-            "afternoon、dinner、evening、night 七个键。每项用一句简短中文描述角色当时在做什么；"
+            "请为角色生成今天的生活日程。只返回一个完整的 JSON 对象，输出必须以 { 开头、以 } 结尾，"
+            "不得省略最外层花括号，不要输出裸键值对、Markdown 代码块、解释文字或 reasoning。"
+            "对象必须恰好包含 morning、forenoon、lunch、afternoon、dinner、evening、night 七个键；"
+            "每项用一句简短中文描述角色当时在做什么。格式示例："
+            '{"morning":"起床整理房间","forenoon":"处理今天的重要事务",'
+            '"lunch":"吃午饭并稍作休息","afternoon":"阅读或学习",'
+            '"dinner":"准备晚餐","evening":"做喜欢的事","night":"准备休息"}。'
             "日程只作为聊天背景，不要替任何用户安排事务，也不要包含发送消息的指令。"
         )
         parse_stage = "not_started"
@@ -684,6 +690,21 @@ class ScheduledScenarioService:
             )
 
     @classmethod
+    def _wrap_naked_schedule_members(cls, candidate: str) -> str | None:
+        """Return a JSON object candidate for a response missing outer braces."""
+        body = str(candidate or "").strip()
+        if not body:
+            return None
+        key_pattern = r'"(?:' + "|".join(map(re.escape, SCHEDULE_SLOTS)) + r')"\s*:'
+        first_key = re.search(key_pattern, body)
+        if first_key is None:
+            return None
+        # Ignore prose before the first known schedule key and harmless trailing commas.
+        body = body[first_key.start() :].strip().rstrip("` \t\r\n")
+        body = body.rstrip(", \t\r\n")
+        return "{" + body + "}"
+
+    @classmethod
     def _normalize_schedule_response(cls, raw: Any) -> tuple[dict[str, Any], str]:
         if isinstance(raw, dict):
             return dict(raw), "valid"
@@ -721,7 +742,22 @@ class ScheduledScenarioService:
 
         repair_input = malformed_candidate or candidates[0][0]
         if not saw_object_start:
-            raise ScheduleParseError("no_object", "missing JSON object")
+            # Some providers emit the object members but omit the outer braces.
+            # Recognize only known schedule keys so ordinary prose remains no_object.
+            for candidate, _stage in candidates:
+                wrapped = cls._wrap_naked_schedule_members(candidate)
+                if wrapped is None:
+                    continue
+                repair_input = wrapped
+                try:
+                    parsed = json.loads(wrapped)
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    return parsed, "json_repaired"
+                break
+            else:
+                raise ScheduleParseError("no_object", "missing JSON object")
         if repair_json is not None:
             try:
                 repair_kwargs = {"return_objects": True}
