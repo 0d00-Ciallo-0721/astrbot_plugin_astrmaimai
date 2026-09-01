@@ -19,7 +19,7 @@ class ExpressionMiner:
     现在采用“确定性候选提取 + LLM 增强”两段式，不再和黑话共用 joint prompt。
     """
 
-    def __init__(self, gateway, config=None, memory_engine=None):
+    def __init__(self, gateway, config=None, memory_engine=None, background_task_budget=None):
         self.gateway = gateway
         self.config = config if config else gateway.config
         self.memory_engine = memory_engine
@@ -31,7 +31,11 @@ class ExpressionMiner:
             int(getattr(evolution_config, "expression_min_distinct_turns", 3) or 3),
             int(getattr(evolution_config, "expression_min_count", 2) or 2),
         )
-        self.enricher = ExpressionPatternEnricher(gateway, config=self.config)
+        self.enricher = ExpressionPatternEnricher(
+            gateway,
+            config=self.config,
+            background_task_budget=background_task_budget,
+        )
         self.input_policy = LearningInputPolicy()
         self.last_report: dict[str, Any] = {}
         self.last_result = ExpressionEnrichmentResult(status="completed", reason="not_run")

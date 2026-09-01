@@ -15,7 +15,6 @@
 3. 一次性 LLM 调用 → 生成各话题段落的摘要
 4. 写入记忆引擎 (附带话题标签)
 """
-import json
 import math
 import re
 import time
@@ -25,6 +24,8 @@ from dataclasses import dataclass, field
 from astrbot.api import logger
 from ...infrastructure.context_economy import PromptTemplateId
 from ...infrastructure.runtime.lane_manager import LaneKey
+from ...infrastructure.runtime.background_task_budget import BackgroundTaskBudget
+from ...infrastructure.gateway.json_utils import parse_json_payload
 
 
 @dataclass
@@ -71,9 +72,10 @@ class TopicSummarizer:
         "生气", "怒", "sb", "cnm", "怎么回事"
     ])
 
-    def __init__(self, gateway=None, config=None):
+    def __init__(self, gateway=None, config=None, background_task_budget=None):
         self.gateway = gateway
         self.config = config
+        self.background_task_budget = background_task_budget or BackgroundTaskBudget()
         self.prompt_registry = getattr(getattr(gateway, "context_economy", None), "templates", None) if gateway else None
 
     @staticmethod
@@ -352,13 +354,21 @@ class TopicSummarizer:
 
         try:
             lane_key = self._memory_lane_key(session_id)
-            result = await self.gateway.call_data_process_task(
-                prompt=prompt,
-                system_prompt=system_prompt,
-                is_json=True,
-                lane_key=lane_key,
-                base_origin=session_id,
-                template_envelope=envelope,
+            async def _call():
+                return await self.gateway.call_data_process_task(
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    is_json=True,
+                    lane_key=lane_key,
+                    base_origin=session_id,
+                    template_envelope=envelope,
+                )
+
+            result = await self.background_task_budget.run(
+                _call,
+                task_name="memory.topic_summary",
+                scope_id=session_id,
+                defer_release_on_timeout=True,
             )
             summaries = self._parse_summaries(result, len(segments))
             return summaries
@@ -375,13 +385,11 @@ class TopicSummarizer:
         if isinstance(raw, list):
             items = raw
         elif isinstance(raw, str):
-            match = re.search(r'\[.*\]', raw, re.DOTALL)
-            if match:
-                try:
-                    items = json.loads(match.group(0))
-                except Exception:
-                    logger.debug("[TopicSummarizer] _parse_summaries JSON parse failed", exc_info=True)
-                    pass
+            try:
+                parsed = parse_json_payload(raw)
+                items = parsed.value if isinstance(parsed.value, list) else []
+            except ValueError:
+                logger.debug("[TopicSummarizer] _parse_summaries JSON parse failed", exc_info=True)
 
         # 确保数量对齐
         result = [str(s)[:50] for s in items if isinstance(s, str)]

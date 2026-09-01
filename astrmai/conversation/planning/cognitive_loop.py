@@ -10,6 +10,7 @@ from typing import Any, Optional
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
+from ...infrastructure.gateway.json_utils import parse_json_contract
 from ...infrastructure.runtime.lane_manager import LaneKey
 from ..contracts.prompt_envelope import PromptEnvelope
 from ..contracts.turn_context import ensure_turn_context, get_turn_context
@@ -468,21 +469,36 @@ class CognitiveLoop:
         )
 
     def _safe_parse_json(self, raw: Any) -> dict[str, Any]:
-        if isinstance(raw, dict):
-            return raw
-        text = str(raw or "").strip()
-        if not text:
+        allowed_keys = (
+            "action", "intent", "memory_policy", "retrieve_keys", "style_policy",
+            "forbid_history_continuation", "inner_monologue", "reply_need",
+            "social_intent", "action_tier", "allowed_action_families", "stance",
+            "state_bias", "risk_flags", "attack_confidence", "member_action_purpose",
+            "member_action_target", "member_action_confidence", "need_tool",
+            "tool_name", "tool_query",
+        )
+        result = parse_json_contract(
+            raw,
+            required_keys=("action",),
+            optional_keys=tuple(key for key in allowed_keys if key != "action"),
+            field_types={
+                "action": str,
+                "retrieve_keys": list,
+                "allowed_action_families": list,
+                "risk_flags": list,
+                "need_tool": bool,
+            },
+            allow_extra_keys=False,
+            allow_naked_members=True,
+        )
+        if not result.schema_valid:
+            logger.debug(
+                "[CognitiveLoop] structured output rejected "
+                f"status={result.terminal_status} missing={list(result.missing_keys)} "
+                f"unexpected={list(result.unexpected_keys)}"
+            )
             return {}
-        try:
-            return json.loads(text)
-        except Exception:
-            chunk = self._extract_braced_json(text)
-            if chunk is None:
-                return {}
-            try:
-                return json.loads(chunk)
-            except Exception:
-                return {}
+        return dict(result.value)
 
     @staticmethod
     def _extract_braced_json(text: str) -> str | None:

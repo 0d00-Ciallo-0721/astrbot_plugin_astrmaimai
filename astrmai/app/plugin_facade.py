@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import threading
 import time
@@ -49,6 +50,10 @@ class PluginFacade(RuntimeFacadeProtocol):
                 self._runtime_registration = registration
                 self._runtime_generation = registration.generation
                 self.runtime.runtime_generation = registration.generation
+                registry = getattr(self.runtime, "owner_registry", None)
+                set_generation = getattr(registry, "set_generation", None)
+                if callable(set_generation):
+                    set_generation(registration.generation)
                 self.runtime.runtime_previous_termination = registration.previous_termination
                 self.runtime.runtime_facade = self
                 self.runtime.runtime_registration = registration
@@ -476,18 +481,16 @@ class PluginFacade(RuntimeFacadeProtocol):
             event.set_extra("astrmai_incoming_recorded", True)
             event.set_extra("astrmai_incoming_record_mode", "without_reply")
         if result and scope is not None and not getattr(scope, "is_anonymous_sender", False):
-            evolution = getattr(self.runtime, "evolution", None)
-            evolution_recorder = getattr(evolution, "record_user_message", None)
-            if callable(evolution_recorder):
-                try:
-                    await evolution_recorder(event)
-                    if hasattr(event, "set_extra"):
-                        event.set_extra("astrmai_evolution_recorded", True)
-                except Exception as exc:
-                    if hasattr(event, "set_extra"):
-                        event.set_extra("astrmai_evolution_record_failed", type(exc).__name__)
-                    logger.debug("[AstrMai] inbound evolution record deferred", exc_info=True)
-                    return False
+            if not self._schedule_evolution_record(event):
+                # A missing scheduler/outbox must never put an LLM call back on
+                # the inbound path. Keep the event accepted and expose the
+                # degraded state for diagnostics; a configured EvolutionManager
+                # will recover through its durable ingress worker.
+                if hasattr(event, "set_extra"):
+                    event.set_extra("astrmai_evolution_record_pending", False)
+                    event.set_extra("astrmai_evolution_recorded", False)
+                    event.set_extra("astrmai_evolution_record_source", "degraded")
+                    event.set_extra("astrmai_evolution_record_failed", "scheduler_unavailable")
         return bool(result)
 
     async def handle_group_reply_wait(self, event, scope) -> str:
@@ -564,6 +567,179 @@ class PluginFacade(RuntimeFacadeProtocol):
         if user_id and self.runtime.lifecycle.manager:
             self.runtime.lifecycle.manager.track_task(self.update_user_stats(user_id))
 
+    async def _record_evolution_inline(self, event) -> bool:
+        """Compatibility path for runtimes without a lifecycle task manager."""
+        evolution = getattr(self.runtime, "evolution", None)
+        recorder = getattr(evolution, "record_user_message", None)
+        if not callable(recorder):
+            # Some lightweight hosts do not wire the optional learning service;
+            # absence is a no-op, not a failed ingress record.
+            return True
+        try:
+            await recorder(event)
+        except Exception as exc:
+            if hasattr(event, "set_extra"):
+                event.set_extra("astrmai_evolution_record_failed", type(exc).__name__)
+                event.set_extra("astrmai_evolution_record_pending", False)
+                event.set_extra("astrmai_evolution_recorded", False)
+            logger.debug("[AstrMai] inbound evolution record degraded", exc_info=True)
+            return False
+        if hasattr(event, "set_extra"):
+            event.set_extra("astrmai_evolution_recorded", True)
+            event.set_extra("astrmai_evolution_record_source", "inline")
+            event.set_extra("astrmai_evolution_record_attempted", True)
+            event.set_extra("astrmai_evolution_record_pending", False)
+        return True
+
+    def _schedule_evolution_record(self, event) -> bool:
+        evolution = getattr(self.runtime, "evolution", None)
+        recorder = getattr(evolution, "record_user_message", None)
+        manager = getattr(getattr(self.runtime, "lifecycle", None), "manager", None)
+        if not callable(recorder):
+            return False
+
+        from ..learning.contracts.learning_envelope import LearningMessageEnvelope
+
+        if hasattr(event, "get_extra") and event.get_extra(
+            "astrmai_evolution_record_scheduled", False
+        ):
+            return True
+        envelope = LearningMessageEnvelope.from_event(event)
+
+        def schedule(awaitable) -> bool:
+            if manager is not None and hasattr(manager, "track_task"):
+                try:
+                    track_task = manager.track_task
+                    try:
+                        parameters = inspect.signature(track_task).parameters
+                        supports_metadata = any(
+                            item.kind is inspect.Parameter.VAR_KEYWORD
+                            for item in parameters.values()
+                        ) or all(
+                            name in parameters
+                            for name in ("task_family", "scope_id", "run_id", "owner")
+                        )
+                    except (TypeError, ValueError):
+                        supports_metadata = False
+                    if supports_metadata:
+                        track_task(
+                            awaitable,
+                            task_family="learning.ingress.enqueue",
+                            scope_id=str(getattr(event, "unified_msg_origin", "") or "GLOBAL"),
+                            run_id=str(getattr(envelope, "event_id", "") or "learning-ingress"),
+                            owner="PluginFacade",
+                        )
+                    else:
+                        track_task(awaitable)
+                    return True
+                except Exception:
+                    # A lifecycle manager can be in the middle of shutdown or
+                    # reload. Keep the immutable envelope alive by falling
+                    # back to an untracked task; the enqueue itself remains
+                    # durable and no LLM work is reintroduced on the reply path.
+                    logger.debug(
+                        "[AstrMai] lifecycle learning ingress scheduling failed; "
+                        "using detached fallback",
+                        exc_info=True,
+                    )
+            registry = getattr(self.runtime, "owner_registry", None)
+            track = getattr(registry, "track", None)
+            try:
+                if callable(track):
+                    task = track(
+                        awaitable,
+                        task_family="learning.ingress.enqueue",
+                        scope_id=str(getattr(event, "unified_msg_origin", "") or "GLOBAL"),
+                        run_id=str(getattr(envelope, "event_id", "") or "learning-ingress"),
+                        owner="PluginFacade",
+                        name="astrmai-learning-ingress-detached",
+                    )
+                else:
+                    task = asyncio.create_task(
+                        awaitable,
+                        name="astrmai-learning-ingress-detached",
+                    )
+            except Exception:
+                close = getattr(awaitable, "close", None)
+                if callable(close):
+                    close()
+                logger.debug("[AstrMai] learning ingress task scheduling failed", exc_info=True)
+                return False
+
+            def consume_result(completed: asyncio.Task) -> None:
+                try:
+                    completed.result()
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    logger.debug(
+                        "[AstrMai] detached learning ingress degraded",
+                        exc_info=True,
+                    )
+
+            task.add_done_callback(consume_result)
+            return True
+
+        enqueue = getattr(evolution, "enqueue_user_message", None)
+        if callable(enqueue):
+            async def _enqueue() -> None:
+                try:
+                    inserted = await enqueue(envelope)
+                except Exception as exc:
+                    inserted = False
+                    logger.debug("[AstrMai] inbound learning outbox enqueue degraded", exc_info=True)
+                if inserted and hasattr(event, "set_extra"):
+                    event.set_extra("astrmai_evolution_recorded", True)
+                    event.set_extra("astrmai_evolution_record_source", "outbox")
+                if hasattr(event, "set_extra"):
+                    event.set_extra("astrmai_evolution_record_pending", False)
+                    if not inserted:
+                        event.set_extra("astrmai_evolution_recorded", False)
+                        event.set_extra("astrmai_evolution_record_failed", "outbox_unavailable")
+                        event.set_extra("astrmai_evolution_record_source", "degraded")
+
+            if hasattr(event, "set_extra"):
+                event.set_extra("astrmai_evolution_record_pending", True)
+                event.set_extra("astrmai_evolution_record_scheduled", True)
+            if not schedule(_enqueue()):
+                if hasattr(event, "set_extra"):
+                    event.set_extra("astrmai_evolution_record_pending", False)
+                    event.set_extra("astrmai_evolution_record_scheduled", False)
+                    event.set_extra("astrmai_evolution_record_failed", "scheduler_unavailable")
+                return False
+            return True
+
+        async def _record() -> None:
+            # Keep the framework event out of the detached task.  The envelope
+            # is immutable and contains only the fields learning needs.
+            evolution = getattr(self.runtime, "evolution", None)
+            recorder = getattr(evolution, "record_user_message", None)
+            if not callable(recorder):
+                return
+            try:
+                await recorder(envelope)
+            except Exception as exc:
+                if hasattr(event, "set_extra"):
+                    event.set_extra("astrmai_evolution_record_failed", type(exc).__name__)
+                    event.set_extra("astrmai_evolution_record_pending", False)
+                    event.set_extra("astrmai_evolution_recorded", False)
+                logger.debug("[AstrMai] inbound evolution record degraded", exc_info=True)
+                return
+            if hasattr(event, "set_extra"):
+                event.set_extra("astrmai_evolution_recorded", True)
+                event.set_extra("astrmai_evolution_record_pending", False)
+
+        if hasattr(event, "set_extra"):
+            event.set_extra("astrmai_evolution_record_pending", True)
+            event.set_extra("astrmai_evolution_record_scheduled", True)
+        if not schedule(_record()):
+            if hasattr(event, "set_extra"):
+                event.set_extra("astrmai_evolution_record_pending", False)
+                event.set_extra("astrmai_evolution_record_scheduled", False)
+                event.set_extra("astrmai_evolution_record_failed", "scheduler_unavailable")
+            return False
+        return True
+
     async def try_consume_reflect_feedback(self, event):
         if self.runtime.reflect_tracker:
             return await self.runtime.reflect_tracker.try_consume_feedback(event)
@@ -575,9 +751,11 @@ class PluginFacade(RuntimeFacadeProtocol):
         if not getattr(scope, "is_anonymous_sender", False) and (
             not incoming_recorded or not evolution_recorded
         ):
-            await self.runtime.evolution.record_user_message(event)
-            if hasattr(event, "set_extra"):
-                event.set_extra("astrmai_evolution_recorded", True)
+            scheduled = self._schedule_evolution_record(event)
+            if scheduled:
+                # Let the detached task claim the record before attention
+                # dispatch, without awaiting its provider/database work.
+                await asyncio.sleep(0)
         if getattr(self.runtime, "chat_loop_kernel", None) is not None:
             tick_result = await self.runtime.chat_loop_kernel.tick(
                 chat_id=scope.chat_id,
@@ -644,6 +822,9 @@ class PluginFacade(RuntimeFacadeProtocol):
             diagnostics["gateway_provider_health"] = gateway.describe_provider_health()
         diagnostics["capabilities"] = self.get_capability_overview_sync()
         return diagnostics
+
+    def get_expression_governance_runner(self):
+        return getattr(self.runtime, "expression_governance_runner", None)
 
     def get_capability_overview_sync(self) -> dict:
         return self.runtime.build_capability_overview_sync()

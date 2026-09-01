@@ -8,6 +8,7 @@ from astrbot.api import logger
 from ...infrastructure.context_economy import PromptTemplateId
 from ...infrastructure.gateway.model_gateway import GlobalModelGateway
 from ...infrastructure.runtime.lane_manager import LaneKey
+from ...infrastructure.runtime.background_task_budget import BackgroundTaskBudget
 from .fact_contract import parse_dream_fact_log
 
 
@@ -21,10 +22,37 @@ class DreamGenerator:
         "恐怖怪谈", "喜剧荒诞", "哲学思辨", "末日废土", "魔法学院", "神话传说",
     ]
 
-    def __init__(self, gateway: GlobalModelGateway, config=None):
+    def __init__(self, gateway: GlobalModelGateway, config=None, background_task_budget=None):
         self.gateway = gateway
         self.config = config if config else gateway.config
         self.prompt_registry = getattr(getattr(gateway, "context_economy", None), "templates", None)
+        self.background_task_budget = background_task_budget or BackgroundTaskBudget()
+
+    async def _call_background_llm(self, *, prompt: str, system_prompt: str, session_id: str, template_envelope=None):
+        kwargs = {
+            "prompt": prompt,
+            "system_prompt": system_prompt,
+            "is_json": False,
+            "lane_key": LaneKey(
+                subsystem="bg",
+                task_family="dream",
+                scope_id=session_id,
+                scope_kind="chat" if session_id != "global" else "global",
+            ),
+            "base_origin": "",
+        }
+        if template_envelope is not None:
+            kwargs["template_envelope"] = template_envelope
+
+        async def _call():
+            return await self.gateway.call_data_process_task(**kwargs)
+
+        return await self.background_task_budget.run(
+            _call,
+            task_name="dream",
+            scope_id=session_id,
+            defer_release_on_timeout=True,
+        )
 
     @staticmethod
     def _resolve_scope(session_id: str) -> tuple[str, str]:
@@ -69,12 +97,10 @@ class DreamGenerator:
                         "dream_log": normalized_dream_log[:800],
                     },
                 )
-                result = await self.gateway.call_data_process_task(
+                result = await self._call_background_llm(
                     prompt=envelope.prompt,
                     system_prompt=envelope.system_prompt,
-                    is_json=False,
-                    lane_key=LaneKey(subsystem="bg", task_family="dream", scope_id=lane_scope_id, scope_kind=lane_scope_kind),
-                    base_origin="",
+                    session_id=lane_scope_id,
                     template_envelope=envelope,
                 )
             else:
@@ -94,12 +120,10 @@ class DreamGenerator:
 4. 保持 {persona_name} 的人格与说话方式。
 5. 直接输出梦境日记，不要解释。
 """
-                result = await self.gateway.call_data_process_task(
+                result = await self._call_background_llm(
                     prompt=prompt,
-                    is_json=False,
                     system_prompt="你是一个善于幻想与创作的写作助手，擅长用诗意的语言描述梦境。",
-                    lane_key=LaneKey(subsystem="bg", task_family="dream", scope_id=lane_scope_id, scope_kind=lane_scope_kind),
-                    base_origin="",
+                    session_id=lane_scope_id,
                 )
 
             dream_text = str(result).strip()

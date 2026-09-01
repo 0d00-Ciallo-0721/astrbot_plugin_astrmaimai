@@ -11,7 +11,7 @@ from typing import Any, Iterable, List, Sequence
 
 
 class JargonMiner:
-    def __init__(self, expression_miner, min_messages: int = 1, memory_engine=None):
+    def __init__(self, expression_miner, min_messages: int = 1, memory_engine=None, background_task_budget=None):
         self.expression_miner = expression_miner
         self.min_messages = max(int(min_messages or 1), 1)
         self.memory_engine = memory_engine
@@ -20,7 +20,15 @@ class JargonMiner:
         self.candidate_extractor = JargonCandidateExtractor(
             min_count=getattr(getattr(config, "evolution", None), "jargon_min_count", 2)
         )
-        self.enricher = JargonEnricher(gateway, config=config) if gateway is not None else None
+        self.enricher = (
+            JargonEnricher(
+                gateway,
+                config=config,
+                background_task_budget=background_task_budget,
+            )
+            if gateway is not None
+            else None
+        )
         self.input_policy = LearningInputPolicy()
         self.last_report: dict[str, Any] = {}
 

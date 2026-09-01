@@ -19,7 +19,7 @@ from .topic_summarizer import TopicSummarizer
 class SessionMemorySummarizer:
     """Authoritative long-horizon memory summarization implementation."""
 
-    def __init__(self, context, gateway, engine, config=None):
+    def __init__(self, context, gateway, engine, config=None, background_task_budget=None):
         self.context = context
         self.gateway = gateway
         self.engine = engine
@@ -27,9 +27,10 @@ class SessionMemorySummarizer:
         self.prompt_registry = getattr(getattr(gateway, "context_economy", None), "templates", None)
         self.check_interval = getattr(self.config.memory, "cleanup_interval", 3600)
         self.msg_threshold = getattr(self.config.memory, "summary_threshold", 30)
-        self.processor = MemoryProcessor(gateway)
-        self.topic_summarizer = TopicSummarizer(gateway, config)
-        self.claim_extractor = MemoryClaimExtractor(gateway)
+        self.background_task_budget = background_task_budget or getattr(engine, "background_task_budget", None)
+        self.processor = MemoryProcessor(gateway, background_task_budget=self.background_task_budget)
+        self.topic_summarizer = TopicSummarizer(gateway, config, background_task_budget=self.background_task_budget)
+        self.claim_extractor = MemoryClaimExtractor(gateway, background_task_budget=self.background_task_budget)
         self.conflict_resolver = MemoryConflictResolver()
 
     def refresh_config(self, config) -> None:

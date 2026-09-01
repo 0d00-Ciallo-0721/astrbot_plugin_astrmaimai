@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import json
-import re
 from typing import Any
+
+from ...infrastructure.gateway.json_utils import parse_json_contract
 
 
 class ProfileGenerator:
@@ -68,16 +68,23 @@ class ProfileGenerator:
         tags: list[str] = []
         analysis = ""
         memory_points: list[str] = []
+        parse_status = "parse_failed"
         data = result if isinstance(result, dict) else None
         text = "" if data is not None else str(result or "").strip()
         if data is None and not text:
-            return {"tags": tags, "analysis": analysis, "memory_points": memory_points}
+            return {"tags": tags, "analysis": analysis, "memory_points": memory_points, "parse_status": "empty"}
 
         try:
-            if data is None:
-                match = re.search(r"\{.*\}", text, re.DOTALL)
-                if match:
-                    data = json.loads(match.group(0))
+            parsed = parse_json_contract(
+                data if data is not None else text,
+                required_keys=("tags", "memory_points"),
+                optional_keys=("summary", "analysis"),
+                field_types={"tags": list, "summary": str, "analysis": str, "memory_points": list},
+                allow_extra_keys=False,
+                allow_naked_members=True,
+            )
+            parse_status = parsed.terminal_status
+            data = parsed.value if parsed.schema_valid else None
             if isinstance(data, dict):
                 raw_tags = data.get("tags", [])
                 if isinstance(raw_tags, list):
@@ -98,12 +105,17 @@ class ProfileGenerator:
                         category = str(item.get("category", "其他") or "其他").strip()
                         weight = item.get("weight", 0.5)
                         memory_points.append(f"{category}:{content}:{weight}")
-        except (json.JSONDecodeError, TypeError, ValueError):
-            pass
+        except (TypeError, ValueError):
+            parse_status = "parse_failed"
 
-        if not analysis:
+        if not analysis and parse_status == "parsed":
             analysis = text
-        return {"tags": tags, "analysis": analysis, "memory_points": memory_points}
+        return {
+            "tags": tags,
+            "analysis": analysis,
+            "memory_points": memory_points,
+            "parse_status": parse_status,
+        }
 
     def categorize_memory_points(self, memory_points: Any) -> dict[str, list[str]]:
         buckets = {

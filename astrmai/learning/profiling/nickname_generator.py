@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import json
-import re
 from typing import Any
+
+from ...infrastructure.gateway.json_utils import parse_json_contract
 
 
 class NicknameGenerator:
@@ -41,17 +41,27 @@ class NicknameGenerator:
 """
 
     def parse_result(self, result: Any) -> tuple[str, str]:
+        self.last_parse_status = "parse_failed"
         text = str(result or "").strip()
         if not text:
+            self.last_parse_status = "empty"
             return "", ""
         try:
-            match = re.search(r"\{.*\}", text, re.DOTALL)
-            if match:
-                data = json.loads(match.group(0))
+            parsed = parse_json_contract(
+                text,
+                required_keys=("nickname", "reason"),
+                field_types={"nickname": str, "reason": str},
+                allow_extra_keys=False,
+                allow_naked_members=True,
+            )
+            data = parsed.value
+            if parsed.schema_valid and isinstance(data, dict):
+                self.last_parse_status = parsed.terminal_status
                 nickname = str(data.get("nickname", "") or "").strip()
                 reason = str(data.get("reason", "") or "").strip()
                 return nickname, reason
         except Exception:
+            self.last_parse_status = "parse_failed"
             pass
         return "", ""
 

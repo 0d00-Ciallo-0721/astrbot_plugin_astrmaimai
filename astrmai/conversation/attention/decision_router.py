@@ -438,6 +438,14 @@ class AttentionDecisionRouter:
                 await _settle_budget_failure("degraded", exc)
 
         task = asyncio.create_task(_run_budgeted_validation())
+        register = getattr(self.gate, "_register_owner_task", None)
+        if callable(register):
+            register(
+                task,
+                task_family="attention.judge_validation",
+                scope_id=normalized_chat_id or "GLOBAL",
+                run_id=f"judge-validation-{int(time.time() * 1000)}",
+            )
         self._validation_tasks.add(task)
         self._validation_tasks_by_chat[normalized_chat_id] = task
         gate_background_tasks = getattr(self.gate, "_background_tasks", None)
@@ -904,6 +912,14 @@ class AttentionDecisionRouter:
         timeout_sec: float,
     ) -> Any:
         task = asyncio.create_task(coroutine)
+        register = getattr(self.gate, "_register_owner_task", None)
+        if callable(register):
+            register(
+                task,
+                task_family="attention.judge",
+                scope_id="GLOBAL",
+                run_id=f"judge-{int(time.time() * 1000)}",
+            )
         done, _ = await asyncio.wait({task}, timeout=timeout_sec)
         if task in done:
             return task.result()

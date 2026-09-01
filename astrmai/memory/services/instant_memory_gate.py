@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import json
 import re
 from typing import Any
 
 from astrbot.api import logger
 
 from ...infrastructure.context_economy import PromptTemplateId
+from ...infrastructure.gateway.json_utils import parse_json_contract
 from ...infrastructure.runtime.lane_manager import LaneKey
 from ..contracts.memory_query import CommittedMemoryTurn, InstantGateResult, MemoryWriteRequest
 from .memory_claim_service import MemoryClaimExtractor, MemoryConflictResolver
@@ -316,13 +316,30 @@ class InstantMemoryGate:
         return await self._consume_llm_backfill_response(turn, response)
 
     async def _consume_llm_backfill_response(self, turn: CommittedMemoryTurn, response: Any) -> InstantGateResult:
-        try:
-            if isinstance(response, str):
-                response = json.loads(response)
-        except Exception:
-            logger.debug("[AstrMai-gate] backfill response parse failed", exc_info=True)
+        parsed = parse_json_contract(
+            response,
+            required_keys=("worth",),
+            optional_keys=("fact", "evidence"),
+            field_types={"worth": bool, "fact": str},
+            allow_extra_keys=False,
+            allow_naked_members=True,
+        )
+        if not parsed.schema_valid:
+            logger.debug(
+                "[AstrMai-gate] backfill response rejected "
+                f"status={parsed.terminal_status} missing={list(parsed.missing_keys)} "
+                f"unexpected={list(parsed.unexpected_keys)}"
+            )
+            await self._observe(
+                turn,
+                "backfill_failed",
+                level="error",
+                reason=parsed.terminal_status,
+                summary="invalid structured backfill response",
+            )
             return InstantGateResult()
-        if not isinstance(response, dict) or not bool(response.get("worth")):
+        response = dict(parsed.value)
+        if not bool(response.get("worth")):
             await self._observe(turn, "backfill_skipped", reason="worth_false", summary="llm backfill judged not worth memorizing")
             return InstantGateResult()
         fact = str(response.get("fact") or "").strip()

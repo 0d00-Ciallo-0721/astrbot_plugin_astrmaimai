@@ -4,6 +4,7 @@ from astrbot.api import logger
 
 from ..context_economy import PromptEnvelope, WorkloadFamily
 from ..runtime.lane_manager import LaneKey
+from ..runtime.runtime_contracts import LLMCallResult
 from .gateway_exceptions import LLMCascadeFailureException
 
 
@@ -369,7 +370,7 @@ class GatewayTaskMixin:
         )
         return result.parsed_json if is_json else result.text
 
-    async def call_proactive_task(
+    async def call_proactive_task_result(
         self,
         prompt: str,
         system_prompt: str = "",
@@ -379,7 +380,7 @@ class GatewayTaskMixin:
         persona_id: str = "",
         workload_family: Optional[WorkloadFamily] = None,
         template_envelope: Optional[PromptEnvelope] = None,
-    ) -> str:
+    ) -> LLMCallResult:
         task_models = self._task_models()
         resolved_family = workload_family or self.context_economy.infer_workload_family(
             lane_key=lane_key,
@@ -400,8 +401,8 @@ class GatewayTaskMixin:
                 persona_id=persona_id,
                 template_envelope=template_envelope,
             )
-            return result.text
-        result = await self._elastic_call_result(
+            return result
+        return await self._elastic_call_result(
             "task",
             prompt,
             system_prompt,
@@ -431,6 +432,28 @@ class GatewayTaskMixin:
             ledger_stage=f"proactive.{resolved_family.value}",
             ledger_family=resolved_family.value,
             ledger_critical_path=False,
+        )
+
+    async def call_proactive_task(
+        self,
+        prompt: str,
+        system_prompt: str = "",
+        lane_key: Optional[LaneKey] = None,
+        base_origin: str = "",
+        prefix_hash: str = "",
+        persona_id: str = "",
+        workload_family: Optional[WorkloadFamily] = None,
+        template_envelope: Optional[PromptEnvelope] = None,
+    ) -> str:
+        result = await self.call_proactive_task_result(
+            prompt=prompt,
+            system_prompt=system_prompt,
+            lane_key=lane_key,
+            base_origin=base_origin,
+            prefix_hash=prefix_hash,
+            persona_id=persona_id,
+            workload_family=workload_family,
+            template_envelope=template_envelope,
         )
         return result.text
 

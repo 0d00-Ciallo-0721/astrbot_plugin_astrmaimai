@@ -2,9 +2,8 @@
 """
 Dream maintenance agent.
 
-The agent periodically inspects legacy MemoryEvent rows as maintenance seeds,
-then uses read-only/search and maintenance tools to merge, rewrite, or prune
-their canonical projections.
+The agent uses canonical Memory V2 records as maintenance seeds and falls back
+to legacy MemoryEvent rows only when no canonical records are available.
 """
 
 from __future__ import annotations
@@ -22,6 +21,8 @@ from astrbot.api import logger
 from ...infrastructure.gateway.model_gateway import GlobalModelGateway
 from ...infrastructure.persistence.database_service import DatabaseService
 from ...infrastructure.runtime.lane_manager import LaneKey
+from ...infrastructure.runtime.background_task_budget import BackgroundTaskBudget
+from ...infrastructure.gateway.json_utils import parse_json_contract
 from ..contracts.memory_query import MemoryQuery
 from .fact_contract import format_dream_fact_log, normalize_dream_facts
 
@@ -53,11 +54,34 @@ class DreamAgent:
         db_service: DatabaseService,
         memory_engine=None,
         config=None,
+        background_task_budget=None,
     ):
         self.gateway = gateway
         self.db = db_service
         self.memory_engine = memory_engine
         self.config = config if config else gateway.config
+        self.background_task_budget = background_task_budget or BackgroundTaskBudget()
+
+    async def _call_background_llm(self, *, prompt: str, session_id: str):
+        async def _call():
+            return await self.gateway.call_data_process_task(
+                prompt=prompt,
+                is_json=True,
+                lane_key=LaneKey(
+                    subsystem="bg",
+                    task_family="dream",
+                    scope_id=session_id or "global",
+                    scope_kind="chat" if session_id and session_id != "global" else "global",
+                ),
+                base_origin="",
+            )
+
+        return await self.background_task_budget.run(
+            _call,
+            task_name="dream",
+            scope_id=session_id or "global",
+            defer_release_on_timeout=True,
+        )
 
     async def run_dream_cycle(self, session_id: str = None) -> Optional[str]:
         if not session_id:
@@ -107,25 +131,18 @@ class DreamAgent:
             logger.debug(f"[DreamAgent] dream iteration={iteration}")
 
             try:
-                response = await self.gateway.call_data_process_task(
+                response = await self._call_background_llm(
                     prompt=json.dumps(messages, ensure_ascii=False),
-                    is_json=True,
-                    lane_key=LaneKey(
-                        subsystem="bg",
-                        task_family="dream",
-                        scope_id=session_id or "global",
-                        scope_kind="chat" if session_id and session_id != "global" else "global",
-                    ),
-                    base_origin="",
+                    session_id=session_id,
                 )
             except Exception as exc:
                 logger.error(f"[DreamAgent] LLM call failed: {exc}")
-                break
+                raise RuntimeError("dream_llm_call_failed") from exc
 
             action = self._parse_action(response)
             if not action:
-                logger.debug("[DreamAgent] unable to parse action, ending cycle")
-                break
+                logger.debug("[DreamAgent] unable to parse action, retry required")
+                raise ValueError("dream_action_parse_failed")
 
             tool_name = action.get("tool", "")
             params = action.get("params", {})
@@ -202,6 +219,18 @@ class DreamAgent:
         if not event_id:
             return "参数缺失: event_id"
         try:
+            v2_store = getattr(self.memory_engine, "v2_store", None) if self.memory_engine else None
+            getter = getattr(v2_store, "get_by_id", None)
+            if self._is_canonical_memory_id(event_id) and callable(getter):
+                memory = await getter(str(event_id), allow_stale=True)
+                if memory:
+                    metadata = dict(getattr(memory, "metadata", {}) or {})
+                    return (
+                        f"叙事: {getattr(memory, 'content', '')}\n"
+                        f"情感: {metadata.get('emotion', '')}\n"
+                        f"重要度: {getattr(memory, 'importance', 0)}"
+                    )
+                return "未找到该记忆"
             event = await asyncio.to_thread(self._get_event_by_id, event_id)
             if event:
                 if event.get("error"):
@@ -233,6 +262,9 @@ class DreamAgent:
                     return "合并失败: 新记忆写入被过滤或失败"
                 canonical_ids = []
                 for event_id in event_ids:
+                    if self._is_canonical_memory_id(event_id):
+                        canonical_ids.append(str(event_id))
+                        continue
                     finder = getattr(getattr(self.memory_engine, "v2_store", None), "find_ids_by_source_ref", None)
                     if finder:
                         canonical_ids.extend(await finder(f"MemoryEvent:{event_id}"))
@@ -325,15 +357,19 @@ class DreamAgent:
         if not event_id:
             return "参数缺失: event_id"
         try:
-            logger.info(
-                f"[DreamAgent] legacy delete skipped for {event_id}; "
-                f"soft-deleting canonical by source_ref only"
-            )
             if self.memory_engine:
+                maintenance = getattr(self.memory_engine, "maintenance_service", None)
+                if self._is_canonical_memory_id(event_id) and maintenance:
+                    await maintenance.soft_delete(str(event_id), reason=reason)
+                    return f"Deleted memory {event_id} (reason: {reason})"
+                logger.info(
+                    f"[DreamAgent] legacy delete skipped for {event_id}; "
+                    f"soft-deleting canonical by source_ref only"
+                )
                 finder = getattr(getattr(self.memory_engine, "v2_store", None), "find_ids_by_source_ref", None)
-                if finder and getattr(self.memory_engine, "maintenance_service", None):
+                if finder and maintenance:
                     for memory_id in await finder(f"MemoryEvent:{event_id}"):
-                        await self.memory_engine.maintenance_service.soft_delete(memory_id, reason=reason)
+                        await maintenance.soft_delete(memory_id, reason=reason)
             return f"Deleted memory {event_id} (reason: {reason})"
         except Exception as exc:
             return f"删除失败: {exc}"
@@ -443,6 +479,48 @@ class DreamAgent:
             "importance": event.importance,
         }
 
+    @staticmethod
+    def _serialize_canonical_seed(memory) -> Dict[str, Any]:
+        metadata = dict(getattr(memory, "metadata", {}) or {})
+        narrative = str(getattr(memory, "content", "") or getattr(memory, "summary", "") or "")
+        return {
+            "event_id": str(getattr(memory, "id", "") or ""),
+            "narrative": narrative,
+            "emotion": str(metadata.get("emotion", "") or ""),
+            "importance": float(getattr(memory, "importance", 0.5) or 0.5),
+            "session_id": str(getattr(memory, "session_id", "") or ""),
+            "source": "memory_v2",
+        }
+
+    async def _load_canonical_candidates(self, session_id: str = "", *, limit: int) -> list[Any]:
+        store = getattr(self.memory_engine, "v2_store", None) if self.memory_engine else None
+        loader = getattr(store, "list_candidates", None)
+        if not callable(loader):
+            return []
+        candidates = list(
+            await loader(
+                session_id=str(session_id or ""),
+                limit=max(1, int(limit or self.SEED_QUERY_LIMIT)),
+                include_inactive=False,
+            )
+            or []
+        )
+        if not session_id:
+            return candidates
+        return [
+            item
+            for item in candidates
+            if str(getattr(item, "session_id", "") or "") == str(session_id)
+        ]
+
+    async def _load_canonical_seed_events(self, session_id: str, *, limit: int) -> List[Dict[str, Any]]:
+        candidates = await self._load_canonical_candidates(session_id, limit=limit)
+        return [
+            self._serialize_canonical_seed(item)
+            for item in candidates
+            if str(getattr(item, "content", "") or getattr(item, "summary", "") or "").strip()
+        ]
+
     def _load_session_events(self, session, session_id: str):
         from ...infrastructure.persistence import MemoryEvent
         from sqlmodel import desc, select
@@ -480,6 +558,22 @@ class DreamAgent:
         from sqlmodel import select
 
         try:
+            candidates = await self._load_canonical_candidates("", limit=500)
+            buckets: dict[str, int] = {}
+            for item in candidates:
+                session_key = str(getattr(item, "session_id", "") or "")
+                if session_key:
+                    buckets[session_key] = buckets.get(session_key, 0) + 1
+            selected = self._select_session_bucket(
+                [key for key, count in buckets.items() if count >= self.MIN_EVENTS_TO_DREAM],
+                preferred_session_id=preferred_session_id,
+            )
+            if selected:
+                return selected
+        except Exception as exc:
+            logger.warning(f"[DreamAgent] failed to choose canonical session: {exc}")
+
+        try:
             def _query():
                 with self.db.get_session() as session:
                     stmt = select(MemoryEvent.session_id, MemoryEvent.date)
@@ -510,6 +604,16 @@ class DreamAgent:
             return 0
 
         try:
+            canonical = await self._load_canonical_candidates(
+                session_id,
+                limit=max(self.SEED_QUERY_LIMIT, self.MIN_EVENTS_TO_DREAM),
+            )
+            if canonical:
+                return len(canonical)
+        except Exception as exc:
+            logger.warning(f"[DreamAgent] failed to count canonical seed events: {exc}")
+
+        try:
             def _query() -> int:
                 with self.db.get_session() as session:
                     count = session.exec(
@@ -529,6 +633,16 @@ class DreamAgent:
 
     async def _get_seed_events(self, session_id: str) -> List[Dict]:
         try:
+            canonical = await self._load_canonical_seed_events(
+                session_id,
+                limit=self.SEED_QUERY_LIMIT,
+            )
+            if canonical:
+                return random.sample(canonical, min(self.SEED_SAMPLE_SIZE, len(canonical)))
+        except Exception as exc:
+            logger.warning(f"[DreamAgent] failed to fetch canonical seed events: {exc}")
+
+        try:
             def _query():
                 with self.db.get_session() as session:
                     events = self._load_session_events(session, session_id)
@@ -542,19 +656,19 @@ class DreamAgent:
 
     @staticmethod
     def _parse_action(response) -> Optional[Dict]:
-        try:
-            if isinstance(response, dict):
+        if isinstance(response, dict):
+            required = {"tool", "params"}
+            if required.issubset(response) and isinstance(response.get("tool"), str) and isinstance(response.get("params"), dict):
                 return response
-            raw = str(response)
-            match = json.loads(raw) if raw.strip().startswith("{") and raw.strip().endswith("}") else None
-            if isinstance(match, dict):
-                return match
-            regex_match = re.search(r"\{.*\}", raw, re.DOTALL)
-            if regex_match:
-                return json.loads(regex_match.group(0))
-        except Exception:
-            pass
-        return None
+        parsed = parse_json_contract(
+            response,
+            required_keys=("tool", "params"),
+            optional_keys=("thought",),
+            field_types={"tool": str, "params": dict, "thought": str},
+            allow_extra_keys=False,
+            allow_naked_members=True,
+        )
+        return dict(parsed.value) if parsed.schema_valid else None
 
 
 __all__ = ["DreamAgent"]

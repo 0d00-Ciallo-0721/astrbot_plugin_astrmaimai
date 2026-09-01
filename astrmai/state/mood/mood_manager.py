@@ -1,13 +1,11 @@
 import asyncio
-import ast
-import json
 import math
-import re
 from typing import Any, Tuple
 
 from astrbot.api import logger
 
 from ...infrastructure.gateway import GlobalModelGateway
+from ...infrastructure.gateway.json_utils import parse_json_contract
 from ...infrastructure.runtime.lane_manager import LaneKey
 from ...shared.emotion_tags import build_emotion_tag_catalog
 
@@ -74,63 +72,21 @@ class MoodManager:
         return None
 
     def _parse_result_payload(self, result: Any) -> dict[str, Any]:
-        if isinstance(result, dict):
-            return dict(result)
-        raw_str = str(result or "").strip()
-        if not raw_str:
-            return {}
-        clean_str = re.sub(r"```(?:json)?", "", raw_str, flags=re.IGNORECASE).strip()
-        data: dict[str, Any] = {}
-        parsed_successfully = False
-
-        match = re.search(r"(\{.*\}|\[.*\])", clean_str, re.DOTALL)
-        if match:
-            json_str = match.group(1)
-            try:
-                parsed_data = json.loads(json_str)
-                if isinstance(parsed_data, list) and parsed_data and isinstance(parsed_data[0], dict):
-                    data = parsed_data[0]
-                elif isinstance(parsed_data, dict):
-                    data = parsed_data
-                if data:
-                    parsed_successfully = True
-            except json.JSONDecodeError as exc:
-                logger.debug(f"[MoodManager] standard JSON parse failed, trying AST fallback: {exc}")
-                if len(json_str) > 10000:  # ponytail: size guard against LLM hallucination
-                    pass
-                else:
-                    try:
-                        eval_data = ast.literal_eval(json_str)
-                        if isinstance(eval_data, list) and eval_data and isinstance(eval_data[0], dict):
-                            data = eval_data[0]
-                        elif isinstance(eval_data, dict):
-                            data = eval_data
-                        if data:
-                            parsed_successfully = True
-                    except Exception:
-                        logger.debug("[AstrMai-mood] AST literal_eval failed", exc_info=True)
-
-        if not parsed_successfully or ("mood_tag" not in data and "mood_value" not in data):
-            logger.debug(f"[MoodManager] structured parse failed, trying regex extraction: {clean_str[:80]}...")
-            tag_match = re.search(
-                r'(?:"|\')?mood_tag(?:"|\')?\s*[:：]\s*(?:"|\')?([\w-]+)(?:"|\')?',
-                clean_str,
-                re.IGNORECASE,
-            )
-            if tag_match:
-                data["mood_tag"] = tag_match.group(1).lower()
-
-            val_match = re.search(
-                r'(?:"|\')?mood_value(?:"|\')?\s*[:：]\s*([-+]?\d*\.?\d+)',
-                clean_str,
-                re.IGNORECASE,
-            )
-            if val_match:
-                try:
-                    data["mood_value"] = float(val_match.group(1))
-                except ValueError:
-                    pass
-        return data
+        parsed = parse_json_contract(
+            result,
+            required_keys=("mood_tag", "mood_value"),
+            field_types={"mood_tag": str, "mood_value": (int, float)},
+            allow_extra_keys=False,
+            allow_naked_members=True,
+        )
+        if parsed.schema_valid:
+            return dict(parsed.value)
+        logger.debug(
+            "[MoodManager] structured output rejected "
+            f"status={parsed.terminal_status} missing={list(parsed.missing_keys)} "
+            f"unexpected={list(parsed.unexpected_keys)}"
+        )
+        return {}
 
     def _normalize_result(self, data: dict[str, Any], current_mood: float) -> tuple[str, float] | None:
         if not isinstance(data, dict):

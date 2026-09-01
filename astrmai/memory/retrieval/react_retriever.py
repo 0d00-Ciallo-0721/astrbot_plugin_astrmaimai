@@ -10,6 +10,7 @@ from astrbot.api import logger
 
 from ...infrastructure.runtime.lane_manager import LaneKey
 from ...infrastructure.runtime.turn_call_ledger import clamp_timeout_to_turn_budget
+from ...infrastructure.gateway.json_utils import parse_json_payload
 from ..contracts.memory_query import MemoryQuery
 from ..contracts.retrieval_trace import RetrievalTrace
 
@@ -163,7 +164,7 @@ class ReActRetriever:
                 ),
                 timeout=self._question_timeout_seconds(),
             )
-            data = self._safe_parse_json(result)
+            data = self._safe_parse_json(result, allowed_keys=("need_search", "question"))
             if data.get("need_search") and data.get("question"):
                 return str(data["question"])
         except Exception as exc:  # pragma: no cover - defensive fallback
@@ -206,7 +207,7 @@ class ReActRetriever:
                 base_origin=chat_id,
                 **step_kwargs,
             )
-            return self._safe_parse_json(result)
+            return self._safe_parse_json(result, allowed_keys=("thinking", "tool", "args"))
         except Exception as exc:  # pragma: no cover - defensive fallback
             logger.debug(f"[ReAct] step failed: {exc}")
         return None
@@ -326,17 +327,16 @@ class ReActRetriever:
             return f"查询知识节点失败: {exc}"
 
     @staticmethod
-    def _safe_parse_json(raw) -> Dict:
-        if isinstance(raw, dict):
-            return raw
-        if isinstance(raw, str):
-            chunk = ReActRetriever._extract_braced_json(raw)
-            if chunk:
-                try:
-                    return json.loads(chunk)
-                except json.JSONDecodeError:
-                    pass
-        return {}
+    def _safe_parse_json(raw, *, allowed_keys=()) -> Dict:
+        try:
+            parsed = parse_json_payload(
+                raw,
+                allowed_keys=allowed_keys,
+                allow_naked_members=bool(allowed_keys),
+            )
+        except ValueError:
+            return {}
+        return parsed.value if isinstance(parsed.value, dict) else {}
 
     @staticmethod
     def _extract_braced_json(text: str):

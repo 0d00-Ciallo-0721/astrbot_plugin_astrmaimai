@@ -241,6 +241,116 @@ _MIGRATIONS: list[tuple[int, str]] = [
         payload_json TEXT NOT NULL DEFAULT '{}'
     )"""),
     (95, "CREATE INDEX IF NOT EXISTS ix_proactive_dispatch_history_created ON proactive_dispatch_history(created_at DESC, id DESC)"),
+    (96, """CREATE TABLE IF NOT EXISTS dream_run (
+        run_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT '',
+        attempt INTEGER NOT NULL DEFAULT 1,
+        seed_event_ids_json TEXT NOT NULL DEFAULT '[]',
+        maintenance_summary TEXT NOT NULL DEFAULT '',
+        maintenance_actions_json TEXT NOT NULL DEFAULT '[]',
+        dream_text_hash TEXT NOT NULL DEFAULT '',
+        promotion_report_json TEXT NOT NULL DEFAULT '{}',
+        stage_status_json TEXT NOT NULL DEFAULT '{}',
+        error TEXT NOT NULL DEFAULT '',
+        started_at REAL NOT NULL DEFAULT 0,
+        completed_at REAL NOT NULL DEFAULT 0,
+        updated_at REAL NOT NULL DEFAULT 0
+    )"""),
+    (97, "CREATE INDEX IF NOT EXISTS ix_dream_run_session_started ON dream_run(session_id, started_at DESC)"),
+    (98, """CREATE TABLE IF NOT EXISTS user_profile_revision (
+        revision_id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        source TEXT NOT NULL DEFAULT '',
+        summary TEXT NOT NULL DEFAULT '',
+        tags_json TEXT NOT NULL DEFAULT '[]',
+        memory_points_json TEXT NOT NULL DEFAULT '[]',
+        changed_fields_json TEXT NOT NULL DEFAULT '[]',
+        model_id TEXT NOT NULL DEFAULT '',
+        run_id TEXT NOT NULL DEFAULT '',
+        created_at REAL NOT NULL DEFAULT 0
+    )"""),
+    (99, "CREATE INDEX IF NOT EXISTS ix_user_profile_revision_user_created ON user_profile_revision(user_id, created_at DESC)"),
+    (100, """CREATE TABLE IF NOT EXISTS memory_turn_ledger (
+        turn_id TEXT PRIMARY KEY,
+        chat_id TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'recorded',
+        first_seen_at REAL NOT NULL DEFAULT 0,
+        committed_at REAL NOT NULL DEFAULT 0,
+        last_error TEXT NOT NULL DEFAULT '',
+        updated_at REAL NOT NULL DEFAULT 0
+    )"""),
+    (101, "CREATE INDEX IF NOT EXISTS ix_memory_turn_ledger_chat_updated ON memory_turn_ledger(chat_id, updated_at DESC)"),
+    (102, """CREATE TABLE IF NOT EXISTS learning_ingest_outbox (
+        event_id TEXT PRIMARY KEY,
+        envelope_json TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'queued',
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_retry_at REAL NOT NULL DEFAULT 0,
+        lease_until REAL NOT NULL DEFAULT 0,
+        last_error TEXT NOT NULL DEFAULT '',
+        created_at REAL NOT NULL DEFAULT 0,
+        updated_at REAL NOT NULL DEFAULT 0
+    )"""),
+    (103, "CREATE INDEX IF NOT EXISTS ix_learning_ingest_outbox_due ON learning_ingest_outbox(status, next_retry_at)"),
+    (104, """CREATE TABLE IF NOT EXISTS background_task_ledger (
+        task_id TEXT PRIMARY KEY,
+        task_family TEXT NOT NULL,
+        scope_id TEXT NOT NULL DEFAULT '',
+        scheduled_at REAL NOT NULL DEFAULT 0,
+        started_at REAL NOT NULL DEFAULT 0,
+        finished_at REAL NOT NULL DEFAULT 0,
+        lease_until REAL NOT NULL DEFAULT 0,
+        lease_token TEXT NOT NULL DEFAULT '',
+        input_fingerprint TEXT NOT NULL DEFAULT '',
+        checkpoint_before TEXT NOT NULL DEFAULT '{}',
+        checkpoint_after TEXT NOT NULL DEFAULT '{}',
+        llm_call_count INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'queued',
+        retry_count INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT NOT NULL DEFAULT '',
+        payload_json TEXT NOT NULL DEFAULT '{}',
+        created_at REAL NOT NULL DEFAULT 0,
+        updated_at REAL NOT NULL DEFAULT 0,
+        UNIQUE(task_family, scope_id, input_fingerprint)
+    )"""),
+    (105, "CREATE INDEX IF NOT EXISTS ix_background_task_ledger_scope_status ON background_task_ledger(task_family, scope_id, status, lease_until)"),
+    (106, """CREATE TABLE IF NOT EXISTS reflection_outbox (
+        reflection_id TEXT PRIMARY KEY,
+        chat_id TEXT NOT NULL DEFAULT '',
+        pattern_id TEXT NOT NULL DEFAULT '',
+        payload_json TEXT NOT NULL DEFAULT '{}',
+        status TEXT NOT NULL DEFAULT 'queued',
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_retry_at REAL NOT NULL DEFAULT 0,
+        lease_until REAL NOT NULL DEFAULT 0,
+        lease_token TEXT NOT NULL DEFAULT '',
+        last_error TEXT NOT NULL DEFAULT '',
+        created_at REAL NOT NULL DEFAULT 0,
+        updated_at REAL NOT NULL DEFAULT 0
+    )"""),
+    (107, "CREATE INDEX IF NOT EXISTS ix_reflection_outbox_due ON reflection_outbox(status, next_retry_at, chat_id)"),
+    (108, """CREATE TABLE IF NOT EXISTS dream_completion_outbox (
+        request_key TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL DEFAULT '',
+        session_id TEXT NOT NULL DEFAULT '',
+        payload_json TEXT NOT NULL DEFAULT '{}',
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at REAL NOT NULL DEFAULT 0,
+        updated_at REAL NOT NULL DEFAULT 0
+    )"""),
+    (109, "CREATE INDEX IF NOT EXISTS ix_dream_completion_outbox_updated ON dream_completion_outbox(status, updated_at)"),
+    (110, "ALTER TABLE reply_commit_outbox ADD COLUMN lease_until REAL NOT NULL DEFAULT 0"),
+    (111, "ALTER TABLE reply_commit_outbox ADD COLUMN lease_token TEXT NOT NULL DEFAULT ''"),
+    (112, "CREATE INDEX IF NOT EXISTS ix_reply_commit_outbox_lease ON reply_commit_outbox(next_retry_at, lease_until)"),
+    (113, "ALTER TABLE dream_completion_outbox ADD COLUMN lease_until REAL NOT NULL DEFAULT 0"),
+    (114, "ALTER TABLE dream_completion_outbox ADD COLUMN lease_token TEXT NOT NULL DEFAULT ''"),
+    (115, "CREATE INDEX IF NOT EXISTS ix_dream_completion_outbox_lease ON dream_completion_outbox(status, lease_until)"),
+    (116, "ALTER TABLE memory_turn_ledger ADD COLUMN lease_until REAL NOT NULL DEFAULT 0"),
+    (117, "ALTER TABLE memory_turn_ledger ADD COLUMN lease_token TEXT NOT NULL DEFAULT ''"),
+    (118, "CREATE INDEX IF NOT EXISTS ix_memory_turn_ledger_lease ON memory_turn_ledger(status, lease_until)"),
+    (119, "ALTER TABLE learning_mining_run ADD COLUMN mining_run_id TEXT NOT NULL DEFAULT ''"),
+    (120, "CREATE INDEX IF NOT EXISTS ix_learning_mining_run_mining_run_id ON learning_mining_run(mining_run_id, pipeline, chat_id)"),
 ]
 
 
@@ -255,6 +365,50 @@ def _run_migrations(db: sqlite3.Connection) -> None:
     for version, ddl in _MIGRATIONS:
         if version <= current:
             continue
+        if version in (110, 111, 112):
+            table = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='reply_commit_outbox'"
+            ).fetchone()
+            if not table:
+                db.execute(f"PRAGMA user_version = {version}")
+                logger.info(
+                    f"[AstrMai-DB] migration v{version} skipped "
+                    "(reply_commit_outbox table absent)"
+                )
+                continue
+        if version in (113, 114, 115):
+            table = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='dream_completion_outbox'"
+            ).fetchone()
+            if not table:
+                db.execute(f"PRAGMA user_version = {version}")
+                logger.info(
+                    f"[AstrMai-DB] migration v{version} skipped "
+                    "(dream_completion_outbox table absent)"
+                )
+                continue
+        if version in (116, 117, 118):
+            table = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_turn_ledger'"
+            ).fetchone()
+            if not table:
+                db.execute(f"PRAGMA user_version = {version}")
+                logger.info(
+                    f"[AstrMai-DB] migration v{version} skipped "
+                    "(memory_turn_ledger table absent)"
+                )
+                continue
+        if version in (119, 120):
+            table = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='learning_mining_run'"
+            ).fetchone()
+            if not table:
+                db.execute(f"PRAGMA user_version = {version}")
+                logger.info(
+                    f"[AstrMai-DB] migration v{version} skipped "
+                    "(learning_mining_run table absent)"
+                )
+                continue
         if version == 93:
             table = db.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='proactive_scenario_delivery'"
@@ -297,6 +451,58 @@ async def _run_migrations_async(db: aiosqlite.Connection) -> None:
     for version, ddl in _MIGRATIONS:
         if version <= current:
             continue
+        if version in (110, 111, 112):
+            cursor = await db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='reply_commit_outbox'"
+            )
+            table = await cursor.fetchone()
+            await cursor.close()
+            if not table:
+                await db.execute(f"PRAGMA user_version = {version}")
+                logger.info(
+                    f"[AstrMai-DB] migration v{version} skipped "
+                    "(reply_commit_outbox table absent)"
+                )
+                continue
+        if version in (113, 114, 115):
+            cursor = await db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='dream_completion_outbox'"
+            )
+            table = await cursor.fetchone()
+            await cursor.close()
+            if not table:
+                await db.execute(f"PRAGMA user_version = {version}")
+                logger.info(
+                    f"[AstrMai-DB] migration v{version} skipped "
+                    "(dream_completion_outbox table absent)"
+                )
+                continue
+        if version in (116, 117, 118):
+            cursor = await db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_turn_ledger'"
+            )
+            table = await cursor.fetchone()
+            await cursor.close()
+            if not table:
+                await db.execute(f"PRAGMA user_version = {version}")
+                logger.info(
+                    f"[AstrMai-DB] migration v{version} skipped "
+                    "(memory_turn_ledger table absent)"
+                )
+                continue
+        if version in (119, 120):
+            cursor = await db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='learning_mining_run'"
+            )
+            table = await cursor.fetchone()
+            await cursor.close()
+            if not table:
+                await db.execute(f"PRAGMA user_version = {version}")
+                logger.info(
+                    f"[AstrMai-DB] migration v{version} skipped "
+                    "(learning_mining_run table absent)"
+                )
+                continue
         if version == 93:
             cursor = await db.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='proactive_scenario_delivery'"

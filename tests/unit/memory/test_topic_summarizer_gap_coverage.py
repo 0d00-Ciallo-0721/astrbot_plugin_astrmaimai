@@ -137,6 +137,16 @@ class TopicSummarizerGapCoverageTests(unittest.TestCase):
 
         asyncio.run(_run())
 
+    def test_batch_summarize_parses_fenced_array(self):
+        from astrmai.memory.services.topic_summarizer import TopicSummarizer
+
+        result = TopicSummarizer._parse_summaries(
+            '```json\n["第一段摘要", "第二段摘要"]\n```',
+            2,
+        )
+
+        self.assertEqual(result, ["第一段摘要", "第二段摘要"])
+
     def test_process_history_builds_structured_topic_result(self):
         from astrmai.memory.services.topic_summarizer import TopicSummarizer
 

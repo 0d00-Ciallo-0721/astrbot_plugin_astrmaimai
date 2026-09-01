@@ -1023,6 +1023,13 @@
         "default": 30,
         "hint": "当记忆或对话积累到一定规模后，会更倾向于做摘要压缩。"
       },
+      "long_term_memory_cooldown_sec": {
+        "description": "长期记忆整理冷却（秒）",
+        "type": "int",
+        "default": 7200,
+        "minimum": 60,
+        "hint": "同一会话两次长期记忆整理之间的最短间隔。"
+      },
       "maintenance_concurrency": {
         "description": "记忆维护最大并发数",
         "type": "int",
@@ -1213,6 +1220,20 @@
         "default": 60,
         "hint": "同一会话连续两次学习之间至少间隔多久。"
       },
+      "mining_interval_sec": {
+        "description": "学习挖掘最短间隔（秒）",
+        "type": "int",
+        "default": 21600,
+        "minimum": 60,
+        "hint": "同一会话的黑话与表达习惯学习共用此间隔；未到间隔时只累计证据。"
+      },
+      "learning_mining_interval_sec": {
+        "description": "学习挖掘规范间隔（秒）",
+        "type": "int",
+        "default": null,
+        "minimum": 60,
+        "hint": "优先使用规范字段；留空时沿用旧版学习间隔设置。"
+      },
       "review_batch_size": {
         "description": "单轮自动审核数量",
         "type": "int",
@@ -1324,6 +1345,30 @@
         "maximum": 365,
         "hint": "仅清理学习诊断流水，不影响表达、黑话、消息证据或学习游标。"
       },
+      "message_log_retention_days": {
+        "description": "已消费消息日志保留天数",
+        "type": "int",
+        "default": 90,
+        "minimum": 7,
+        "maximum": 3650,
+        "hint": "只清理已被表达和黑话两条学习管线共同越过、且没有图片关联的消息。"
+      },
+      "message_log_cleanup_batch_size": {
+        "description": "消息日志单次清理上限",
+        "type": "int",
+        "default": 500,
+        "minimum": 10,
+        "maximum": 5000,
+        "hint": "使用分批删除，避免后台维护长时间占用数据库。"
+      },
+      "message_log_cleanup_interval_sec": {
+        "description": "消息日志清理间隔（秒）",
+        "type": "int",
+        "default": 86400,
+        "minimum": 3600,
+        "maximum": 604800,
+        "hint": "跨重载由后台任务账本保持该间隔。"
+      },
       "learning_run_max_per_pipeline_chat": {
         "description": "单管线单会话运行记录上限",
         "type": "int",
@@ -1335,13 +1380,13 @@
       "review_runner_interval_sec": {
         "description": "表达审核运行间隔（秒）",
         "type": "int",
-        "default": 60,
-        "hint": "后台多久检查一次待审核的表达，允许范围为 30 到 600 秒。"
+        "default": 21600,
+        "hint": "后台多久检查一次待审核的表达。"
       },
       "review_runner_min_interval_sec": {
         "description": "同一会话表达审核最短间隔（秒）",
         "type": "int",
-        "default": 45,
+        "default": 21600,
         "hint": "同一会话两次表达审核之间至少间隔多久，避免短时间连续触发。"
       },
       "enable_backlog_mining": {
@@ -1407,7 +1452,7 @@
       "dream_interval_min": {
         "description": "梦境整理触发间隔（分钟）",
         "type": "int",
-        "default": 30,
+        "default": 720,
         "hint": "在空闲时，系统会按这个间隔检查是否进入“梦境整理”流程。"
       },
       "dream_time_ranges": {
@@ -1635,6 +1680,22 @@
         "minimum": 0,
         "maximum": 604800,
         "hint": "同一用户刚生成画像后，即使短时间内再次达到消息阈值，也会等到冷却结束再生成，避免重复占用后台模型。"
+      },
+      "profile_scan_interval_sec": {
+        "description": "用户画像扫描间隔（秒）",
+        "type": "int",
+        "default": 7200,
+        "minimum": 300,
+        "maximum": 86400,
+        "hint": "后台多久扫描一次需要更新画像的用户。"
+      },
+      "proactive_scan_interval_sec": {
+        "description": "主动任务扫描间隔（秒）",
+        "type": "int",
+        "default": 3600,
+        "minimum": 300,
+        "maximum": 86400,
+        "hint": "后台多久扫描一次主动任务候选；不影响用户消息到达后的正常回复。"
       }
     }
   },

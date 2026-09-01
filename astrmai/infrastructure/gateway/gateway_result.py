@@ -9,6 +9,7 @@ from ...conversation.contracts.reply_artifact import VisibleReplyArtifact
 from ..runtime.runtime_contracts import FailureKind, LLMCallResult
 from .output_guard import is_safe_visible_text
 from .provider_capabilities import resolve_provider_capabilities
+from .json_utils import parse_json_payload
 
 try:
     from json_repair import repair_json
@@ -237,17 +238,11 @@ class GatewayResultMixin:
         return normalized
 
     def _parse_json_completion(self, content: str) -> Any:
-        raw_json_str = self._extract_json(content)
         try:
-            return json.loads(raw_json_str)
-        except json.JSONDecodeError:
-            if repair_json:
-                repaired = repair_json(raw_json_str, return_objects=False)
-                if isinstance(repaired, str):
-                    return json.loads(repaired)
-                if isinstance(repaired, (dict, list)):
-                    return repaired
-            raise ValueError(f"json_decode_error: {raw_json_str[:120]}")
+            return parse_json_payload(content).value
+        except ValueError as exc:
+            raw_json_str = self._extract_json(content)
+            raise ValueError(f"json_decode_error: {raw_json_str[:120]}") from exc
 
     def _build_lane_artifact(self, result: LLMCallResult, persistable_text: str) -> VisibleReplyArtifact:
         return VisibleReplyArtifact(

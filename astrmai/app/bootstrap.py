@@ -28,6 +28,7 @@ from ..infrastructure.gateway.model_gateway import GlobalModelGateway
 from ..infrastructure.persistence.database_service import DatabaseService
 from ..infrastructure.persistence.persistence_manager import PersistenceManager
 from ..infrastructure.persistence.reply_commit_outbox import ReplyCommitOutboxStore
+from ..infrastructure.persistence.memory_turn_ledger import MemoryTurnLedgerStore
 from ..infrastructure.runtime.chat_runtime_coordinator import ChatRuntimeCoordinator
 from ..infrastructure.runtime.cross_session_handoff_store import CrossSessionHandoffStore
 from ..infrastructure.runtime.context_economy_benchmark_store import ContextEconomyBenchmarkSampleStore
@@ -212,7 +213,12 @@ class PluginBootstrap:
     ) -> tuple[EventBus, MemoryEngine, RuntimeObservabilityHub]:
         embedding_models = getattr(runtime.config.provider, "embedding_models", [])
         event_bus = EventBus()
-        memory_engine = MemoryEngine(self.context, gateway, embedding_models=embedding_models)
+        memory_engine = MemoryEngine(
+            self.context,
+            gateway,
+            embedding_models=embedding_models,
+            owner_registry=getattr(runtime, "owner_registry", None),
+        )
         memory_engine.background_task_budget = getattr(runtime, "background_task_budget", None)
         self._wire_memory_database_services(persistence, db_service, gateway, memory_engine)
         observability_hub = RuntimeObservabilityHub(db_service.raw_trace_store)
@@ -366,6 +372,7 @@ class PluginBootstrap:
             runtime.gateway,
             event_bus=runtime.event_bus,
             background_task_budget=getattr(runtime, "background_task_budget", None),
+            owner_registry=getattr(runtime, "owner_registry", None),
         )
         reply_engine = ReplyService(
             runtime.state_engine,
@@ -375,7 +382,8 @@ class PluginBootstrap:
             dialogue_store=runtime.dialogue_store,
             evolution_manager=evolution,
             reply_commit_service=ReplyCommitService(
-                ReplyCommitOutboxStore(runtime.db_service.db_path)
+                ReplyCommitOutboxStore(runtime.db_service.db_path),
+                owner_registry=getattr(runtime, "owner_registry", None),
             ),
         )
         persona_summarizer = PersonaSummarizer(
@@ -445,6 +453,7 @@ class PluginBootstrap:
             config=runtime.config,
             dialogue_store=runtime.dialogue_store,
             gateway=runtime.gateway,
+            owner_registry=getattr(runtime, "owner_registry", None),
         )
         group_reread_observer = GroupRereadObserver(config=runtime.config)
         reread_action_dispatcher = RereadActionDispatcher(
@@ -453,6 +462,7 @@ class PluginBootstrap:
             runtime_coordinator=runtime.runtime_coordinator,
             dialogue_store=runtime.dialogue_store,
             reread_observer=group_reread_observer,
+            owner_registry=getattr(runtime, "owner_registry", None),
         )
         post_reply_feedback_coordinator = PostReplyFeedbackCoordinator(
             private_chat_manager=private_chat_manager,
@@ -496,6 +506,7 @@ class PluginBootstrap:
                 None,
             ),
             background_task_budget=getattr(runtime, "background_task_budget", None),
+            owner_registry=getattr(runtime, "owner_registry", None),
         )
         return InteractionServices(
             frequency_controller=frequency_controller,
@@ -536,6 +547,7 @@ class PluginBootstrap:
             review_dispatcher,
         )
         proactive_task = self._build_proactive_task(runtime, reflector)
+        proactive_task.expression_governance_runner = expression_governance_runner
         return LifecycleServices(
             reflector=reflector,
             reflect_tracker=reflect_tracker,
@@ -553,11 +565,13 @@ class PluginBootstrap:
             db_service=runtime.db_service,
             gateway=runtime.gateway,
             config=runtime.config,
+            background_task_budget=getattr(runtime, "background_task_budget", None),
         )
         reflect_tracker = ReflectTracker(
             db_service=runtime.db_service,
             gateway=runtime.gateway,
             config=runtime.config,
+            background_task_budget=getattr(runtime, "background_task_budget", None),
         )
         review_service = ExpressionReviewService(runtime.db_service)
         review_dispatcher = ReviewDispatcher(self.context, reflect_tracker)
@@ -576,6 +590,7 @@ class PluginBootstrap:
                 gateway=runtime.gateway,
                 tracker=reflect_tracker,
                 config=runtime.config,
+                background_task_budget=getattr(runtime, "background_task_budget", None),
             )
         except Exception as exc:
             self._record_optional_failure(runtime, "learning.auto_check_task", exc)
@@ -584,6 +599,7 @@ class PluginBootstrap:
                 db_service=runtime.db_service,
                 gateway=runtime.gateway,
                 config=runtime.config,
+                background_task_budget=getattr(runtime, "background_task_budget", None),
             )
         except Exception as exc:
             self._record_optional_failure(runtime, "learning.jargon_auto_check_task", exc)
@@ -631,6 +647,7 @@ class PluginBootstrap:
                 runtime_coordinator=runtime.runtime_coordinator,
                 attention_gate=runtime.attention_gate,
                 background_task_budget=getattr(runtime, "background_task_budget", None),
+                owner_registry=getattr(runtime, "owner_registry", None),
             )
             proactive_task.configure(
                 ProactiveDeps(

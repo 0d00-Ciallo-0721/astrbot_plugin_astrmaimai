@@ -237,6 +237,9 @@ class PluginApiAdapter:
     def get_auto_check_task(self) -> Any:
         return self._call_facade("get_auto_check_task")
 
+    def get_expression_governance_runner(self) -> Any:
+        return self._call_facade("get_expression_governance_runner")
+
     def get_reflect_tracker(self) -> Any:
         return self._call_facade("get_reflect_tracker")
 

@@ -315,6 +315,11 @@ class ReplyPostSendMixin:
             )
             return "committed"
 
+        # Mark only these concrete, non-LLM persistence consumers as safe for
+        # synchronous execution on hosts without a durable reply outbox.
+        setattr(group_dialogue, "_reply_commit_lightweight", True)
+        setattr(native_history, "_reply_commit_lightweight", True)
+
         consumers = {
             "social_feedback": social_feedback,
             "group_dialogue": group_dialogue,
@@ -337,7 +342,14 @@ class ReplyPostSendMixin:
             event,
             user_text=user_text,
         )
-        result = await self.reply_commit_service.commit(
+        enqueue = getattr(self.reply_commit_service, "enqueue", None)
+        commit_method = enqueue if callable(enqueue) else self.reply_commit_service.commit
+        inline_consumer_names = ["group_dialogue", "native_history"]
+        if repair_context.get("skip_semantic_persistence", False):
+            # Skipped consumers are pure status transitions and should be
+            # reflected in the returned artifact immediately.
+            inline_consumer_names.extend(("memory", "learning"))
+        result = await commit_method(
             event,
             committed_turn,
             consumers=self._build_reply_commit_consumers(
@@ -346,6 +358,7 @@ class ReplyPostSendMixin:
                 event,
             ),
             repair_context=repair_context,
+            inline_consumer_names=inline_consumer_names,
         )
         return result
 

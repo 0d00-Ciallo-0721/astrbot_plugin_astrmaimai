@@ -19,6 +19,7 @@ from .actor_memory_scope import filter_candidates_for_actor_scope
 from .v2_store import MemoryV2Store
 from ...infrastructure.runtime.lane_manager import LaneKey
 from ...infrastructure.runtime.turn_call_ledger import clamp_timeout_to_turn_budget
+from ...infrastructure.gateway.json_utils import parse_json_contract
 from ...conversation.runtime.architecture_rollout import ArchitectureTimer, rollout_enabled
 
 
@@ -1193,9 +1194,16 @@ class MemoryRetrievalService:
                 task.add_done_callback(self._consume_background_task)
                 raise asyncio.TimeoutError("query rewrite hard deadline exceeded")
             response = task.result()
-            if isinstance(response, str):
-                response = json.loads(response)
-            queries = response.get("queries", []) if isinstance(response, dict) else []
+            parsed = parse_json_contract(
+                response,
+                required_keys=("queries",),
+                field_types={"queries": list},
+                allow_extra_keys=False,
+                allow_naked_members=True,
+            )
+            if not parsed.schema_valid:
+                raise ValueError(f"query_rewrite_{parsed.terminal_status}")
+            queries = parsed.value.get("queries", [])
             cleaned = [str(item).strip() for item in queries if str(item).strip()]
             if not cleaned:
                 status = "empty"
@@ -1342,9 +1350,27 @@ class MemoryRetrievalService:
             elapsed_ms=(time.perf_counter() - started) * 1000,
             timeout_sec=timeout_override,
         )
-        if isinstance(response, str):
-            return json.loads(response)
-        return response if isinstance(response, dict) else {}
+        if stage not in {"rerank", "compress"}:
+            return response if isinstance(response, dict) else {}
+        required = ("ids",) if stage == "rerank" else ("guidance",)
+        field_types = {"ids": list} if stage == "rerank" else {"guidance": str}
+        parsed = parse_json_contract(
+            response,
+            required_keys=required,
+            field_types=field_types,
+            allow_extra_keys=False,
+            allow_naked_members=True,
+        )
+        if not parsed.schema_valid:
+            self._record_deep_memory_stage(
+                query,
+                stage,
+                status="schema_invalid",
+                elapsed_ms=(time.perf_counter() - started) * 1000,
+                timeout_sec=timeout_override,
+            )
+            return {}
+        return dict(parsed.value)
 
     @staticmethod
     def _candidate_payload(candidates: list[MemoryCandidate]) -> list[dict]:

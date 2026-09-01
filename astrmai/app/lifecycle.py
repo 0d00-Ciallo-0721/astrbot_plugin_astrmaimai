@@ -34,13 +34,37 @@ class PluginLifecycleManager:
         self._persistence_dispose_task: asyncio.Task[Any] | None = None
         self.runtime.lifecycle.manager = self
 
-    def track_task(self, coro: Any) -> asyncio.Task[Any]:
+    def track_task(
+        self,
+        coro: Any,
+        *,
+        task_family: str = "lifecycle",
+        scope_id: str = "GLOBAL",
+        run_id: str = "",
+        owner: str = "PluginLifecycleManager",
+        cancel_status: str = "cancelled",
+    ) -> asyncio.Task[Any]:
         # ponytail: prune done tasks to prevent unbounded set growth
         done_tasks = {t for t in self._background_tasks if t.done()}
         self._background_tasks -= done_tasks
         task = safe_create_task(coro)
         self._background_tasks.add(task)
         task.add_done_callback(self._handle_task_result)
+        registry = getattr(self.runtime, "owner_registry", None)
+        register = getattr(registry, "register", None)
+        if callable(register):
+            try:
+                register(
+                    task,
+                    task_family=task_family,
+                    scope_id=scope_id,
+                    run_id=run_id,
+                    owner=owner,
+                    generation=getattr(self.runtime, "runtime_generation", 0),
+                    cancel_status=cancel_status,
+                )
+            except Exception as exc:
+                logger.debug("[AstrMai] owner registry registration degraded: %s", exc)
         return task
 
     def _handle_task_result(self, task: asyncio.Task[Any]) -> None:
@@ -1943,6 +1967,15 @@ class PluginLifecycleManager:
                 await evolution.stop_background_tasks()
         except Exception as exc:
             logger.warning(f"[AstrMai] Evolution background shutdown degraded: {exc}")
+
+        try:
+            reply_engine = getattr(self.runtime, "reply_engine", None)
+            commit_service = getattr(reply_engine, "reply_commit_service", None)
+            stop_commit = getattr(commit_service, "stop", None)
+            if callable(stop_commit):
+                await stop_commit()
+        except Exception as exc:
+            logger.warning(f"[AstrMai] Reply commit detached worker shutdown degraded: {exc}")
 
         try:
             stop_memory = getattr(self.runtime.memory_engine, "stop_background_producers", None)

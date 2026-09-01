@@ -1417,7 +1417,7 @@ class ProactiveGapCoverageTests(unittest.TestCase):
             task._fire_background_task = self.task_mod.ProactiveTask._fire_background_task.__get__(task, self.task_mod.ProactiveTask)
 
             await task._run_maintenance_cycle()
-            await asyncio.gather(*list(task._background_tasks))
+            await asyncio.gather(*list(task._background_tasks), return_exceptions=True)
 
             self.assertEqual(calls, ["decay", "signin", ("digest", "heartflow")])
             self.assertEqual(task._background_tasks, set())
@@ -1553,8 +1553,8 @@ class ProactiveGapCoverageTests(unittest.TestCase):
                 self.assertEqual(args[2], "profile:Alice:persona summary")
                 return "analysis response"
 
-            async def _save(profile):
-                saved.append(profile)
+            async def _save(profile, **kwargs):
+                saved.append((profile, kwargs))
 
             task._load_persona_summary = _load_summary
             task._call_background_lane = _call_lane
@@ -1572,7 +1572,12 @@ class ProactiveGapCoverageTests(unittest.TestCase):
             self.assertEqual(profile.identity_points, ["likes puzzles"])
             self.assertEqual(profile.message_count_for_profiling, 0)
             self.assertTrue(profile.is_dirty)
-            self.assertEqual(saved, [profile])
+            self.assertEqual(saved[0][0], profile)
+            self.assertTrue(saved[0][1]["revision"]["run_id"].startswith("profile_"))
+            self.assertEqual(
+                saved[0][1]["revision"]["changed_fields"],
+                ["persona_analysis", "tags", "memory_points"],
+            )
 
         asyncio.run(_run())
 
@@ -1595,8 +1600,8 @@ class ProactiveGapCoverageTests(unittest.TestCase):
                 self.assertEqual(args[2], "nickname:Alice:persona summary")
                 return "nickname response"
 
-            async def _save(profile):
-                saved.append(profile)
+            async def _save(profile, **kwargs):
+                saved.append((profile, kwargs))
 
             task._load_persona_summary = _load_summary
             task._call_background_lane = _call_lane
@@ -1613,7 +1618,12 @@ class ProactiveGapCoverageTests(unittest.TestCase):
             self.assertEqual(profile.nickname_reason, "friendly")
             self.assertTrue(profile.is_known)
             self.assertTrue(profile.is_dirty)
-            self.assertEqual(saved, [profile])
+            self.assertEqual(saved[0][0], profile)
+            self.assertTrue(saved[0][1]["revision"]["run_id"].startswith("profile_"))
+            self.assertEqual(
+                saved[0][1]["revision"]["changed_fields"],
+                ["nickname", "nickname_reason", "is_known"],
+            )
 
         asyncio.run(_run())
 
@@ -1621,46 +1631,19 @@ class ProactiveGapCoverageTests(unittest.TestCase):
         async def _run():
             calls = []
 
-            class _Reflector:
-                async def reflect_batch(self, chat_id):
-                    calls.append(("reflect", chat_id))
-
-                async def auto_audit(self, chat_id):
-                    calls.append(("audit", chat_id))
-
-            class _AutoCheck:
-                async def run_once(self, chat_id):
-                    calls.append(("check", chat_id))
-
-            class _ReviewDispatcher:
-                async def dispatch_pending(self):
-                    calls.append(("dispatch", None))
+            class _GovernanceRunner:
+                async def run_once(self):
+                    calls.append(("runner", None))
 
             task = self.task_mod.ProactiveTask.__new__(self.task_mod.ProactiveTask)
             task.config = SimpleNamespace(
                 evolution=SimpleNamespace(enable_expression_mining=True)
             )
-            task.reflector = _Reflector()
-            task.auto_check_task = _AutoCheck()
-            task.review_dispatcher = _ReviewDispatcher()
-            task.state_engine = SimpleNamespace(
-                get_active_states=lambda: [
-                    SimpleNamespace(chat_id=""),
-                    SimpleNamespace(chat_id="chat-1"),
-                ]
-            )
+            task.expression_governance_runner = _GovernanceRunner()
 
             await task._run_reflection_tasks()
 
-            self.assertEqual(
-                calls,
-                [
-                    ("reflect", "chat-1"),
-                    ("audit", "chat-1"),
-                    ("check", "chat-1"),
-                    ("dispatch", None),
-                ],
-            )
+            self.assertEqual(calls, [("runner", None)])
 
         asyncio.run(_run())
 

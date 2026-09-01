@@ -1,5 +1,3 @@
-import json
-import re
 import time
 from time import monotonic
 from typing import Optional
@@ -10,6 +8,8 @@ from ...infrastructure.persistence import DatabaseService
 from ...infrastructure.persistence import ExpressionPattern
 from ...infrastructure.gateway import GlobalModelGateway
 from ...infrastructure.runtime.lane_manager import LaneKey
+from ...infrastructure.gateway.json_utils import parse_json_contract
+from ...infrastructure.runtime.background_task_budget import BackgroundTaskBudget
 
 
 class ExpressionAutoCheckTask:
@@ -26,21 +26,26 @@ class ExpressionAutoCheckTask:
         "\"weight_delta\":-0.3}"
     )
 
-    def __init__(self, db_service: DatabaseService, gateway: GlobalModelGateway, tracker=None, config=None):
+    def __init__(self, db_service: DatabaseService, gateway: GlobalModelGateway, tracker=None, config=None, background_task_budget=None):
         self.db = db_service
         self.gateway = gateway
         self.tracker = tracker
         self.config = config if config else gateway.config
+        self.background_task_budget = background_task_budget or BackgroundTaskBudget()
         self._last_run_at: dict[str, float] = {}
 
     def refresh_config(self, config) -> None:
         self.config = config
 
-    async def run_once(self, group_id: Optional[str] = None) -> int:
+    async def run_once(self, group_id: Optional[str] = None, *, force: bool = False) -> int:
         now = monotonic()
         scope = str(group_id or "__global__")
-        min_interval = float(getattr(self.config.evolution, "review_runner_min_interval_sec", 45) or 45)
-        if now - float(self._last_run_at.get(scope, 0.0) or 0.0) < min_interval:
+        min_interval = float(getattr(self.config.evolution, "review_runner_min_interval_sec", 21600) or 21600)
+        last_run_at = float(self._last_run_at.get(scope, 0.0) or 0.0)
+        # The six-hour governance interval is a hard business cooldown.  The
+        # ``force`` flag may bypass candidate-count gates, but never starts a
+        # second audit for the same scope during the cooldown window.
+        if last_run_at > 0.0 and now - last_run_at < min_interval:
             return 0
         self._last_run_at[scope] = now
         # ponytail: prune unbounded _last_run_at, keep most recent 250 entries
@@ -78,19 +83,36 @@ class ExpressionAutoCheckTask:
             "请判断这条表达是否适合作为长期表达习惯。"
         )
         try:
-            result = await self.gateway.call_data_process_task(
-                prompt=prompt,
-                system_prompt=self.REVIEW_SYSTEM_PROMPT,
-                is_json=True,
-                lane_key=LaneKey(subsystem="bg", task_family="reflect", scope_id=pattern.group_id or "global", scope_kind="global"),
-                base_origin="",
+            async def _call():
+                return await self.gateway.call_data_process_task(
+                    prompt=prompt,
+                    system_prompt=self.REVIEW_SYSTEM_PROMPT,
+                    is_json=True,
+                    lane_key=LaneKey(subsystem="bg", task_family="reflect", scope_id=pattern.group_id or "global", scope_kind="global"),
+                    base_origin="",
+                )
+
+            result = await self.background_task_budget.run(
+                _call,
+                task_name="governance.expression_check",
+                scope_id=str(pattern.group_id or "GLOBAL"),
+                defer_release_on_timeout=True,
             )
-            if isinstance(result, dict):
-                return result
-            if isinstance(result, str):
-                match = re.search(r"\{.*\}", result, re.DOTALL)
-                if match:
-                    return json.loads(match.group(0))
+            parsed = parse_json_contract(
+                result,
+                required_keys=("decision",),
+                optional_keys=("reason", "replacement_expression", "style", "weight_delta"),
+                field_types={
+                    "decision": str,
+                    "reason": str,
+                    "replacement_expression": str,
+                    "style": str,
+                    "weight_delta": (int, float),
+                },
+                allow_extra_keys=False,
+                allow_naked_members=True,
+            )
+            return dict(parsed.value) if parsed.schema_valid else None
         except Exception as exc:
             logger.error(f"[ExpressionAutoCheck] 审核表达失败 #{getattr(pattern, 'id', '?')}: {exc}")
         return None

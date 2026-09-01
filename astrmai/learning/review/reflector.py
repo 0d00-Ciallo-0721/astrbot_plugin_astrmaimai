@@ -15,9 +15,12 @@ AstrBot 规范:
 import asyncio
 import time
 import uuid
+from pathlib import Path
 from typing import List, Optional, Dict
 from astrbot.api import logger
 from ...infrastructure.runtime.lane_manager import LaneKey
+from ...infrastructure.runtime.background_task_budget import BackgroundTaskBudget
+from ...infrastructure.persistence.reflection_outbox import ReflectionOutboxStore
 
 
 class ExpressionReflector:
@@ -27,14 +30,24 @@ class ExpressionReflector:
     WEIGHT_FLOOR = 0.1     # 权重下限，低于此值自动淘汰
     SIMILARITY_THRESHOLD = 0.8  # 去重相似度阈值
 
-    def __init__(self, db_service, gateway, config=None):
+    def __init__(self, db_service, gateway, config=None, background_task_budget=None):
         self.db = db_service
         self.gateway = gateway
         self.config = config
+        self.background_task_budget = background_task_budget or BackgroundTaskBudget()
         self._pending_reflections: List[Dict] = []
         self._lock = asyncio.Lock()
         self._processing_lock = asyncio.Lock()
-        self._last_audit_time = 0.0
+        self._last_audit_time: dict[str, float] = {}
+        db_path = (
+            getattr(db_service, "db_path", None)
+            or getattr(getattr(db_service, "persistence", None), "db_path", None)
+        )
+        if not db_path:
+            cache_dir = getattr(getattr(db_service, "persistence", None), "cache_dir", None)
+            if cache_dir:
+                db_path = str(Path(cache_dir) / "reflection_outbox.db")
+        self._outbox = ReflectionOutboxStore(db_path) if db_path else None
 
     def refresh_config(self, config) -> None:
         self.config = config
@@ -56,8 +69,7 @@ class ExpressionReflector:
         记录一次表达使用，添加到待反思队列。
         由 ReplyEngine 在每次回复后调用。
         """
-        async with self._lock:
-            self._pending_reflections.append({
+        item = {
                 "reflection_id": uuid.uuid4().hex,
                 "pattern_id": str(pattern_id or ""),
                 "chat_id": str(chat_id or ""),
@@ -66,10 +78,54 @@ class ExpressionReflector:
                 "reply": actual_reply[:300],
                 "reaction": user_reaction[:200] if user_reaction else "",
                 "time": time.time()
-            })
+            }
+        async with self._lock:
+            self._pending_reflections.append(item)
             if len(self._pending_reflections) > 200:
                 self._pending_reflections = self._pending_reflections[-200:]
                 logger.warning("[Reflector] _pending_reflections capped at 200, oldest entries discarded")
+        if self._outbox is not None:
+            try:
+                await self._outbox.enqueue(item)
+            except Exception:
+                logger.debug("[Reflector] durable pending enqueue degraded", exc_info=True)
+
+    async def _load_pending_from_store(self, group_id: str = "") -> None:
+        if self._outbox is None:
+            return
+        try:
+            claim_due = getattr(self._outbox, "claim_due", None)
+            entries = (
+                await claim_due(
+                    chat_id=str(group_id or ""),
+                    limit=200,
+                    lease_seconds=300.0,
+                )
+                if callable(claim_due)
+                else await self._outbox.list_due(chat_id=str(group_id or ""), limit=200)
+            )
+        except Exception:
+            logger.debug("[Reflector] durable pending load degraded", exc_info=True)
+            return
+        if not entries:
+            return
+        async with self._lock:
+            existing = {
+                str(item.get("reflection_id") or ""): item
+                for item in self._pending_reflections
+            }
+            for entry in entries:
+                item = existing.get(entry.reflection_id)
+                if item is None:
+                    item = dict(entry.payload)
+                    self._pending_reflections.append(item)
+                    existing[entry.reflection_id] = item
+                item["_reflection_lease_token"] = str(
+                    getattr(entry, "lease_token", "") or ""
+                )
+                item["_reflection_attempts"] = int(
+                    getattr(entry, "attempts", 0) or 0
+                )
 
     async def pending_scope_ids(self) -> list[str]:
         async with self._lock:
@@ -77,28 +133,101 @@ class ExpressionReflector:
                 str(item.get("chat_id") or "GLOBAL").strip() or "GLOBAL"
                 for item in self._pending_reflections
             ]
+        list_scope_ids = getattr(self._outbox, "list_scope_ids", None)
+        if callable(list_scope_ids):
+            try:
+                values.extend(await list_scope_ids(limit=500))
+            except Exception:
+                logger.debug(
+                    "[Reflector] durable pending scope scan degraded",
+                    exc_info=True,
+                )
         return list(dict.fromkeys(values))
+
+    async def _settle_unacked_batch(
+        self,
+        batch: List[Dict],
+        *,
+        error: str,
+        immediate: bool = False,
+    ) -> None:
+        if self._outbox is None or not batch:
+            return
+        for item in batch:
+            token = str(item.get("_reflection_lease_token") or "")
+            if not token:
+                continue
+            reflection_id = str(item.get("reflection_id") or "")
+            try:
+                if immediate:
+                    await self._outbox.release_lease(
+                        reflection_id,
+                        lease_token=token,
+                        next_retry_at=0.0,
+                        error=error,
+                    )
+                else:
+                    await self._outbox.mark_retry(
+                        reflection_id,
+                        int(item.get("_reflection_attempts") or 0) + 1,
+                        error,
+                        lease_token=token,
+                    )
+            except Exception:
+                logger.debug(
+                    "[Reflector] durable pending retry settlement degraded",
+                    exc_info=True,
+                )
+        async with self._lock:
+            for item in batch:
+                item.pop("_reflection_lease_token", None)
 
     async def reflect_batch(self, group_id: str):
         """
         批量反思: 评估最近使用过的表达效果。
         建议在 ProactiveTask 的心跳循环中周期性调用。
         """
+        await self._load_pending_from_store(group_id)
         async with self._processing_lock:
+            insufficient_batch: List[Dict] = []
             async with self._lock:
-                retry_items = [
+                requested_scope = str(group_id or "GLOBAL").strip() or "GLOBAL"
+                has_scoped_items = any(str(item.get("chat_id") or "").strip() for item in self._pending_reflections)
+                scoped_items = [
                     item
                     for item in self._pending_reflections
+                    if (
+                        str(item.get("chat_id") or "").strip() == requested_scope
+                        or (not has_scoped_items and not str(item.get("chat_id") or "").strip())
+                    )
+                    and (
+                        self._outbox is None
+                        or bool(str(item.get("_reflection_lease_token") or ""))
+                    )
+                ]
+                retry_items = [
+                    item
+                    for item in scoped_items
                     if "_reflection_score" in item or item.get("_reflection_attempted")
                 ]
                 if retry_items:
                     batch = retry_items[:8]
                 else:
-                    if len(self._pending_reflections) < 3:
-                        return
-                    batch = self._pending_reflections[:8]
+                    if len(scoped_items) < 3:
+                        insufficient_batch = list(scoped_items)
+                        batch = []
+                    else:
+                        batch = scoped_items[:8]
                 for item in batch:
                     item.setdefault("reflection_id", uuid.uuid4().hex)
+
+            if insufficient_batch:
+                await self._settle_unacked_batch(
+                    insufficient_batch,
+                    error="insufficient_batch",
+                    immediate=True,
+                )
+                return
 
             unscored = [item for item in batch if "_reflection_score" not in item]
             try:
@@ -106,6 +235,10 @@ class ExpressionReflector:
                     scores = await self._score_reflections(group_id, unscored)
                     if not scores:
                         logger.warning("[Reflector] empty score payload from LLM; keeping batch for retry")
+                        await self._settle_unacked_batch(
+                            batch,
+                            error="empty_score_payload",
+                        )
                         return
                     async with self._lock:
                         for item in unscored:
@@ -153,6 +286,27 @@ class ExpressionReflector:
                         acked_ids.add(str(item["reflection_id"]))
 
                 if acked_ids:
+                    if self._outbox is not None:
+                        confirmed_ids: set[str] = set()
+                        for item in batch:
+                            reflection_id = str(item.get("reflection_id") or "")
+                            if reflection_id not in acked_ids:
+                                continue
+                            try:
+                                confirmed = await self._outbox.mark_done(
+                                    reflection_id,
+                                    lease_token=str(
+                                        item.get("_reflection_lease_token") or ""
+                                    ),
+                                )
+                                if confirmed:
+                                    confirmed_ids.add(reflection_id)
+                            except Exception:
+                                logger.debug(
+                                    "[Reflector] durable pending ack degraded",
+                                    exc_info=True,
+                                )
+                        acked_ids = confirmed_ids
                     async with self._lock:
                         self._pending_reflections = [
                             item
@@ -160,8 +314,29 @@ class ExpressionReflector:
                             if str(item.get("reflection_id") or "") not in acked_ids
                         ]
                 if len(acked_ids) < len(batch):
+                    await self._settle_unacked_batch(
+                        [
+                            item
+                            for item in batch
+                            if str(item.get("reflection_id") or "") not in acked_ids
+                        ],
+                        error="partial_reflection_failure",
+                    )
                     logger.warning("[Reflector] partial reflection failure; retrying only unacked items")
+            except asyncio.CancelledError:
+                await asyncio.shield(
+                    self._settle_unacked_batch(
+                        batch,
+                        error="cancelled",
+                        immediate=True,
+                    )
+                )
+                raise
             except Exception as e:
+                await self._settle_unacked_batch(
+                    batch,
+                    error=str(e),
+                )
                 logger.debug(f"[Reflector] 批量反思失败: {e}")
 
     async def _score_reflections(self, group_id: str, batch: List[Dict]) -> List[Dict]:
@@ -182,21 +357,37 @@ class ExpressionReflector:
 - 0分: 完全不合适，应该淘汰
 
 返回 JSON 数组: [{{"index": 1, "score": 8, "feedback": "简评"}}]"""
-        result = await self.gateway.call_data_process_task(
-            prompt,
-            is_json=True,
-            lane_key=LaneKey(subsystem="bg", task_family="reflect", scope_id=group_id, scope_kind="global"),
-            base_origin="",
+        async def _call():
+            return await self.gateway.call_data_process_task(
+                prompt,
+                is_json=True,
+                lane_key=LaneKey(subsystem="bg", task_family="reflect", scope_id=group_id, scope_kind="global"),
+                base_origin="",
+            )
+
+        result = await self.background_task_budget.run(
+            _call,
+            task_name="governance.reflect",
+            scope_id=str(group_id or "GLOBAL"),
+            defer_release_on_timeout=True,
         )
         return self._parse_scores(result)
 
-    async def auto_audit(self, group_id: str):
+    async def auto_audit(self, group_id: str, *, force: bool = False):
         """
         定期审计: 检测重复/低质量表达并清理。
         建议在 ProactiveTask 的心跳循环中每 6 小时调用一次。
         """
         now = time.time()
-        if now - self._last_audit_time < self.AUDIT_INTERVAL:
+        scope_id = str(group_id or "GLOBAL").strip() or "GLOBAL"
+        last_audit_time = (
+            float(self._last_audit_time.get(scope_id, 0.0) or 0.0)
+            if isinstance(self._last_audit_time, dict)
+            else float(self._last_audit_time or 0.0)
+        )
+        # Manual force requests can bypass candidate selection policy, but the
+        # per-scope governance cooldown remains a hard safety limit.
+        if last_audit_time > 0.0 and now - last_audit_time < self.AUDIT_INTERVAL:
             return
 
         try:
@@ -212,7 +403,9 @@ class ExpressionReflector:
                 )
             else:
                 return
-            self._last_audit_time = now
+            if not isinstance(self._last_audit_time, dict):
+                self._last_audit_time = {}
+            self._last_audit_time[scope_id] = now
             if len(patterns) < 10:
                 return
 
@@ -347,15 +540,29 @@ class ExpressionReflector:
     @staticmethod
     def _parse_scores(raw) -> List[Dict]:
         """安全解析评分结果"""
-        import json, re
+        from ...infrastructure.gateway.json_utils import parse_json_contract, parse_json_payload
         if isinstance(raw, list):
-            return [r for r in raw if isinstance(r, dict)]
-        if isinstance(raw, str):
-            match = re.search(r'\[.*\]', raw, re.DOTALL)
-            if match:
-                try:
-                    items = json.loads(match.group(0))
-                    return [r for r in items if isinstance(r, dict)]
-                except json.JSONDecodeError:
-                    pass
-        return []
+            items = raw
+        else:
+            try:
+                parsed = parse_json_payload(raw)
+                items = parsed.value if isinstance(parsed.value, list) else []
+            except ValueError:
+                return []
+        validated: list[dict] = []
+        for item in items:
+            contract = parse_json_contract(
+                item,
+                required_keys=("index", "score"),
+                optional_keys=("feedback",),
+                field_types={"index": (int, float), "score": (int, float), "feedback": str},
+                allow_extra_keys=False,
+            )
+            if not contract.schema_valid:
+                continue
+            normalized = dict(contract.value)
+            normalized["index"] = int(normalized["index"])
+            normalized["score"] = max(0.0, min(10.0, float(normalized["score"])))
+            normalized["feedback"] = str(normalized.get("feedback", "") or "")
+            validated.append(normalized)
+        return validated

@@ -52,7 +52,14 @@ class VectorRetriever:
     向量密集检索器 (基于 AstrBot FaissVecDB 原生底座)
     完全重构：废弃脆弱的本地 bin 文件维护，全面接入平台提供的一致性存储。
     """
-    def __init__(self, faiss_db: FaissVecDB, config=None, *, projection_count_provider=None):
+    def __init__(
+        self,
+        faiss_db: FaissVecDB,
+        config=None,
+        *,
+        projection_count_provider=None,
+        owner_registry=None,
+    ):
         self.faiss_db = faiss_db
         self.processor = TextProcessor()
         self.config = config or {}
@@ -101,6 +108,32 @@ class VectorRetriever:
         self._dimension_unknown_total = 0
         self._last_dimension_error = ""
         self._last_query_dimension: int | None = None
+        self.owner_registry = owner_registry
+
+    def _register_owner_task(
+        self,
+        task: asyncio.Task,
+        *,
+        task_family: str,
+        scope_id: str = "GLOBAL",
+        run_id: str = "",
+    ) -> None:
+        registry = getattr(self, "owner_registry", None)
+        register = getattr(registry, "register", None)
+        if not callable(register):
+            return
+        try:
+            register(
+                task,
+                task_family=task_family,
+                scope_id=scope_id or "GLOBAL",
+                run_id=run_id,
+                owner="VectorRetriever",
+                generation=getattr(registry, "generation", 0),
+                cancel_status="cancelled",
+            )
+        except Exception as exc:
+            logger.debug("[VectorRetriever] owner registry registration degraded: %s", exc)
 
     def _timing_value(self, name: str, default: float) -> float:
         timing = getattr(self.config, "timing", None)
@@ -383,6 +416,12 @@ class VectorRetriever:
                     fetch_k if metadata_filters else k,
                     _admitted=True,
                 )
+        )
+        self._register_owner_task(
+            index_task,
+            task_family="memory.vector.query",
+            scope_id="GLOBAL",
+            run_id=f"vector-query-{uuid.uuid4().hex[:12]}",
         )
         try:
             scores, indices = await asyncio.wait_for(
@@ -702,6 +741,12 @@ class VectorRetriever:
         except RuntimeError:
             return
         self._storage_metrics_task = task
+        self._register_owner_task(
+            task,
+            task_family="memory.vector.storage_metrics",
+            scope_id="GLOBAL",
+            run_id=f"vector-metrics-{uuid.uuid4().hex[:12]}",
+        )
         task.add_done_callback(lambda completed: completed.exception() if not completed.cancelled() else None)
 
     @staticmethod

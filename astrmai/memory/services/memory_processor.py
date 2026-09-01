@@ -1,9 +1,9 @@
-import json
-import re
 from typing import Any, Dict, List
 from astrbot.api import logger
+from ...infrastructure.gateway.json_utils import parse_json_contract
 from ...infrastructure.context_economy import PromptTemplateId
 from ...infrastructure.runtime.lane_manager import LaneKey
+from ...infrastructure.runtime.background_task_budget import BackgroundTaskBudget
 
 class MemoryProcessor:
     """
@@ -11,8 +11,9 @@ class MemoryProcessor:
     负责将非结构化的对话历史，通过 LLM 降维压缩为高密度的多维记忆数据模型。
     """
 # 位置: astrmai/memory/processor.py -> MemoryProcessor 类下
-    def __init__(self, gateway):
+    def __init__(self, gateway, background_task_budget=None):
         self.gateway = gateway
+        self.background_task_budget = background_task_budget or BackgroundTaskBudget()
         self.prompt_registry = getattr(getattr(gateway, "context_economy", None), "templates", None)
         # [修改] 更新内部提示词模板，确保第一阶段输出 reflection 维度
         self.prompt_template = """你是一个专业的对话分析智能体和记忆提炼大脑。
@@ -86,20 +87,27 @@ JSON 格式要求：
         try:
             lane_key = self._memory_lane_key(session_id)
             # 阶段一：提取事件与感想
-            result = await self.gateway.call_data_process_task(
-                prompt=summary_prompt,
-                system_prompt=summary_system_prompt,
-                is_json=True,
-                lane_key=lane_key,
-                base_origin=session_id,
-                template_envelope=summary_envelope,
+            async def _summary_call():
+                return await self.gateway.call_data_process_task(
+                    prompt=summary_prompt,
+                    system_prompt=summary_system_prompt,
+                    is_json=True,
+                    lane_key=lane_key,
+                    base_origin=session_id,
+                    template_envelope=summary_envelope,
+                )
+
+            result = await self.background_task_budget.run(
+                _summary_call,
+                task_name="memory.summary",
+                scope_id=session_id,
+                defer_release_on_timeout=True,
             )
             
-            data1 = {}
-            if isinstance(result, dict) and "summary" in result:
-                data1 = result
-            else:
-                data1 = self._parse_json(str(result))
+            data1 = self._parse_json(
+                result,
+                required_keys=("summary", "topics", "key_facts", "reflection", "sentiment", "importance"),
+            )
                 
             validated_data = self._validate_and_fill(data1)
 
@@ -116,20 +124,27 @@ JSON 格式要求：
                     )
                     node_prompt = node_envelope.prompt
                     node_system_prompt = node_envelope.system_prompt
-                node_result = await self.gateway.call_data_process_task(
-                    prompt=node_prompt,
-                    system_prompt=node_system_prompt,
-                    is_json=True,
-                    lane_key=lane_key,
-                    base_origin=session_id,
-                    template_envelope=node_envelope,
+                async def _node_call():
+                    return await self.gateway.call_data_process_task(
+                        prompt=node_prompt,
+                        system_prompt=node_system_prompt,
+                        is_json=True,
+                        lane_key=lane_key,
+                        base_origin=session_id,
+                        template_envelope=node_envelope,
+                    )
+
+                node_result = await self.background_task_budget.run(
+                    _node_call,
+                    task_name="memory.summary_nodes",
+                    scope_id=session_id,
+                    defer_release_on_timeout=True,
                 )
                 
-                node_data = {}
-                if isinstance(node_result, dict):
-                    node_data = node_result
-                else:
-                    node_data = self._parse_json(str(node_result))
+                node_data = self._parse_json(
+                    node_result,
+                    required_keys=("nodes", "deleted_nodes"),
+                )
                     
                 validated_data["nodes"] = node_data.get("nodes", [])
                 validated_data["deleted_nodes"] = node_data.get("deleted_nodes", [])
@@ -184,19 +199,37 @@ JSON 格式要求：
             "deleted_nodes": []
         }
 
-    def _parse_json(self, text: str) -> Dict[str, Any]:
-        """健壮的 JSON 解析器（带 Markdown 修复和正则兜底）"""
-        # 尝试剥离 Markdown 代码块
-        match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL | re.IGNORECASE)
-        if match:
-            text = match.group(1)
-        else:
-            # 正则兜底提取大括号内容（balanced braces, not greedy .*）
-            match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text, re.DOTALL)
-            if match:
-                text = match.group(0)
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            logger.warning(f"[MemoryProcessor] JSON 解析失败，原始文本: {text[:100]}...")
-            return {}
+    def _parse_json(
+        self,
+        text: Any,
+        *,
+        required_keys: tuple[str, ...] = (),
+    ) -> Dict[str, Any]:
+        result = parse_json_contract(
+            text,
+            required_keys=required_keys,
+            optional_keys=(
+                "summary", "topics", "key_facts", "reflection", "sentiment",
+                "importance", "nodes", "deleted_nodes",
+            ),
+            field_types={
+                "summary": str,
+                "topics": list,
+                "key_facts": list,
+                "reflection": str,
+                "sentiment": str,
+                "importance": (int, float),
+                "nodes": list,
+                "deleted_nodes": list,
+            },
+            allow_extra_keys=False,
+            allow_naked_members=True,
+        )
+        if result.schema_valid:
+            return dict(result.value)
+        logger.warning(
+            "[MemoryProcessor] structured output rejected "
+            f"status={result.terminal_status} missing={list(result.missing_keys)} "
+            f"unexpected={list(result.unexpected_keys)} invalid_types={list(result.invalid_type_keys)}"
+        )
+        return {}

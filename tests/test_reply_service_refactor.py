@@ -852,8 +852,17 @@ class RefactoredReplyServiceTests(unittest.TestCase):
 
         async def _run():
             await service.handle_reply(first, "reply-1", first.unified_msg_origin)
+            for _ in range(50):
+                if first.unified_msg_origin in pipeline._session_history_buffer:
+                    break
+                await asyncio.sleep(0)
             after_first = await pipeline.describe_session_eligibility(first.unified_msg_origin)
             await service.handle_reply(second, "reply-2", second.unified_msg_origin)
+            for _ in range(50):
+                session = pipeline._session_history_buffer.get(second.unified_msg_origin, {})
+                if len(session.get("buffer", [])) >= 4:
+                    break
+                await asyncio.sleep(0)
             memory_engine.session_summarizer.config.memory.summary_threshold = 2
             after_second = await pipeline.describe_session_eligibility(second.unified_msg_origin)
             return after_first, after_second

@@ -57,6 +57,8 @@ from .memory_write_service import MemoryWriteService
 from .session_memory_summarizer import SessionMemorySummarizer
 from .v2_store import MemoryV2Store
 from ...infrastructure.persistence.memory_turn_checkpoint import MemoryTurnCheckpointStore
+from ...infrastructure.persistence.memory_turn_ledger import MemoryTurnLedgerStore
+from ...infrastructure.runtime.background_task_ledger import BackgroundTaskLedger
 
 
 @dataclass(slots=True)
@@ -113,10 +115,18 @@ class MemoryEngine:
     STARTUP_BATCH_SIZE = 32
     STARTUP_YIELD_SEC = 0.001
 
-    def __init__(self, context, gateway, embedding_models: list = None, config=None):
+    def __init__(
+        self,
+        context,
+        gateway,
+        embedding_models: list = None,
+        config=None,
+        owner_registry=None,
+    ):
         self.context = context
         self.gateway = gateway
         self.config = config if config else gateway.config
+        self.owner_registry = owner_registry
         self.db_service = None
         if hasattr(self.config, "provider") and getattr(self.config.provider, "embedding_models", None):
             self.embedding_models = self.config.provider.embedding_models
@@ -214,6 +224,31 @@ class MemoryEngine:
         self._last_feedback_cleanup_ts = 0.0
         self.v2_store = MemoryV2Store(self.v2_db_path, data_path=self.data_path, legacy_db_path=self.db_path)
         # Sub-components that depend on self are initialized in initialize()
+
+    def _register_owner_task(
+        self,
+        task: asyncio.Task,
+        *,
+        task_family: str,
+        scope_id: str = "GLOBAL",
+        run_id: str = "",
+    ) -> None:
+        registry = getattr(self, "owner_registry", None)
+        register = getattr(registry, "register", None)
+        if not callable(register):
+            return
+        try:
+            register(
+                task,
+                task_family=task_family,
+                scope_id=scope_id or "GLOBAL",
+                run_id=run_id,
+                owner="MemoryEngine",
+                generation=getattr(registry, "generation", 0),
+                cancel_status="cancelled",
+            )
+        except Exception as exc:
+            logger.debug("[MemoryEngine] owner registry registration degraded: %s", exc)
 
     @staticmethod
     def _configured_embedding_models(config, fallback: list | None = None) -> list:
@@ -470,6 +505,12 @@ class MemoryEngine:
                     }
             task = asyncio.create_task(_probe(), name="astrmai-embedding-dimension-probe")
             self._vector_dimension_probe_task = task
+            self._register_owner_task(
+                task,
+                task_family="memory.embedding.dimension_probe",
+                scope_id="GLOBAL",
+                run_id=f"embedding-probe-{uuid.uuid4().hex[:12]}",
+            )
         result = dict(await asyncio.shield(task))
         result.update({"fingerprint": fingerprint, "provider_source_id": source_id})
         if not getattr(self, "_accepting_dimension_probe", True):
@@ -977,6 +1018,12 @@ class MemoryEngine:
                 self._run_vector_bootstrap_budgeted(),
                 name="astrmai-vector-bootstrap",
             )
+            self._register_owner_task(
+                task,
+                task_family="memory.vector.bootstrap",
+                scope_id="GLOBAL",
+                run_id=f"vector-bootstrap-{uuid.uuid4().hex[:12]}",
+            )
         except RuntimeError:
             return
         self._vector_bootstrap_task = task
@@ -1161,6 +1208,12 @@ class MemoryEngine:
                         self._close_vector_stack(resource, None),
                         name="astrmai-vector-resource-close",
                     )
+                    self._register_owner_task(
+                        task,
+                        task_family="memory.vector.close",
+                        scope_id=str(key),
+                        run_id=f"vector-close-{uuid.uuid4().hex[:12]}",
+                    )
                     self._vector_close_tasks[key] = (resource, task)
                     task.add_done_callback(
                         lambda completed, owner=resource: self._consume_vector_close_task(owner, completed)
@@ -1266,6 +1319,12 @@ class MemoryEngine:
             return await asyncio.wrap_future(physical_future)
 
         task = asyncio.create_task(_wait_for_candidate(), name="astrmai-vector-candidate-build")
+        self._register_owner_task(
+            task,
+            task_family="memory.vector.candidate_build",
+            scope_id="GLOBAL",
+            run_id=f"vector-candidate-{uuid.uuid4().hex[:12]}",
+        )
         with self._vector_registry_lock:
             self._vector_candidate_build_tasks.add(task)
 
@@ -1905,7 +1964,11 @@ class MemoryEngine:
                         embedding_provider=provider_instance,
                     )
                     await candidate_db.initialize()
-                    candidate_retriever = VectorRetriever(candidate_db, self.config)
+                    candidate_retriever = VectorRetriever(
+                        candidate_db,
+                        self.config,
+                        owner_registry=getattr(self, "owner_registry", None),
+                    )
                     candidate_hybrid = HybridRetriever(
                         self.bm25_retriever,
                         candidate_retriever,
@@ -1919,6 +1982,7 @@ class MemoryEngine:
                         vec_retriever=candidate_retriever,
                         retriever=candidate_hybrid,
                         background_task_budget=getattr(self, "background_task_budget", None),
+                        owner_registry=getattr(self, "owner_registry", None),
                         _projection_lock=self._projection_lock,
                         _ack_projection_outbox=False,
                         _candidate_outbox_candidates=candidate_outbox_candidates,
@@ -2181,6 +2245,12 @@ class MemoryEngine:
                         self._projection_ready_replay_task = asyncio.create_task(
                             replay(limit=int(self._timing_value("projection_retry_batch_size", 20) or 20)),
                             name="astrmai-memory-projection-ready-replay",
+                        )
+                        self._register_owner_task(
+                            self._projection_ready_replay_task,
+                            task_family="memory.projection.replay",
+                            scope_id="GLOBAL",
+                            run_id=f"projection-replay-{uuid.uuid4().hex[:12]}",
                         )
                         replay_task = self._projection_ready_replay_task
 
@@ -2453,10 +2523,13 @@ class MemoryEngine:
         importance: float = 0.8,
         sender_id: str = "",
         created_at: float = 0.0,
+        kind: str | None = None,
+        source: str = "legacy_add_memory",
+        metadata: dict[str, Any] | None = None,
     ):
         request = MemoryWriteRequest(
-            source="legacy_add_memory",
-            kind="persona_lore" if session_id == "__self_lore__" else "memory",
+            source=str(source or "legacy_add_memory"),
+            kind=str(kind or ("persona_lore" if session_id == "__self_lore__" else "memory")),
             session_id=str(session_id or ""),
             sender_id=str(sender_id or ""),
             persona_id=str(persona_id or ""),
@@ -2464,6 +2537,7 @@ class MemoryEngine:
             importance=float(importance or 0.8),
             confidence=0.8,
             source_ref="memory_engine.add_memory",
+            metadata=dict(metadata or {}),
             created_at=float(created_at or 0.0),
         )
         return await self.write_service.write(request)
@@ -2996,13 +3070,21 @@ class MemoryEngine:
             raw_trace_store,
             observability_hub=getattr(self, "observability_hub", None),
         )
-        self.session_summarizer = SessionMemorySummarizer(self.context, self.gateway, self, config=self.config)
+        self.session_summarizer = SessionMemorySummarizer(
+            self.context,
+            self.gateway,
+            self,
+            config=self.config,
+            background_task_budget=getattr(self, "background_task_budget", None),
+        )
         self.instant_gate = InstantMemoryGate(self.gateway, self, config=self.config)
         checkpoint_store = None
         persistence = getattr(getattr(self, "db_service", None), "persistence", None)
         checkpoint_db_path = getattr(persistence, "db_path", None)
         if checkpoint_db_path:
             checkpoint_store = MemoryTurnCheckpointStore(checkpoint_db_path)
+        turn_ledger = MemoryTurnLedgerStore(checkpoint_db_path) if checkpoint_db_path else None
+        task_ledger = BackgroundTaskLedger(checkpoint_db_path) if checkpoint_db_path else None
         self.memory_pipeline = MemoryTurnPipeline(
             context=self.context,
             gateway=self.gateway,
@@ -3013,7 +3095,10 @@ class MemoryEngine:
             config=self.config,
             observer=self.memory_observer,
             checkpoint_store=checkpoint_store,
+            turn_ledger=turn_ledger,
+            task_ledger=task_ledger,
             background_task_budget=getattr(self, "background_task_budget", None),
+            owner_registry=getattr(self, "owner_registry", None),
         )
         await self.memory_pipeline.start()
 
@@ -3031,6 +3116,12 @@ class MemoryEngine:
         try:
             self._vector_bootstrap_delay_task = asyncio.create_task(
                 _delayed_start(), name="astrmai-vector-bootstrap-delay"
+            )
+            self._register_owner_task(
+                self._vector_bootstrap_delay_task,
+                task_family="memory.vector.bootstrap_delay",
+                scope_id="GLOBAL",
+                run_id=f"vector-bootstrap-delay-{uuid.uuid4().hex[:12]}",
             )
         except RuntimeError:
             self._vector_bootstrap_delay_task = None

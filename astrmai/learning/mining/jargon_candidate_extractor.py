@@ -213,6 +213,12 @@ class JargonCandidateExtractor:
                 if self._looks_noise(token, sender_tokens) or self._near_duplicate(token, blocked):
                     skipped_noise += 1
                     continue
+                # Existing canonical terms and aliases remain evidence only; do
+                # not send them through enrichment again on checkpoint overlap.
+                if self._normalize_token(token) in canonical_terms:
+                    quality_filtered += 1
+                    route_reasons["existing_term"] += 1
+                    continue
                 route = LearningCandidateRouter.classify(token)
                 route_reasons[route.reason] += 1
                 if route.target == "expression":

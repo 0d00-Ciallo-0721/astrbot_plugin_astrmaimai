@@ -77,6 +77,78 @@ class DreamAgentGapCoverageTests(unittest.TestCase):
 
         asyncio.run(_run())
 
+    def test_canonical_seed_events_are_preferred_without_touching_legacy_store(self):
+        async def _run():
+            from astrmai.memory.dream.dream_agent import DreamAgent
+
+            class _Store:
+                async def list_candidates(self, **_kwargs):
+                    return [
+                        SimpleNamespace(
+                            id="mem_1",
+                            session_id="chat-1",
+                            content="canonical memory",
+                            summary="",
+                            importance=0.8,
+                            metadata={"emotion": "calm"},
+                        )
+                    ]
+
+            class _LegacyDB:
+                def get_session(self):
+                    raise AssertionError("legacy MemoryEvent store must not be read")
+
+            agent = DreamAgent(
+                SimpleNamespace(config=SimpleNamespace()),
+                _LegacyDB(),
+                memory_engine=SimpleNamespace(v2_store=_Store()),
+            )
+            agent.SEED_SAMPLE_SIZE = 10
+
+            seeds = await agent._get_seed_events("chat-1")
+            count = await agent.count_session_events("chat-1")
+
+            self.assertEqual([item["event_id"] for item in seeds], ["mem_1"])
+            self.assertEqual(seeds[0]["source"], "memory_v2")
+            self.assertEqual(seeds[0]["emotion"], "calm")
+            self.assertEqual(count, 1)
+
+        asyncio.run(_run())
+
+    def test_empty_canonical_seed_store_falls_back_to_legacy_events(self):
+        async def _run():
+            from astrmai.memory.dream.dream_agent import DreamAgent
+
+            class _Store:
+                async def list_candidates(self, **_kwargs):
+                    return []
+
+            event = SimpleNamespace(
+                event_id="legacy-1",
+                narrative="legacy memory",
+                emotion="neutral",
+                importance=0.5,
+            )
+
+            class _DB:
+                def get_session(self):
+                    return _SessionContext(SimpleNamespace())
+
+            agent = DreamAgent(
+                SimpleNamespace(config=SimpleNamespace()),
+                _DB(),
+                memory_engine=SimpleNamespace(v2_store=_Store()),
+            )
+            agent.SEED_SAMPLE_SIZE = 10
+            agent._load_session_events = lambda _session, _session_id: [event]
+
+            seeds = await agent._get_seed_events("chat-1")
+
+            self.assertEqual([item["event_id"] for item in seeds], ["legacy-1"])
+            self.assertNotIn("source", seeds[0])
+
+        asyncio.run(_run())
+
     def test_count_session_events_uses_session_id_then_legacy_date(self):
         from sqlalchemy.pool import StaticPool
         from sqlmodel import Session, create_engine

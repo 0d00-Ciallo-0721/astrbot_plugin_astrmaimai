@@ -12,6 +12,7 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
 from ..contracts.turn_context import ensure_turn_context
+from ...infrastructure.gateway.json_utils import parse_json_contract
 from ...infrastructure.runtime.lane_manager import LaneKey
 from ...shared.emotion_tags import build_emotion_tag_catalog
 from ..contracts.prompt_envelope import PromptEnvelope
@@ -1928,9 +1929,6 @@ class PlannerSideInputMixin:
         )
 
         try:
-            import json as _json
-            import re
-
             result = await self.gateway.call_data_process_task(
                 prompt,
                 system_prompt=self.FOLLOW_UP_SYSTEM_PROMPT,
@@ -1938,11 +1936,15 @@ class PlannerSideInputMixin:
                 lane_key=LaneKey(subsystem="sys2", task_family="followup", scope_id=chat_id),
                 base_origin=chat_id,
             )
-            data = result if isinstance(result, dict) else {}
-            if not isinstance(data, dict):
-                match = re.search(r"\{.*?\}", str(result), re.DOTALL)
-                if match:
-                    data = _json.loads(match.group(0))
+            parsed = parse_json_contract(
+                result,
+                required_keys=("follow",),
+                optional_keys=("reason", "should_follow"),
+                field_types={"follow": bool, "reason": str, "should_follow": bool},
+                allow_extra_keys=False,
+                allow_naked_members=True,
+            )
+            data = dict(parsed.value) if parsed.schema_valid else {}
             if data.get("follow") or data.get("should_follow"):
                 return data.get("reason", "补充细节")
         except Exception as exc:
@@ -2251,9 +2253,6 @@ class PlannerSideInputMixin:
         )
 
         try:
-            import json as _json
-            import re
-
             result = await self.gateway.call_data_process_task(
                 prompt,
                 system_prompt=self.FOLLOW_UP_SYSTEM_PROMPT,
@@ -2261,11 +2260,15 @@ class PlannerSideInputMixin:
                 lane_key=LaneKey(subsystem="sys2", task_family="followup", scope_id=chat_id),
                 base_origin=chat_id,
             )
-            data = result if isinstance(result, dict) else {}
-            if not isinstance(data, dict):
-                match = re.search(r"\{.*?\}", str(result), re.DOTALL)
-                if match:
-                    data = _json.loads(match.group(0))
+            parsed = parse_json_contract(
+                result,
+                required_keys=("follow",),
+                optional_keys=("reason", "should_follow"),
+                field_types={"follow": bool, "reason": str, "should_follow": bool},
+                allow_extra_keys=False,
+                allow_naked_members=True,
+            )
+            data = dict(parsed.value) if parsed.schema_valid else {}
             if data.get("follow") or data.get("should_follow"):
                 reason = str(data.get("reason", "extra_detail") or "extra_detail")
                 cooldown_until = self._set_follow_up_cooldown(chat_id, social_intent)

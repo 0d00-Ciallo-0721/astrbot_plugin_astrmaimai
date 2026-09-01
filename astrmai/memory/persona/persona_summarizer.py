@@ -11,6 +11,7 @@ from ...infrastructure.context_economy import PromptTemplateId
 from ...infrastructure.persistence.persistence_manager import PersistenceManager
 from ...infrastructure.gateway.model_gateway import GlobalModelGateway
 from ...infrastructure.runtime.lane_manager import LaneKey
+from ...infrastructure.runtime.background_task_budget import BackgroundTaskBudget
 from ...shared.helpers.plugin_helpers import safe_create_task
 
 class PersonaSummarizer:
@@ -52,7 +53,7 @@ class PersonaSummarizer:
         self.gateway = gateway
         self.config = config if config else gateway.config
         self.memory_engine = memory_engine
-        self.background_task_budget = background_task_budget
+        self.background_task_budget = background_task_budget or BackgroundTaskBudget()
         # 加载持久化缓存
         self.cache = self.persistence.load_persona_cache()
         # 运行时任务锁

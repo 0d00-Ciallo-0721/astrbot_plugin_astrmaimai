@@ -1298,7 +1298,7 @@ class GroupRereadTests(unittest.TestCase):
         self.assertTrue(asyncio.run(facade.try_dispatch_group_reread(event)))
         self.assertEqual(order, ["observe", "record", "dispatch"])
 
-    def test_facade_evolution_record_failure_abandons_reread_and_allows_normal_retry(self):
+    def test_facade_evolution_record_failure_does_not_block_reread_dispatch(self):
         facade_mod = importlib.import_module("astrmai.app.plugin_facade")
         contract_mod = importlib.import_module("astrmai.conversation.contracts.reread")
         request = contract_mod.RereadActionRequest(
@@ -1308,6 +1308,7 @@ class GroupRereadTests(unittest.TestCase):
             trigger_kind="group_reread_passive",
         )
         calls = []
+        learning_failed = asyncio.Event()
 
         class _Observer:
             async def observe(self, _event):
@@ -1324,7 +1325,10 @@ class GroupRereadTests(unittest.TestCase):
 
         class _Evolution:
             async def record_user_message(self, _event):
-                raise RuntimeError("learning store unavailable")
+                try:
+                    raise RuntimeError("learning store unavailable")
+                finally:
+                    learning_failed.set()
 
         class _Dispatcher:
             async def dispatch(self, *_args):
@@ -1340,9 +1344,15 @@ class GroupRereadTests(unittest.TestCase):
         )
         event = _Event("早", sender_id="evolution-failure", message_id="evolution-failure")
 
-        result = asyncio.run(facade.try_dispatch_group_reread(event))
-        self.assertFalse(result)
-        self.assertEqual(calls, [("abandon", request.chat_id)])
+        async def _run():
+            result = await facade.try_dispatch_group_reread(event)
+            await asyncio.wait_for(learning_failed.wait(), timeout=1.0)
+            await asyncio.sleep(0)
+            return result
+
+        result = asyncio.run(_run())
+        self.assertTrue(result)
+        self.assertEqual(calls, [("dispatch",)])
         self.assertFalse(event.get_extra("astrmai_evolution_recorded", False))
         self.assertEqual(event.get_extra("astrmai_evolution_record_failed"), "RuntimeError")
 

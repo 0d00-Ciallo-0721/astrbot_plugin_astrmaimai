@@ -1,6 +1,7 @@
 import asyncio
 import dataclasses
 import importlib
+import sqlite3
 import sys
 import tempfile
 import time
@@ -69,6 +70,34 @@ def _install_proactive_stubs():
 
     dream_generator_mod.DreamGenerator = DreamGenerator
     sys.modules["astrmai.memory.dream_generator"] = dream_generator_mod
+
+
+def _create_background_task_ledger_schema(db):
+    db.execute(
+        """
+        CREATE TABLE background_task_ledger (
+            task_id TEXT PRIMARY KEY,
+            task_family TEXT NOT NULL,
+            scope_id TEXT NOT NULL DEFAULT '',
+            scheduled_at REAL NOT NULL DEFAULT 0,
+            started_at REAL NOT NULL DEFAULT 0,
+            finished_at REAL NOT NULL DEFAULT 0,
+            lease_until REAL NOT NULL DEFAULT 0,
+            lease_token TEXT NOT NULL DEFAULT '',
+            input_fingerprint TEXT NOT NULL DEFAULT '',
+            checkpoint_before TEXT NOT NULL DEFAULT '{}',
+            checkpoint_after TEXT NOT NULL DEFAULT '{}',
+            llm_call_count INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'queued',
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT NOT NULL DEFAULT '',
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at REAL NOT NULL DEFAULT 0,
+            updated_at REAL NOT NULL DEFAULT 0,
+            UNIQUE(task_family, scope_id, input_fingerprint)
+        )
+        """
+    )
 
 
 class ProactiveSchedulerRefactorTests(unittest.TestCase):
@@ -882,6 +911,46 @@ class ProactiveSchedulerRefactorTests(unittest.TestCase):
         self.assertEqual(second["reason"], "dream_session_backoff")
         self.assertEqual(agent.run_calls, 1)
 
+    def test_dream_scheduler_failure_uses_short_retry_backoff(self):
+        dream_mod = importlib.import_module("astrmai.proactive.dream_scheduler")
+
+        class _DreamAgent:
+            MIN_EVENTS_TO_DREAM = 1
+            TIMEOUT_SEC = 1
+
+            async def count_session_events(self, _session_id):
+                return 1
+
+            async def run_dream_cycle(self, **_kwargs):
+                raise RuntimeError("provider unavailable")
+
+        scheduler = dream_mod.DreamScheduler(
+            context=SimpleNamespace(send_message=None),
+            memory_engine=None,
+            config=SimpleNamespace(
+                life=SimpleNamespace(
+                    dream_interval_min=720,
+                    dream_time_ranges=[],
+                    min_memory_events_to_dream=1,
+                )
+            ),
+            semaphore=asyncio.Semaphore(1),
+        )
+        scheduler.bind_dependencies(_DreamAgent(), object())
+
+        with self.assertRaises(RuntimeError):
+            asyncio.run(scheduler.run_once_for_session("chat-failure"))
+
+        self.assertGreater(scheduler._dream_retry_at, time.time())
+        self.assertLess(
+            scheduler._dream_retry_at - time.time(),
+            scheduler._dream_interval,
+        )
+        self.assertEqual(
+            scheduler.describe_session_eligibility("chat-failure", time.time())["reason"],
+            "dream_session_backoff",
+        )
+
     def test_dream_scheduler_restores_cooldowns_after_reload(self):
         dream_mod = importlib.import_module("astrmai.proactive.dream_scheduler")
         cache_dir = Path(self.temp_dir.name) / "cache"
@@ -1600,6 +1669,243 @@ class ProactiveSchedulerRefactorTests(unittest.TestCase):
         self.assertEqual(history_after["decision"]["reply_preview"], "hello world")
         self.assertEqual(history_after["decision"]["status"], "sent")
         self.assertEqual(history_after["status"], "sent")
+
+    def test_bound_kernel_bridge_detaches_and_deduplicates_slow_signal(self):
+        async def _run():
+            bridges = {}
+            started = asyncio.Event()
+            release = asyncio.Event()
+            calls = []
+
+            class _Kernel:
+                def bind_dispatch_bridge(self, action, handler):
+                    bridges[action] = handler
+
+            task = self.mod.ProactiveTask.__new__(self.mod.ProactiveTask)
+            task._background_tasks = set()
+            task._background_task_stats = {}
+            task._kernel_signal_tasks = {}
+            task.background_task_budget = None
+
+            async def slow_memory(chat_id, _snapshot, _decision):
+                calls.append(chat_id)
+                started.set()
+                await release.wait()
+                return {"performed": True}
+
+            task.handle_memory_signal = slow_memory
+            task.bind_chat_loop_kernel(_Kernel())
+            bridge = bridges["MEMORY_MAINTENANCE"]
+            snapshot = SimpleNamespace()
+            decision = SimpleNamespace(action="MEMORY_MAINTENANCE", metadata={})
+
+            first = await asyncio.wait_for(
+                bridge("chat-1", snapshot, decision),
+                timeout=0.2,
+            )
+            await asyncio.wait_for(started.wait(), timeout=1.0)
+            duplicate = await bridge("chat-1", snapshot, decision)
+
+            self.assertTrue(first["queued"])
+            self.assertEqual(first["dispatch_mode"], "queued_background")
+            self.assertFalse(duplicate["queued"])
+            self.assertEqual(duplicate["reason"], "already_queued")
+            self.assertEqual(calls, ["chat-1"])
+
+            release.set()
+            await asyncio.gather(*list(task._background_tasks))
+            await asyncio.sleep(0)
+            self.assertEqual(task._kernel_signal_tasks, {})
+
+        asyncio.run(_run())
+
+    def test_dream_reload_completion_is_resumed_by_different_chat_tick(self):
+        from astrmai.infrastructure.persistence.dream_completion_outbox import (
+            DreamCompletionOutboxStore,
+        )
+        from astrmai.infrastructure.runtime.background_task_ledger import (
+            BackgroundTaskLedger,
+        )
+
+        async def _run():
+            db_path = Path(self.temp_dir.name) / "dream.db"
+            with sqlite3.connect(db_path) as db:
+                _create_background_task_ledger_schema(db)
+                db.execute(
+                    """
+                    CREATE TABLE dream_completion_outbox (
+                        request_key TEXT PRIMARY KEY,
+                        run_id TEXT NOT NULL DEFAULT '',
+                        session_id TEXT NOT NULL DEFAULT '',
+                        payload_json TEXT NOT NULL DEFAULT '{}',
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        lease_until REAL NOT NULL DEFAULT 0,
+                        lease_token TEXT NOT NULL DEFAULT '',
+                        created_at REAL NOT NULL DEFAULT 0,
+                        updated_at REAL NOT NULL DEFAULT 0
+                    )
+                    """
+                )
+                db.commit()
+            outbox = DreamCompletionOutboxStore(db_path)
+            task_ledger = BackgroundTaskLedger(db_path)
+            task_lease = await task_ledger.claim(
+                task_family="dream",
+                scope_id="__global__",
+                input_fingerprint="chat-old",
+                lease_seconds=43200.0,
+            )
+            await outbox.save(
+                "chat-old",
+                {
+                    "run_id": "dream-reload-1",
+                    "session_id": "chat-old",
+                    "started_at": time.time() - 60,
+                    "dream_text": "old dream",
+                    "maintenance": {"summary": "done", "actions": []},
+                    "promotion_report": {},
+                    "feedback_done": True,
+                    "diary_memory_done": True,
+                    "maintenance_memory_done": True,
+                    "visible_send_done": True,
+                    "task_input_fingerprint": "chat-old",
+                    "_background_task_lease": {
+                        "task_id": task_lease.task_id,
+                        "task_family": task_lease.task_family,
+                        "scope_id": task_lease.scope_id,
+                        "lease_token": task_lease.lease_token,
+                        "lease_until": task_lease.lease_until,
+                        "retry_count": task_lease.retry_count,
+                    },
+                },
+            )
+            config = SimpleNamespace(
+                life=SimpleNamespace(dream_interval_min=720, dream_time_ranges=[]),
+            )
+            scheduler = importlib.import_module("astrmai.proactive.dream_scheduler").DreamScheduler(
+                context=SimpleNamespace(send_message=None),
+                memory_engine=None,
+                config=config,
+                semaphore=asyncio.Semaphore(1),
+                dream_visible=False,
+            )
+            db_service = SimpleNamespace(
+                persistence=SimpleNamespace(
+                    db_path=db_path,
+                    cache_dir=Path(self.temp_dir.name) / "cache",
+                )
+            )
+            scheduler.bind_dependencies(object(), object(), db_service=db_service)
+
+            result = await scheduler.run_once_for_session("chat-new")
+
+            self.assertTrue(result["performed"])
+            self.assertEqual(result["session_id"], "chat-old")
+            self.assertEqual(await outbox.list_pending(), [])
+            self.assertEqual(scheduler.describe_status()["pending_completions"], 0)
+            rows = await scheduler._task_ledger.list_recent(task_family="dream")
+            self.assertEqual(rows[0]["status"], "succeeded")
+
+        asyncio.run(_run())
+
+    def test_dream_generation_failure_uses_short_retry_and_can_run_again(self):
+        async def _run():
+            db_path = Path(self.temp_dir.name) / "dream-failure.db"
+            with sqlite3.connect(db_path) as db:
+                _create_background_task_ledger_schema(db)
+                db.execute(
+                    """
+                    CREATE TABLE dream_completion_outbox (
+                        request_key TEXT PRIMARY KEY,
+                        run_id TEXT NOT NULL DEFAULT '',
+                        session_id TEXT NOT NULL DEFAULT '',
+                        payload_json TEXT NOT NULL DEFAULT '{}',
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        lease_until REAL NOT NULL DEFAULT 0,
+                        lease_token TEXT NOT NULL DEFAULT '',
+                        created_at REAL NOT NULL DEFAULT 0,
+                        updated_at REAL NOT NULL DEFAULT 0
+                    )
+                    """
+                )
+                db.commit()
+
+            class _FailingDreamAgent:
+                MIN_EVENTS_TO_DREAM = 1
+
+                def __init__(self):
+                    self.fail = True
+
+                async def count_session_events(self, _session_id):
+                    return 1
+
+                async def run_dream_cycle(self, **_kwargs):
+                    if self.fail:
+                        raise RuntimeError("provider unavailable")
+                    return "dream log"
+
+            class _DreamGenerator:
+                async def generate(self, **_kwargs):
+                    return "dream text"
+
+                def build_maintenance_result(self, *_args, **_kwargs):
+                    return {"summary": "done", "actions": [], "tags": []}
+
+            config = SimpleNamespace(
+                life=SimpleNamespace(
+                    dream_interval_min=720,
+                    dream_time_ranges=[],
+                    min_memory_events_to_dream=1,
+                ),
+                persona=SimpleNamespace(name="Mai"),
+            )
+            scheduler = importlib.import_module("astrmai.proactive.dream_scheduler").DreamScheduler(
+                context=SimpleNamespace(send_message=None),
+                memory_engine=None,
+                config=config,
+                semaphore=asyncio.Semaphore(1),
+                dream_visible=False,
+            )
+            db_service = SimpleNamespace(
+                persistence=SimpleNamespace(
+                    db_path=db_path,
+                    cache_dir=Path(self.temp_dir.name) / "cache-failure",
+                )
+            )
+            agent = _FailingDreamAgent()
+            scheduler.bind_dependencies(
+                agent,
+                _DreamGenerator(),
+                db_service=db_service,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "provider unavailable"):
+                await scheduler.run_once_for_session("chat-failure")
+
+            rows = await scheduler._task_ledger.list_recent(task_family="dream")
+            self.assertEqual(rows[0]["status"], "retry_wait")
+            self.assertEqual(rows[0]["last_error"], "provider unavailable")
+            self.assertGreater(rows[0]["lease_until"] - time.time(), 240.0)
+            self.assertLess(rows[0]["lease_until"] - time.time(), 360.0)
+            self.assertGreater(scheduler._dream_reservation_until - time.time(), 240.0)
+            self.assertEqual(scheduler._last_dream_time, 0.0)
+
+            with sqlite3.connect(db_path) as db:
+                db.execute(
+                    "UPDATE background_task_ledger SET lease_until=0 WHERE task_family='dream'"
+                )
+                db.commit()
+            scheduler._dream_retry_at = 0.0
+            scheduler._dream_reservation_until = 0.0
+            agent.fail = False
+
+            retried = await scheduler.run_once_for_session("chat-failure")
+
+            self.assertTrue(retried["performed"])
+            self.assertGreater(scheduler._last_dream_time, 0.0)
+            self.assertEqual(scheduler._dream_failure_count, 0)
+
+        asyncio.run(_run())
 
 
 if __name__ == "__main__":

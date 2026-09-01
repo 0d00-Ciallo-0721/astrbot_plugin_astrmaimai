@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 
-LATEST_ARCHITECTURE_SCHEMA_VERSION = 95
+LATEST_ARCHITECTURE_SCHEMA_VERSION = 120
 
 MESSAGELOG_REQUIRED_COLUMNS = (
     "event_id",
@@ -51,10 +51,19 @@ REQUIRED_INDEXES = (
     "ix_chat_states_next_proactive_due_at",
     "ix_reply_commit_outbox_next_retry_at",
     "ix_learning_mining_run_created_at",
+    "ix_learning_mining_run_mining_run_id",
     "ix_memory_turn_checkpoint_updated_at",
     "ix_relationship_event_ledger_user_created",
     "ix_relationship_event_ledger_chat_created",
     "ix_relationship_event_ledger_turn_id",
+    "ix_memory_turn_ledger_chat_updated",
+    "ix_learning_ingest_outbox_due",
+    "ix_background_task_ledger_scope_status",
+    "ix_reflection_outbox_due",
+    "ix_dream_completion_outbox_updated",
+    "ix_dream_completion_outbox_lease",
+    "ix_reply_commit_outbox_lease",
+    "ix_memory_turn_ledger_lease",
 )
 
 
@@ -170,6 +179,11 @@ def inspect_architecture_migration(
         "reply_commit_outbox",
         "memory_turn_checkpoint",
         "relationship_event_ledger",
+        "memory_turn_ledger",
+        "learning_ingest_outbox",
+        "background_task_ledger",
+        "reflection_outbox",
+        "dream_completion_outbox",
     )
     missing_tables = tuple(name for name in required_tables if name not in tables)
     table_row_counts = {
@@ -181,6 +195,8 @@ def inspect_architecture_migration(
     requirements = {
         "messagelog": MESSAGELOG_REQUIRED_COLUMNS,
         "chat_states": CHAT_STATE_REQUIRED_COLUMNS,
+        "dream_completion_outbox": ("lease_until", "lease_token"),
+        "memory_turn_ledger": ("lease_until", "lease_token"),
     }
     missing_columns: dict[str, tuple[str, ...]] = {}
     available_columns: dict[str, set[str]] = {}
@@ -194,7 +210,21 @@ def inspect_architecture_migration(
             missing_columns[table] = missing
 
     indexes = _index_names(db)
-    missing_indexes = tuple(name for name in REQUIRED_INDEXES if name not in indexes)
+    index_table = {
+        "ix_memory_turn_ledger_chat_updated": "memory_turn_ledger",
+        "ix_learning_ingest_outbox_due": "learning_ingest_outbox",
+        "ix_background_task_ledger_scope_status": "background_task_ledger",
+        "ix_reflection_outbox_due": "reflection_outbox",
+        "ix_dream_completion_outbox_updated": "dream_completion_outbox",
+        "ix_dream_completion_outbox_lease": "dream_completion_outbox",
+        "ix_reply_commit_outbox_lease": "reply_commit_outbox",
+        "ix_memory_turn_ledger_lease": "memory_turn_ledger",
+    }
+    missing_indexes = tuple(
+        name
+        for name in REQUIRED_INDEXES
+        if index_table.get(name) in (None, *tables) and name not in indexes
+    )
 
     canonical_event_rows = 0
     duplicate_event_id_groups = 0

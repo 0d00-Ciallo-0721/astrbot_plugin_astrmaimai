@@ -6,14 +6,17 @@ from typing import Any
 
 from astrbot.api import logger
 
+from ...infrastructure.gateway.json_utils import parse_json_payload
 from ...infrastructure.runtime.lane_manager import LaneKey
+from ...infrastructure.runtime.background_task_budget import BackgroundTaskBudget
 from .expression_results import ExpressionEnrichmentResult
 
 
 class ExpressionPatternEnricher:
-    def __init__(self, gateway, config=None):
+    def __init__(self, gateway, config=None, background_task_budget=None):
         self.gateway = gateway
         self.config = config if config else getattr(gateway, "config", None)
+        self.background_task_budget = background_task_budget or BackgroundTaskBudget()
         self.last_result = ExpressionEnrichmentResult(status="completed")
 
     @staticmethod
@@ -56,7 +59,7 @@ class ExpressionPatternEnricher:
     @staticmethod
     def _coerce_rows(result: Any) -> list[dict[str, Any]]:
         if isinstance(result, str):
-            result = json.loads(result)
+            result = parse_json_payload(result).value
         if isinstance(result, list):
             rows = result
         elif isinstance(result, dict):
@@ -115,11 +118,19 @@ class ExpressionPatternEnricher:
             "\"contradicted_by\":[\"真实消息ID\"],\"content_samples\":[\"模型示例，不作证据\"]}]}\n"
             f"Candidates: {json.dumps(prompt_items, ensure_ascii=False)}"
         )
-        result = await self.gateway.call_data_process_task(
-            prompt=prompt,
-            is_json=True,
-            lane_key=self._lane(group_id),
-            base_origin=group_id,
+        async def _call():
+            return await self.gateway.call_data_process_task(
+                prompt=prompt,
+                is_json=True,
+                lane_key=self._lane(group_id),
+                base_origin=group_id,
+            )
+
+        result = await self.background_task_budget.run(
+            _call,
+            task_name="learning.expression_enrichment",
+            scope_id=group_id,
+            defer_release_on_timeout=True,
         )
         return self._coerce_rows(result)
 

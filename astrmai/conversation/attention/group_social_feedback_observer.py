@@ -23,10 +23,11 @@ class GroupSocialFeedbackObserver:
     DEFAULT_WINDOW_SEC = 45.0
     DEFAULT_MAX_ACTIVE = 5
 
-    def __init__(self, *, config=None, dialogue_store=None, gateway=None):
+    def __init__(self, *, config=None, dialogue_store=None, gateway=None, owner_registry=None):
         self.config = config
         self.dialogue_store = dialogue_store
         self.gateway = gateway
+        self.owner_registry = owner_registry
         self._active: dict[str, dict[str, SocialFeedbackObservation]] = defaultdict(dict)
         self._turn_index: dict[tuple[str, str], str] = {}
         self._timeout_tasks: dict[str, asyncio.Task] = {}
@@ -132,6 +133,21 @@ class GroupSocialFeedbackObserver:
 
     def _track_task(self, task: asyncio.Task) -> None:
         self._background_tasks.add(task)
+        registry = getattr(self, "owner_registry", None)
+        register = getattr(registry, "register", None)
+        if callable(register):
+            try:
+                register(
+                    task,
+                    task_family="social_feedback.expiry",
+                    scope_id="GLOBAL",
+                    run_id=f"social-feedback-{int(time.time() * 1000)}",
+                    owner="GroupSocialFeedbackObserver",
+                    generation=getattr(registry, "generation", 0),
+                    cancel_status="cancelled",
+                )
+            except Exception as exc:
+                logger.debug("[SocialFeedback] owner registry registration degraded: %s", exc)
         task.add_done_callback(self._background_tasks.discard)
 
     async def _record_feedback(

@@ -27,6 +27,7 @@ from ...infrastructure.runtime.background_task_budget import (
 )
 from ...infrastructure.runtime.trace_runtime import debug_trace, new_trace_id, preview_text
 from ...infrastructure.runtime.outbound_send_guard import outbound_send_allowed
+from ...infrastructure.persistence.attention_deferred_outbox import AttentionDeferredOutboxStore
 from ...infrastructure.runtime.turn_call_ledger import (
     attach_background_task_trace,
     begin_stage,
@@ -126,6 +127,7 @@ class AttentionGate:
         conversation_continuity=None,
         turn_trace_callback=None,
         background_task_budget=None,
+        owner_registry=None,
     ):
         self.state_engine = state_engine
         self.judge = judge
@@ -142,6 +144,7 @@ class AttentionGate:
         self.conversation_continuity = conversation_continuity
         self.turn_trace_callback = turn_trace_callback
         self.background_task_budget = background_task_budget
+        self.owner_registry = owner_registry
         self._proactive_injection_lock: dict[str, asyncio.Lock] = {}
         self._proactive_dispatching: dict[str, bool] = {}
         self._deferred_messages: dict[str, list] = {}  # ponytail: R12 — queue blocked messages
@@ -170,6 +173,12 @@ class AttentionGate:
         self._deferred_attention_dispatcher: asyncio.Task | None = None
         self._deferred_attention_sequence = 0
         self._deferred_attention_counts: collections.Counter[str] = collections.Counter()
+        deferred_db_path = getattr(self.dialogue_store, "db_path", None)
+        if not deferred_db_path:
+            deferred_db_path = getattr(getattr(state_engine, "db_service", None), "db_path", None)
+        self._deferred_attention_outbox = AttentionDeferredOutboxStore(deferred_db_path)
+        self._deferred_persist_tasks: set[asyncio.Task] = set()
+        self._deferred_persist_by_work: dict[str, asyncio.Task] = {}
         self._deferred_attention_terminal_statuses = frozenset(
             {
                 "replayed",
@@ -199,6 +208,227 @@ class AttentionGate:
         self.perception_builder = PerceptionBuilder(self)
         self.window_buffer = AttentionWindowBuffer(self)
         self.decision_router = AttentionDecisionRouter(self)
+
+    def _register_owner_task(
+        self,
+        task: asyncio.Task,
+        *,
+        task_family: str,
+        scope_id: str = "GLOBAL",
+        run_id: str = "",
+    ) -> None:
+        registry = getattr(self, "owner_registry", None)
+        register = getattr(registry, "register", None)
+        if not callable(register):
+            return
+        try:
+            register(
+                task,
+                task_family=task_family,
+                scope_id=scope_id or "GLOBAL",
+                run_id=run_id,
+                owner="AttentionGate",
+                generation=getattr(registry, "generation", 0),
+                cancel_status="cancelled",
+            )
+        except Exception as exc:
+            logger.debug("[AttentionGate] owner registry registration degraded: %s", exc)
+
+    @staticmethod
+    def _json_safe(value: Any, *, depth: int = 0) -> Any:
+        if depth > 4 or value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, dict):
+            return {
+                str(key): AttentionGate._json_safe(item, depth=depth + 1)
+                for key, item in list(value.items())[:128]
+            }
+        if isinstance(value, (list, tuple, set)):
+            return [AttentionGate._json_safe(item, depth=depth + 1) for item in list(value)[:128]]
+        return str(value)
+
+    def _serialize_deferred_event(self, event: Any) -> dict[str, Any]:
+        data = getattr(event, "_data", None)
+        if not isinstance(data, dict):
+            data = {
+                "message_str": str(getattr(event, "message_str", "") or ""),
+                "unified_msg_origin": str(getattr(event, "unified_msg_origin", "") or ""),
+                "timestamp": float(getattr(event, "timestamp", time.time()) or time.time()),
+            }
+            for name, getter in (
+                ("group_id", "get_group_id"),
+                ("sender_id", "get_sender_id"),
+                ("sender_name", "get_sender_name"),
+                ("self_id", "get_self_id"),
+            ):
+                method = getattr(event, getter, None)
+                if callable(method):
+                    try:
+                        data[name] = str(method() or "")
+                    except Exception:
+                        data[name] = ""
+        extra = getattr(event, "_extra", None)
+        if not isinstance(extra, dict) and hasattr(event, "get_extra"):
+            extra = {}
+            for key in (
+                "astrmai_trace_id",
+                "astrmai_turn_thread_id",
+                "astrmai_turn_generation",
+                "astrmai_execution_status",
+                "astrmai_reply_sent",
+                "astrmai_system2_failure_handled",
+                "astrmai_proactive_completed",
+            ):
+                try:
+                    extra[key] = event.get_extra(key, None)
+                except Exception:
+                    pass
+        data = dict(data)
+        data["extra"] = self._json_safe(extra or {})
+        return self._json_safe(data)
+
+    def _schedule_deferred_persist(self, item: dict[str, Any]) -> None:
+        store = getattr(self, "_deferred_attention_outbox", None)
+        if store is None or not getattr(store, "db_path", ""):
+            return
+        work_id = str(item.get("work_id") or "")
+        if not work_id:
+            return
+        previous = self._deferred_persist_by_work.get(work_id)
+        if previous is not None and not previous.done():
+            return
+        delay = max(0.0, self._deferred_next_retry_value(item) - time.monotonic())
+        payload = dict(item)
+        payload["next_retry_at_wall"] = time.time() + delay
+        payload.pop("event", None)
+        payload.pop("retry_factory", None)
+        payload.pop("session_identity", None)
+        event = item.get("event")
+        event_data = self._serialize_deferred_event(event)
+
+        async def _persist() -> None:
+            try:
+                await store.enqueue(payload, event_data=event_data)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("[Attention] deferred outbox enqueue degraded: %s", exc)
+
+        task = asyncio.create_task(_persist(), name=f"attention-deferred-persist:{work_id}")
+        self._deferred_persist_tasks.add(task)
+        self._deferred_persist_by_work[work_id] = task
+        self._background_tasks.add(task)
+        self._register_owner_task(
+            task,
+            task_family="attention.deferred.persistence",
+            scope_id=str(item.get("chat_id") or "GLOBAL"),
+            run_id=f"attention-deferred-persist-{work_id}",
+        )
+
+        def _done(completed: asyncio.Task) -> None:
+            self._deferred_persist_tasks.discard(completed)
+            self._background_tasks.discard(completed)
+            if self._deferred_persist_by_work.get(work_id) is completed:
+                self._deferred_persist_by_work.pop(work_id, None)
+            try:
+                completed.exception()
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        task.add_done_callback(_done)
+
+    def _schedule_deferred_finish(self, item: dict[str, Any], status: str, reason: str = "") -> None:
+        store = getattr(self, "_deferred_attention_outbox", None)
+        token = str(item.get("_outbox_lease_token") or "")
+        work_id = str(item.get("work_id") or "")
+        if store is None or not getattr(store, "db_path", "") or not work_id:
+            return
+        pending = self._deferred_persist_by_work.get(work_id)
+
+        async def _finish() -> None:
+            if pending is not None and not pending.done():
+                await asyncio.gather(pending, return_exceptions=True)
+            try:
+                await store.finish(
+                    work_id,
+                    lease_token=token,
+                    status="retry_wait" if status == "shutdown" else status,
+                    attempts=int(item.get("attempts", 0) or 0),
+                    next_retry_at=time.time() if status == "shutdown" else 0.0,
+                    error=reason,
+                )
+            except Exception as exc:
+                logger.debug("[Attention] deferred outbox settlement degraded: %s", exc)
+
+        task = asyncio.create_task(_finish(), name=f"attention-deferred-finish:{work_id}")
+        self._deferred_persist_tasks.add(task)
+        self._deferred_persist_by_work[work_id] = task
+        self._background_tasks.add(task)
+        self._register_owner_task(
+            task,
+            task_family="attention.deferred.persistence",
+            scope_id=str(item.get("chat_id") or "GLOBAL"),
+            run_id=f"attention-deferred-finish-{work_id}",
+        )
+        task.add_done_callback(lambda completed: self._deferred_persist_tasks.discard(completed))
+
+    async def _restore_deferred_attention(self) -> None:
+        store = getattr(self, "_deferred_attention_outbox", None)
+        if store is None or not getattr(store, "db_path", "") or self._workers_shutdown:
+            return
+        try:
+            rows = await store.claim_due(limit=max(1, int(self._deferred_attention_config("attention_deferred_queue_max", 128))))
+        except Exception as exc:
+            logger.debug("[Attention] deferred outbox restore degraded: %s", exc)
+            return
+        for row in rows:
+            work_id = str(row.get("work_id") or "")
+            if not work_id or work_id in self._deferred_attention_work:
+                continue
+            event = _SyntheticExternalEvent(dict(row.get("event_data") or {}))
+            now = time.time()
+            if float(row.get("expires_at", now) or now) <= now:
+                await store.finish(work_id, lease_token=str(row.get("lease_token") or ""), status="expired", error="ttl_expired")
+                continue
+            item = {
+                "work_id": work_id,
+                "chat_id": str(row.get("chat_id") or ""),
+                "task_name": str(row.get("task_name") or "attention.misc"),
+                "event": event,
+                "retry_factory": lambda event=event: self.process_event(event),
+                "enqueued_at": now,
+                "next_retry_at": time.monotonic() + max(0.0, float(row.get("next_retry_at_wall", now) or now) - now),
+                "expires_at": float(row.get("expires_at", now) or now),
+                "attempts": int(row.get("attempts", 0) or 0),
+                "max_attempts": max(1, int(row.get("max_attempts", 3) or 3)),
+                "reason": str(row.get("reason") or "queue_timeout"),
+                "session_identity": None,
+                "worker_generation": int(row.get("worker_generation", 0) or 0),
+                "shutdown_generation": int(self._shutdown_generation),
+                "turn_thread_id": str(row.get("turn_thread_id") or ""),
+                "turn_generation": int(row.get("turn_generation", 0) or 0),
+                "_outbox_lease_token": str(row.get("lease_token") or ""),
+                "_terminal_status": None,
+            }
+            self._deferred_attention_work[work_id] = item
+            self._deferred_attention_sequence += 1
+            self._deferred_attention_counts["restored"] += 1
+        if rows:
+            self._ensure_deferred_attention_dispatcher()
+            if self._deferred_attention_event is not None:
+                self._deferred_attention_event.set()
+
+    def _schedule_deferred_restore(self) -> None:
+        if not getattr(getattr(self, "_deferred_attention_outbox", None), "db_path", ""):
+            return
+        task = asyncio.create_task(self._restore_deferred_attention(), name="attention-deferred-restore")
+        self._background_tasks.add(task)
+        self._register_owner_task(
+            task,
+            task_family="attention.deferred.restore",
+            scope_id="GLOBAL",
+            run_id=f"attention-deferred-restore-{self._shutdown_generation}",
+        )
 
     def refresh_config(self, config):
         self.config = config
@@ -981,6 +1211,12 @@ class AttentionGate:
         except RuntimeError:
             return
         self._deferred_attention_dispatcher = task
+        self._register_owner_task(
+            task,
+            task_family="attention.deferred.dispatcher",
+            scope_id="GLOBAL",
+            run_id=f"attention-deferred-{self._deferred_attention_dispatcher_started_total}",
+        )
         self._deferred_attention_dispatcher_started_total += 1
         if self._deferred_attention_dispatcher_started_total > 1:
             self._deferred_attention_dispatcher_restart_total += 1
@@ -1566,6 +1802,12 @@ class AttentionGate:
         task._astrmai_inner_coro = coro
         task._astrmai_task_name = task_name
         self._background_tasks.add(task)
+        self._register_owner_task(
+            task,
+            task_family=task_name,
+            scope_id=str(getattr(event, "unified_msg_origin", "") or "GLOBAL"),
+            run_id=f"attention-{new_trace_id()}",
+        )
         attach_background_task_trace(
             task,
             event,
@@ -1584,6 +1826,12 @@ class AttentionGate:
         task._astrmai_inner_coro = coro
         task._astrmai_task_name = "attention.priority"
         self._background_tasks.add(task)
+        self._register_owner_task(
+            task,
+            task_family="attention.priority",
+            scope_id=str(getattr(event, "unified_msg_origin", "") or "GLOBAL"),
+            run_id=f"attention-priority-{new_trace_id()}",
+        )
         attach_background_task_trace(
             task,
             event,
@@ -1652,6 +1900,12 @@ class AttentionGate:
         )
         session.worker_task = task
         self._session_tasks.add(task)
+        self._register_owner_task(
+            task,
+            task_family="attention.session_worker",
+            scope_id=str(chat_id or "GLOBAL"),
+            run_id=f"attention-worker-{chat_id}-{worker_token}",
+        )
         attach_background_task_trace(
             task,
             event,
@@ -1694,6 +1948,12 @@ class AttentionGate:
             if current_worker and worker_context is not None and raw_token is not None:
                 recovery = asyncio.create_task(self._recover_failed_session_worker(worker_context))
                 self._background_tasks.add(recovery)
+                self._register_owner_task(
+                    recovery,
+                    task_family="attention.session_worker.recovery",
+                    scope_id=str(getattr(worker_context, "chat_id", "") or "GLOBAL"),
+                    run_id=f"attention-recovery-{new_trace_id()}",
+                )
                 recovery.add_done_callback(self._handle_background_task_result)
             return
         try:
@@ -1703,6 +1963,12 @@ class AttentionGate:
             if current_worker and worker_context is not None:
                 recovery = asyncio.create_task(self._recover_failed_session_worker(worker_context))
                 self._background_tasks.add(recovery)
+                self._register_owner_task(
+                    recovery,
+                    task_family="attention.session_worker.recovery",
+                    scope_id=str(getattr(worker_context, "chat_id", "") or "GLOBAL"),
+                    run_id=f"attention-recovery-{new_trace_id()}",
+                )
                 attach_background_task_trace(
                     recovery,
                     getattr(worker_context, "event", None),

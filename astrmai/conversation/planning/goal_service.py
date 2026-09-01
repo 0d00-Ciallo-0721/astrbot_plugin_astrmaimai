@@ -17,6 +17,7 @@ from typing import Dict, List, Optional
 from dataclasses import dataclass, field
 from astrbot.api import logger
 from ...infrastructure.runtime.lane_manager import LaneKey
+from ...infrastructure.gateway.json_utils import parse_json_payload
 
 
 @dataclass
@@ -196,16 +197,14 @@ class GoalManager:
 
     def _parse_goals(self, raw) -> Optional[List[ConversationGoal]]:
         """安全解析 LLM 返回的目标列表"""
-        items = None
         if isinstance(raw, list):
             items = raw
-        elif isinstance(raw, str):
-            match = re.search(r'\[.*\]', raw, re.DOTALL)
-            if match:
-                try:
-                    items = json.loads(match.group(0))
-                except json.JSONDecodeError:
-                    return None
+        else:
+            try:
+                parsed = parse_json_payload(raw, allow_naked_members=False)
+                items = parsed.value if isinstance(parsed.value, list) else None
+            except ValueError:
+                items = None
 
         if not isinstance(items, list):
             return None

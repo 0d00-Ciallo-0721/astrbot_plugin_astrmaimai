@@ -107,6 +107,51 @@ def test_legacy_processed_flag_waits_for_both_pipeline_checkpoints(tmp_path):
     assert [item.content for item in remaining] == ["消息4", "消息5"]
 
 
+def test_message_log_retention_only_deletes_fully_consumed_non_visual_rows(tmp_path):
+    service = _database_service(tmp_path)
+    chat_id = "ff:GroupMessage:retention"
+    _add_logs(service, chat_id, 5, processed_until=3)
+    with sqlite3.connect(service.persistence.db_path) as db:
+        rows = db.execute(
+            "SELECT id FROM messagelog WHERE group_id=? ORDER BY id",
+            (chat_id,),
+        ).fetchall()
+        ids = [int(row[0]) for row in rows]
+        db.execute("UPDATE messagelog SET image_refs='[\"image-1\"]' WHERE id=?", (ids[1],))
+        db.execute(
+            "UPDATE messagelog SET event_id=?, platform_message_id=? WHERE id=?",
+            ("event-visual", "platform-visual", ids[2]),
+        )
+        db.execute(
+            "INSERT INTO visualmessagebinding(chat_id,message_id,sender_id,image_index,asset_id,legacy_picid,source_ref_hash,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (chat_id, "event-visual", "user", 0, "", "", "hash", 1.0, 1.0),
+        )
+        db.commit()
+
+    service.ensure_learning_checkpoint("expression", chat_id)
+    service.ensure_learning_checkpoint("jargon", chat_id)
+    service.advance_learning_checkpoint("expression", chat_id, ids[2])
+    service.advance_learning_checkpoint("jargon", chat_id, ids[2])
+
+    report = service.purge_consumed_message_logs(
+        retention_days=7,
+        batch_size=10,
+        now=8 * 86400,
+    )
+
+    assert report["deleted"] == 1
+    with sqlite3.connect(service.persistence.db_path) as db:
+        remaining = [
+            row[0]
+            for row in db.execute(
+                "SELECT content FROM messagelog WHERE group_id=? ORDER BY id",
+                (chat_id,),
+            ).fetchall()
+        ]
+    assert remaining == ["消息2", "消息3", "消息4", "消息5"]
+
+
 def test_learning_run_ledger_is_append_only_and_filterable(tmp_path):
     service = _database_service(tmp_path)
     for status in ("insufficient_context", "completed"):
@@ -157,7 +202,7 @@ def test_quarantined_pipeline_returns_no_logs_until_retry_time(tmp_path):
     assert len(logs) == 4
 
 
-def test_learning_run_ledger_rejects_duplicate_run_id(tmp_path):
+def test_learning_run_ledger_retry_is_idempotent_by_run_id(tmp_path):
     service = _database_service(tmp_path)
     payload = {
         "run_id": "fixed-run-id",
@@ -166,13 +211,128 @@ def test_learning_run_ledger_rejects_duplicate_run_id(tmp_path):
         "status": "completed",
     }
     service.record_learning_mining_run(payload)
+    service.record_learning_mining_run({**payload, "status": "completed_retry"})
 
-    try:
-        service.record_learning_mining_run(payload)
-    except sqlite3.IntegrityError:
-        pass
-    else:
-        raise AssertionError("append-only ledger must reject duplicate run_id")
+    rows = service.list_learning_mining_runs(chat_id="ff:GroupMessage:6")
+    assert len(rows) == 1
+    assert rows[0]["run_id"] == "fixed-run-id"
+    assert rows[0]["mining_run_id"] == "fixed-run-id"
+    assert rows[0]["status"] == "completed_retry"
+
+
+def test_learning_snapshot_reads_pipeline_views_from_one_transaction(tmp_path):
+    service = _database_service(tmp_path)
+    _add_logs(service, "ff:GroupMessage:snapshot", 6)
+    service.ensure_learning_checkpoint("expression", "ff:GroupMessage:snapshot")
+    service.ensure_learning_checkpoint("jargon", "ff:GroupMessage:snapshot")
+    service.advance_learning_checkpoint("expression", "ff:GroupMessage:snapshot", 3)
+    service.advance_learning_checkpoint("jargon", "ff:GroupMessage:snapshot", 1)
+
+    snapshot = service.load_learning_snapshot(
+        "ff:GroupMessage:snapshot",
+        limit=10,
+        replay_recent={"expression": 0, "jargon": 0},
+    )
+
+    assert [item.content for item in snapshot["pipeline_logs"]["expression"]] == [
+        "消息4", "消息5", "消息6"
+    ]
+    assert [item.content for item in snapshot["pipeline_logs"]["jargon"]] == [
+        "消息2", "消息3", "消息4", "消息5", "消息6"
+    ]
+
+
+def test_expression_and_jargon_share_one_mining_run_id(tmp_path):
+    service = _database_service(tmp_path)
+    _add_logs(service, "ff:GroupMessage:shared-run", 3)
+    service.memory_engine = SimpleNamespace(write_service=SimpleNamespace())
+    config = AstrMaiConfig(
+        evolution={
+            "min_mining_context": 1,
+            "expression_min_valid_messages": 3,
+            "jargon_min_valid_messages": 2,
+            "expression_overlap_messages": 0,
+            "jargon_overlap_messages": 0,
+        }
+    )
+    manager = EvolutionManager(service, SimpleNamespace(config=config), config=config)
+
+    async def mine_expression(_group_id, _logs):
+        manager.expression_miner.last_report = {
+            "candidate_count": 0,
+            "enrichment": {"terminal": True},
+        }
+        return []
+
+    async def mine_jargon(_group_id, _logs):
+        manager.jargon_miner.last_report = {
+            "candidate_count": 0,
+            "enrichment": {"terminal": True},
+        }
+        return []
+
+    class PersistenceResult:
+        saved = 0
+        deduplicated = 0
+        complete = True
+
+        @staticmethod
+        def to_report():
+            return {"saved": 0, "deduplicated": 0, "complete": True}
+
+    manager.expression_miner.mine = mine_expression
+    manager.jargon_miner.mine = mine_jargon
+    manager._save_patterns = lambda *_args, **_kwargs: asyncio.sleep(
+        0, result=PersistenceResult()
+    )
+    manager._save_jargons = lambda *_args, **_kwargs: asyncio.sleep(0, result=0)
+
+    async def run():
+        snapshot = await manager._load_learning_snapshot(
+            "ff:GroupMessage:shared-run", 10
+        )
+        return await manager._process_mining_snapshot(
+            "ff:GroupMessage:shared-run",
+            snapshot,
+            run_id="shared-mining-run",
+        )
+
+    outcomes = asyncio.run(run())
+    rows = service.list_learning_mining_runs(chat_id="ff:GroupMessage:shared-run")
+
+    assert set(outcomes) == {"expression", "jargon"}
+    assert {row["mining_run_id"] for row in rows} == {"shared-mining-run"}
+    assert {row["run_id"] for row in rows} == {
+        "shared-mining-run:expression",
+        "shared-mining-run:jargon",
+    }
+
+
+def test_mining_outcome_uses_stable_run_id_for_same_snapshot():
+    metadata = {}
+
+    class Store:
+        async def set_meta(self, key, value):
+            metadata[key] = value
+
+    manager = EvolutionManager.__new__(EvolutionManager)
+    manager._last_mining_outcomes = {}
+    manager.db = SimpleNamespace(memory_engine=SimpleNamespace(v2_store=Store()))
+    logs = [SimpleNamespace(id=1), SimpleNamespace(id=2)]
+
+    async def record():
+        await manager._record_mining_outcome(
+            "group-1", logs, status="failed", reason="provider_error"
+        )
+        first = manager._last_mining_outcomes["group-1"]["run_id"]
+        await manager._record_mining_outcome(
+            "group-1", logs, status="retry_wait", reason="retry"
+        )
+        second = manager._last_mining_outcomes["group-1"]["run_id"]
+        return first, second
+
+    first, second = asyncio.run(record())
+    assert first == second == manager._mining_run_id("group-1", logs)
 
 
 def test_pipeline_failure_count_survives_manager_restart_and_quarantines(tmp_path):

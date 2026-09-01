@@ -39,6 +39,25 @@ class ChatRepository:
             conversation_event=conversation_event,
         )
 
+    async def add_message_log_if_absent_async(
+        self,
+        group_id: str,
+        sender_id: str,
+        sender_name: str,
+        content: str,
+        *,
+        conversation_event=None,
+    ) -> bool:
+        return bool(
+            await self.db.add_message_log_if_absent_async(
+                group_id,
+                sender_id,
+                sender_name,
+                content,
+                conversation_event=conversation_event,
+            )
+        )
+
     def get_unprocessed_logs(self, group_id: str, limit: int = 50):
         return self.db.get_unprocessed_logs(group_id, limit=limit)
 

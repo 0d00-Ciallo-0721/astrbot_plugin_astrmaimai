@@ -1,5 +1,4 @@
 import json
-import re
 import time
 from time import monotonic
 from typing import Optional
@@ -7,6 +6,8 @@ from typing import Optional
 from astrbot.api import logger
 
 from ...infrastructure.runtime.lane_manager import LaneKey
+from ...infrastructure.gateway.json_utils import parse_json_contract
+from ...infrastructure.runtime.background_task_budget import BackgroundTaskBudget
 
 
 class JargonAutoCheckTask:
@@ -24,10 +25,11 @@ class JargonAutoCheckTask:
         "\"review_suggestion\":\"可选人工复审建议\"}"
     )
 
-    def __init__(self, db_service, gateway, config=None):
+    def __init__(self, db_service, gateway, config=None, background_task_budget=None):
         self.db = db_service
         self.gateway = gateway
         self.config = config if config else gateway.config
+        self.background_task_budget = background_task_budget or BackgroundTaskBudget()
         self._last_run_at: dict[str, float] = {}
 
     def refresh_config(self, config) -> None:
@@ -76,14 +78,17 @@ class JargonAutoCheckTask:
             groups.append(self._scope_id(candidate.session_id))
         return list(dict.fromkeys(groups))
 
-    async def run_once(self, group_id: Optional[str] = None) -> int:
+    async def run_once(self, group_id: Optional[str] = None, *, force: bool = False) -> int:
         store = self._store()
         if not store or not hasattr(store, "list_candidates"):
             return 0
         now = monotonic()
         scope = self._scope_id(group_id)
-        min_interval = float(getattr(self.config.evolution, "review_runner_min_interval_sec", 45) or 45)
-        if now - float(self._last_run_at.get(scope, 0.0) or 0.0) < min_interval:
+        min_interval = float(getattr(self.config.evolution, "review_runner_min_interval_sec", 21600) or 21600)
+        last_run_at = float(self._last_run_at.get(scope, 0.0) or 0.0)
+        # ``force`` is intentionally not a cooldown override: governance is
+        # limited to one run per scope every configured six-hour interval.
+        if last_run_at > 0.0 and now - last_run_at < min_interval:
             return 0
         self._last_run_at[scope] = now
         # ponytail: prune unbounded _last_run_at, keep most recent 250 entries
@@ -148,24 +153,42 @@ class JargonAutoCheckTask:
             "请判断它是否应作为长期群内黑话保留。"
         )
         try:
-            result = await self.gateway.call_data_process_task(
-                prompt=prompt,
-                system_prompt=self.REVIEW_SYSTEM_PROMPT,
-                is_json=True,
-                lane_key=LaneKey(
-                    subsystem="bg",
-                    task_family="reflect",
-                    scope_id=self._scope_id(candidate.session_id),
-                    scope_kind="global",
-                ),
-                base_origin=str(candidate.session_id or ""),
+            async def _call():
+                return await self.gateway.call_data_process_task(
+                    prompt=prompt,
+                    system_prompt=self.REVIEW_SYSTEM_PROMPT,
+                    is_json=True,
+                    lane_key=LaneKey(
+                        subsystem="bg",
+                        task_family="reflect",
+                        scope_id=self._scope_id(candidate.session_id),
+                        scope_kind="global",
+                    ),
+                    base_origin=str(candidate.session_id or ""),
+                )
+
+            result = await self.background_task_budget.run(
+                _call,
+                task_name="governance.jargon_check",
+                scope_id=self._scope_id(candidate.session_id),
+                defer_release_on_timeout=True,
             )
-            if isinstance(result, dict):
-                return result
-            if isinstance(result, str):
-                match = re.search(r"\{.*\}", result, re.DOTALL)
-                if match:
-                    return json.loads(match.group(0))
+            parsed = parse_json_contract(
+                result,
+                required_keys=("decision",),
+                optional_keys=("reason", "meaning", "scene", "examples", "review_suggestion"),
+                field_types={
+                    "decision": str,
+                    "reason": str,
+                    "meaning": str,
+                    "scene": str,
+                    "examples": list,
+                    "review_suggestion": str,
+                },
+                allow_extra_keys=False,
+                allow_naked_members=True,
+            )
+            return dict(parsed.value) if parsed.schema_valid else None
         except Exception as exc:
             logger.error(f"[JargonAutoCheck] 审核黑话失败 #{getattr(candidate, 'id', '?')}: {exc}")
         return None

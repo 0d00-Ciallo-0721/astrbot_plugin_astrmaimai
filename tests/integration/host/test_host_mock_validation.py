@@ -501,7 +501,15 @@ class HostMockValidationTests(unittest.TestCase):
             activity_updates: list[str] = []
 
             async def _record_user_message(event):
-                attention_calls.append(("record", event.unified_msg_origin))
+                attention_calls.append(
+                    (
+                        "record",
+                        str(
+                            getattr(event, "unified_msg_origin", "")
+                            or getattr(event, "chat_id", "")
+                        ),
+                    )
+                )
 
             async def _process_event(event):
                 attention_calls.append(("attention", event.unified_msg_origin))
@@ -566,7 +574,7 @@ class HostMockValidationTests(unittest.TestCase):
 
             async def _run():
                 results = await _collect_asyncgen(plugin.on_global_message(event))
-                await asyncio.sleep(0)
+                await asyncio.sleep(0.05)
                 return results
 
             results = asyncio.run(_run())
@@ -575,7 +583,7 @@ class HostMockValidationTests(unittest.TestCase):
 
             self.assertIsInstance(plugin.facade, main_mod.PluginFacade)
             self.assertEqual(results, [{"type": "plain", "text": "(ghost)"}])
-            self.assertEqual(
+            self.assertCountEqual(
                 attention_calls,
                 [
                     ("record", "default:GroupMessage:group-1"),

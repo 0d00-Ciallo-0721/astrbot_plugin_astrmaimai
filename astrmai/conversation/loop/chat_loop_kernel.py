@@ -531,7 +531,15 @@ class ChatLoopKernel:
         await self._state_store.save(state)
         return state
 
-    async def tick(self, *, chat_id: str, trigger: str, event: Any = None) -> ChatLoopTickResult:
+    async def tick(
+        self,
+        *,
+        chat_id: str,
+        trigger: str,
+        event: Any = None,
+        include_proactive: bool = True,
+        include_maintenance: bool = True,
+    ) -> ChatLoopTickResult:
         chat_id = str(chat_id or "")
         trigger = str(trigger or "").strip().lower() or "heartbeat"
         external_result_id = ""
@@ -546,7 +554,14 @@ class ChatLoopKernel:
             )
         state = await self._state_store.get_or_create(chat_id)
         pre_state_summary = self._summarize_state(state)
-        snapshot = await self._build_snapshot(state, chat_id, trigger, event)
+        snapshot = await self._build_snapshot(
+            state,
+            chat_id,
+            trigger,
+            event,
+            include_proactive=include_proactive,
+            include_maintenance=include_maintenance,
+        )
         decision = self._decide(state, snapshot, event)
         self._plan_next_tick(state, snapshot, decision, None)
         self._update_state(state, snapshot, decision)
@@ -1250,7 +1265,16 @@ class ChatLoopKernel:
         context["maintenance_blocked_by_budget"] = blocked
         self._heartbeat_pass_context = context
 
-    async def _build_snapshot(self, state: ChatLoopState, chat_id: str, trigger: str, event: Any) -> ChatLoopSnapshot:
+    async def _build_snapshot(
+        self,
+        state: ChatLoopState,
+        chat_id: str,
+        trigger: str,
+        event: Any,
+        *,
+        include_proactive: bool = True,
+        include_maintenance: bool = True,
+    ) -> ChatLoopSnapshot:
         threaded_group_mirror = bool(
             getattr(self.group_reply_wait_manager, "threaded_enabled", False)
             and state.wait_scope == "group"
@@ -1300,10 +1324,11 @@ class ChatLoopKernel:
         dream_signal = ""
         dream_summary: dict[str, Any] = {}
 
-        if trigger == "heartbeat":
-            proactive_summary = await self._collect_proactive_summary(chat_id, state)
-            if proactive_summary.get("eligible"):
-                proactive_signal = "wakeup"
+        if trigger == "heartbeat" and include_maintenance:
+            if include_proactive:
+                proactive_summary = await self._collect_proactive_summary(chat_id, state)
+                if proactive_summary.get("eligible"):
+                    proactive_signal = "wakeup"
 
             heartflow_summary = await self._collect_heartflow_summary(chat_id, latest_activity)
             if heartflow_summary.get("eligible"):

@@ -5,15 +5,18 @@ from typing import Any
 
 from astrbot.api import logger
 
+from ...infrastructure.gateway.json_utils import parse_json_contract
 from ...infrastructure.runtime.lane_manager import LaneKey
+from ...infrastructure.runtime.background_task_budget import BackgroundTaskBudget
 from ..dedup import normalize_jargon_term
 from .jargon_results import JargonEnrichmentResult
 
 
 class JargonEnricher:
-    def __init__(self, gateway, config=None):
+    def __init__(self, gateway, config=None, background_task_budget=None):
         self.gateway = gateway
         self.config = config if config else getattr(gateway, "config", None)
+        self.background_task_budget = background_task_budget or BackgroundTaskBudget()
 
     @staticmethod
     def _reflect_lane(group_id: str) -> LaneKey:
@@ -80,23 +83,44 @@ class JargonEnricher:
             f"候选：{json.dumps(prompt_items, ensure_ascii=False)}"
         )
         try:
-            result = await self.gateway.call_data_process_task(
-                prompt=prompt,
-                is_json=True,
-                lane_key=self._reflect_lane(group_id),
-                base_origin=group_id,
+            async def _call():
+                return await self.gateway.call_data_process_task(
+                    prompt=prompt,
+                    is_json=True,
+                    lane_key=self._reflect_lane(group_id),
+                    base_origin=group_id,
+                )
+
+            result = await self.background_task_budget.run(
+                _call,
+                task_name="learning.jargon_enrichment",
+                scope_id=group_id,
+                defer_release_on_timeout=True,
             )
-            if isinstance(result, str):
-                try:
-                    result = json.loads(result)
-                except (TypeError, ValueError) as exc:
-                    return self._failed_result(
-                        group_id,
-                        candidates,
-                        status="invalid_json",
-                        reason="response_json_decode_failed",
-                        error_type=type(exc).__name__,
-                    )
+            parsed = parse_json_contract(
+                result,
+                required_keys=("items",),
+                field_types={"items": list},
+                allow_extra_keys=False,
+                allow_naked_members=True,
+            )
+            if not parsed.schema_valid:
+                # Preserve the legacy public status for callers that classify
+                # malformed model JSON as retryable invalid_json; the parser's
+                # stricter schema_invalid terminal status remains in reason.
+                compatibility_status = (
+                    "invalid_json"
+                    if parsed.terminal_status in {"schema_invalid", "parse_failed"}
+                    else parsed.terminal_status
+                )
+                return self._failed_result(
+                    group_id,
+                    candidates,
+                    status=compatibility_status,
+                    reason="response_schema_invalid",
+                    error_type="InvalidStructuredResponse",
+                )
+            result = parsed.value
         except Exception as exc:
             return self._failed_result(
                 group_id,

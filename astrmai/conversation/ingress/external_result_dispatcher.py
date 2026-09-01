@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import inspect
 import time
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -151,9 +152,43 @@ class ExternalResultDispatcher:
             return
         manager = getattr(getattr(self.runtime, "lifecycle", None), "manager", None)
         if manager is not None and callable(getattr(manager, "track_task", None)):
-            self._worker_task = manager.track_task(self._run())
+            track_task = manager.track_task
+            worker_coro = self._run()
+            try:
+                parameters = inspect.signature(track_task).parameters
+                supports_metadata = any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters.values()
+                ) or all(
+                    name in parameters
+                    for name in ("task_family", "scope_id", "run_id", "owner")
+                )
+            except (TypeError, ValueError):
+                supports_metadata = False
+            if supports_metadata:
+                self._worker_task = track_task(
+                    worker_coro,
+                    task_family="external_result.dispatch",
+                    scope_id="GLOBAL",
+                    run_id=f"external-result-{int(time.time() * 1000)}",
+                    owner="ExternalResultDispatcher",
+                )
+            else:
+                self._worker_task = track_task(worker_coro)
         else:
-            self._worker_task = asyncio.create_task(self._run(), name="astrmai:external-result-dispatch")
+            registry = getattr(self.runtime, "owner_registry", None)
+            track = getattr(registry, "track", None)
+            if callable(track):
+                self._worker_task = track(
+                    self._run(),
+                    task_family="external_result.dispatch",
+                    scope_id="GLOBAL",
+                    run_id=f"external-result-{int(time.time() * 1000)}",
+                    owner="ExternalResultDispatcher",
+                    name="astrmai:external-result-dispatch",
+                )
+            else:
+                self._worker_task = asyncio.create_task(self._run(), name="astrmai:external-result-dispatch")
             task_set = getattr(self.runtime, "background_tasks", None)
             if isinstance(task_set, set):
                 task_set.add(self._worker_task)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import uuid
 
 from astrbot.api import logger
 
@@ -15,6 +16,7 @@ class MemoryIndexProjector:
 
     def __init__(self, engine):
         self.engine = engine
+        self.owner_registry = getattr(engine, "owner_registry", None)
         self._pending_projection_ids: set[str] = set()
         self._pending_projection_reasons: dict[str, str] = {}
         self._pending_projection_scheduled: dict[str, bool] = {}
@@ -59,6 +61,31 @@ class MemoryIndexProjector:
         self._durable_cleanup_tasks: set[asyncio.Task] = set()
         self._accepting = True
         self._last_shutdown_diagnostics: dict[str, object] = {}
+
+    def _register_owner_task(
+        self,
+        task: asyncio.Task,
+        *,
+        task_family: str,
+        scope_id: str = "GLOBAL",
+        run_id: str = "",
+    ) -> None:
+        registry = getattr(self, "owner_registry", None)
+        register = getattr(registry, "register", None)
+        if not callable(register):
+            return
+        try:
+            register(
+                task,
+                task_family=task_family,
+                scope_id=scope_id or "GLOBAL",
+                run_id=run_id,
+                owner="MemoryIndexProjector",
+                generation=getattr(registry, "generation", 0),
+                cancel_status="cancelled",
+            )
+        except Exception as exc:
+            logger.debug("[MemoryIndexProjector] owner registry registration degraded: %s", exc)
 
     def _get_projection_lock(self) -> asyncio.Lock:
         lock = getattr(self, "_projection_lock", None)
@@ -409,6 +436,12 @@ class MemoryIndexProjector:
                 self._run_projection_owner(normalized_id),
                 name=f"astrmai-memory-projection:{normalized_id}",
             )
+            self._register_owner_task(
+                task,
+                task_family="memory.projection",
+                scope_id=normalized_id,
+                run_id=f"memory-projection-{uuid.uuid4().hex[:12]}",
+            )
             inflight_tasks[normalized_id] = task
             inflight_ids = getattr(self, "_projection_inflight_ids", None)
             if inflight_ids is None:
@@ -498,6 +531,12 @@ class MemoryIndexProjector:
         cleanup = asyncio.create_task(
             self._mark_pending_persisted(memory_id, "shutdown_rejected"),
             name=f"astrmai-memory-projection-reject:{memory_id}",
+        )
+        self._register_owner_task(
+            cleanup,
+            task_family="memory.projection.settlement",
+            scope_id=memory_id,
+            run_id=f"memory-projection-settlement-{uuid.uuid4().hex[:12]}",
         )
         self._track_background_task(cleanup, durable=True)
         try:
@@ -625,6 +664,12 @@ class MemoryIndexProjector:
         self._retry_task = asyncio.create_task(
             self._retry_loop(),
             name="astrmai-memory-projection-retry",
+        )
+        self._register_owner_task(
+            self._retry_task,
+            task_family="memory.projection.retry",
+            scope_id="GLOBAL",
+            run_id=f"memory-projection-retry-{uuid.uuid4().hex[:12]}",
         )
         await self._refresh_outbox_diagnostics()
 

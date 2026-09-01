@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -9,6 +8,8 @@ from astrbot.api import logger
 
 from ...infrastructure.context_economy.prompt_templates import PromptTemplateId
 from ...infrastructure.runtime.lane_manager import LaneKey
+from ...infrastructure.gateway.json_utils import parse_json_contract
+from ...infrastructure.runtime.background_task_budget import BackgroundTaskBudget
 from ..contracts.memory_query import MemoryClaim
 from .claim_rules import (
     ANXIETY_KEYWORDS,
@@ -39,8 +40,9 @@ class MemoryClaimExtractor:
     _IDENTITY_PATTERN = re.compile(r"(?:我叫|我的名字(?:是|叫))\s*([^\s，。！？?]{1,20})")
     _PREFERENCE_PATTERN = re.compile(r"我(不喜欢|讨厌|喜欢|最爱|偏好|爱吃|不吃)\s*(.{1,40})")
 
-    def __init__(self, gateway=None):
+    def __init__(self, gateway=None, background_task_budget=None):
         self.gateway = gateway
+        self.background_task_budget = background_task_budget or BackgroundTaskBudget()
         self.prompt_registry = getattr(getattr(gateway, "context_economy", None), "templates", None) if gateway else None
 
     @staticmethod
@@ -192,21 +194,37 @@ class MemoryClaimExtractor:
                     "context_hint": context_hint,
                 },
             )
-            response = await self.gateway.call_data_process_task(
-                prompt=envelope.prompt,
-                system_prompt=envelope.system_prompt,
-                is_json=True,
-                lane_key=self._lane_key(
-                    lane_scope_id=lane_scope_id,
-                    lane_scope_kind=lane_scope_kind,
-                    subject_id=subject_id,
-                    turn_id=turn_id,
-                ),
-                base_origin="",
-                template_envelope=envelope,
+            async def _call():
+                return await self.gateway.call_data_process_task(
+                    prompt=envelope.prompt,
+                    system_prompt=envelope.system_prompt,
+                    is_json=True,
+                    lane_key=self._lane_key(
+                        lane_scope_id=lane_scope_id,
+                        lane_scope_kind=lane_scope_kind,
+                        subject_id=subject_id,
+                        turn_id=turn_id,
+                    ),
+                    base_origin="",
+                    template_envelope=envelope,
+                )
+
+            response = await self.background_task_budget.run(
+                _call,
+                task_name="memory.claim_extraction",
+                scope_id=lane_scope_id or subject_id or turn_id,
+                defer_release_on_timeout=True,
             )
-            if isinstance(response, str):
-                response = json.loads(response)
+            parsed = parse_json_contract(
+                response,
+                required_keys=("claims",),
+                field_types={"claims": list},
+                allow_extra_keys=False,
+                allow_naked_members=True,
+            )
+            if not parsed.schema_valid:
+                return []
+            response = parsed.value
         except Exception:
             logger.debug("[MemoryClaimExtractor] LLM claim extraction failed", exc_info=True)
             return []

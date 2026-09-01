@@ -77,11 +77,13 @@ class ProactiveDispatcher:
         state_engine: Any = None,
         config: Any = None,
         history_db_path: Any = None,
+        owner_registry: Any = None,
     ) -> None:
         self.attention_gate = attention_gate
         self.runtime_coordinator = runtime_coordinator
         self.state_engine = state_engine
         self.config = config
+        self.owner_registry = owner_registry
         self._history: list[dict[str, Any]] = []
         self._history_store = ProactiveHistoryStore(history_db_path)
         self._history = self._load_persistent_history()
@@ -96,6 +98,24 @@ class ProactiveDispatcher:
         self._terminal_order: deque[str] = deque()
         self._shutting_down = False
         self._dispatch_lock = asyncio.Lock()
+
+    def _register_owner_task(self, task: asyncio.Task, *, task_family: str, scope_id: str, run_id: str) -> None:
+        registry = getattr(self, "owner_registry", None)
+        register = getattr(registry, "register", None)
+        if not callable(register):
+            return
+        try:
+            register(
+                task,
+                task_family=task_family,
+                scope_id=scope_id or "GLOBAL",
+                run_id=run_id,
+                owner="ProactiveDispatcher",
+                generation=getattr(registry, "generation", 0),
+                cancel_status="cancelled",
+            )
+        except Exception as exc:
+            logger.debug("[ProactiveDispatcher] owner registry registration degraded: %s", exc)
 
     def _load_persistent_history(self) -> list[dict[str, Any]]:
         if self._history_store.db_path is None:
@@ -183,6 +203,12 @@ class ProactiveDispatcher:
             self._watch_completion(intent.intent_id, timeout_sec, decision, completion),
             name=f"proactive-completion-watchdog:{intent.intent_id}",
         )
+        self._register_owner_task(
+            task,
+            task_family="proactive.completion.watchdog",
+            scope_id=intent.chat_id,
+            run_id=f"proactive-watchdog-{intent.intent_id}",
+        )
         self._completion_watchdogs[intent.intent_id] = task
 
     def _cancel_completion_watchdog(self, intent_id: str) -> None:
@@ -264,9 +290,16 @@ class ProactiveDispatcher:
                 if self._completion_retry_tasks.get(intent_id) is asyncio.current_task():
                     self._completion_retry_tasks.pop(intent_id, None)
 
-        self._completion_retry_tasks[intent_id] = asyncio.create_task(
+        task = asyncio.create_task(
             _retry(),
             name=f"proactive-completion-retry:{intent_id}:{attempt}",
+        )
+        self._completion_retry_tasks[intent_id] = task
+        self._register_owner_task(
+            task,
+            task_family="proactive.completion.retry",
+            scope_id=decision.chat_id,
+            run_id=f"proactive-retry-{intent_id}-{attempt}",
         )
 
     @staticmethod

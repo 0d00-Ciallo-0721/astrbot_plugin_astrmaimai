@@ -43,7 +43,7 @@ class BootEventLoopResponsivenessTests(unittest.IsolatedAsyncioTestCase):
         engine._schedule_vector_bootstrap = called.set
         engine.schedule_vector_bootstrap_after_startup(delay_sec=0.01)
         self.assertFalse(called.is_set())
-        await asyncio.sleep(0.02)
+        await asyncio.wait_for(called.wait(), timeout=1.0)
         self.assertTrue(called.is_set())
 
     async def test_vector_bootstrap_delay_can_be_cancelled_before_start(self):

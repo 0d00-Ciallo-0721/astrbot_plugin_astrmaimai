@@ -19,12 +19,13 @@ class RereadActionDispatcher:
 
     MAX_SETTLEMENT_RETRY_TASKS = 64
 
-    def __init__(self, *, context=None, config=None, runtime_coordinator=None, dialogue_store=None, reread_observer=None):
+    def __init__(self, *, context=None, config=None, runtime_coordinator=None, dialogue_store=None, reread_observer=None, owner_registry=None):
         self.context = context
         self.config = config
         self.runtime_coordinator = runtime_coordinator
         self.dialogue_store = dialogue_store
         self.reread_observer = reread_observer
+        self.owner_registry = owner_registry
         self._settlement_retry_tasks: dict[str, asyncio.Task] = {}
         self._background_tasks: set[asyncio.Task] = set()
         self._active_dispatches: set[asyncio.Task] = set()
@@ -38,6 +39,24 @@ class RereadActionDispatcher:
         self._settlement_retry_stats = {"retry_pending": 0, "retry_exhausted": 0, "retry_rejected": 0}
         self._claim_rollback_degraded = 0
         self._shutting_down = False
+
+    def _register_owner_task(self, task: asyncio.Task, *, task_family: str, scope_id: str, run_id: str = "") -> None:
+        registry = getattr(self, "owner_registry", None)
+        register = getattr(registry, "register", None)
+        if not callable(register):
+            return
+        try:
+            register(
+                task,
+                task_family=task_family,
+                scope_id=scope_id or "GLOBAL",
+                run_id=run_id,
+                owner="RereadActionDispatcher",
+                generation=getattr(registry, "generation", 0),
+                cancel_status="cancelled",
+            )
+        except Exception as exc:
+            logger.debug("[RereadAction] owner registry registration degraded: %s", exc)
 
     def refresh_config(self, config) -> None:
         self.config = config
@@ -120,6 +139,12 @@ class RereadActionDispatcher:
         task = asyncio.create_task(_retry())
         self._release_retry_tasks[key] = task
         self._background_tasks.add(task)
+        self._register_owner_task(
+            task,
+            task_family="reread.settlement.release",
+            scope_id=chat_id,
+            run_id=f"reread-release-{hashlib.sha256(key.encode()).hexdigest()[:12]}",
+        )
 
         def _forget(done: asyncio.Task) -> None:
             self._release_retry_tasks.pop(key, None)
@@ -333,6 +358,12 @@ class RereadActionDispatcher:
         self._settlement_retry_tasks[send_key] = task
         self._retry_leases[send_key] = (request.chat_id, observer_token)
         self._background_tasks.add(task)
+        self._register_owner_task(
+            task,
+            task_family="reread.settlement",
+            scope_id=request.chat_id,
+            run_id=f"reread-settlement-{hashlib.sha256(send_key.encode()).hexdigest()[:12]}",
+        )
         self._settlement_retry_stats["retry_pending"] += 1
 
         def _forget(_task: asyncio.Task) -> None:
@@ -345,6 +376,12 @@ class RereadActionDispatcher:
                 )
                 self._retry_cleanup_tasks.add(cleanup)
                 self._background_tasks.add(cleanup)
+                self._register_owner_task(
+                    cleanup,
+                    task_family="reread.settlement.cleanup",
+                    scope_id=request.chat_id,
+                    run_id=f"reread-cleanup-{hashlib.sha256(send_key.encode()).hexdigest()[:12]}",
+                )
 
                 def _forget_cleanup(done: asyncio.Task) -> None:
                     self._retry_cleanup_tasks.discard(done)
@@ -377,6 +414,12 @@ class RereadActionDispatcher:
                 )
                 self._retry_cleanup_tasks.add(retry_task)
                 self._background_tasks.add(retry_task)
+                self._register_owner_task(
+                    retry_task,
+                    task_family="reread.settlement.cleanup",
+                    scope_id=self._retry_leases.get(send_key, ("GLOBAL", None))[0],
+                    run_id=f"reread-cleanup-retry-{hashlib.sha256(send_key.encode()).hexdigest()[:12]}",
+                )
 
                 def _forget_release(done: asyncio.Task) -> None:
                     self._retry_cleanup_tasks.discard(done)

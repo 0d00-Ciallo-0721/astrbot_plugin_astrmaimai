@@ -66,7 +66,23 @@ class FollowupManager:
         existing = self._private_wait_tasks.get(chat_id)
         if existing is not None and not existing.done():
             existing.cancel()
-        task = asyncio.create_task(self._await_private_followup_reply(chat_id, sender_id))
+        awaitable = self._await_private_followup_reply(chat_id, sender_id)
+        registry = getattr(self.runtime, "owner_registry", None)
+        track = getattr(registry, "track", None)
+        if callable(track):
+            task = track(
+                awaitable,
+                task_family="conversation.private_followup",
+                scope_id=chat_id or "GLOBAL",
+                run_id=f"private-followup-{chat_id}-{int(time.time() * 1000)}",
+                owner="FollowupManager",
+                name=f"astrmai-private-followup:{chat_id}",
+            )
+        else:
+            task = asyncio.create_task(
+                awaitable,
+                name=f"astrmai-private-followup:{chat_id}",
+            )
         self._private_wait_tasks[chat_id] = task
 
     async def finalize_after_reply(self, chat_id: str, main_event, reply_sent: bool) -> None:

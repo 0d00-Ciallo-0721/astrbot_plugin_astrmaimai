@@ -8,6 +8,7 @@ from typing import Any, Awaitable, Callable
 
 from ..shared.constants.defaults import InfrastructureSettings, build_infrastructure_settings
 from ..infrastructure.runtime.background_task_budget import BackgroundTaskBudget
+from ..infrastructure.runtime.background_task_owner_registry import BackgroundTaskOwnerRegistry
 
 System2Callback = Callable[[Any, list[Any] | None], Awaitable[Any]]
 
@@ -194,6 +195,9 @@ class PluginRuntimeContext:
     )
     background_tasks: set[asyncio.Task[Any]] = field(default_factory=set)
     background_task_budget: BackgroundTaskBudget | None = None
+    owner_registry: BackgroundTaskOwnerRegistry = field(
+        default_factory=BackgroundTaskOwnerRegistry
+    )
     core: CoreServices = field(default_factory=CoreServices)
     workmode: WorkModeServices = field(default_factory=WorkModeServices)
     cognition: CognitionServices = field(default_factory=CognitionServices)
@@ -445,6 +449,7 @@ class PluginRuntimeContext:
             self.reread_action_dispatcher,
             self.external_result_dispatcher,
             self.event_bus,
+            self.owner_registry,
         )
 
     def build_diagnostics(self) -> dict[str, Any]:

@@ -96,6 +96,32 @@ class MemoryConflictResolutionTests(unittest.TestCase):
 
         self.assertEqual(asyncio.run(run()), [])
 
+    def test_llm_claim_extraction_accepts_naked_members(self):
+        class _Templates:
+            def render_template(self, *_args, **_kwargs):
+                return SimpleNamespace(prompt="extract", system_prompt="system")
+
+        class _Gateway:
+            context_economy = SimpleNamespace(templates=_Templates())
+
+            async def call_data_process_task(self, **_kwargs):
+                return (
+                    '"claims":[{"subject_id":"u1","entity":"profile",'
+                    '"attribute":"name","value":"Alice","certainty":0.9}]'
+                )
+
+        async def run():
+            extractor = self.claim_mod.MemoryClaimExtractor(_Gateway())
+            return await extractor.extract(
+                user_text="plain chat with no rule claim",
+                subject_id="u1",
+                turn_id="turn-naked",
+            )
+
+        claims = asyncio.run(run())
+        self.assertEqual(len(claims), 1)
+        self.assertEqual(claims[0].value, "Alice")
+
     def test_llm_claim_extraction_uses_explicit_chat_lane(self):
         captured = {}
 

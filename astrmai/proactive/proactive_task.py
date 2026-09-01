@@ -73,6 +73,7 @@ class ProactiveTask:
         runtime_coordinator=None,
         attention_gate=None,
         background_task_budget=None,
+        owner_registry=None,
     ):
         self.context = context
         self.state_engine = state_engine
@@ -85,6 +86,7 @@ class ProactiveTask:
         self.background_task_budget = background_task_budget or self._build_local_background_budget(
             self.config
         )
+        self.owner_registry = owner_registry
         task_db_path = getattr(persistence, "db_path", None)
         self._task_ledger = BackgroundTaskLedger(task_db_path) if task_db_path else None
         self.expression_governance_runner = None
@@ -156,6 +158,7 @@ class ProactiveTask:
             state_engine=state_engine,
             config=self.config,
             history_db_path=getattr(persistence, "db_path", None),
+            owner_registry=owner_registry,
         )
         self.scheduled_scenario_service = ScheduledScenarioService(
             state_engine=state_engine,
@@ -523,6 +526,21 @@ class ProactiveTask:
             self._bind_dream_dependencies()
         self._task = asyncio.create_task(self._loop())
         self._task.add_done_callback(self._on_loop_done)
+        registry = getattr(self, "owner_registry", None)
+        register = getattr(registry, "register", None)
+        if callable(register):
+            try:
+                register(
+                    self._task,
+                    task_family="proactive.scheduler",
+                    scope_id="GLOBAL",
+                    run_id=f"proactive-loop-{uuid.uuid4().hex[:12]}",
+                    owner="ProactiveTask",
+                    generation=getattr(registry, "generation", 0),
+                    cancel_status="cancelled",
+                )
+            except Exception as exc:
+                logger.debug("[ProactiveTask] owner registry registration degraded: %s", exc)
 
     def _on_loop_done(self, task):
         """Loop 意外终止时自动重启（正常 stop 不触发）。"""
@@ -766,6 +784,21 @@ class ProactiveTask:
         task._astrmai_scope_id = str(scope_id or "")
         task._astrmai_started_at = time.time()
         self._background_tasks.add(task)
+        registry = getattr(self, "owner_registry", None)
+        register = getattr(registry, "register", None)
+        if callable(register):
+            try:
+                register(
+                    task,
+                    task_family=task_name,
+                    scope_id=scope_id,
+                    run_id=run_id,
+                    owner="ProactiveTask",
+                    generation=getattr(registry, "generation", 0),
+                    cancel_status=cancel_status,
+                )
+            except Exception as exc:
+                logger.debug("[ProactiveTask] owner registry registration degraded: %s", exc)
         task.add_done_callback(self._handle_task_result)
         if task_lease is not None and cancel_status != "retry_wait":
             def _settle_unstarted_cancel(completed: asyncio.Task) -> None:

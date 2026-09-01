@@ -1,5 +1,4 @@
 import asyncio
-import json
 import re
 import time
 from typing import Dict, List, Optional
@@ -11,15 +10,18 @@ from ...infrastructure.persistence import DatabaseService
 from ...infrastructure.persistence import ExpressionPattern
 from ...infrastructure.gateway import GlobalModelGateway
 from ...infrastructure.runtime.lane_manager import LaneKey
+from ...infrastructure.runtime.background_task_budget import BackgroundTaskBudget
+from ...infrastructure.gateway.json_utils import parse_json_contract
 
 
 class ReflectTracker:
     """人工反馈追踪器。"""
 
-    def __init__(self, db_service: DatabaseService, gateway: GlobalModelGateway, config=None):
+    def __init__(self, db_service: DatabaseService, gateway: GlobalModelGateway, config=None, background_task_budget=None):
         self.db = db_service
         self.gateway = gateway
         self.config = config if config else gateway.config
+        self.background_task_budget = background_task_budget or BackgroundTaskBudget()
         self._pending: Dict[str, Dict] = {}
         self._lock = asyncio.Lock()
 
@@ -219,18 +221,29 @@ class ReflectTracker:
             "\"replacement_expression\":\"可选替代表达\"}"
         )
         try:
-            result = await self.gateway.call_data_process_task(
-                prompt=prompt,
-                is_json=True,
-                lane_key=LaneKey(subsystem="bg", task_family="reflect", scope_id=chat_id or "global", scope_kind="global"),
-                base_origin="",
+            async def _call():
+                return await self.gateway.call_data_process_task(
+                    prompt=prompt,
+                    is_json=True,
+                    lane_key=LaneKey(subsystem="bg", task_family="reflect", scope_id=chat_id or "global", scope_kind="global"),
+                    base_origin="",
+                )
+
+            result = await self.background_task_budget.run(
+                _call,
+                task_name="governance.feedback_parse",
+                scope_id=str(chat_id or "GLOBAL"),
+                defer_release_on_timeout=True,
             )
-            if isinstance(result, dict):
-                return result
-            if isinstance(result, str):
-                match = re.search(r"\{.*\}", result, re.DOTALL)
-                if match:
-                    return json.loads(match.group(0))
+            parsed = parse_json_contract(
+                result,
+                required_keys=("decision",),
+                optional_keys=("replacement_expression",),
+                field_types={"decision": str, "replacement_expression": str},
+                allow_extra_keys=False,
+                allow_naked_members=True,
+            )
+            return dict(parsed.value) if parsed.schema_valid else None
         except Exception as exc:
             logger.debug(f"[ReflectTracker] 解析人工反馈失败: {exc}")
         return None

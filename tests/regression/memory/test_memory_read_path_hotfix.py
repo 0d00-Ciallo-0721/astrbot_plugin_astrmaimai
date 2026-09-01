@@ -236,6 +236,18 @@ class ReactBudgetTests(unittest.TestCase):
         self.assertIn("timeout_override", captured)
         self.assertLessEqual(captured["timeout_override"], 8.0)
 
+    def test_react_step_accepts_naked_members(self):
+        class _Gateway:
+            async def call_data_process_task(self, *args, **kwargs):
+                return '"thinking":"done","tool":"found_answer","args":{"answer":"42"}'
+
+        retriever = ReActRetriever(gateway=_Gateway())
+        retriever._save_trace = lambda **_kwargs: asyncio.sleep(0)
+
+        answer = asyncio.run(retriever.retrieve("问题", "chat-1", retrieve_keys=["person"]))
+
+        self.assertIn("42", answer)
+
 
 if __name__ == "__main__":
     unittest.main()

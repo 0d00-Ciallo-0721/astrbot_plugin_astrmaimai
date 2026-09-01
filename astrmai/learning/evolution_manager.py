@@ -2,25 +2,33 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import re
 import time
+import uuid
+from pathlib import Path
 from typing import Any, Dict, List
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
 from ..infrastructure.runtime.background_task_budget import (
+    BackgroundTaskBudget,
     BackgroundTaskQueueFull,
     BackgroundTaskQueueTimeout,
 )
 from ..infrastructure.runtime.lane_manager import LaneKey
+from ..infrastructure.gateway.json_utils import parse_json_contract, parse_json_payload
 from ..memory.contracts.memory_query import MemoryWriteRequest
 from .contracts.learning_events import (
     BotReplyRecordedEvent,
     MiningCompletedEvent,
     UserMessageRecordedEvent,
 )
+from .contracts.learning_envelope import LearningMessageEnvelope
+from ..infrastructure.persistence.learning_ingest_outbox import LearningIngressOutboxStore
+from ..infrastructure.runtime.background_task_ledger import BackgroundTaskLedger
 from .logging.bot_reply_recorder import BotReplyRecorder
 from .logging.message_recorder import MessageRecorder
 from .dedup import GLOBAL_JARGON_SESSION_ID, jargon_fingerprint, normalize_jargon_term
@@ -90,20 +98,35 @@ def _jargon_sense_evidence(evidence: dict[str, Any], sense: dict[str, Any]) -> d
 
 
 class EvolutionManager:
-    def __init__(self, db, gateway, config=None, event_bus=None, background_task_budget=None):
+    def __init__(
+        self,
+        db,
+        gateway,
+        config=None,
+        event_bus=None,
+        background_task_budget=None,
+        ingest_spool_path: str | Path | None = None,
+        owner_registry=None,
+    ):
         self.db = db
         self.gateway = gateway
         self.config = config if config else gateway.config
         self.event_bus = event_bus
-        self.background_task_budget = background_task_budget
+        # A compatibility host may omit the runtime-shared budget.  Keep the
+        # same admission contract with a bounded local budget instead of
+        # silently running provider work unbounded.
+        self.background_task_budget = background_task_budget or BackgroundTaskBudget()
+        self.owner_registry = owner_registry
         self.expression_miner = ExpressionMiner(
             gateway,
             self.config,
             memory_engine=getattr(self.db, "memory_engine", None),
+            background_task_budget=self.background_task_budget,
         )
         self.jargon_miner = JargonMiner(
             self.expression_miner,
             memory_engine=getattr(self.db, "memory_engine", None),
+            background_task_budget=self.background_task_budget,
         )
         self.recorder = MessageRecorder(
             window_seconds=getattr(self.config.evolution, "mining_window_sec", 60),
@@ -134,9 +157,31 @@ class EvolutionManager:
         self._last_backlog_report: dict[str, Any] = {}
         self._last_expression_backfill: dict[str, Any] = {}
         self._last_mining_outcomes: dict[str, dict[str, Any]] = {}
+        self._last_mining_at: dict[str, float] = {}
+        self._mining_timestamp_loaded: set[str] = set()
         self._pipeline_failure_counts: dict[str, int] = {}
         self._last_learning_run_purge_at = 0.0
         self._last_learning_run_purge: dict[str, Any] = {}
+        self._last_message_log_purge: dict[str, Any] = {}
+        persistence = getattr(db, "persistence", None)
+        db_path = getattr(persistence, "db_path", None)
+        self._ingest_outbox = LearningIngressOutboxStore(db_path) if db_path else None
+        spool_path = Path(ingest_spool_path) if ingest_spool_path else None
+        if spool_path is None and db_path:
+            spool_path = Path(db_path).with_name("learning_ingest_spool.db")
+        if spool_path is None:
+            cache_dir = getattr(persistence, "cache_dir", None)
+            if cache_dir:
+                spool_path = Path(cache_dir) / "learning_ingest_spool.db"
+        self._ingest_fallback_outbox = (
+            LearningIngressOutboxStore(spool_path)
+            if spool_path is not None
+            and (db_path is None or Path(db_path) != spool_path)
+            else None
+        )
+        self._ingest_worker: asyncio.Task | None = None
+        self._ingest_processing: set[str] = set()
+        self._task_ledger = BackgroundTaskLedger(db_path) if db_path else None
 
     def refresh_config(self, config):
         self.config = config
@@ -214,6 +259,89 @@ class EvolutionManager:
         evolution = self._evolution_config()
         return max(60, int(getattr(evolution, "backlog_failure_cooldown_sec", 1800) or 1800))
 
+    def _mining_interval(self) -> float:
+        evolution = self._evolution_config()
+        try:
+            configured = getattr(evolution, "learning_mining_interval_sec", None)
+            if configured is None:
+                configured = getattr(evolution, "mining_interval_sec", 21600)
+            return max(60.0, float(configured or 21600))
+        except (TypeError, ValueError):
+            return 21600.0
+
+    def _message_log_retention_days(self) -> int:
+        return max(7, int(getattr(self._evolution_config(), "message_log_retention_days", 90) or 90))
+
+    def _message_log_cleanup_batch_size(self) -> int:
+        return max(10, min(5000, int(getattr(self._evolution_config(), "message_log_cleanup_batch_size", 500) or 500)))
+
+    def _message_log_cleanup_interval(self) -> float:
+        return max(3600.0, float(getattr(self._evolution_config(), "message_log_cleanup_interval_sec", 86400) or 86400))
+
+    def _mining_cooldown_active(self, group_id: str, now: float | None = None) -> bool:
+        last = float(self._last_mining_at.get(str(group_id or ""), 0.0) or 0.0)
+        return last > 0.0 and (time.time() if now is None else now) - last < self._mining_interval()
+
+    @staticmethod
+    def _mining_timestamp_key(group_id: str) -> str:
+        digest = hashlib.sha256(str(group_id or "").encode("utf-8")).hexdigest()[:24]
+        return f"learning_mining_last_at:{digest}"
+
+    async def _load_mining_timestamp(self, group_id: str) -> None:
+        normalized = str(group_id or "").strip()
+        if not normalized or normalized in self._mining_timestamp_loaded:
+            return
+        store = getattr(getattr(self.db, "memory_engine", None), "v2_store", None)
+        getter = getattr(store, "get_meta", None)
+        if not callable(getter):
+            self._mining_timestamp_loaded.add(normalized)
+            return
+        try:
+            raw = await getter(self._mining_timestamp_key(normalized), "")
+            timestamp = float(raw or 0.0)
+            if timestamp > 0.0:
+                self._last_mining_at[normalized] = timestamp
+            self._mining_timestamp_loaded.add(normalized)
+        except (TypeError, ValueError):
+            logger.debug("[Evolution] invalid persisted mining timestamp for %s", normalized)
+            self._mining_timestamp_loaded.add(normalized)
+        except Exception:
+            # Leave the key unmarked so a transient store outage can recover
+            # on the next admission check instead of allowing an early run.
+            logger.debug("[Evolution] failed to restore mining timestamp for %s", normalized, exc_info=True)
+
+    async def _persist_mining_timestamp(self, group_id: str, timestamp: float) -> None:
+        normalized = str(group_id or "").strip()
+        if not normalized:
+            return
+        store = getattr(getattr(self.db, "memory_engine", None), "v2_store", None)
+        setter = getattr(store, "set_meta", None)
+        if not callable(setter):
+            return
+        try:
+            await setter(self._mining_timestamp_key(normalized), str(float(timestamp)))
+        except Exception:
+            # Persistence is best-effort; the in-memory fence still protects
+            # the current process and a failed write must not lose the result.
+            logger.debug("[Evolution] failed to persist mining timestamp for %s", normalized, exc_info=True)
+
+    async def _settle_cancelled_mining(
+        self,
+        group_id: str,
+        previous_mining_at: float,
+        lease,
+    ) -> None:
+        normalized = str(group_id or "")
+        self._last_mining_at[normalized] = float(previous_mining_at or 0.0)
+        await self._persist_mining_timestamp(normalized, previous_mining_at)
+        if self._task_ledger is not None and lease is not None:
+            await self._task_ledger.finish(
+                lease,
+                status="retry_wait",
+                error="cancelled",
+                retry_after_seconds=0.0,
+            )
+
     def _learning_run_retention_days(self) -> int:
         return max(
             1,
@@ -239,7 +367,14 @@ class EvolutionManager:
                 self._mining_locks[group_id] = asyncio.Lock()
             return self._mining_locks[group_id]
 
-    def _fire_background_task(self, awaitable_factory, *, task_name: str = "learning.triggered", scope_id: str = ""):
+    def _fire_background_task(
+        self,
+        awaitable_factory,
+        *,
+        task_name: str = "learning.triggered",
+        scope_id: str = "",
+        run_id: str = "",
+    ):
         if self.background_task_budget is not None:
             coro = self.background_task_budget.run(
                 awaitable_factory,
@@ -251,8 +386,49 @@ class EvolutionManager:
             coro = awaitable_factory()
         task = asyncio.create_task(coro)
         self._background_tasks.add(task)
+        registry = getattr(self, "owner_registry", None)
+        register = getattr(registry, "register", None)
+        if callable(register):
+            try:
+                register(
+                    task,
+                    task_family=task_name,
+                    scope_id=scope_id or "GLOBAL",
+                    run_id=run_id,
+                    owner="EvolutionManager",
+                    generation=getattr(registry, "generation", 0),
+                    cancel_status="cancelled",
+                )
+            except Exception as exc:
+                logger.debug("[Evolution] owner registry registration degraded: %s", exc)
         task.add_done_callback(self._handle_task_result)
         return task
+
+    def _register_owner_task(
+        self,
+        task: asyncio.Task,
+        *,
+        task_family: str,
+        scope_id: str = "GLOBAL",
+        run_id: str = "",
+        cancel_status: str = "cancelled",
+    ) -> None:
+        registry = getattr(self, "owner_registry", None)
+        register = getattr(registry, "register", None)
+        if not callable(register):
+            return
+        try:
+            register(
+                task,
+                task_family=task_family,
+                scope_id=scope_id or "GLOBAL",
+                run_id=run_id,
+                owner="EvolutionManager",
+                generation=getattr(registry, "generation", 0),
+                cancel_status=cancel_status,
+            )
+        except Exception as exc:
+            logger.debug("[Evolution] owner registry registration degraded: %s", exc)
 
     async def _run_backlog_mining_budgeted(self) -> None:
         budget = self.background_task_budget
@@ -278,6 +454,7 @@ class EvolutionManager:
             lambda: self._try_trigger_mining(group_id),
             task_name="learning.triggered",
             scope_id=group_id,
+            run_id=f"learning-trigger-{uuid.uuid4().hex[:12]}",
         )
         self._mining_tasks[group_id] = task
 
@@ -310,7 +487,7 @@ class EvolutionManager:
         sender_name: str,
         content: str,
         conversation_event=None,
-    ):
+    ) -> bool:
         kwargs = {
             "group_id": group_id,
             "sender_id": sender_id,
@@ -319,10 +496,21 @@ class EvolutionManager:
         }
         if conversation_event is not None:
             kwargs["conversation_event"] = conversation_event
+        event_id = ""
+        if isinstance(conversation_event, dict):
+            event_id = str(conversation_event.get("event_id") or "").strip()
+        conditional_append = getattr(
+            self.db,
+            "add_message_log_if_absent_async",
+            None,
+        )
+        if event_id and callable(conditional_append):
+            return bool(await conditional_append(**kwargs))
         if hasattr(self.db, "add_message_log_async"):
             await self.db.add_message_log_async(**kwargs)
-            return
+            return True
         await asyncio.to_thread(self.db.add_message_log, **kwargs)
+        return True
 
     async def _publish_learning_event(self, publisher_name: str, payload: dict) -> None:
         if not self.event_bus:
@@ -452,6 +640,98 @@ class EvolutionManager:
         else:
             logs = await self._load_unprocessed_logs(group_id, limit=limit)
         return await self._attach_learning_visual_context(group_id, list(logs or []))
+
+    async def _load_learning_snapshot(self, group_id: str, limit: int) -> dict[str, Any]:
+        pipelines = tuple(
+            pipeline
+            for pipeline in ("expression", "jargon")
+            if self._pipeline_enabled(pipeline)
+        )
+        replay_recent = {
+            pipeline: self._pipeline_replay_recent(pipeline)
+            for pipeline in pipelines
+        }
+        db = getattr(self, "db", None)
+        if db is None:
+            pipeline_logs = {
+                pipeline: list(
+                    await self._load_pipeline_logs(pipeline, group_id, limit=limit)
+                    or []
+                )
+                for pipeline in pipelines
+            }
+            union = {
+                int(self._field(item, "id", 0) or 0): item
+                for logs in pipeline_logs.values()
+                for item in logs
+            }
+            return {
+                "chat_id": str(group_id),
+                "logs": [union[key] for key in sorted(union)],
+                "pipeline_logs": pipeline_logs,
+                "created_at": time.time(),
+                "transactional": False,
+            }
+        loader = getattr(db, "load_learning_snapshot_async", None)
+        if callable(loader):
+            snapshot = dict(
+                await loader(
+                    group_id,
+                    limit=limit,
+                    pipelines=pipelines,
+                    replay_recent=replay_recent,
+                )
+                or {}
+            )
+        else:
+            sync_loader = getattr(db, "load_learning_snapshot", None)
+            if callable(sync_loader):
+                snapshot = dict(
+                    await asyncio.to_thread(
+                        sync_loader,
+                        group_id,
+                        limit,
+                        pipelines=pipelines,
+                        replay_recent=replay_recent,
+                    )
+                    or {}
+                )
+            else:
+                pipeline_logs = {
+                    pipeline: list(
+                        await self._load_pipeline_logs(pipeline, group_id, limit=limit)
+                        or []
+                    )
+                    for pipeline in pipelines
+                }
+                union = {
+                    int(self._field(item, "id", 0) or 0): item
+                    for logs in pipeline_logs.values()
+                    for item in logs
+                }
+                return {
+                    "chat_id": str(group_id),
+                    "logs": [union[key] for key in sorted(union)],
+                    "pipeline_logs": pipeline_logs,
+                    "created_at": time.time(),
+                    "transactional": False,
+                }
+        raw_logs = list(snapshot.get("logs") or [])
+        enriched = await self._attach_learning_visual_context(group_id, raw_logs)
+        enriched_by_id = {
+            int(self._field(item, "id", 0) or 0): item
+            for item in enriched
+        }
+        snapshot["logs"] = enriched
+        snapshot["pipeline_logs"] = {
+            pipeline: [
+                enriched_by_id.get(int(self._field(item, "id", 0) or 0), item)
+                for item in list(logs or [])
+            ]
+            for pipeline, logs in dict(snapshot.get("pipeline_logs") or {}).items()
+        }
+        snapshot["transactional"] = True
+        return snapshot
 
     async def _attach_learning_visual_context(self, group_id: str, logs: list[Any]) -> list[Any]:
         resolver = getattr(self.db, "get_learning_visual_context_async", None)
@@ -665,6 +945,49 @@ class EvolutionManager:
         self._last_learning_run_purge_at = now
         self._last_learning_run_purge = {**report, "purged_at": now}
         return dict(self._last_learning_run_purge)
+
+    async def _maybe_purge_message_logs(self, *, force: bool = False) -> dict[str, Any]:
+        purge = getattr(self.db, "purge_consumed_message_logs_async", None)
+        if not callable(purge):
+            return {"unsupported": True}
+        lease = None
+        if self._task_ledger is not None:
+            lease = await self._task_ledger.claim(
+                task_family="message_log_retention",
+                scope_id="global",
+                input_fingerprint="message-log-retention-v1",
+                lease_seconds=300.0,
+                min_interval_seconds=0.0 if force else self._message_log_cleanup_interval(),
+            )
+            if lease is None:
+                return {**self._last_message_log_purge, "skipped": "cooldown_or_active_lease"}
+        try:
+            report = dict(
+                await purge(
+                    retention_days=self._message_log_retention_days(),
+                    batch_size=self._message_log_cleanup_batch_size(),
+                )
+                or {}
+            )
+            report["purged_at"] = time.time()
+            self._last_message_log_purge = report
+            if lease is not None:
+                await self._task_ledger.finish(
+                    lease,
+                    status="succeeded",
+                    checkpoint_after={"deleted": int(report.get("deleted", 0) or 0)},
+                )
+            return dict(report)
+        except Exception as exc:
+            if lease is not None:
+                await self._task_ledger.finish(
+                    lease,
+                    status="retry_wait",
+                    error=str(exc),
+                    retry_after_seconds=3600.0,
+                )
+            logger.warning("[Evolution-Retention] message log cleanup degraded: %s", exc)
+            return {"error": str(exc), "deleted": 0}
 
     async def retry_learning_pipeline(self, pipeline: str, chat_id: str) -> dict[str, Any]:
         if hasattr(self.db, "reset_learning_checkpoint_async"):
@@ -905,6 +1228,17 @@ class EvolutionManager:
         evidence = [str(cls._field(log, "id", "")) for log in logs if cls._field(log, "id") is not None]
         payload = f"{prefix}|{group_id}|{'|'.join(evidence)}"
         return f"{prefix}:{hashlib.sha256(payload.encode('utf-8')).hexdigest()[:24]}"
+
+    @classmethod
+    def _mining_run_id(cls, group_id: str, logs: List["MessageLog"]) -> str:
+        """Return a stable run id for one immutable learning snapshot.
+
+        Retries and reload recovery must update the same learning run rather
+        than create a second audit row for identical input evidence.
+        """
+        batch_id = cls._mining_batch_id(group_id, logs, prefix="learning")
+        digest = hashlib.sha256(batch_id.encode("utf-8")).hexdigest()[:20]
+        return f"learning_{digest}"
 
     async def _save_patterns(
         self,
@@ -1224,29 +1558,179 @@ class EvolutionManager:
         triggered = self.recorder.record(event.unified_msg_origin)
         self._schedule_mining_if_triggered(event.unified_msg_origin, triggered)
 
-    async def record_user_message(self, event: AstrMessageEvent):
-        rich_text = event.get_extra("astrmai_rich_text", event.message_str)
-        conversation_event = event.get_extra("astrmai_conversation_event", None)
-        await self._append_message_log(
-            group_id=event.unified_msg_origin,
-            sender_id=event.get_sender_id(),
-            sender_name=event.get_sender_name(),
+    async def record_user_message(self, event: AstrMessageEvent | LearningMessageEnvelope):
+        envelope = event if isinstance(event, LearningMessageEnvelope) else None
+        if envelope is not None:
+            event_id = str(envelope.event_id or "").strip()
+            if event_id:
+                exists = False
+                checker = getattr(self.db, "message_log_event_exists_async", None)
+                if callable(checker):
+                    exists = bool(await checker(event_id))
+                if exists:
+                    return {"recorded": False, "reason": "duplicate_event", "event_id": event_id}
+            rich_text = envelope.content
+            group_id = envelope.chat_id
+            sender_id = envelope.sender_id
+            sender_name = envelope.sender_name
+            conversation_event = dict(envelope.conversation_event or {})
+            if event_id:
+                conversation_event.setdefault("event_id", event_id)
+        else:
+            event_id = str(
+                event.get_extra("astrmai_event_id", None)
+                or getattr(getattr(event, "message_obj", None), "message_id", "")
+                or ""
+            ).strip()
+            rich_text = event.get_extra("astrmai_rich_text", event.message_str)
+            group_id = event.unified_msg_origin
+            sender_id = event.get_sender_id()
+            sender_name = event.get_sender_name()
+            conversation_event = event.get_extra("astrmai_conversation_event", None)
+        inserted = await self._append_message_log(
+            group_id=group_id,
+            sender_id=sender_id,
+            sender_name=sender_name,
             content=rich_text,
-            conversation_event=conversation_event,
+            conversation_event={
+                **dict(conversation_event or {}),
+                **({"event_id": event_id} if event_id else {}),
+            },
         )
-        triggered = self.recorder.record(event.unified_msg_origin)
-        self._schedule_mining_if_triggered(event.unified_msg_origin, triggered)
+        if not inserted:
+            return {"recorded": False, "reason": "duplicate_event", "event_id": event_id}
+        triggered = self.recorder.record(group_id)
+        self._schedule_mining_if_triggered(group_id, triggered)
         payload = UserMessageRecordedEvent(
-            chat_id=str(event.unified_msg_origin),
-            sender_id=str(event.get_sender_id() or ""),
-            sender_name=str(event.get_sender_name() or ""),
+            chat_id=str(group_id),
+            sender_id=str(sender_id or ""),
+            sender_name=str(sender_name or ""),
             content=str(rich_text or ""),
         ).to_payload()
         await self._publish_learning_event("publish_learning_message_recorded", payload)
+        return {"recorded": True, "event_id": event_id}
+
+    async def enqueue_user_message(self, envelope: LearningMessageEnvelope) -> bool:
+        """Durably enqueue an immutable learning ingress and kick the worker."""
+        stores = [
+            store
+            for store in (
+                getattr(self, "_ingest_outbox", None),
+                getattr(self, "_ingest_fallback_outbox", None),
+            )
+            if store is not None
+        ]
+        if not stores:
+            return False
+        inserted = False
+        primary = stores[0]
+        try:
+            inserted = await primary.enqueue(envelope)
+            if not inserted and await primary.contains(envelope.event_id):
+                inserted = True
+        except Exception as exc:
+            logger.warning("[Evolution] primary learning ingress outbox unavailable: %s", exc)
+        if not inserted and len(stores) > 1:
+            try:
+                inserted = await stores[1].enqueue(envelope)
+                if not inserted and await stores[1].contains(envelope.event_id):
+                    inserted = True
+            except Exception as exc:
+                logger.warning("[Evolution] fallback learning ingress spool unavailable: %s", exc)
+        if self._ingest_worker is None or self._ingest_worker.done():
+            self._ingest_worker = asyncio.create_task(self._drain_ingest_outbox(), name="astrmai-learning-ingest")
+            self._background_tasks.add(self._ingest_worker)
+            self._register_owner_task(
+                self._ingest_worker,
+                task_family="learning.ingest",
+                scope_id="GLOBAL",
+                run_id=f"learning-ingest-{uuid.uuid4().hex[:12]}",
+            )
+            self._ingest_worker.add_done_callback(self._handle_task_result)
+        return inserted
+
+    async def _drain_ingest_outbox(self) -> None:
+        stores = [
+            store
+            for store in (
+                getattr(self, "_ingest_outbox", None),
+                getattr(self, "_ingest_fallback_outbox", None),
+            )
+            if store is not None
+        ]
+        if not stores:
+            return
+        for store in stores:
+            try:
+                claim_due = getattr(store, "claim_due", None)
+                entries = (
+                    await claim_due(limit=50, lease_seconds=300.0)
+                    if callable(claim_due)
+                    else await store.list_due(limit=50)
+                )
+                await self._drain_ingest_entries(store, entries)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # One unavailable store must not prevent the fallback spool
+                # (or any later store) from being drained.
+                logger.warning(
+                    "[Evolution] learning ingest store degraded store=%s: %s",
+                    type(store).__name__,
+                    exc,
+                )
+
+    async def _drain_ingest_entries(self, store, entries) -> None:
+        for entry in entries:
+            if entry.event_id in self._ingest_processing:
+                continue
+            self._ingest_processing.add(entry.event_id)
+            try:
+                await self.record_user_message(entry.envelope)
+                await store.delete(
+                    entry.event_id,
+                    lease_token=str(getattr(entry, "lease_token", "") or ""),
+                )
+            except asyncio.CancelledError:
+                await asyncio.shield(
+                    store.release_lease(
+                        entry.event_id,
+                        lease_token=str(getattr(entry, "lease_token", "") or ""),
+                        next_retry_at=0.0,
+                        error="cancelled",
+                    )
+                )
+                raise
+            except Exception as exc:
+                retry_status = await store.mark_retry(
+                    entry.event_id,
+                    entry.attempts + 1,
+                    str(exc),
+                    lease_token=str(getattr(entry, "lease_token", "") or ""),
+                )
+                if retry_status == "exhausted":
+                    logger.warning(
+                        "[Evolution] learning ingest exhausted "
+                        f"event_id={entry.event_id} attempts={entry.attempts + 1}: {exc}"
+                    )
+            finally:
+                self._ingest_processing.discard(entry.event_id)
+
+    async def _ingest_outbox_loop(self) -> None:
+        while True:
+            try:
+                await self._drain_ingest_outbox()
+                await asyncio.sleep(5.0)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(f"[Evolution] learning ingest outbox degraded: {exc}")
+                await asyncio.sleep(5.0)
 
     async def _record_pipeline_state(
         self,
         *,
+        run_id: str = "",
         pipeline: str,
         group_id: str,
         logs: List["MessageLog"],
@@ -1263,7 +1747,14 @@ class EvolutionManager:
         error_type: str = "",
         duration_ms: float = 0.0,
     ) -> dict[str, Any]:
+        # Direct/legacy callers may omit ``run_id``. Derive it from the same
+        # immutable evidence fingerprint used by realtime and backlog paths so
+        # retries cannot create a second ledger row for one mining batch.
+        mining_run_id = str(run_id or self._mining_run_id(group_id, logs))
+        pipeline_run_id = f"{mining_run_id}:{pipeline}"
         outcome = {
+            "run_id": pipeline_run_id,
+            "mining_run_id": mining_run_id,
             "pipeline": pipeline,
             "group_id": str(group_id),
             "batch_id": batch_id,
@@ -1291,6 +1782,8 @@ class EvolutionManager:
         await self._record_pipeline_run(
             {
                 "pipeline": pipeline,
+                "run_id": pipeline_run_id,
+                "mining_run_id": mining_run_id,
                 "chat_id": group_id,
                 "batch_id": batch_id,
                 "raw_count": len(logs),
@@ -1326,6 +1819,8 @@ class EvolutionManager:
         pipeline: str,
         group_id: str,
         logs: List["MessageLog"],
+        *,
+        run_id: str = "",
     ) -> dict[str, Any]:
         cursor_before = max(0, int(self._field(logs[0], "id", 1) or 1) - 1) if logs else 0
         cursor_after = int(self._field(logs[-1], "id", cursor_before) or cursor_before) if logs else cursor_before
@@ -1338,6 +1833,7 @@ class EvolutionManager:
             status="skipped_non_group",
         )
         return await self._record_pipeline_state(
+            run_id=run_id,
             pipeline=pipeline,
             group_id=group_id,
             logs=logs,
@@ -1355,11 +1851,20 @@ class EvolutionManager:
         pipeline: str,
         group_id: str,
         logs: List["MessageLog"],
+        *,
+        run_id: str = "",
     ) -> dict[str, Any]:
         await self._pipeline_semaphore.acquire()
         self._active_pipeline_tasks += 1
         try:
-            return await self._run_learning_pipeline_unlimited(pipeline, group_id, logs)
+            method = self._run_learning_pipeline_unlimited
+            try:
+                parameters = inspect.signature(method).parameters
+            except (TypeError, ValueError):
+                parameters = {}
+            if "run_id" in parameters:
+                return await method(pipeline, group_id, logs, run_id=run_id)
+            return await method(pipeline, group_id, logs)
         finally:
             self._active_pipeline_tasks = max(0, self._active_pipeline_tasks - 1)
             self._pipeline_semaphore.release()
@@ -1369,6 +1874,8 @@ class EvolutionManager:
         pipeline: str,
         group_id: str,
         logs: List["MessageLog"],
+        *,
+        run_id: str = "",
     ) -> dict[str, Any]:
         started = time.perf_counter()
         timeout_sec = max(
@@ -1409,6 +1916,7 @@ class EvolutionManager:
                         status="waiting_for_evidence",
                     )
                     return await self._record_pipeline_state(
+                        run_id=run_id,
                         pipeline=pipeline,
                         group_id=group_id,
                         logs=logs,
@@ -1450,6 +1958,7 @@ class EvolutionManager:
                         status="waiting_for_evidence",
                     )
                     return await self._record_pipeline_state(
+                        run_id=run_id,
                         pipeline=pipeline,
                         group_id=group_id,
                         logs=logs,
@@ -1486,6 +1995,7 @@ class EvolutionManager:
             )
             self._pipeline_failure_counts.pop(failure_key, None)
             return await self._record_pipeline_state(
+                run_id=run_id,
                 pipeline=pipeline,
                 group_id=group_id,
                 logs=logs,
@@ -1533,6 +2043,7 @@ class EvolutionManager:
                 f"[Evolution-{pipeline}] mining {status} for {group_id}: {exc}"
             )
             return await self._record_pipeline_state(
+                run_id=run_id,
                 pipeline=pipeline,
                 group_id=group_id,
                 logs=logs,
@@ -1554,9 +2065,18 @@ class EvolutionManager:
                 duration_ms=(time.perf_counter() - started) * 1000,
             )
 
-    async def process_logs_and_mine(self, group_id: str, logs: List["MessageLog"]):
+    async def process_logs_and_mine(
+        self,
+        group_id: str,
+        logs: List["MessageLog"],
+        *,
+        run_id: str | None = None,
+        snapshot_is_authoritative: bool = False,
+        pipeline_snapshots: dict[str, List["MessageLog"]] | None = None,
+    ):
         if not logs:
             return {}
+        run_id = str(run_id or self._mining_run_id(group_id, logs))
         group_lock = await self._get_mining_lock(group_id)
         async with group_lock:
             enabled_thresholds = [
@@ -1577,13 +2097,21 @@ class EvolutionManager:
                     and not getattr(getattr(self.db, "memory_engine", None), "write_service", None)
                 ):
                     continue
-                pipeline_logs = list(await self._load_pipeline_logs(pipeline, group_id, limit=limit) or [])
+                pipeline_logs = (
+                    list((pipeline_snapshots or {}).get(pipeline, logs) or [])
+                    if snapshot_is_authoritative
+                    else list(await self._load_pipeline_logs(pipeline, group_id, limit=limit) or [])
+                )
                 if not pipeline_logs:
                     continue
                 if not self._is_group_learning_scope(group_id, pipeline_logs):
-                    outcome = await self._skip_non_group_pipeline(pipeline, group_id, pipeline_logs)
+                    outcome = await self._skip_non_group_pipeline(
+                        pipeline, group_id, pipeline_logs, run_id=run_id
+                    )
                 else:
-                    outcome = await self._run_learning_pipeline(pipeline, group_id, pipeline_logs)
+                    outcome = await self._run_learning_pipeline(
+                        pipeline, group_id, pipeline_logs, run_id=run_id
+                    )
                 outcomes[pipeline] = outcome
                 if pipeline == "expression":
                     pattern_count = int(outcome.get("saved_count", 0) or 0) + int(
@@ -1627,6 +2155,7 @@ class EvolutionManager:
                 else "degraded"
             )
             aggregate = {
+                "run_id": run_id,
                 "group_id": str(group_id),
                 "status": aggregate_status,
                 "reason": "pipelines_completed" if aggregate_status == "completed" else "pipeline_incomplete",
@@ -1662,6 +2191,7 @@ class EvolutionManager:
         group_id: str,
         logs: List["MessageLog"],
         *,
+        run_id: str | None = None,
         status: str,
         reason: str,
         pattern_count: int = 0,
@@ -1673,7 +2203,9 @@ class EvolutionManager:
         persistence_report: dict[str, Any] | None = None,
         retryable: bool = False,
     ) -> None:
+        stable_run_id = str(run_id or self._mining_run_id(group_id, logs))
         outcome = {
+            "run_id": stable_run_id,
             "group_id": str(group_id or ""),
             "status": str(status or "unknown"),
             "reason": str(reason or ""),
@@ -1712,14 +2244,15 @@ class EvolutionManager:
                 lane_key=LaneKey(subsystem="sys2", task_family="goal", scope_id=chat_id),
                 base_origin=chat_id,
             )
-            if isinstance(result, dict):
-                return str(result.get("goal", "陪伴用户，提供有趣且连贯的对话"))
-            if isinstance(result, str):
-                match = re.search(r"\{.*?\}", result, re.DOTALL)
-                if match:
-                    data = json.loads(match.group(0))
-                    if isinstance(data, dict):
-                        return str(data.get("goal", "陪伴用户，提供有趣且连贯的对话"))
+            parsed = parse_json_contract(
+                result,
+                required_keys=("goal",),
+                field_types={"goal": str},
+                allow_extra_keys=False,
+                allow_naked_members=True,
+            )
+            if parsed.schema_valid:
+                return str(parsed.value.get("goal", "陪伴用户，提供有趣且连贯的对话"))
         except Exception as exc:
             logger.error(f"[Evolution-Processor] goal analysis failed: {exc}")
         return "陪伴用户，提供有趣且连贯的对话"
@@ -1758,25 +2291,87 @@ class EvolutionManager:
     get_active_patterns = get_active_patterns_canonical
 
     async def _try_trigger_mining(self, group_id: str):
+        await self._load_mining_timestamp(group_id)
+        if self._mining_cooldown_active(group_id):
+            return
         limit = max(100, self._backlog_batch_size())
-        seed_logs: List["MessageLog"] = []
+        snapshot = await self._load_learning_snapshot(group_id, limit)
+        seed_logs = list(snapshot.get("logs") or [])
+        eligible = False
         for pipeline in ("expression", "jargon"):
             if not self._pipeline_enabled(pipeline):
                 continue
-            logs = list(await self._load_pipeline_logs(pipeline, group_id, limit=limit) or [])
+            logs = list(dict(snapshot.get("pipeline_logs") or {}).get(pipeline, ()) or ())
             threshold = max(int(self.recorder.min_messages or 0), self._pipeline_threshold(pipeline))
-            if len(logs) >= threshold and (not seed_logs or len(logs) > len(seed_logs)):
-                seed_logs = logs
-        if seed_logs:
-            await self.process_logs_and_mine(group_id, seed_logs)
+            eligible = eligible or len(logs) >= threshold
+        if seed_logs and eligible:
+            run_id = self._mining_run_id(group_id, seed_logs)
+            mining_fingerprint = self._mining_batch_id(
+                group_id, seed_logs, prefix="learning"
+            )
+            lease = None
+            if self._task_ledger is not None:
+                lease = await self._task_ledger.claim(
+                    task_family="learning_mining",
+                    scope_id=str(group_id),
+                    input_fingerprint=self._mining_batch_id(group_id, seed_logs, prefix="learning"),
+                    lease_seconds=max(300.0, float(getattr(self._evolution_config(), "learning_pipeline_timeout_sec", 60.0) or 60.0)),
+                    min_interval_seconds=max(0.0, self._mining_interval()),
+                    payload={"run_id": run_id, "batch_id": mining_fingerprint},
+                )
+                if lease is None:
+                    return
+            previous_mining_at = float(self._last_mining_at.get(str(group_id), 0.0) or 0.0)
+            self._last_mining_at[str(group_id)] = time.time()
+            await self._persist_mining_timestamp(group_id, self._last_mining_at[str(group_id)])
+            try:
+                outcomes = await self._process_mining_snapshot(
+                    group_id, snapshot, run_id=run_id
+                )
+                all_failed = bool(outcomes) and all(
+                    str(item.get("status", "")).lower() in {"failed", "quarantined"}
+                    for item in outcomes.values()
+                )
+                if all_failed:
+                    self._last_mining_at[str(group_id)] = previous_mining_at
+                    await self._persist_mining_timestamp(group_id, previous_mining_at)
+                if lease is not None:
+                    await self._task_ledger.finish(
+                        lease,
+                        status="retry_wait" if all_failed else "succeeded",
+                        error="all_pipelines_failed" if all_failed else "",
+                        retry_after_seconds=self._backlog_failure_cooldown() if all_failed else 0.0,
+                    )
+            except asyncio.CancelledError:
+                await asyncio.shield(
+                    self._settle_cancelled_mining(
+                        group_id,
+                        previous_mining_at,
+                        lease,
+                    )
+                )
+                raise
+            except Exception as exc:
+                self._last_mining_at[str(group_id)] = previous_mining_at
+                await self._persist_mining_timestamp(group_id, previous_mining_at)
+                if lease is not None:
+                    await self._task_ledger.finish(
+                        lease,
+                        status="retry_wait",
+                        error=str(exc),
+                        retry_after_seconds=self._backlog_failure_cooldown(),
+                    )
+                raise
 
     async def run_backlog_mining_once(self) -> dict[str, Any]:
         purge_report = await self._maybe_purge_learning_runs()
+        message_log_purge = await self._maybe_purge_message_logs()
         if not self._backlog_enabled():
             report = {
                 "enabled": False,
                 "checked_at": time.time(),
                 "run_retention": purge_report,
+                "message_log_retention": message_log_purge,
                 "processed_groups": [],
                 "skipped_groups": [],
                 "errors": [],
@@ -1830,6 +2425,7 @@ class EvolutionManager:
             "skipped_groups": [],
             "errors": [],
             "run_retention": purge_report,
+            "message_log_retention": message_log_purge,
         }
 
         processed_count = 0
@@ -1839,8 +2435,12 @@ class EvolutionManager:
                 continue
             if processed_count >= group_limit:
                 break
+            await self._load_mining_timestamp(group_id)
             if self._mining_tasks.get(group_id) is not None and not self._mining_tasks[group_id].done():
                 report["skipped_groups"].append({"group_id": group_id, "reason": "already_mining"})
+                continue
+            if self._mining_cooldown_active(group_id, now):
+                report["skipped_groups"].append({"group_id": group_id, "reason": "mining_interval"})
                 continue
             failure_until = float(self._backlog_failure_until.get(group_id, 0.0) or 0.0)
             if failure_until > now:
@@ -1848,21 +2448,63 @@ class EvolutionManager:
                     {"group_id": group_id, "reason": "failure_cooldown", "retry_after": failure_until}
                 )
                 continue
-            eligible_pipelines = list(group.get("pipelines", []) or [])
-            seed_pipeline = str(eligible_pipelines[0].get("pipeline", "expression")) if eligible_pipelines else "expression"
-            logs = list(await self._load_pipeline_logs(seed_pipeline, group_id, limit=batch_size) or [])
-            if len(logs) < threshold:
+            snapshot = await self._load_learning_snapshot(group_id, batch_size)
+            logs = list(snapshot.get("logs") or [])
+            pipeline_logs = dict(snapshot.get("pipeline_logs") or {})
+            eligible_pipelines = [
+                pipeline
+                for pipeline, items in pipeline_logs.items()
+                if len(list(items or [])) >= max(threshold, self._pipeline_threshold(pipeline))
+            ]
+            if not eligible_pipelines:
                 report["skipped_groups"].append(
                     {
                         "group_id": group_id,
                         "reason": "below_threshold",
                         "count": len(logs),
-                        "pipeline": seed_pipeline,
+                        "pipeline": "snapshot",
                     }
                 )
                 continue
+            lease = None
+            previous_mining_at = None
+            run_id = self._mining_run_id(group_id, logs)
+            mining_fingerprint = self._mining_batch_id(
+                group_id, logs, prefix="learning"
+            )
             try:
-                outcomes = await self.process_logs_and_mine(group_id, logs)
+                if self._task_ledger is not None:
+                    lease = await self._task_ledger.claim(
+                        task_family="learning_mining",
+                        scope_id=group_id,
+                        input_fingerprint=mining_fingerprint,
+                        lease_seconds=max(300.0, float(getattr(self._evolution_config(), "learning_pipeline_timeout_sec", 60.0) or 60.0)),
+                        min_interval_seconds=max(0.0, self._mining_interval()),
+                        payload={"run_id": run_id, "batch_id": mining_fingerprint},
+                    )
+                    if lease is None:
+                        report["skipped_groups"].append({"group_id": group_id, "reason": "lease_busy"})
+                        continue
+                previous_mining_at = float(self._last_mining_at.get(group_id, 0.0) or 0.0)
+                self._last_mining_at[group_id] = time.time()
+                await self._persist_mining_timestamp(group_id, self._last_mining_at[group_id])
+                outcomes = await self._process_mining_snapshot(
+                    group_id, snapshot, run_id=run_id
+                )
+                all_failed = bool(outcomes) and all(
+                    str(item.get("status", "")).lower() in {"failed", "quarantined"}
+                    for item in outcomes.values()
+                )
+                if all_failed:
+                    self._last_mining_at[group_id] = previous_mining_at
+                    await self._persist_mining_timestamp(group_id, previous_mining_at)
+                if lease is not None:
+                    await self._task_ledger.finish(
+                        lease,
+                        status="retry_wait" if all_failed else "succeeded",
+                        error="all_pipelines_failed" if all_failed else "",
+                        retry_after_seconds=self._backlog_failure_cooldown() if all_failed else 0.0,
+                    )
                 processed_count += 1
                 report["processed_groups"].append(
                     {
@@ -1886,7 +2528,36 @@ class EvolutionManager:
                     f"[Evolution-Backlog] mined group={group_id} logs={len(logs)} "
                     f"processed_total={processed_count} outcomes={outcome_summary}"
                 )
+            except asyncio.CancelledError:
+                if previous_mining_at is not None:
+                    await asyncio.shield(
+                        self._settle_cancelled_mining(
+                            group_id,
+                            previous_mining_at,
+                            lease,
+                        )
+                    )
+                elif self._task_ledger is not None and lease is not None:
+                    await asyncio.shield(
+                        self._task_ledger.finish(
+                            lease,
+                            status="retry_wait",
+                            error="cancelled",
+                            retry_after_seconds=0.0,
+                        )
+                    )
+                raise
             except Exception as exc:
+                if previous_mining_at is not None:
+                    self._last_mining_at[group_id] = previous_mining_at
+                    await self._persist_mining_timestamp(group_id, previous_mining_at)
+                if self._task_ledger is not None and lease is not None:
+                    await self._task_ledger.finish(
+                        lease,
+                        status="retry_wait",
+                        error=str(exc),
+                        retry_after_seconds=self._backlog_failure_cooldown(),
+                    )
                 failure_count = int(self._backlog_failure_counts.get(group_id, 0) or 0) + 1
                 self._backlog_failure_counts[group_id] = failure_count
                 self._backlog_failure_until[group_id] = time.time() + self._backlog_failure_cooldown()
@@ -1895,6 +2566,36 @@ class EvolutionManager:
 
         self._last_backlog_report = report
         return report
+
+    async def _process_mining_snapshot(
+        self,
+        group_id: str,
+        snapshot: Any,
+        *,
+        run_id: str = "",
+    ):
+        """Call the snapshot-aware API while retaining legacy test adapters."""
+        method = self.process_logs_and_mine
+        if isinstance(snapshot, dict):
+            logs = list(snapshot.get("logs") or [])
+            pipeline_snapshots = dict(snapshot.get("pipeline_logs") or {})
+        else:
+            logs = list(snapshot or [])
+            pipeline_snapshots = {}
+        try:
+            parameters = inspect.signature(method).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        kwargs = {}
+        if "snapshot_is_authoritative" in parameters:
+            kwargs["snapshot_is_authoritative"] = True
+        if "pipeline_snapshots" in parameters:
+            kwargs["pipeline_snapshots"] = pipeline_snapshots
+        if "run_id" in parameters:
+            kwargs["run_id"] = str(run_id or "")
+        if kwargs:
+            return await method(group_id, logs, **kwargs)
+        return await method(group_id, logs)
 
     async def _backlog_mining_loop(self) -> None:
         try:
@@ -1905,6 +2606,12 @@ class EvolutionManager:
                     name="astrmai-learning-backlog-mining",
                 )
                 self._backlog_mining_task = mining_task
+                self._register_owner_task(
+                    mining_task,
+                    task_family="learning.backlog",
+                    scope_id="GLOBAL",
+                    run_id=f"learning-backlog-{uuid.uuid4().hex[:12]}",
+                )
                 try:
                     await mining_task
                 except Exception as exc:
@@ -1923,14 +2630,44 @@ class EvolutionManager:
             raise
 
     async def start_background_tasks(self) -> None:
-        if self._backlog_task is not None and not self._backlog_task.done():
-            return
-        self._backlog_task = asyncio.create_task(
-            self._backlog_mining_loop(),
-            name="astrmai-learning-backlog-scheduler",
-        )
-        self._background_tasks.add(self._backlog_task)
-        self._backlog_task.add_done_callback(self._handle_task_result)
+        if self._task_ledger is not None:
+            try:
+                recovered = await self._task_ledger.recover_expired_leases()
+                if recovered:
+                    logger.info(
+                        "[Evolution] recovered expired background leases count=%s",
+                        recovered,
+                    )
+            except Exception as exc:
+                logger.warning("[Evolution] background lease recovery degraded: %s", exc)
+        if self._backlog_task is None or self._backlog_task.done():
+            self._backlog_task = asyncio.create_task(
+                self._backlog_mining_loop(),
+                name="astrmai-learning-backlog-scheduler",
+            )
+            self._background_tasks.add(self._backlog_task)
+            self._register_owner_task(
+                self._backlog_task,
+                task_family="learning.backlog.scheduler",
+                scope_id="GLOBAL",
+                run_id=f"learning-backlog-scheduler-{uuid.uuid4().hex[:12]}",
+            )
+            self._backlog_task.add_done_callback(self._handle_task_result)
+        if (
+            self._ingest_outbox is not None
+            or self._ingest_fallback_outbox is not None
+        ) and (self._ingest_worker is None or self._ingest_worker.done()):
+            self._ingest_worker = asyncio.create_task(
+                self._ingest_outbox_loop(), name="astrmai-learning-ingest-worker"
+            )
+            self._background_tasks.add(self._ingest_worker)
+            self._register_owner_task(
+                self._ingest_worker,
+                task_family="learning.ingest.worker",
+                scope_id="GLOBAL",
+                run_id=f"learning-ingest-worker-{uuid.uuid4().hex[:12]}",
+            )
+            self._ingest_worker.add_done_callback(self._handle_task_result)
 
     async def stop_background_tasks(self) -> None:
         self._mining_rerun_requested.clear()
@@ -1944,6 +2681,8 @@ class EvolutionManager:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._backlog_task = None
+        self._ingest_worker = None
+        self._ingest_processing.clear()
 
     async def process_bot_reply(self, chat_id: str, bot_id: str, reply_text: str):
         recorded = await self.bot_reply_recorder.record(chat_id, bot_id, reply_text)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from typing import Any
 
 from ..adapters.plugin_api import PluginApiAdapter
@@ -53,7 +54,15 @@ class ChatRuntimeService:
         scheduler = getattr(task, "dream_scheduler", None) if task else None
         if not scheduler or not getattr(scheduler, "dream_agent", None) or not getattr(scheduler, "dream_generator", None):
             return {"status": "error", "message": "Dream dependencies are not bound", "runtime_bound": scheduler is not None}
-        safe_create_task(scheduler.run_once())
+        launcher = getattr(task, "_fire_background_task", None)
+        if callable(launcher):
+            launcher(
+                scheduler.run_once,
+                task_name="proactive.dream_manual",
+                scope_id="__global__",
+            )
+        else:
+            safe_create_task(scheduler.run_once())
         return {"status": "ok", "scheduled": True, "runtime_bound": True}
 
     async def diary_status(self) -> dict[str, Any]:
@@ -73,7 +82,15 @@ class ChatRuntimeService:
         state_engine = self._api.get_state_engine()
         if not service or not state_engine:
             return {"status": "error", "message": "Diary dependencies are not bound", "runtime_bound": task is not None}
-        safe_create_task(service.run_once(state_engine.get_active_states()))
+        launcher = getattr(task, "_fire_background_task", None)
+        if callable(launcher):
+            launcher(
+                lambda: service.run_once(state_engine.get_active_states()),
+                task_name="proactive.diary_manual",
+                scope_id="__global__",
+            )
+        else:
+            safe_create_task(service.run_once(state_engine.get_active_states()))
         return {"status": "ok", "scheduled": True, "runtime_bound": True}
 
     async def wakeup_status(self) -> dict[str, Any]:
@@ -90,17 +107,46 @@ class ChatRuntimeService:
         }
 
     async def run_reflect_once(self, chat_id: str) -> dict[str, Any]:
-        reflector = self._api.get_reflector()
-        if not reflector:
-            return {"status": "error", "message": "Reflector is not bound", "runtime_bound": self._api.has_bound_facade()}
-        if hasattr(reflector, "reflect_batch"):
-            await reflector.reflect_batch(chat_id)
-        if hasattr(reflector, "auto_audit"):
-            await reflector.auto_audit(chat_id)
-        auto_check = self._api.get_auto_check_task()
-        if auto_check and hasattr(auto_check, "run_once"):
-            await auto_check.run_once(chat_id)
-        return {"status": "ok", "runtime_bound": True}
+        runner = getattr(self._api, "get_expression_governance_runner", lambda: None)()
+        if runner is not None and hasattr(runner, "run_scope_once"):
+            await runner.run_scope_once(chat_id, force=True)
+            return {"status": "ok", "runtime_bound": True, "forced": True}
+        # Compatibility facade for older hosts/tests that have not bound the
+        # unified runner yet. Production runtimes use the branch above, so the
+        # governance lease remains the single admission path there.
+        reflector = getattr(self._api, "get_reflector", lambda: None)()
+        auto_check = getattr(self._api, "get_auto_check_task", lambda: None)()
+        if reflector is not None:
+            reflect_batch = getattr(reflector, "reflect_batch", None)
+            auto_audit = getattr(reflector, "auto_audit", None)
+            if callable(reflect_batch):
+                await reflect_batch(chat_id)
+            if callable(auto_audit):
+                audit_kwargs = (
+                    {"force": True}
+                    if "force" in inspect.signature(auto_audit).parameters
+                    else {}
+                )
+                await auto_audit(chat_id, **audit_kwargs)
+            run_once = getattr(auto_check, "run_once", None)
+            if callable(run_once):
+                run_kwargs = (
+                    {"force": True}
+                    if "force" in inspect.signature(run_once).parameters
+                    else {}
+                )
+                await run_once(chat_id, **run_kwargs)
+            return {
+                "status": "ok",
+                "runtime_bound": True,
+                "forced": True,
+                "compatibility_path": True,
+            }
+        return {
+            "status": "error",
+            "message": "Governance runner is not bound",
+            "runtime_bound": self._api.has_bound_facade(),
+        }
 
     async def active_chats(self, max_age_seconds: float = 1800) -> dict[str, Any]:
         coordinator = self._api.get_runtime_coordinator()

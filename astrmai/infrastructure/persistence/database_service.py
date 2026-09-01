@@ -189,6 +189,54 @@ class DatabaseService(
 
         self._run_with_session(_sync)
 
+    def add_message_log_if_absent(
+        self,
+        group_id: str,
+        sender_id: str,
+        sender_name: str,
+        content: str,
+        *,
+        conversation_event: Any,
+    ) -> bool:
+        """Atomically append one canonical event across plugin instances."""
+        event_fields = self._conversation_event_log_fields(conversation_event)
+        event_id = str(event_fields.get("event_id") or "").strip()
+        if not event_id:
+            self.add_message_log(
+                group_id,
+                sender_id,
+                sender_name,
+                content,
+                conversation_event=conversation_event,
+            )
+            return True
+        values: dict[str, Any] = {
+            "group_id": str(group_id or ""),
+            "sender_id": str(sender_id or ""),
+            "sender_name": str(sender_name or ""),
+            "content": str(content or ""),
+            "processed": False,
+            **event_fields,
+        }
+        columns = tuple(values)
+        placeholders = ", ".join("?" for _ in columns)
+        column_sql = ", ".join(f'"{name}"' for name in columns)
+        with connect_sqlite(self.persistence.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            exists = conn.execute(
+                "SELECT 1 FROM messagelog WHERE event_id = ? LIMIT 1",
+                (event_id,),
+            ).fetchone()
+            if exists is not None:
+                conn.rollback()
+                return False
+            conn.execute(
+                f"INSERT INTO messagelog ({column_sql}) VALUES ({placeholders})",
+                tuple(values[name] for name in columns),
+            )
+            conn.commit()
+        return True
+
     def get_unprocessed_logs(self, group_id: str, limit: int = 50) -> List[MessageLog]:
         def _sync(session: Session) -> List[MessageLog]:
             statement = (
@@ -318,6 +366,17 @@ class DatabaseService(
             session.commit()
 
         self._run_with_session(_sync)
+
+    def message_log_event_exists(self, event_id: str) -> bool:
+        normalized = str(event_id or "").strip()
+        if not normalized:
+            return False
+        with connect_sqlite(self.persistence.db_path) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM messagelog WHERE event_id = ? LIMIT 1",
+                (normalized,),
+            ).fetchone()
+        return row is not None
 
     @staticmethod
     def _normalize_learning_pipeline(pipeline: str) -> str:
@@ -505,6 +564,104 @@ class DatabaseService(
 
         return self._run_with_session(_sync)
 
+    def load_learning_snapshot(
+        self,
+        chat_id: str,
+        limit: int = 100,
+        *,
+        pipelines: tuple[str, ...] = ("expression", "jargon"),
+        replay_recent: dict[str, int] | None = None,
+    ) -> dict[str, Any]:
+        """Read all learning pipeline inputs from one SQLite snapshot."""
+        normalized_chat_id = str(chat_id or "").strip()
+        if not normalized_chat_id:
+            raise ValueError("chat_id is required")
+        safe_limit = max(1, min(int(limit or 100), 1000))
+        replay = dict(replay_recent or {})
+        normalized_pipelines = tuple(
+            dict.fromkeys(self._normalize_learning_pipeline(item) for item in pipelines)
+        )
+        for pipeline in normalized_pipelines:
+            self.ensure_learning_checkpoint(
+                pipeline,
+                normalized_chat_id,
+                replay_recent=max(0, int(replay.get(pipeline, 0) or 0)),
+            )
+        now = time.time()
+        with connect_sqlite(self.persistence.db_path) as conn:
+            conn.execute("BEGIN")
+            checkpoint_rows = conn.execute(
+                f"""
+                SELECT pipeline, cursor_log_id, retry_at
+                FROM learning_pipeline_checkpoint
+                WHERE chat_id = ? AND pipeline IN ({','.join('?' for _ in normalized_pipelines)})
+                """,
+                (normalized_chat_id, *normalized_pipelines),
+            ).fetchall()
+            checkpoints = {
+                str(row[0]): {
+                    "cursor_log_id": int(row[1] or 0),
+                    "retry_at": float(row[2] or 0.0),
+                }
+                for row in checkpoint_rows
+            }
+            active_cursors = [
+                item["cursor_log_id"]
+                for item in checkpoints.values()
+                if item["retry_at"] <= now
+            ]
+            if not active_cursors:
+                conn.commit()
+                return {
+                    "chat_id": normalized_chat_id,
+                    "logs": [],
+                    "checkpoints": checkpoints,
+                    "created_at": now,
+                }
+            cursor_floor = min(active_cursors)
+            rows = conn.execute(
+                """
+                SELECT id, group_id, sender_id, sender_name, content, timestamp,
+                       processed, event_id, event_schema_version,
+                       platform_message_id, chat_kind, role, message_kind,
+                       is_bot, reply_target_event_id, reply_target_actor_id,
+                       reply_target_actor_name, quote_event_id, at_actor_ids,
+                       topic_epoch, causal_parent_event_id, source_event_ids,
+                       provenance, image_refs, interaction_kind, recalled, outcome
+                FROM messagelog
+                WHERE group_id = ? AND id > ?
+                ORDER BY id ASC LIMIT ?
+                """,
+                (normalized_chat_id, cursor_floor, safe_limit),
+            ).fetchall()
+            conn.commit()
+        columns = (
+            "id", "group_id", "sender_id", "sender_name", "content", "timestamp",
+            "processed", "event_id", "event_schema_version", "platform_message_id",
+            "chat_kind", "role", "message_kind", "is_bot", "reply_target_event_id",
+            "reply_target_actor_id", "reply_target_actor_name", "quote_event_id",
+            "at_actor_ids", "topic_epoch", "causal_parent_event_id", "source_event_ids",
+            "provenance", "image_refs", "interaction_kind", "recalled", "outcome",
+        )
+        logs = [MessageLog(**dict(zip(columns, row))) for row in rows]
+        pipeline_logs = {
+            pipeline: [
+                item
+                for item in logs
+                if checkpoints.get(pipeline, {}).get("retry_at", 0.0) <= now
+                and int(getattr(item, "id", 0) or 0)
+                > int(checkpoints.get(pipeline, {}).get("cursor_log_id", 0) or 0)
+            ]
+            for pipeline in normalized_pipelines
+        }
+        return {
+            "chat_id": normalized_chat_id,
+            "logs": logs,
+            "pipeline_logs": pipeline_logs,
+            "checkpoints": checkpoints,
+            "created_at": now,
+        }
+
     def list_learning_checkpoints(
         self,
         *,
@@ -690,6 +847,7 @@ class DatabaseService(
 
     def record_learning_mining_run(self, payload: dict[str, Any]) -> str:
         run_id = str(payload.get("run_id") or uuid.uuid4().hex)
+        mining_run_id = str(payload.get("mining_run_id") or run_id)
         now = float(payload.get("created_at") or time.time())
         details = payload.get("details")
         if details is None:
@@ -702,15 +860,38 @@ class DatabaseService(
             conn.execute(
                 """
                 INSERT INTO learning_mining_run (
-                    run_id, pipeline, chat_id, batch_id, raw_count,
+                    run_id, mining_run_id, pipeline, chat_id, batch_id, raw_count,
                     normalized_count, required_count, candidate_count,
                     saved_count, deduplicated_count, cursor_before,
                     cursor_after, retained_count, status, reason, duration_ms,
                     model_id, retryable, error_type, details_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO UPDATE SET
+                    mining_run_id=excluded.mining_run_id,
+                    pipeline=excluded.pipeline,
+                    chat_id=excluded.chat_id,
+                    batch_id=excluded.batch_id,
+                    raw_count=excluded.raw_count,
+                    normalized_count=excluded.normalized_count,
+                    required_count=excluded.required_count,
+                    candidate_count=excluded.candidate_count,
+                    saved_count=excluded.saved_count,
+                    deduplicated_count=excluded.deduplicated_count,
+                    cursor_before=excluded.cursor_before,
+                    cursor_after=excluded.cursor_after,
+                    retained_count=excluded.retained_count,
+                    status=excluded.status,
+                    reason=excluded.reason,
+                    duration_ms=excluded.duration_ms,
+                    model_id=excluded.model_id,
+                    retryable=excluded.retryable,
+                    error_type=excluded.error_type,
+                    details_json=excluded.details_json,
+                    created_at=excluded.created_at
                 """,
                 (
                     run_id,
+                    mining_run_id,
                     self._normalize_learning_pipeline(str(payload.get("pipeline") or "")),
                     str(payload.get("chat_id") or ""),
                     str(payload.get("batch_id") or ""),
@@ -735,6 +916,72 @@ class DatabaseService(
             )
             conn.commit()
         return run_id
+
+    def record_dream_run(self, payload: dict[str, Any]) -> str:
+        run_id = str(payload.get("run_id") or uuid.uuid4().hex)
+        now = float(payload.get("updated_at") or time.time())
+        def _json(value: Any, default: Any) -> str:
+            if isinstance(value, str):
+                return value
+            return json.dumps(value if value is not None else default, ensure_ascii=False, default=str)
+        with connect_sqlite(self.persistence.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO dream_run (
+                    run_id, session_id, status, attempt, seed_event_ids_json,
+                    maintenance_summary, maintenance_actions_json, dream_text_hash,
+                    promotion_report_json, stage_status_json, error,
+                    started_at, completed_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO UPDATE SET
+                    status=excluded.status,
+                    attempt=excluded.attempt,
+                    maintenance_summary=excluded.maintenance_summary,
+                    maintenance_actions_json=excluded.maintenance_actions_json,
+                    dream_text_hash=excluded.dream_text_hash,
+                    promotion_report_json=excluded.promotion_report_json,
+                    stage_status_json=excluded.stage_status_json,
+                    error=excluded.error,
+                    completed_at=excluded.completed_at,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    run_id,
+                    str(payload.get("session_id") or ""),
+                    str(payload.get("status") or ""),
+                    int(payload.get("attempt") or 1),
+                    _json(payload.get("seed_event_ids"), []),
+                    str(payload.get("maintenance_summary") or ""),
+                    _json(payload.get("maintenance_actions"), []),
+                    str(payload.get("dream_text_hash") or ""),
+                    _json(payload.get("promotion_report"), {}),
+                    _json(payload.get("stage_status"), {}),
+                    str(payload.get("error") or "")[:1000],
+                    float(payload.get("started_at") or now),
+                    float(payload.get("completed_at") or 0.0),
+                    now,
+                ),
+            )
+            conn.commit()
+        return run_id
+
+    def list_dream_runs(self, *, session_id: str = "", limit: int = 50) -> list[dict[str, Any]]:
+        params: list[Any] = []
+        where = ""
+        if str(session_id or "").strip():
+            where = "WHERE session_id = ?"
+            params.append(str(session_id))
+        params.append(max(1, min(int(limit or 50), 200)))
+        with connect_sqlite(self.persistence.db_path) as conn:
+            rows = conn.execute(
+                f"SELECT run_id, session_id, status, attempt, seed_event_ids_json, maintenance_summary, "
+                f"maintenance_actions_json, dream_text_hash, promotion_report_json, stage_status_json, "
+                f"error, started_at, completed_at, updated_at FROM dream_run {where} "
+                "ORDER BY started_at DESC LIMIT ?",
+                params,
+            ).fetchall()
+        keys = ("run_id", "session_id", "status", "attempt", "seed_event_ids_json", "maintenance_summary", "maintenance_actions_json", "dream_text_hash", "promotion_report_json", "stage_status_json", "error", "started_at", "completed_at", "updated_at")
+        return [dict(zip(keys, row)) for row in rows]
 
     def list_learning_mining_runs(
         self,
@@ -762,7 +1009,7 @@ class DatabaseService(
         with connect_sqlite(self.persistence.db_path) as conn:
             cursor = conn.execute(
                 f"""
-                SELECT run_id, pipeline, chat_id, batch_id, raw_count,
+                SELECT run_id, mining_run_id, pipeline, chat_id, batch_id, raw_count,
                        normalized_count, required_count, candidate_count,
                        saved_count, deduplicated_count, cursor_before,
                        cursor_after, retained_count, status, reason, duration_ms,
@@ -776,7 +1023,7 @@ class DatabaseService(
             )
             rows = cursor.fetchall()
         keys = (
-            "run_id", "pipeline", "chat_id", "batch_id", "raw_count",
+            "run_id", "mining_run_id", "pipeline", "chat_id", "batch_id", "raw_count",
             "normalized_count", "required_count", "candidate_count",
             "saved_count", "deduplicated_count", "cursor_before",
             "cursor_after", "retained_count", "status", "reason",
@@ -886,6 +1133,71 @@ class DatabaseService(
             conn.commit()
             return max(0, int(result.rowcount or 0))
 
+    def purge_consumed_message_logs(
+        self,
+        *,
+        retention_days: int = 90,
+        batch_size: int = 500,
+        pipelines: tuple[str, ...] = ("expression", "jargon"),
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        normalized = tuple(self._normalize_learning_pipeline(item) for item in pipelines)
+        safe_days = max(7, int(retention_days or 90))
+        safe_batch = max(1, min(int(batch_size or 500), 5000))
+        cutoff = float(time.time() if now is None else now) - safe_days * 86400
+        placeholders = ",".join("?" for _ in normalized)
+        with connect_sqlite(self.persistence.db_path) as conn:
+            binding_table_exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='visualmessagebinding'"
+            ).fetchone() is not None
+            binding_guard = ""
+            if binding_table_exists:
+                binding_guard = """
+                    AND NOT EXISTS (
+                        SELECT 1 FROM visualmessagebinding binding
+                        WHERE binding.chat_id = log.group_id
+                          AND binding.message_id IN (
+                              CAST(log.id AS TEXT), log.event_id, log.platform_message_id
+                          )
+                    )
+                """
+            rows = conn.execute(
+                f"""
+                SELECT log.id
+                FROM messagelog AS log
+                JOIN (
+                    SELECT chat_id, MIN(cursor_log_id) AS safe_cursor,
+                           COUNT(DISTINCT pipeline) AS pipeline_count
+                    FROM learning_pipeline_checkpoint
+                    WHERE pipeline IN ({placeholders})
+                    GROUP BY chat_id
+                ) AS checkpoint ON checkpoint.chat_id = log.group_id
+                WHERE checkpoint.pipeline_count = ?
+                  AND log.processed = 1
+                  AND log.id <= checkpoint.safe_cursor
+                  AND log.timestamp < ?
+                  AND COALESCE(log.image_refs, '[]') IN ('', '[]')
+                  {binding_guard}
+                ORDER BY log.timestamp ASC, log.id ASC
+                LIMIT ?
+                """,
+                (*normalized, len(normalized), cutoff, safe_batch),
+            ).fetchall()
+            log_ids = [int(row[0]) for row in rows]
+            if log_ids:
+                id_placeholders = ",".join("?" for _ in log_ids)
+                conn.execute(
+                    f"DELETE FROM messagelog WHERE id IN ({id_placeholders})",
+                    log_ids,
+                )
+                conn.commit()
+        return {
+            "deleted": len(log_ids),
+            "retention_days": safe_days,
+            "batch_size": safe_batch,
+            "cutoff": cutoff,
+        }
+
     def get_chat_state(self, chat_id: str) -> Optional[ChatState]:
         with connect_sqlite(self.persistence.db_path) as conn:
             conn.execute("PRAGMA journal_mode=WAL")
@@ -970,6 +1282,30 @@ class DatabaseService(
             with_lock=True,
         )
 
+    async def add_message_log_if_absent_async(
+        self,
+        group_id: str,
+        sender_id: str,
+        sender_name: str,
+        content: str,
+        *,
+        conversation_event: Any,
+    ) -> bool:
+        return bool(
+            await self._run_blocking(
+                self.add_message_log_if_absent,
+                group_id,
+                sender_id,
+                sender_name,
+                content,
+                conversation_event=conversation_event,
+                with_lock=True,
+            )
+        )
+
+    async def message_log_event_exists_async(self, event_id: str) -> bool:
+        return bool(await self._run_blocking(self.message_log_event_exists, event_id))
+
     async def mark_logs_processed_async(self, log_ids: List[int]):
         return await self._run_blocking(self.mark_logs_processed, log_ids, with_lock=True)
 
@@ -997,6 +1333,13 @@ class DatabaseService(
             chat_id,
             limit,
             replay_recent=replay_recent,
+        )
+
+    async def load_learning_snapshot_async(self, *args, **kwargs):
+        return await self._run_blocking(
+            self.load_learning_snapshot,
+            *args,
+            **kwargs,
         )
 
     async def ensure_learning_checkpoint_async(self, *args, **kwargs):
@@ -1033,6 +1376,116 @@ class DatabaseService(
 
     async def list_learning_checkpoints_async(self, **kwargs):
         return await self._run_blocking(self.list_learning_checkpoints, **kwargs)
+
+    async def record_dream_run_async(self, payload: dict[str, Any]) -> str:
+        return await self._run_blocking(self.record_dream_run, payload, with_lock=True)
+
+    async def list_dream_runs_async(self, **kwargs):
+        return await self._run_blocking(self.list_dream_runs, **kwargs)
+
+    def record_user_profile_revision(self, payload: dict[str, Any]) -> str:
+        revision_id = str(payload.get("revision_id") or uuid.uuid4().hex)
+        created_at = float(payload.get("created_at") or time.time())
+        def _json(value: Any) -> str:
+            if isinstance(value, str):
+                return value
+            return json.dumps(value if value is not None else [], ensure_ascii=False, default=str)
+        with connect_sqlite(self.persistence.db_path) as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO user_profile_revision (
+                    revision_id, user_id, source, summary, tags_json,
+                    memory_points_json, changed_fields_json, model_id, run_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    revision_id,
+                    str(payload.get("user_id") or ""),
+                    str(payload.get("source") or ""),
+                    str(payload.get("summary") or "")[:1000],
+                    _json(payload.get("tags")),
+                    _json(payload.get("memory_points")),
+                    _json(payload.get("changed_fields")),
+                    str(payload.get("model_id") or ""),
+                    str(payload.get("run_id") or ""),
+                    created_at,
+                ),
+            )
+            conn.commit()
+        return revision_id
+
+    async def record_user_profile_revision_async(self, payload: dict[str, Any]) -> str:
+        return await self._run_blocking(self.record_user_profile_revision, payload, with_lock=True)
+
+    def purge_user_profile_revisions(
+        self,
+        *,
+        user_id: str = "",
+        keep_latest: int = 12,
+        max_age_days: int = 180,
+        batch_size: int = 100,
+    ) -> int:
+        keep = max(1, int(keep_latest or 12))
+        cutoff = time.time() - max(1, int(max_age_days or 180)) * 86400
+        batch = max(1, min(int(batch_size or 100), 1000))
+        params: list[Any] = []
+        user_filter = ""
+        if user_id:
+            user_filter = "WHERE user_id = ?"
+            params.append(str(user_id))
+        params.extend((keep, cutoff, batch))
+        with connect_sqlite(self.persistence.db_path) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT revision_id FROM (
+                    SELECT revision_id, created_at,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY user_id
+                               ORDER BY created_at DESC, revision_id DESC
+                           ) AS revision_rank
+                    FROM user_profile_revision
+                    {user_filter}
+                )
+                WHERE revision_rank > ? OR created_at < ?
+                ORDER BY created_at ASC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+            revision_ids = [str(row[0]) for row in rows]
+            if revision_ids:
+                placeholders = ",".join("?" for _ in revision_ids)
+                conn.execute(
+                    f"DELETE FROM user_profile_revision WHERE revision_id IN ({placeholders})",
+                    revision_ids,
+                )
+                conn.commit()
+        return len(revision_ids)
+
+    async def purge_user_profile_revisions_async(self, **kwargs) -> int:
+        return await self._run_blocking(
+            self.purge_user_profile_revisions,
+            with_lock=True,
+            **kwargs,
+        )
+
+    async def list_user_profile_revisions_async(self, *, user_id: str, limit: int = 12):
+        return await self._run_blocking(
+            self._list_user_profile_revisions_sync,
+            user_id,
+            limit,
+        )
+
+    def _list_user_profile_revisions_sync(self, user_id: str, limit: int = 12) -> list[dict[str, Any]]:
+        with connect_sqlite(self.persistence.db_path) as conn:
+            rows = conn.execute(
+                "SELECT revision_id, user_id, source, summary, tags_json, memory_points_json, "
+                "changed_fields_json, model_id, run_id, created_at FROM user_profile_revision "
+                "WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
+                (str(user_id or ""), max(1, min(int(limit or 12), 100))),
+            ).fetchall()
+        keys = ("revision_id", "user_id", "source", "summary", "tags_json", "memory_points_json", "changed_fields_json", "model_id", "run_id", "created_at")
+        return [dict(zip(keys, row)) for row in rows]
 
     async def count_learning_checkpoints_async(self, **kwargs):
         return await self._run_blocking(self.count_learning_checkpoints, **kwargs)
@@ -1077,6 +1530,13 @@ class DatabaseService(
         return await self._run_blocking(
             self.mark_logs_processed_through_learning_checkpoints,
             chat_id,
+            with_lock=True,
+            **kwargs,
+        )
+
+    async def purge_consumed_message_logs_async(self, **kwargs):
+        return await self._run_blocking(
+            self.purge_consumed_message_logs,
             with_lock=True,
             **kwargs,
         )
