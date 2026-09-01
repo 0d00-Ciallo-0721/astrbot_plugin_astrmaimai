@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
+
+import aiosqlite
 
 from astrmai.infrastructure.persistence.architecture_migration_audit import (
     LATEST_ARCHITECTURE_SCHEMA_VERSION,
@@ -11,6 +14,7 @@ from astrmai.infrastructure.persistence.architecture_migration_audit import (
 from astrmai.infrastructure.persistence.persistence_schema import (
     _MIGRATIONS,
     _run_migrations,
+    _run_migrations_async,
 )
 
 
@@ -143,7 +147,62 @@ def test_v121_adds_learning_ingest_lease_token_to_existing_outbox(tmp_path):
         version = int(db.execute("PRAGMA user_version").fetchone()[0])
 
     assert "lease_token" in columns
-    assert version == 121
+    assert version == 122
+
+
+def test_v122_creates_qq_action_ledger(tmp_path):
+    path = tmp_path / "astrmai.db"
+    with sqlite3.connect(path) as db:
+        db.execute("PRAGMA user_version = 121")
+        _run_migrations(db)
+        columns = {
+            str(row[1])
+            for row in db.execute("PRAGMA table_info(qq_action_ledger)").fetchall()
+        }
+        version = int(db.execute("PRAGMA user_version").fetchone()[0])
+
+    assert version == 122
+    assert {
+        "transport_idempotency_key",
+        "action_instance_id",
+        "action_id",
+        "action_type",
+        "chat_id",
+        "turn_id",
+        "trace_id",
+        "status",
+        "lease_token",
+        "lease_until",
+        "attempts",
+        "last_error",
+        "created_at",
+        "updated_at",
+        "sending_at",
+        "sent_at",
+        "completed_at",
+    } <= columns
+
+
+def test_async_v122_creates_qq_action_ledger(tmp_path):
+    path = tmp_path / "astrmai-async.db"
+
+    async def run():
+        async with aiosqlite.connect(path) as db:
+            await db.execute("PRAGMA user_version = 121")
+            await _run_migrations_async(db)
+            await db.commit()
+            cursor = await db.execute("PRAGMA table_info(qq_action_ledger)")
+            columns = {str(row[1]) for row in await cursor.fetchall()}
+            await cursor.close()
+            cursor = await db.execute("PRAGMA user_version")
+            row = await cursor.fetchone()
+            await cursor.close()
+            return columns, int(row[0] if row else 0)
+
+    columns, version = asyncio.run(run())
+
+    assert version == 122
+    assert "transport_idempotency_key" in columns
 
 
 def test_migration_audit_is_repeatable_and_never_repairs_unknown_actor(tmp_path):

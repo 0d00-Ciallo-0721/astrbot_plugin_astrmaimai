@@ -222,6 +222,55 @@ class ContextRuntimeWiringTests(unittest.TestCase):
         self.assertIsNone(core.db_service.dialogue_store)
         self.assertIsNone(core.db_service.context_compaction)
 
+    def test_cognition_stack_wires_qq_action_ledger_from_runtime_database(self):
+        bootstrap_mod = importlib.import_module("astrmai.app.bootstrap")
+        captured = {}
+
+        class DummyReplyService:
+            def __init__(self, *_args, **kwargs):
+                captured.update(kwargs)
+
+        runtime = SimpleNamespace(
+            db_service=SimpleNamespace(db_path="C:/runtime/astrmai.db"),
+            gateway=SimpleNamespace(),
+            event_bus=None,
+            background_task_budget=None,
+            owner_registry=None,
+            state_engine=SimpleNamespace(mood_manager=SimpleNamespace()),
+            memory_engine=SimpleNamespace(),
+            dialogue_store=None,
+            runtime_coordinator=SimpleNamespace(),
+            persistence=SimpleNamespace(),
+            config=SimpleNamespace(),
+            sys3_router=None,
+            cross_session_handoff_store=None,
+            conversation_history_service=None,
+            visual_cortex=None,
+            image_resolver=None,
+        )
+        bootstrap = bootstrap_mod.PluginBootstrap(
+            context=SimpleNamespace(),
+            config=runtime.config,
+            raw_config={},
+        )
+
+        with patch.object(bootstrap_mod, "EvolutionManager", lambda *_args, **_kwargs: SimpleNamespace()), \
+             patch.object(bootstrap_mod, "ReplyService", DummyReplyService), \
+             patch.object(bootstrap_mod, "ReplyCommitService", lambda *_args, **_kwargs: SimpleNamespace()), \
+             patch.object(bootstrap_mod, "ReplyCommitOutboxStore", lambda *_args, **_kwargs: SimpleNamespace()), \
+             patch.object(bootstrap_mod, "PersonaSummarizer", lambda *_args, **_kwargs: SimpleNamespace()), \
+             patch.object(bootstrap_mod, "ContextEngine", lambda *_args, **_kwargs: SimpleNamespace()), \
+             patch.object(bootstrap_mod, "ReActRetriever", lambda *_args, **_kwargs: SimpleNamespace()), \
+             patch.object(bootstrap_mod, "PromptRefiner", lambda *_args, **_kwargs: SimpleNamespace()), \
+             patch.object(bootstrap_mod, "Planner", lambda *_args, **_kwargs: SimpleNamespace()), \
+             patch.object(bootstrap_mod, "System2Runner", lambda *_args, **_kwargs: SimpleNamespace()):
+            bootstrap._build_cognition_stack(runtime)
+
+        self.assertEqual(
+            captured["qq_action_store"].db_path,
+            runtime.db_service.db_path,
+        )
+
     def test_runtime_exports_context_compaction_and_prefix_cache_can_be_disabled(self):
         runtime_context_mod = importlib.import_module("astrmai.app.runtime_context")
         context_engine_mod = importlib.import_module("astrmai.conversation.planning.context_engine")

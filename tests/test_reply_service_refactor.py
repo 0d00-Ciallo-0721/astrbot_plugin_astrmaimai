@@ -84,6 +84,18 @@ class RefactoredReplyServiceTests(unittest.TestCase):
             mood_manager=SimpleNamespace(),
         )
 
+    def test_qq_action_store_is_forwarded_to_dispatcher(self):
+        state_engine = FakeStateEngine()
+        store = object()
+
+        service = self.reply_mod.ReplyService(
+            state_engine=state_engine,
+            mood_manager=SimpleNamespace(),
+            qq_action_store=store,
+        )
+
+        self.assertIs(service.qq_action_dispatcher.action_store, store)
+
     def _enable_tts(self, service, **overrides):
         values = {
             "enabled": True,

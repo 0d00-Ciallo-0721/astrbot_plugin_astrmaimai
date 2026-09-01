@@ -62,6 +62,7 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
         evolution_manager=None,
         reply_commit_service=None,
         post_reply_feedback_coordinator=None,
+        qq_action_store=None,
     ):
         self.state_engine = state_engine
         self.mood_manager = mood_manager
@@ -80,6 +81,7 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
         self.qq_action_dispatcher = QQActionDispatcher(
             config=self.config,
             runtime_coordinator=runtime_coordinator,
+            action_store=qq_action_store,
         )
         self.tts_bridge = TTSBridge(config=self.config)
 

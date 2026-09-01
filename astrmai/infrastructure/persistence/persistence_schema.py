@@ -352,6 +352,25 @@ _MIGRATIONS: list[tuple[int, str]] = [
     (119, "ALTER TABLE learning_mining_run ADD COLUMN mining_run_id TEXT NOT NULL DEFAULT ''"),
     (120, "CREATE INDEX IF NOT EXISTS ix_learning_mining_run_mining_run_id ON learning_mining_run(mining_run_id, pipeline, chat_id)"),
     (121, "ALTER TABLE learning_ingest_outbox ADD COLUMN lease_token TEXT NOT NULL DEFAULT ''"),
+    (122, """CREATE TABLE IF NOT EXISTS qq_action_ledger (
+        transport_idempotency_key TEXT PRIMARY KEY,
+        action_instance_id TEXT NOT NULL DEFAULT '',
+        action_id TEXT NOT NULL DEFAULT '',
+        action_type TEXT NOT NULL DEFAULT '',
+        chat_id TEXT NOT NULL DEFAULT '',
+        turn_id TEXT NOT NULL DEFAULT '',
+        trace_id TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'sending',
+        lease_token TEXT NOT NULL DEFAULT '',
+        lease_until REAL NOT NULL DEFAULT 0,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT NOT NULL DEFAULT '',
+        created_at REAL NOT NULL DEFAULT 0,
+        updated_at REAL NOT NULL DEFAULT 0,
+        sending_at REAL NOT NULL DEFAULT 0,
+        sent_at REAL NOT NULL DEFAULT 0,
+        completed_at REAL NOT NULL DEFAULT 0
+    )"""),
 ]
 
 

@@ -1,8 +1,10 @@
 import asyncio
 import importlib
+import sqlite3
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 from tests.helpers.astrbot_stubs import install_astrbot_stubs
@@ -25,6 +27,11 @@ class _TimeoutSendApi(_Api):
         if action == "send_msg":
             raise TimeoutError("request timed out after remote acceptance")
         return {"status": "ok"}
+
+
+class _BrokenClaimStore:
+    async def claim(self, *_args, **_kwargs):
+        raise RuntimeError("ledger unavailable")
 
 
 class _Event:
@@ -67,6 +74,18 @@ class QQActionDispatcherTests(unittest.TestCase):
     def tearDown(self):
         OUTBOUND_SEND_GATE.close()
         self.temp_dir.cleanup()
+
+    def _persistent_store(self):
+        from astrmai.infrastructure.persistence.persistence_schema import _run_migrations
+
+        db_path = Path(self.temp_dir.name) / "qq_action_ledger.db"
+        with sqlite3.connect(db_path) as db:
+            db.execute("PRAGMA user_version = 121")
+            _run_migrations(db)
+        store_mod = importlib.import_module(
+            "astrmai.infrastructure.persistence.qq_action_ledger"
+        )
+        return store_mod.QQActionLedgerStore(db_path)
 
     def test_shutdown_gate_rejects_deferred_actions_before_napcat(self):
         event = _Event()
@@ -215,6 +234,260 @@ class QQActionDispatcherTests(unittest.TestCase):
         dispatcher = self.mod.QQActionDispatcher(self.config, _Coordinator())
 
         result = asyncio.run(dispatcher.commit(event, "ff:FriendMessage:123", send_key="turn-timeout"))
+        asyncio.run(dispatcher.commit(event, "ff:FriendMessage:123", send_key="turn-timeout"))
 
         self.assertEqual([name for name, _ in event.bot.api.calls], ["send_msg"])
-        self.assertEqual(result[-1]["status"], "failed")
+        self.assertEqual(result[-1]["status"], "uncertain")
+
+    def test_persistent_sent_action_is_deduplicated_after_dispatcher_reload(self):
+        payload = {
+            "action": "like",
+            "action_instance_id": "qqai-persisted-sent",
+            "target_id": "123",
+            "payload": {"times": 1},
+        }
+        first_event = _Event()
+        first_event.set_extra("astrmai_pending_actions", [payload])
+        first = self.mod.QQActionDispatcher(
+            self.config,
+            _Coordinator(),
+            action_store=self._persistent_store(),
+        )
+
+        first_result = asyncio.run(
+            first.commit(first_event, "ff:FriendMessage:123", send_key="turn-persisted")
+        )
+
+        second_event = _Event()
+        second_event.set_extra("astrmai_pending_actions", [payload])
+        second = self.mod.QQActionDispatcher(
+            self.config,
+            _Coordinator(),
+            action_store=self._persistent_store(),
+        )
+        second_result = asyncio.run(
+            second.commit(second_event, "ff:FriendMessage:123", send_key="turn-persisted")
+        )
+
+        self.assertEqual(len(first_event.bot.api.calls), 1)
+        self.assertEqual(second_event.bot.api.calls, [])
+        self.assertEqual(first_result[-1]["status"], "sent")
+        self.assertEqual(second_result[-1]["status"], "skipped")
+        self.assertEqual(second_result[-1]["detail"], "duplicate")
+
+    def test_concurrent_dispatchers_share_one_persistent_claim(self):
+        payload = {
+            "action": "like",
+            "action_instance_id": "qqai-concurrent-claim",
+            "target_id": "123",
+        }
+        first_event = _Event()
+        second_event = _Event()
+        first_event.set_extra("astrmai_pending_actions", [payload])
+        second_event.set_extra("astrmai_pending_actions", [payload])
+        first = self.mod.QQActionDispatcher(
+            self.config,
+            _Coordinator(),
+            action_store=self._persistent_store(),
+        )
+        second = self.mod.QQActionDispatcher(
+            self.config,
+            _Coordinator(),
+            action_store=self._persistent_store(),
+        )
+
+        async def run():
+            return await asyncio.gather(
+                first.commit(
+                    first_event,
+                    "ff:FriendMessage:123",
+                    send_key="turn-concurrent",
+                ),
+                second.commit(
+                    second_event,
+                    "ff:FriendMessage:123",
+                    send_key="turn-concurrent",
+                ),
+            )
+
+        first_result, second_result = asyncio.run(run())
+
+        self.assertEqual(
+            len(first_event.bot.api.calls) + len(second_event.bot.api.calls),
+            1,
+        )
+        self.assertEqual(
+            sorted((first_result[-1]["status"], second_result[-1]["status"])),
+            ["sent", "skipped"],
+        )
+
+    def test_ledger_claim_failure_is_fail_closed_before_napcat(self):
+        event = _Event()
+        event.set_extra(
+            "astrmai_pending_actions",
+            [
+                {
+                    "action": "like",
+                    "action_instance_id": "qqai-ledger-down",
+                    "target_id": "123",
+                }
+            ],
+        )
+        dispatcher = self.mod.QQActionDispatcher(
+            self.config,
+            _Coordinator(),
+            action_store=_BrokenClaimStore(),
+        )
+
+        result = asyncio.run(
+            dispatcher.commit(
+                event,
+                "ff:FriendMessage:123",
+                send_key="turn-ledger-down",
+            )
+        )
+
+        self.assertEqual(event.bot.api.calls, [])
+        self.assertEqual(result[-1]["status"], "retryable")
+        self.assertEqual(result[-1]["failure_kind"], "ledger")
+
+    def test_transport_timeout_is_persisted_uncertain_and_never_auto_replayed(self):
+        payload = {
+            "action": "quote_reply",
+            "action_instance_id": "qqai-timeout-uncertain",
+            "target_id": "123",
+            "message_id": "88",
+            "payload": {"text": "hi"},
+        }
+        store = self._persistent_store()
+        first_event = _Event()
+        first_event.bot.api = _TimeoutSendApi()
+        first_event.set_extra("astrmai_pending_actions", [payload])
+        first = self.mod.QQActionDispatcher(
+            self.config,
+            _Coordinator(),
+            action_store=store,
+        )
+
+        first_result = asyncio.run(
+            first.commit(first_event, "ff:FriendMessage:123", send_key="turn-uncertain")
+        )
+        persisted = asyncio.run(store.get("qqai-timeout-uncertain"))
+
+        second_event = _Event()
+        second_event.set_extra("astrmai_pending_actions", [payload])
+        second = self.mod.QQActionDispatcher(
+            self.config,
+            _Coordinator(),
+            action_store=self._persistent_store(),
+        )
+        second_result = asyncio.run(
+            second.commit(second_event, "ff:FriendMessage:123", send_key="turn-uncertain")
+        )
+
+        self.assertEqual(first_result[-1]["status"], "uncertain")
+        self.assertGreater(first_result[-1]["completed_at"], 0)
+        self.assertEqual(persisted["status"], "uncertain")
+        self.assertEqual(second_event.bot.api.calls, [])
+        self.assertEqual(second_result[-1]["failure_kind"], "uncertain")
+
+    def test_expired_sending_claim_becomes_uncertain_and_old_lease_cannot_finish(self):
+        store = self._persistent_store()
+
+        first_claim = asyncio.run(
+            store.claim(
+                "qqai-expired-sending",
+                action_instance_id="qqai-expired-sending",
+                action_id="qqact-expired",
+                action_type="like",
+                chat_id="ff:FriendMessage:123",
+                turn_id="turn-expired",
+                trace_id="trace-expired",
+                lease_seconds=30.0,
+            )
+        )
+        self.assertTrue(first_claim.acquired)
+        self.assertFalse(
+            asyncio.run(
+                store.mark_sent(
+                    "qqai-expired-sending",
+                    lease_token="stale-token",
+                )
+            )
+        )
+        with sqlite3.connect(store.db_path) as db:
+            db.execute(
+                "UPDATE qq_action_ledger SET lease_until = 0 WHERE transport_idempotency_key = ?",
+                ("qqai-expired-sending",),
+            )
+            db.commit()
+
+        second_claim = asyncio.run(
+            store.claim(
+                "qqai-expired-sending",
+                action_instance_id="qqai-expired-sending",
+                action_id="qqact-expired",
+                action_type="like",
+                chat_id="ff:FriendMessage:123",
+                turn_id="turn-expired",
+                trace_id="trace-expired",
+            )
+        )
+        persisted = asyncio.run(store.get("qqai-expired-sending"))
+
+        self.assertFalse(second_claim.acquired)
+        self.assertEqual(second_claim.status, "uncertain")
+        self.assertEqual(persisted["status"], "uncertain")
+        self.assertFalse(
+            asyncio.run(
+                store.mark_sent(
+                    "qqai-expired-sending",
+                    lease_token=first_claim.lease_token,
+                )
+            )
+        )
+
+    def test_explicit_api_rejection_is_persisted_failed_and_can_retry(self):
+        payload = {
+            "action": "like",
+            "action_instance_id": "qqai-explicit-rejection",
+            "target_id": "123",
+        }
+        store = self._persistent_store()
+        rejected_event = _Event()
+        rejected_event.bot.api = _Api(result={"status": "ok", "retcode": 100})
+        rejected_event.set_extra("astrmai_pending_actions", [payload])
+        rejected = self.mod.QQActionDispatcher(
+            self.config,
+            _Coordinator(),
+            action_store=store,
+        )
+
+        rejected_result = asyncio.run(
+            rejected.commit(
+                rejected_event,
+                "ff:FriendMessage:123",
+                send_key="turn-explicit-rejection",
+            )
+        )
+        failed = asyncio.run(store.get("qqai-explicit-rejection"))
+
+        retry_event = _Event()
+        retry_event.set_extra("astrmai_pending_actions", [payload])
+        retry = self.mod.QQActionDispatcher(
+            self.config,
+            _Coordinator(),
+            action_store=self._persistent_store(),
+        )
+        retry_result = asyncio.run(
+            retry.commit(
+                retry_event,
+                "ff:FriendMessage:123",
+                send_key="turn-explicit-rejection",
+            )
+        )
+
+        self.assertEqual(rejected_result[-1]["status"], "failed")
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(len(retry_event.bot.api.calls), 1)
+        self.assertEqual(retry_result[-1]["status"], "sent")

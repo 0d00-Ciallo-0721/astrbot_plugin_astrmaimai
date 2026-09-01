@@ -30,9 +30,10 @@ class QQActionDispatcher:
         normalized = canonical_action_type(action_type)
         return cls.TOOL_NAMES.get(normalized, normalized)
 
-    def __init__(self, config=None, runtime_coordinator=None):
+    def __init__(self, config=None, runtime_coordinator=None, action_store=None):
         self.config = config
         self.runtime_coordinator = runtime_coordinator
+        self.action_store = action_store
         self._executed_keys: dict[str, float] = {}
 
     def refresh_config(self, config) -> None:
@@ -98,6 +99,23 @@ class QQActionDispatcher:
             items = sorted(self._executed_keys.items(), key=lambda item: item[1], reverse=True)
             self._executed_keys = dict(items[: self.MAX_EXECUTED_KEYS])
 
+    @classmethod
+    def _failure_outcome(cls, exc: Exception) -> tuple[str, str]:
+        detail = str(exc or "")
+        lowered = detail.lower()
+        definitely_not_sent = (
+            lowered.startswith("api_rejected:")
+            or lowered.startswith("failed_target_missing")
+            or lowered.startswith("shutdown_rejected")
+            or "缺少目标会话" in detail
+            or "没有可撤回" in detail
+            or "缺少引用" in detail
+            or cls._is_unsupported_endpoint(exc)
+        )
+        if definitely_not_sent:
+            return "failed", "api"
+        return "uncertain", "uncertain"
+
     @staticmethod
     def _action_identity(action: PendingQQAction, turn_key: str, trace_id: str) -> dict[str, str]:
         key = action.idempotency_key(turn_key)
@@ -162,7 +180,7 @@ class QQActionDispatcher:
                 "queued_at": previous.get("queued_at", now) if previous else now,
                 "sending_at": now if status == "sending" else (previous.get("sending_at", 0.0) if previous else 0.0),
                 "sent_at": now if status == "sent" else (previous.get("sent_at", 0.0) if previous else 0.0),
-                "completed_at": now if status in {"sent", "failed", "skipped", "retryable", "settlement_degraded"} else 0.0,
+                "completed_at": now if status in {"sent", "failed", "skipped", "retryable", "uncertain", "settlement_degraded"} else 0.0,
             }
         )
         if hasattr(event, "get_extra") and hasattr(event, "set_extra"):
@@ -176,6 +194,7 @@ class QQActionDispatcher:
                     "sent": f"{metric_prefix}_sent",
                     "failed": f"{metric_prefix}_failed",
                     "retryable": f"{metric_prefix}_failed",
+                    "uncertain": f"{metric_prefix}_failed",
                     "skipped": f"{metric_prefix}_shutdown_skipped" if failure_kind == "shutdown" else "",
                 }.get(status, "")
                 if metric_name:
@@ -408,6 +427,7 @@ class QQActionDispatcher:
         for action in actions:
             result_kwargs = self._action_identity(action, turn_key, trace_id)
             key = result_kwargs["transport_idempotency_key"]
+            lease_token = ""
             if not outbound_send_allowed(event):
                 self._append_result(event, action, "skipped", "shutdown_rejected", failure_kind="shutdown", **result_kwargs)
                 record_tool_lifecycle(
@@ -430,10 +450,104 @@ class QQActionDispatcher:
                     reason="duplicate",
                 )
                 continue
+            if self.action_store is not None:
+                try:
+                    claim = await self.action_store.claim(
+                        key,
+                        action_instance_id=action.action_instance_id,
+                        action_id=result_kwargs["action_id"],
+                        action_type=action.action_type,
+                        chat_id=chat_id,
+                        turn_id=result_kwargs["turn_id"],
+                        trace_id=result_kwargs["trace_id"],
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        f"[QQActionDispatcher] durable claim failed for {action.action_type}: {exc}"
+                    )
+                    self._append_result(
+                        event,
+                        action,
+                        "retryable",
+                        "idempotency_ledger_unavailable",
+                        failure_kind="ledger",
+                        **result_kwargs,
+                    )
+                    record_tool_lifecycle(
+                        event,
+                        self._tool_name(action.action_type),
+                        "action_commit",
+                        source="deferred_dispatcher",
+                        status="retryable",
+                        reason="idempotency_ledger_unavailable",
+                    )
+                    continue
+                if not claim.acquired:
+                    if claim.status == "sent":
+                        detail = "duplicate"
+                        failure_kind = "duplicate_prevented"
+                    elif claim.status == "uncertain":
+                        detail = "uncertain_outcome"
+                        failure_kind = "uncertain"
+                    else:
+                        detail = "in_flight"
+                        failure_kind = "duplicate_prevented"
+                    self._append_result(
+                        event,
+                        action,
+                        "skipped",
+                        detail,
+                        failure_kind=failure_kind,
+                        **result_kwargs,
+                    )
+                    record_tool_lifecycle(
+                        event,
+                        self._tool_name(action.action_type),
+                        "action_commit",
+                        source="deferred_dispatcher",
+                        status="skipped",
+                        reason=detail,
+                    )
+                    continue
+                lease_token = claim.lease_token
             try:
                 self._append_result(event, action, "sending", **result_kwargs)
                 await self._commit_one(api, event, action, chat_id=chat_id, send_key=send_key)
                 self._executed_keys[key] = time.time()
+                if self.action_store is not None:
+                    try:
+                        settled = await self.action_store.mark_sent(
+                            key,
+                            lease_token=lease_token,
+                        )
+                    except Exception:
+                        settled = False
+                        logger.warning(
+                            f"[QQActionDispatcher] sent action ledger settlement failed "
+                            f"action={action.action_type}",
+                            exc_info=True,
+                        )
+                    if not settled:
+                        try:
+                            await self.action_store.mark_uncertain(
+                                key,
+                                "sent_but_ledger_settlement_failed",
+                                lease_token=lease_token,
+                            )
+                        except Exception:
+                            logger.debug(
+                                "[QQActionDispatcher] uncertain settlement degraded",
+                                exc_info=True,
+                            )
+                        self._append_result(
+                            event,
+                            action,
+                            "uncertain",
+                            "sent_but_ledger_settlement_failed",
+                            failure_kind="uncertain",
+                            **result_kwargs,
+                        )
+                        continue
                 self._append_result(event, action, "sent", **result_kwargs)
                 logger.info(
                     f"[QQActionDispatcher] committed action={action.action_type} "
@@ -442,14 +556,48 @@ class QQActionDispatcher:
             except Exception as exc:
                 logger.warning(f"[QQActionDispatcher] {action.action_type} failed: {exc}")
                 detail = str(exc)
-                failure_kind = "retryable" if any(token in detail.lower() for token in ("timeout", "rate", "429", "tempor", "503")) else "api"
-                self._append_result(event, action, "retryable" if failure_kind == "retryable" else "failed", detail, failure_kind=failure_kind, **result_kwargs)
+                status, failure_kind = self._failure_outcome(exc)
+                if self.action_store is not None and lease_token:
+                    try:
+                        if status == "failed":
+                            settled = await self.action_store.mark_failed(
+                                key,
+                                detail,
+                                lease_token=lease_token,
+                            )
+                        else:
+                            settled = await self.action_store.mark_uncertain(
+                                key,
+                                detail,
+                                lease_token=lease_token,
+                            )
+                    except Exception:
+                        settled = False
+                        logger.warning(
+                            f"[QQActionDispatcher] failed action ledger settlement degraded "
+                            f"action={action.action_type}",
+                            exc_info=True,
+                        )
+                    if not settled:
+                        status = "uncertain"
+                        failure_kind = "uncertain"
+                        detail = f"{detail}; ledger_settlement_failed"
+                if status == "uncertain":
+                    self._executed_keys[key] = time.time()
+                self._append_result(
+                    event,
+                    action,
+                    status,
+                    detail,
+                    failure_kind=failure_kind,
+                    **result_kwargs,
+                )
                 record_tool_lifecycle(
                     event,
                     self._tool_name(action.action_type),
                     "action_commit",
                     source="deferred_dispatcher",
-                    status="retryable" if failure_kind == "retryable" else "failed",
+                    status=status,
                     reason=str(exc),
                 )
         return list(event.get_extra("astrmai_qq_action_results", []) or [])

@@ -29,6 +29,7 @@ from ..infrastructure.persistence.database_service import DatabaseService
 from ..infrastructure.persistence.persistence_manager import PersistenceManager
 from ..infrastructure.persistence.reply_commit_outbox import ReplyCommitOutboxStore
 from ..infrastructure.persistence.memory_turn_ledger import MemoryTurnLedgerStore
+from ..infrastructure.persistence.qq_action_ledger import QQActionLedgerStore
 from ..infrastructure.runtime.chat_runtime_coordinator import ChatRuntimeCoordinator
 from ..infrastructure.runtime.cross_session_handoff_store import CrossSessionHandoffStore
 from ..infrastructure.runtime.context_economy_benchmark_store import ContextEconomyBenchmarkSampleStore
@@ -404,6 +405,7 @@ class PluginBootstrap:
                 ReplyCommitOutboxStore(runtime.db_service.db_path),
                 owner_registry=getattr(runtime, "owner_registry", None),
             ),
+            qq_action_store=QQActionLedgerStore(runtime.db_service.db_path),
         )
         persona_summarizer = PersonaSummarizer(
             runtime.persistence,
