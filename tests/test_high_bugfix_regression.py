@@ -74,7 +74,8 @@ class HighBugfixRegressionTests(unittest.TestCase):
         # R9: improved queue full logging
         self.assertIn("qsize", src)
         # R7: knowledge_update task tracked
-        self.assertIn("self._background_tasks.add(t)", src)
+        self.assertIn("track_set=self._background_tasks", src)
+        self.assertIn("self._track_background_task(", src)
         # R8: health check uses _worker_tasks
         health_src = src[src.find("_worker_health_check"):src.find("_worker_health_check") + 500]
         self.assertIn("self._worker_tasks", health_src)

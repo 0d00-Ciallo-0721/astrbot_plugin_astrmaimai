@@ -642,8 +642,9 @@ class MemoryGapCoverageTests(unittest.TestCase):
         class _Vector:
             instances = []
 
-            def __init__(self, faiss_db, config):
+            def __init__(self, faiss_db, config, *, owner_registry=None):
                 self.faiss_db = faiss_db
+                self.owner_registry = owner_registry
                 self.closed = False
                 self.__class__.instances.append(self)
 
