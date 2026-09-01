@@ -351,6 +351,7 @@ _MIGRATIONS: list[tuple[int, str]] = [
     (118, "CREATE INDEX IF NOT EXISTS ix_memory_turn_ledger_lease ON memory_turn_ledger(status, lease_until)"),
     (119, "ALTER TABLE learning_mining_run ADD COLUMN mining_run_id TEXT NOT NULL DEFAULT ''"),
     (120, "CREATE INDEX IF NOT EXISTS ix_learning_mining_run_mining_run_id ON learning_mining_run(mining_run_id, pipeline, chat_id)"),
+    (121, "ALTER TABLE learning_ingest_outbox ADD COLUMN lease_token TEXT NOT NULL DEFAULT ''"),
 ]
 
 
@@ -407,6 +408,17 @@ def _run_migrations(db: sqlite3.Connection) -> None:
                 logger.info(
                     f"[AstrMai-DB] migration v{version} skipped "
                     "(learning_mining_run table absent)"
+                )
+                continue
+        if version == 121:
+            table = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='learning_ingest_outbox'"
+            ).fetchone()
+            if not table:
+                db.execute(f"PRAGMA user_version = {version}")
+                logger.info(
+                    f"[AstrMai-DB] migration v{version} skipped "
+                    "(learning_ingest_outbox table absent)"
                 )
                 continue
         if version == 93:
@@ -501,6 +513,19 @@ async def _run_migrations_async(db: aiosqlite.Connection) -> None:
                 logger.info(
                     f"[AstrMai-DB] migration v{version} skipped "
                     "(learning_mining_run table absent)"
+                )
+                continue
+        if version == 121:
+            cursor = await db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='learning_ingest_outbox'"
+            )
+            table = await cursor.fetchone()
+            await cursor.close()
+            if not table:
+                await db.execute(f"PRAGMA user_version = {version}")
+                logger.info(
+                    f"[AstrMai-DB] migration v{version} skipped "
+                    "(learning_ingest_outbox table absent)"
                 )
                 continue
         if version == 93:

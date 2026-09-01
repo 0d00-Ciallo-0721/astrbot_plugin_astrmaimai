@@ -116,6 +116,36 @@ def _insert_message(
     )
 
 
+def test_v121_adds_learning_ingest_lease_token_to_existing_outbox(tmp_path):
+    path = tmp_path / "astrmai.db"
+    with sqlite3.connect(path) as db:
+        db.executescript(
+            """
+            CREATE TABLE learning_ingest_outbox (
+                event_id TEXT PRIMARY KEY,
+                envelope_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_retry_at REAL NOT NULL DEFAULT 0,
+                lease_until REAL NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL DEFAULT 0,
+                updated_at REAL NOT NULL DEFAULT 0
+            );
+            PRAGMA user_version = 120;
+            """
+        )
+        _run_migrations(db)
+        columns = {
+            str(row[1])
+            for row in db.execute("PRAGMA table_info(learning_ingest_outbox)").fetchall()
+        }
+        version = int(db.execute("PRAGMA user_version").fetchone()[0])
+
+    assert "lease_token" in columns
+    assert version == 121
+
+
 def test_migration_audit_is_repeatable_and_never_repairs_unknown_actor(tmp_path):
     path = tmp_path / "astrmai.db"
     with sqlite3.connect(path) as db:

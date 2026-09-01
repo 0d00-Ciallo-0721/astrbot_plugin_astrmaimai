@@ -57,6 +57,24 @@ class LearningIngressOutboxStore:
             "CREATE INDEX IF NOT EXISTS idx_learning_ingest_due "
             "ON learning_ingest_outbox(status, next_retry_at, created_at)"
         )
+        cursor = await db.execute("PRAGMA table_info(learning_ingest_outbox)")
+        columns = {str(row[1]) for row in await cursor.fetchall()}
+        await cursor.close()
+        schema_changed = False
+        if "lease_until" not in columns:
+            await db.execute(
+                "ALTER TABLE learning_ingest_outbox "
+                "ADD COLUMN lease_until REAL NOT NULL DEFAULT 0"
+            )
+            schema_changed = True
+        if "lease_token" not in columns:
+            await db.execute(
+                "ALTER TABLE learning_ingest_outbox "
+                "ADD COLUMN lease_token TEXT NOT NULL DEFAULT ''"
+            )
+            schema_changed = True
+        if schema_changed:
+            await db.commit()
 
     async def contains(self, event_id: str) -> bool:
         async with connect_aiosqlite(self.db_path) as db:

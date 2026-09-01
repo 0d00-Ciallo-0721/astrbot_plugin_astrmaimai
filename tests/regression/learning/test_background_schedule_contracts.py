@@ -160,9 +160,10 @@ class BackgroundScheduleContractTests(unittest.IsolatedAsyncioTestCase):
             envelope = LearningMessageEnvelope("evt-1", "g", "u", "n", "text")
             self.assertTrue(await store.enqueue(envelope))
             self.assertFalse(await store.enqueue(envelope))
-            entries = await store.list_due()
+            entries = await store.claim_due()
             self.assertEqual(len(entries), 1)
             self.assertEqual(entries[0].event_id, "evt-1")
+            self.assertTrue(entries[0].lease_token)
 
     async def test_learning_ingest_outbox_stops_after_max_attempts(self):
         import sqlite3
