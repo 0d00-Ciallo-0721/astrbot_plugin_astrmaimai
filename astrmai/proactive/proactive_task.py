@@ -606,7 +606,24 @@ class ProactiveTask:
         if self._is_running:
             self._is_running = False  # reset so start() will actually restart
             from ..shared.helpers.plugin_helpers import safe_create_task
-            safe_create_task(self.start())
+            awaitable = self.start()
+            registry = getattr(self, "owner_registry", None)
+            track = getattr(registry, "track", None)
+            if callable(track):
+                task = track(
+                    awaitable,
+                    task_family="proactive.scheduler.restart",
+                    scope_id="GLOBAL",
+                    run_id=f"proactive-restart-{uuid.uuid4().hex[:12]}",
+                    owner="ProactiveTask",
+                    generation=getattr(registry, "generation", 0),
+                    cancel_status="cancelled",
+                    name="astrmai:proactive:restart",
+                )
+            else:
+                task = safe_create_task(awaitable, name="astrmai:proactive:restart")
+            self._background_tasks.add(task)
+            task.add_done_callback(self._handle_task_result)
 
     async def stop(self):
         request_shutdown = getattr(
@@ -841,6 +858,24 @@ class ProactiveTask:
                             task_name,
                         )
                 settlement = asyncio.create_task(_settle())
+                registry = getattr(self, "owner_registry", None)
+                register = getattr(registry, "register", None)
+                if callable(register):
+                    try:
+                        register(
+                            settlement,
+                            task_family="background.lease_settlement",
+                            scope_id=str(scope_id or "GLOBAL"),
+                            run_id=f"{run_id}-cancel-settlement",
+                            owner="ProactiveTask",
+                            generation=getattr(registry, "generation", 0),
+                            cancel_status="cancelled",
+                        )
+                    except Exception as exc:
+                        logger.debug(
+                            "[ProactiveTask] lease settlement owner registration degraded: %s",
+                            exc,
+                        )
                 settlement_tasks = getattr(self, "_lease_settlement_tasks", None)
                 if not isinstance(settlement_tasks, set):
                     settlement_tasks = set()

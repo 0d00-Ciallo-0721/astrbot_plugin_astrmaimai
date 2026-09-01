@@ -1034,6 +1034,34 @@ class PluginLifecycleManager:
         except (asyncio.CancelledError, Exception):
             pass
 
+    def _track_isolated_shutdown_task(
+        self,
+        task: asyncio.Task[Any],
+        *,
+        task_family: str,
+        scope_id: str = "GLOBAL",
+        run_id: str = "",
+    ) -> asyncio.Task[Any]:
+        task._astrmai_shutdown_internal = True
+        self._isolated_shutdown_tasks.add(task)
+        registry = getattr(self.runtime, "owner_registry", None)
+        register = getattr(registry, "register", None)
+        if callable(register):
+            try:
+                register(
+                    task,
+                    task_family=task_family,
+                    scope_id=scope_id,
+                    run_id=run_id or f"{task_family}-{time.time_ns()}",
+                    owner="PluginLifecycleManager",
+                    generation=getattr(self.runtime, "runtime_generation", 0),
+                    cancel_status="cancelled",
+                )
+            except Exception as exc:
+                logger.debug("[AstrMai] shutdown owner registration degraded: %s", exc)
+        task.add_done_callback(self._consume_isolated_shutdown_task)
+        return task
+
     def _schedule_forced_shutdown_cleanup(self, name: str, operation: Any) -> None:
         """Schedule best-effort tail cleanup without extending the reload wait."""
         try:
@@ -1041,8 +1069,11 @@ class PluginLifecycleManager:
             if not inspect.isawaitable(result):
                 return
             task = asyncio.create_task(result, name=f"astrmai:shutdown:forced:{name}")
-            self._isolated_shutdown_tasks.add(task)
-            task.add_done_callback(self._consume_isolated_shutdown_task)
+            self._track_isolated_shutdown_task(
+                task,
+                task_family="lifecycle.shutdown.forced_cleanup",
+                scope_id=name or "GLOBAL",
+            )
         except Exception as exc:
             logger.warning(f"[AstrMai] forced shutdown cleanup degraded name={name}: {exc}")
 
@@ -1077,7 +1108,11 @@ class PluginLifecycleManager:
                             tasks = collect_background_tasks(*self.runtime.iter_task_owners())
                             current = asyncio.current_task()
                             for pending_task in dict.fromkeys(
-                                task for task in tasks if task is not None and task is not current
+                                task
+                                for task in tasks
+                                if task is not None
+                                and task is not current
+                                and not getattr(task, "_astrmai_shutdown_internal", False)
                             ):
                                 if not pending_task.done():
                                     pending_task.cancel()
@@ -1096,8 +1131,10 @@ class PluginLifecycleManager:
 
                     task = asyncio.create_task(_late_reread_cleanup(), name="astrmai:shutdown:reread-late")
                     self._late_shutdown_cleanup_task = task
-                    self._isolated_shutdown_tasks.add(task)
-                    task.add_done_callback(self._consume_isolated_shutdown_task)
+                    self._track_isolated_shutdown_task(
+                        task,
+                        task_family="lifecycle.shutdown.reread_late_cleanup",
+                    )
                     return
             except Exception as exc:
                 logger.warning(f"[AstrMai] forced reread dispatcher shutdown degraded: {exc}")
@@ -1118,7 +1155,14 @@ class PluginLifecycleManager:
 
         try:
             tasks = collect_background_tasks(*self.runtime.iter_task_owners())
-            for task in dict.fromkeys(task for task in tasks if task is not None):
+            current_task = asyncio.current_task()
+            for task in dict.fromkeys(
+                task
+                for task in tasks
+                if task is not None
+                and task is not current_task
+                and not getattr(task, "_astrmai_shutdown_internal", False)
+            ):
                 if not task.done():
                     task.cancel()
         except Exception as exc:
@@ -1698,11 +1742,14 @@ class PluginLifecycleManager:
                 }
                 return True
             task = asyncio.create_task(result, name=f"astrmai:shutdown:{name}")
+            self._track_isolated_shutdown_task(
+                task,
+                task_family="lifecycle.shutdown.stage",
+                scope_id=name or "GLOBAL",
+            )
             done, pending = await asyncio.wait({task}, timeout=stage_timeout)
             if pending:
                 task.cancel()
-                self._isolated_shutdown_tasks.add(task)
-                task.add_done_callback(self._consume_isolated_shutdown_task)
                 self.runtime.status.shutdown_isolated_tasks += 1
                 self.runtime.status.shutdown_stage_stats[name] = {
                     "status": "isolated_timeout",
@@ -1743,14 +1790,16 @@ class PluginLifecycleManager:
                 asyncio.to_thread(dispose),
                 name="astrmai:shutdown:persistence-dispose",
             )
+            self._track_isolated_shutdown_task(
+                task,
+                task_family="lifecycle.shutdown.persistence_dispose",
+            )
             self._persistence_dispose_task = task
         done, pending = await asyncio.wait(
             {task},
             timeout=max(0.0, float(timeout_sec or 0.0)),
         )
         if pending:
-            self._isolated_shutdown_tasks.add(task)
-            task.add_done_callback(self._consume_isolated_shutdown_task)
             self.runtime.status.shutdown_isolated_tasks += 1
             self.runtime.status.shutdown_stage_stats["persistence_dispose"] = {
                 "status": "isolated_timeout",
@@ -2013,10 +2062,17 @@ class PluginLifecycleManager:
         projector = None
         try:
             tasks_to_wait = collect_background_tasks(*self.runtime.iter_task_owners())
+            current_task = asyncio.current_task()
             durable_tasks: set[Any] = set()
             projector = getattr(getattr(self.runtime, "memory_engine", None), "index_projector", None)
             durable_tasks.update(getattr(projector, "_durable_cleanup_tasks", set()) or set())
-            tasks_to_wait = [task for task in tasks_to_wait if task not in durable_tasks]
+            tasks_to_wait = [
+                task
+                for task in tasks_to_wait
+                if task is not current_task
+                and task not in durable_tasks
+                and not getattr(task, "_astrmai_shutdown_internal", False)
+            ]
         except Exception as exc:
             logger.warning(f"[AstrMai] Shutdown task collection degraded: {exc}")
             tasks_to_wait = []
@@ -2492,8 +2548,10 @@ class PluginLifecycleManager:
                     logger.warning(f"[AstrMai] late shutdown watcher scheduling degraded: {exc}")
                     return
                 self._late_shutdown_cleanup_task = watcher
-                self._isolated_shutdown_tasks.add(watcher)
-                watcher.add_done_callback(self._consume_isolated_shutdown_task)
+                self._track_isolated_shutdown_task(
+                    watcher,
+                    task_family="lifecycle.shutdown.late_cleanup_watcher",
+                )
                 return
             close_deadline = late_started + late_budget
             if not await _retry_close_dependencies(close_deadline):
@@ -2506,8 +2564,10 @@ class PluginLifecycleManager:
                     name="astrmai:shutdown:late-cleanup-watcher",
                 )
                 self._late_shutdown_cleanup_task = watcher
-                self._isolated_shutdown_tasks.add(watcher)
-                watcher.add_done_callback(self._consume_isolated_shutdown_task)
+                self._track_isolated_shutdown_task(
+                    watcher,
+                    task_family="lifecycle.shutdown.late_cleanup_watcher",
+                )
 
         try:
             task = asyncio.create_task(_cleanup(), name="astrmai:shutdown:late-cleanup")
@@ -2521,8 +2581,10 @@ class PluginLifecycleManager:
             logger.warning(f"[AstrMai] late shutdown cleanup scheduling degraded: {exc}")
             return
         self._late_shutdown_cleanup_task = task
-        self._isolated_shutdown_tasks.add(task)
-        task.add_done_callback(self._consume_isolated_shutdown_task)
+        self._track_isolated_shutdown_task(
+            task,
+            task_family="lifecycle.shutdown.late_cleanup",
+        )
 
     # ponytail: 10+ flags set sequentially with no atomicity guarantee.
     # Acceptable because terminate() is called once at shutdown and flags are

@@ -5,7 +5,6 @@ import inspect
 from typing import Any
 
 from ..adapters.plugin_api import PluginApiAdapter
-from ....shared.helpers.plugin_helpers import safe_create_task
 
 
 class ChatRuntimeService:
@@ -62,7 +61,11 @@ class ChatRuntimeService:
                 scope_id="__global__",
             )
         else:
-            safe_create_task(scheduler.run_once())
+            return {
+                "status": "error",
+                "message": "Managed background launcher is unavailable",
+                "runtime_bound": True,
+            }
         return {"status": "ok", "scheduled": True, "runtime_bound": True}
 
     async def diary_status(self) -> dict[str, Any]:
@@ -90,7 +93,11 @@ class ChatRuntimeService:
                 scope_id="__global__",
             )
         else:
-            safe_create_task(service.run_once(state_engine.get_active_states()))
+            return {
+                "status": "error",
+                "message": "Managed background launcher is unavailable",
+                "runtime_bound": True,
+            }
         return {"status": "ok", "scheduled": True, "runtime_bound": True}
 
     async def wakeup_status(self) -> dict[str, Any]:

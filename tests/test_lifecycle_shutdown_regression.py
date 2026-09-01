@@ -107,6 +107,34 @@ class PluginLifecycleShutdownRegressionTests(unittest.TestCase):
         self.assertIn("memory_pipeline.begin_shutdown", calls)
         self.assertFalse(runtime.status.accepting_events)
 
+    def test_shutdown_stage_task_is_registered_with_terminal_status(self):
+        async def _run():
+            from astrmai.app.lifecycle import PluginLifecycleManager
+
+            runtime = self._build_runtime([])
+            runtime.runtime_generation = 17
+            manager = PluginLifecycleManager(runtime)
+
+            completed = await manager._run_bounded_shutdown_stage(
+                "owner-test",
+                lambda: asyncio.sleep(0),
+                deadline=time.monotonic() + 1.0,
+            )
+            await asyncio.sleep(0)
+
+            self.assertTrue(completed)
+            record = next(
+                item
+                for item in runtime.owner_registry.describe()["tasks"]
+                if item["task_family"] == "lifecycle.shutdown.stage"
+            )
+            self.assertEqual(record["scope_id"], "owner-test")
+            self.assertEqual(record["generation"], 17)
+            self.assertTrue(record["run_id"])
+            self.assertEqual(record["status"], "succeeded")
+
+        asyncio.run(_run())
+
     def test_begin_shutdown_fences_memory_index_projector_immediately(self):
         calls = []
         runtime = self._build_runtime(calls)

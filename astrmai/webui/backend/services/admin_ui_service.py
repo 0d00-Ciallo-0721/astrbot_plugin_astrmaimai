@@ -10,7 +10,6 @@ from typing import Any, Callable
 
 from ....infrastructure.runtime.observability import RuntimeObservabilityHub
 from ....infrastructure.runtime.background_task_ledger import BackgroundTaskLedger
-from ....shared.helpers.plugin_helpers import safe_create_task
 from ..adapters.plugin_api import PluginApiAdapter
 
 
@@ -1124,7 +1123,11 @@ class AdminUiService:
                 scope_id="__global__",
             )
         else:
-            safe_create_task(scheduler.run_once())
+            return {
+                "status": "error",
+                "message": "Managed background launcher is unavailable",
+                "runtime_bound": True,
+            }
         return {"status": "ok", "scheduled": True, "runtime_bound": True}
 
     async def diary_status(self) -> dict[str, Any]:
@@ -1152,7 +1155,11 @@ class AdminUiService:
                 scope_id="__global__",
             )
         else:
-            safe_create_task(service.run_once(state_engine.get_active_states()))
+            return {
+                "status": "error",
+                "message": "Managed background launcher is unavailable",
+                "runtime_bound": True,
+            }
         return {"status": "ok", "scheduled": True, "runtime_bound": True}
 
     async def wakeup_status(self) -> dict[str, Any]:

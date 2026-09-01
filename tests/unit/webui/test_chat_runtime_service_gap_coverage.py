@@ -60,6 +60,34 @@ class ChatRuntimeServiceGapCoverageTests(unittest.TestCase):
         self.assertEqual(asyncio.run(service.run_dream_once())["status"], "error")
         self.assertEqual(asyncio.run(service.run_diary_once())["status"], "error")
 
+    def test_manual_background_runs_fail_closed_without_managed_launcher(self):
+        from astrmai.webui.backend.services.chatruntimeservice import ChatRuntimeService
+
+        scheduler = SimpleNamespace(
+            dream_agent=object(),
+            dream_generator=object(),
+            run_once=lambda: asyncio.sleep(0),
+        )
+        proactive_task = SimpleNamespace(
+            dream_scheduler=scheduler,
+            diary_service=SimpleNamespace(run_once=lambda _states: asyncio.sleep(0)),
+        )
+        service = ChatRuntimeService(
+            _PluginApi(
+                bound=True,
+                proactive_task=proactive_task,
+                state_engine=SimpleNamespace(get_active_states=lambda: []),
+            )
+        )
+
+        dream = asyncio.run(service.run_dream_once())
+        diary = asyncio.run(service.run_diary_once())
+
+        self.assertEqual(dream["status"], "error")
+        self.assertEqual(diary["status"], "error")
+        self.assertIn("Managed background launcher", dream["message"])
+        self.assertIn("Managed background launcher", diary["message"])
+
     def test_chat_runtime_clear_removes_coordinator_and_heartflow_state(self):
         from astrmai.webui.backend.services.chatruntimeservice import ChatRuntimeService
 

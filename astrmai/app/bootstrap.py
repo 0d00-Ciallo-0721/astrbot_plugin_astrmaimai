@@ -105,6 +105,13 @@ class PluginBootstrap:
                 ),
             ),
         )
+        bind_budget_registry = getattr(
+            runtime.background_task_budget,
+            "bind_owner_registry",
+            None,
+        )
+        if callable(bind_budget_registry):
+            bind_budget_registry(runtime.owner_registry)
         runtime.set_boot_phase("bootstrap.logging")
         self._log_boot_status(runtime)
         runtime.set_boot_phase("bootstrap.core")
@@ -140,7 +147,7 @@ class PluginBootstrap:
     # extraction improves readability without changing lifecycle order.
 
     def _build_core_services(self, runtime: PluginRuntimeContext) -> CoreServices:
-        persistence, db_service = self._build_persistence_services()
+        persistence, db_service = self._build_persistence_services(runtime)
         gateway, lane_manager = self._build_gateway_lane_services(runtime)
         event_bus, memory_engine, observability_hub = self._build_memory_observability_services(
             runtime,
@@ -185,8 +192,14 @@ class PluginBootstrap:
             image_resolver=image_resolver,
         )
 
-    def _build_persistence_services(self) -> tuple[PersistenceManager, DatabaseService]:
+    def _build_persistence_services(
+        self,
+        runtime: PluginRuntimeContext,
+    ) -> tuple[PersistenceManager, DatabaseService]:
         persistence = PersistenceManager()
+        bind_owner_registry = getattr(persistence, "bind_owner_registry", None)
+        if callable(bind_owner_registry):
+            bind_owner_registry(getattr(runtime, "owner_registry", None))
         db_service = DatabaseService(persistence)
         return persistence, db_service
 

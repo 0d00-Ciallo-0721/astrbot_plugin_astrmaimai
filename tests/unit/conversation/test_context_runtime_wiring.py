@@ -87,10 +87,11 @@ class ContextRuntimeWiringTests(unittest.TestCase):
                 self.settings = settings
 
         class DummyMemoryEngine:
-            def __init__(self, context, gateway, embedding_models=None):
+            def __init__(self, context, gateway, embedding_models=None, owner_registry=None):
                 self.context = context
                 self.gateway = gateway
                 self.embedding_models = embedding_models
+                self.owner_registry = owner_registry
                 self.tool_service = SimpleNamespace(db_service=None)
                 self.db_service = None
 
@@ -172,9 +173,10 @@ class ContextRuntimeWiringTests(unittest.TestCase):
                 self.settings = settings
 
         class DummyMemoryEngine:
-            def __init__(self, context, gateway, embedding_models=None):
+            def __init__(self, context, gateway, embedding_models=None, owner_registry=None):
                 self.tool_service = SimpleNamespace(db_service=None)
                 self.db_service = None
+                self.owner_registry = owner_registry
 
         class DummyStateEngine:
             def __init__(self, persistence, gateway, config=None, event_bus=None):
@@ -437,8 +439,9 @@ class ContextRuntimeWiringTests(unittest.TestCase):
                 self.conversation_manager = conversation_manager
 
         class DummyMemoryEngine:
-            def __init__(self, context, gateway, embedding_models=None):
+            def __init__(self, context, gateway, embedding_models=None, owner_registry=None):
                 self.tool_service = SimpleNamespace(db_service=None)
+                self.owner_registry = owner_registry
 
         class DummyStateEngine:
             def __init__(self, persistence, gateway, config=None, event_bus=None):

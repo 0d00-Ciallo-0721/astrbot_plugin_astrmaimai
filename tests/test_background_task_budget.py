@@ -12,6 +12,9 @@ from astrmai.infrastructure.runtime.background_task_budget import (
     BackgroundTaskQueueFull,
     BackgroundTaskQueueTimeout,
 )
+from astrmai.infrastructure.runtime.background_task_owner_registry import (
+    BackgroundTaskOwnerRegistry,
+)
 from astrmai.conversation.attention.context_compaction import ContextCompactionEngine
 from astrmai.memory.persona.persona_summarizer import PersonaSummarizer
 from astrmai.infrastructure.runtime.outbound_send_guard import OUTBOUND_SEND_GATE
@@ -761,6 +764,46 @@ class BackgroundTaskBudgetTests(unittest.TestCase):
             self.assertTrue(status["owner_task_names"])
             release.set()
             await budget.wait_until_idle(1.0)
+
+        asyncio.run(run())
+
+    def test_late_physical_owner_is_registered_until_completion(self):
+        async def run():
+            registry = BackgroundTaskOwnerRegistry(generation=16)
+            budget = BackgroundTaskBudget(1, execution_timeout_sec=0.01)
+            budget.bind_owner_registry(registry)
+            release = asyncio.Event()
+
+            async def work():
+                await release.wait()
+
+            with self.assertRaises(BackgroundTaskExecutionTimeout):
+                await budget.run(
+                    work,
+                    task_name="memory_projection",
+                    scope_id="chat-budget-owner",
+                    defer_release_on_timeout=True,
+                )
+
+            record = next(
+                item
+                for item in registry.describe()["tasks"]
+                if item["task_family"] == "memory_projection.physical"
+            )
+            self.assertEqual(record["scope_id"], "chat-budget-owner")
+            self.assertEqual(record["generation"], 16)
+            self.assertTrue(record["run_id"])
+            self.assertIn(record["status"], {"queued", "running"})
+
+            release.set()
+            await budget.wait_until_idle(1.0)
+            await asyncio.sleep(0)
+            settled = next(
+                item
+                for item in registry.describe()["tasks"]
+                if item["task_family"] == "memory_projection.physical"
+            )
+            self.assertEqual(settled["status"], "succeeded")
 
         asyncio.run(run())
 

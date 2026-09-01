@@ -29,6 +29,9 @@ from astrmai.infrastructure.runtime.background_task_budget import (
     BackgroundTaskQueueFull,
     BackgroundTaskQueueTimeout,
 )
+from astrmai.infrastructure.runtime.background_task_owner_registry import (
+    BackgroundTaskOwnerRegistry,
+)
 from astrmai.infrastructure.persistence.memory_turn_ledger import MemoryTurnLedgerStore
 from astrmai.learning.review.expression_governance_runner import ExpressionGovernanceRunner
 from astrmai.proactive.proactive_task import ProactiveTask
@@ -1376,6 +1379,7 @@ class BackgroundScheduleContractTests(unittest.IsolatedAsyncioTestCase):
             task._lease_settlement_tasks = set()
             task._background_task_stats = {}
             task.background_task_budget = BackgroundTaskBudget(limit=1, max_queue=1)
+            task.owner_registry = BackgroundTaskOwnerRegistry(generation=15)
 
             queued = await task._enqueue_managed_maintenance(
                 task_family="decay", scope_id="immediate", awaitable_factory=lambda: asyncio.sleep(0)
@@ -1389,6 +1393,15 @@ class BackgroundScheduleContractTests(unittest.IsolatedAsyncioTestCase):
             row = (await task._task_ledger.list_recent(task_family="decay", scope_id="immediate", limit=1))[0]
             self.assertTrue(queued["run_id"])
             self.assertEqual(row["status"], "cancelled")
+            settlement_record = next(
+                item
+                for item in task.owner_registry.describe()["tasks"]
+                if item["task_family"] == "background.lease_settlement"
+            )
+            self.assertEqual(settlement_record["scope_id"], "immediate")
+            self.assertEqual(settlement_record["generation"], 15)
+            self.assertTrue(settlement_record["run_id"])
+            self.assertEqual(settlement_record["status"], "succeeded")
 
     async def test_managed_maintenance_uses_real_budget_queue_full(self):
         with tempfile.TemporaryDirectory() as temp_dir:

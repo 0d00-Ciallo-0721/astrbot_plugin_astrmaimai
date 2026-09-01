@@ -531,10 +531,11 @@ class ScheduledScenarioService:
         self._generation_state[plan_date] = "running"
         try:
             task = self.task_launcher(lambda: self._generate_schedule(plan_date))
-            if inspect.isawaitable(task):
-                task = asyncio.ensure_future(task)
-            if task is None or not hasattr(task, "add_done_callback"):
-                raise RuntimeError("schedule task launcher did not return a task")
+            if not isinstance(task, asyncio.Task):
+                close = getattr(task, "close", None)
+                if callable(close):
+                    close()
+                raise RuntimeError("schedule task launcher must return a tracked asyncio task")
         except BaseException as exc:
             self._generation_state[plan_date] = "launch_rejected"
             self._schedule_generation_failed(plan_date, exc)

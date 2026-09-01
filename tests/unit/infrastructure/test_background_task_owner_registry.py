@@ -9,6 +9,8 @@ from astrmai.memory.services.memory_turn_pipeline import MemoryTurnPipeline
 from astrmai.memory.services.memory_index_projector import MemoryIndexProjector
 from astrmai.conversation.ingress.external_result_dispatcher import ExternalResultDispatcher
 from astrmai.infrastructure.runtime.event_bus import EventBus
+from astrmai.infrastructure.persistence.database_review import ReviewPersistenceMixin
+from astrmai.infrastructure.persistence.persistence_manager import PersistenceManager
 from astrmai.multimodal.visual_cortex import VisualCortex
 from astrmai.learning.review.expression_governance_runner import ExpressionGovernanceRunner
 from astrmai.memory.persona.persona_summarizer import PersonaSummarizer
@@ -314,6 +316,98 @@ class BackgroundTaskOwnerRegistryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(record["generation"], 11)
             self.assertTrue(record["run_id"])
             self.assertEqual(record["status"], "succeeded")
+
+    async def test_persistence_schema_init_late_binding_registers_existing_task(self):
+        registry = BackgroundTaskOwnerRegistry(generation=12)
+        manager = PersistenceManager.__new__(PersistenceManager)
+        manager.owner_registry = None
+        manager._init_owner_task = None
+        manager._init_task = asyncio.create_task(asyncio.sleep(0))
+
+        manager.bind_owner_registry(registry)
+        await manager._init_task
+        await asyncio.sleep(0)
+
+        record = next(
+            item
+            for item in registry.describe()["tasks"]
+            if item["task_family"] == "persistence.schema_init"
+        )
+        self.assertEqual(record["scope_id"], "GLOBAL")
+        self.assertEqual(record["generation"], 12)
+        self.assertTrue(record["run_id"])
+        self.assertEqual(record["status"], "succeeded")
+
+    async def test_database_review_legacy_lifecycle_task_gets_owner_metadata(self):
+        registry = BackgroundTaskOwnerRegistry(generation=13)
+        scheduled: list[asyncio.Task] = []
+        completed = asyncio.Event()
+
+        class _LegacyLifecycleManager:
+            def track_task(self, awaitable):
+                task = asyncio.create_task(awaitable)
+                scheduled.append(task)
+                return task
+
+        class _ReviewPersistence(ReviewPersistenceMixin):
+            def __init__(self):
+                self.memory_engine = SimpleNamespace(
+                    expression_pattern_service=SimpleNamespace(write_pattern=lambda *_args: None)
+                )
+                self.lifecycle = SimpleNamespace(manager=_LegacyLifecycleManager())
+                self.owner_registry = registry
+
+            async def _save_pattern_to_canonical_async(self, _pattern):
+                completed.set()
+
+            def get_session(self):
+                raise RuntimeError("ORM compatibility write disabled in owner test")
+
+        persistence = _ReviewPersistence()
+        persistence.save_pattern(SimpleNamespace(id=41, group_id="group-owner"))
+        await asyncio.wait_for(completed.wait(), timeout=1.0)
+        await asyncio.gather(*scheduled)
+        await asyncio.sleep(0)
+
+        record = next(
+            item
+            for item in registry.describe()["tasks"]
+            if item["task_family"] == "learning.pattern.canonical_save"
+        )
+        self.assertEqual(record["scope_id"], "group-owner")
+        self.assertEqual(record["generation"], 13)
+        self.assertTrue(record["run_id"])
+        self.assertEqual(record["status"], "succeeded")
+
+    async def test_proactive_restart_task_is_registered(self):
+        from astrmai.proactive.proactive_task import ProactiveTask
+
+        registry = BackgroundTaskOwnerRegistry(generation=14)
+        restarted = asyncio.Event()
+        proactive = ProactiveTask.__new__(ProactiveTask)
+        proactive._is_running = True
+        proactive._background_tasks = set()
+        proactive._background_task_stats = {}
+        proactive.owner_registry = registry
+
+        async def _start():
+            restarted.set()
+
+        proactive.start = _start
+        proactive._restart_if_still_running()
+        await asyncio.wait_for(restarted.wait(), timeout=1.0)
+        await asyncio.gather(*list(proactive._background_tasks))
+        await asyncio.sleep(0)
+
+        record = next(
+            item
+            for item in registry.describe()["tasks"]
+            if item["task_family"] == "proactive.scheduler.restart"
+        )
+        self.assertEqual(record["scope_id"], "GLOBAL")
+        self.assertEqual(record["generation"], 14)
+        self.assertTrue(record["run_id"])
+        self.assertEqual(record["status"], "succeeded")
 
 
 if __name__ == "__main__":

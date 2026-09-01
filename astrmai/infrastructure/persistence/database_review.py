@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import time
 from typing import List, Optional
@@ -82,14 +83,41 @@ class ReviewPersistenceMixin:
                 awaitable = self._save_pattern_to_canonical_async(pattern)
                 scope_id = str(getattr(pattern, "group_id", "") or "GLOBAL")
                 run_id = f"pattern-save-{getattr(pattern, 'id', '') or time.time_ns()}"
-                if manager is not None and hasattr(manager, "track_task"):
-                    task = manager.track_task(
-                        awaitable,
-                        task_family="learning.pattern.canonical_save",
-                        scope_id=scope_id,
-                        run_id=run_id,
-                        owner="DatabaseReview",
-                    )
+                track_task = getattr(manager, "track_task", None)
+                if callable(track_task):
+                    try:
+                        parameters = inspect.signature(track_task).parameters
+                        supports_metadata = any(
+                            item.kind is inspect.Parameter.VAR_KEYWORD
+                            for item in parameters.values()
+                        ) or all(
+                            name in parameters
+                            for name in ("task_family", "scope_id", "run_id", "owner")
+                        )
+                    except (TypeError, ValueError):
+                        supports_metadata = False
+                    if supports_metadata:
+                        task = track_task(
+                            awaitable,
+                            task_family="learning.pattern.canonical_save",
+                            scope_id=scope_id,
+                            run_id=run_id,
+                            owner="DatabaseReview",
+                        )
+                    else:
+                        task = track_task(awaitable)
+                        registry = getattr(self, "owner_registry", None)
+                        register = getattr(registry, "register", None)
+                        if callable(register) and isinstance(task, asyncio.Task):
+                            register(
+                                task,
+                                task_family="learning.pattern.canonical_save",
+                                scope_id=scope_id,
+                                run_id=run_id,
+                                owner="DatabaseReview",
+                                generation=getattr(registry, "generation", 0),
+                                cancel_status="cancelled",
+                            )
                 else:
                     registry = getattr(self, "owner_registry", None)
                     track = getattr(registry, "track", None)

@@ -7,7 +7,7 @@ import threading
 from collections import deque
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable, TypeVar
+from typing import Any, Awaitable, Callable, TypeVar
 
 
 T = TypeVar("T")
@@ -84,12 +84,40 @@ class BackgroundTaskBudget:
     _accepting: bool = field(init=False, default=True, repr=False)
     _shutdown_rejected: int = field(init=False, default=0, repr=False)
     _shutdown_rejected_by_kind: dict[str, int] = field(init=False, default_factory=dict, repr=False)
+    _owner_registry: Any = field(init=False, default=None, repr=False)
 
     def __post_init__(self) -> None:
         self.limit = max(1, int(self.limit or 1))
         self.max_queue = max(0, int(self.max_queue or 0))
         self.wait_timeout_sec = max(0.1, float(self.wait_timeout_sec or 0.1))
         self.execution_timeout_sec = max(0.1, float(self.execution_timeout_sec or 0.1))
+
+    def bind_owner_registry(self, owner_registry: Any) -> None:
+        self._owner_registry = owner_registry
+
+    def _register_deferred_owner(
+        self,
+        task: asyncio.Task,
+        *,
+        task_name: str,
+        scope_id: str,
+    ) -> None:
+        registry = self._owner_registry
+        register = getattr(registry, "register", None)
+        if not callable(register):
+            return
+        try:
+            register(
+                task,
+                task_family=f"{task_name}.physical",
+                scope_id=str(scope_id or "GLOBAL"),
+                run_id=f"budget-physical-{time.time_ns()}",
+                owner="BackgroundTaskBudget",
+                generation=getattr(registry, "generation", 0),
+                cancel_status="cancelled",
+            )
+        except Exception:
+            return
 
     def refresh_limit(
         self,
@@ -167,7 +195,13 @@ class BackgroundTaskBudget:
                 on_acquired()
             lease_token = _ACTIVE_BUDGET_LEASES.set(active_leases + (lease,))
             if defer_release_on_timeout:
-                work_task = asyncio.ensure_future(awaitable_factory())
+                async def _run_physical_work() -> T:
+                    return await awaitable_factory()
+
+                work_task = asyncio.create_task(
+                    _run_physical_work(),
+                    name=f"astrmai:budget:{task_name}:{scope_id or 'GLOBAL'}",
+                )
             async with timeout_scope:
                 result = (
                     await asyncio.shield(work_task)
@@ -193,6 +227,7 @@ class BackgroundTaskBudget:
                         lease,
                         task_name,
                         scope_key,
+                        scope_id,
                         started_at,
                         "timeout",
                     )
@@ -212,6 +247,7 @@ class BackgroundTaskBudget:
                     lease,
                     task_name,
                     scope_key,
+                    scope_id,
                     started_at,
                     "cancelled",
                 )
@@ -259,6 +295,7 @@ class BackgroundTaskBudget:
         lease: _BudgetLease,
         task_name: str,
         scope_key: str,
+        scope_id: str,
         started_at: float,
         reason: str,
     ) -> None:
@@ -266,6 +303,12 @@ class BackgroundTaskBudget:
             self._timed_out_but_running += 1
         else:
             self._cancelled_but_running += 1
+        if isinstance(work_task, asyncio.Task):
+            self._register_deferred_owner(
+                work_task,
+                task_name=task_name,
+                scope_id=scope_id,
+            )
         self._deferred_tasks.add(work_task)
         work_task.add_done_callback(
             lambda completed: self._finish_deferred_task(

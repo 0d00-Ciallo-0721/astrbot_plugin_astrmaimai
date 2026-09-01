@@ -611,6 +611,9 @@ class PersistenceSchemaMixin:
         # ponytail: clear event before fire-and-forget, set after init completes
         self._init_ready.clear()
         self._init_task = safe_create_task(self._init_db())
+        register_owner = getattr(self, "_register_init_task_owner", None)
+        if callable(register_owner):
+            register_owner()
         self._init_task.add_done_callback(self._on_init_db_done)
 
     def _on_init_db_done(self, task):

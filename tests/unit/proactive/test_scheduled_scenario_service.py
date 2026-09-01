@@ -486,6 +486,20 @@ class ScheduledScenarioServiceTests(unittest.TestCase):
         self.assertGreater(service._generation_retry_at["2026-05-11"], 0.0)
         self.assertIn("RuntimeError", service.describe_status()["generation_last_error"]["2026-05-11"])
 
+    def test_awaitable_launcher_result_is_rejected_instead_of_detached(self):
+        service = self._service(
+            _Dispatcher(),
+            _config(daily_schedule_ai_enabled=True, daily_schedule_retry_base_sec=30),
+        )
+        service.task_launcher = lambda _factory: asyncio.sleep(0)
+
+        service._start_schedule_generation("2026-05-11")
+
+        status = service.describe_status()
+        self.assertNotIn("2026-05-11", service._generation_started)
+        self.assertEqual(status["generation_state"]["2026-05-11"], "launch_rejected")
+        self.assertIn("tracked asyncio task", status["generation_last_error"]["2026-05-11"])
+
     def test_shutdown_rejection_does_not_schedule_daily_retry(self):
         service = self._service(
             _Dispatcher(),

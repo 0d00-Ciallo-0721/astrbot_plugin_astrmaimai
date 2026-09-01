@@ -1,4 +1,5 @@
 # astrmai/infra/persistence.py
+import asyncio
 from pathlib import Path
 from typing import Any
 from sqlmodel import SQLModel, create_engine, Session
@@ -44,11 +45,39 @@ class PersistenceManager(
         
         # 
         self._init_task = None
+        self.owner_registry = None
+        self._init_owner_task: asyncio.Task[Any] | None = None
         self.database_service = None
         from . import orm_models
         self.orm_models = orm_models
         self._schedule_init_db()
         logger.info(f"[AstrMai-Infra]  Database connected & mounted at {self.db_path}")
+
+    def bind_owner_registry(self, owner_registry: Any) -> None:
+        self.owner_registry = owner_registry
+        self._register_init_task_owner()
+
+    def _register_init_task_owner(self) -> None:
+        task = getattr(self, "_init_task", None)
+        if task is None or task is self._init_owner_task:
+            return
+        registry = getattr(self, "owner_registry", None)
+        register = getattr(registry, "register", None)
+        if not callable(register):
+            return
+        try:
+            register(
+                task,
+                task_family="persistence.schema_init",
+                scope_id="GLOBAL",
+                run_id=f"persistence-schema-init-{id(task)}",
+                owner="PersistenceManager",
+                generation=getattr(registry, "generation", 0),
+                cancel_status="cancelled",
+            )
+            self._init_owner_task = task
+        except Exception as exc:
+            logger.debug("[AstrMai-DB] schema init owner registration degraded: %s", exc)
 
     def get_session(self) -> Session:
         """Return a SQLModel session for compatibility callers."""
