@@ -569,7 +569,8 @@ class PluginBootstrap:
             review_dispatcher,
         )
         proactive_task = self._build_proactive_task(runtime, reflector)
-        proactive_task.expression_governance_runner = expression_governance_runner
+        if proactive_task is not None:
+            proactive_task.expression_governance_runner = expression_governance_runner
         return LifecycleServices(
             reflector=reflector,
             reflect_tracker=reflect_tracker,

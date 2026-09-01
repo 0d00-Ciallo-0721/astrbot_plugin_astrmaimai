@@ -296,6 +296,39 @@ class ContextRuntimeWiringTests(unittest.TestCase):
 
         self.assertEqual(runtime.chat_loop_kernel, "kernel-marker")
 
+    def test_lifecycle_stack_allows_proactive_to_be_disabled(self):
+        bootstrap_mod = importlib.import_module("astrmai.app.bootstrap")
+        bootstrap = bootstrap_mod.PluginBootstrap(
+            context=SimpleNamespace(),
+            config=SimpleNamespace(),
+            raw_config={},
+        )
+        reflector = object()
+        reflect_tracker = object()
+        review_service = object()
+        review_dispatcher = object()
+        auto_check_task = object()
+        jargon_auto_check_task = object()
+        governance_runner = object()
+
+        with patch.object(
+            bootstrap,
+            "_build_reflection_services",
+            return_value=(reflector, reflect_tracker, review_service, review_dispatcher),
+        ), patch.object(
+            bootstrap,
+            "_build_learning_tasks",
+            return_value=(auto_check_task, jargon_auto_check_task),
+        ), patch.object(
+            bootstrap,
+            "_build_expression_governance_runner",
+            return_value=governance_runner,
+        ), patch.object(bootstrap, "_build_proactive_task", return_value=None):
+            lifecycle = bootstrap._build_lifecycle_stack(SimpleNamespace())
+
+        self.assertIs(lifecycle.expression_governance_runner, governance_runner)
+        self.assertIsNone(lifecycle.proactive_task)
+
     def test_runtime_diagnostics_include_chat_loop_status(self):
         runtime_context_mod = importlib.import_module("astrmai.app.runtime_context")
 
