@@ -90,13 +90,14 @@ class MemoryRetrievalService:
             effective = min(effective, remaining)
         return max(0.0, float(effective or 0.0))
 
-    @classmethod
     async def _run_retrieval_branch(
-        cls,
+        self,
         awaitable,
         *,
         timeout_sec: float,
         timing: dict[str, float] | None = None,
+        task_family: str = "memory.retrieval.branch",
+        scope_id: str = "GLOBAL",
     ):
         started = time.monotonic()
         if timeout_sec <= 0.0:
@@ -107,10 +108,18 @@ class MemoryRetrievalService:
             raise asyncio.TimeoutError("memory retrieval budget exhausted")
         try:
             task = asyncio.create_task(awaitable)
+            register = getattr(getattr(self, "engine", None), "_register_owner_task", None)
+            if callable(register):
+                register(
+                    task,
+                    task_family=task_family,
+                    scope_id=scope_id or "GLOBAL",
+                    run_id=f"memory-retrieval-{time.time_ns()}",
+                )
             done, _ = await asyncio.wait({task}, timeout=timeout_sec)
             if task not in done:
                 task.cancel()
-                task.add_done_callback(cls._consume_background_task)
+                task.add_done_callback(self._consume_background_task)
                 raise asyncio.TimeoutError(
                     f"memory retrieval branch timed out after {timeout_sec:.3f}s"
                 )
@@ -786,11 +795,15 @@ class MemoryRetrievalService:
             ),
             timeout_sec=canonical_timeout,
             timing=canonical_timing,
+            task_family="memory.retrieval.canonical_fts",
+            scope_id=resolved_session_id or "GLOBAL",
         )
         hybrid_task = self._run_retrieval_branch(
             self._hybrid_search(query, visibility_mode),
             timeout_sec=retrieval_timeout,
             timing=hybrid_timing,
+            task_family="memory.retrieval.hybrid",
+            scope_id=resolved_session_id or "GLOBAL",
         )
         canonical_results, hybrid_results = await asyncio.gather(canonical_task, hybrid_task, return_exceptions=True)
         if isinstance(canonical_results, Exception):
@@ -1187,6 +1200,14 @@ class MemoryRetrievalService:
                     reserve_for_reply=True,
                 )
             )
+            register = getattr(getattr(self, "engine", None), "_register_owner_task", None)
+            if callable(register):
+                register(
+                    task,
+                    task_family="memory.retrieval.query_rewrite",
+                    scope_id=str(query.session_id or "GLOBAL"),
+                    run_id=f"memory-query-rewrite-{time.time_ns()}",
+                )
             done, _ = await asyncio.wait({task}, timeout=timeout_sec)
             if task not in done:
                 cancellation_requested = True

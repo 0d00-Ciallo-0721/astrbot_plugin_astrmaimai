@@ -16,6 +16,7 @@ from ...infrastructure.runtime.background_task_budget import (
     BackgroundTaskQueueTimeout,
     BackgroundTaskExecutionTimeout,
 )
+from ...infrastructure.runtime.background_task_ledger import settle_task_lease
 from ...infrastructure.runtime.turn_call_ledger import detach_turn_telemetry
 from ..contracts.memory_query import CommittedMemoryTurn, InstantGateResult
 
@@ -567,6 +568,7 @@ class MemoryTurnPipeline:
         lock = self._get_memory_lock(chat_id)
         shutdown_rejected_pending = 0
         task_lease = None
+        task_run_id = ""
         async with lock:
             session_data = self._session_history_buffer.setdefault(
                 chat_id,
@@ -604,6 +606,7 @@ class MemoryTurnPipeline:
                         "threshold_messages": threshold * 2,
                     }
                 if self.task_ledger is not None:
+                    task_run_id = f"long_term_memory_{uuid.uuid4().hex}"
                     fingerprint_payload = json.dumps(
                         buffer,
                         ensure_ascii=False,
@@ -622,7 +625,7 @@ class MemoryTurnPipeline:
                             "pending_messages": len(buffer),
                             "last_run_at": last_run_at,
                         },
-                        payload={"force": bool(force)},
+                        payload={"force": bool(force), "run_id": task_run_id},
                     )
                     if task_lease is None:
                         return {
@@ -706,8 +709,10 @@ class MemoryTurnPipeline:
                 summary=f"summarized {len(messages_to_process)} messages",
             )
             if task_lease is not None:
-                await self.task_ledger.finish(
+                await settle_task_lease(
+                    self.task_ledger,
                     task_lease,
+                    run_id=task_run_id,
                     status="succeeded",
                     checkpoint_after={
                         "pending_messages_processed": len(messages_to_process),
@@ -750,8 +755,10 @@ class MemoryTurnPipeline:
                     payload={"pending_messages": len(messages_to_process), "shutdown_generation": self._shutdown_generation},
                 )
                 if task_lease is not None:
-                    await self.task_ledger.finish(
+                    await settle_task_lease(
+                        self.task_ledger,
                         task_lease,
+                        run_id=task_run_id,
                         status="retry_wait",
                         checkpoint_after={"pending_messages_restored": len(messages_to_process)},
                         error="shutdown_rejected",
@@ -763,8 +770,10 @@ class MemoryTurnPipeline:
                     "pending_messages": len(current_data.get("buffer", []) or []),
                 }
             if task_lease is not None:
-                await self.task_ledger.finish(
+                await settle_task_lease(
+                    self.task_ledger,
                     task_lease,
+                    run_id=task_run_id,
                     status="retry_wait",
                     checkpoint_after={"pending_messages_restored": len(messages_to_process)},
                     error=str(exc),
@@ -795,8 +804,10 @@ class MemoryTurnPipeline:
             await self._persist_checkpoint(chat_id)
             await self._observe_chat(chat_id, "memory_pipeline", "maintenance_cancelled", level="warning", reason="cancelled")
             if task_lease is not None:
-                await self.task_ledger.finish(
+                await settle_task_lease(
+                    self.task_ledger,
                     task_lease,
+                    run_id=task_run_id,
                     status="retry_wait",
                     checkpoint_after={"pending_messages_restored": len(messages_to_process)},
                     error="cancelled",
@@ -840,8 +851,10 @@ class MemoryTurnPipeline:
                 payload={"restored_messages": len(merged_buffer), "cooldown_until": cooldown_until},
             )
             if task_lease is not None:
-                await self.task_ledger.finish(
+                await settle_task_lease(
+                    self.task_ledger,
                     task_lease,
+                    run_id=task_run_id,
                     status="retry_wait",
                     checkpoint_after={"pending_messages_restored": len(merged_buffer)},
                     llm_call_count=1,

@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+import json
 import sqlite3
 import time
 import unittest
@@ -19,7 +20,10 @@ from astrmai.infrastructure.gateway.json_utils import parse_json_payload
 from astrmai.learning.contracts.learning_envelope import LearningMessageEnvelope
 from astrmai.infrastructure.persistence.learning_ingest_outbox import LearningIngressOutboxStore
 from astrmai.infrastructure.persistence.reflection_outbox import ReflectionOutboxStore
-from astrmai.infrastructure.runtime.background_task_ledger import BackgroundTaskLedger
+from astrmai.infrastructure.runtime.background_task_ledger import (
+    BackgroundTaskLedger,
+    TaskLease,
+)
 from astrmai.infrastructure.runtime.background_task_budget import (
     BackgroundTaskBudget,
     BackgroundTaskQueueFull,
@@ -589,6 +593,193 @@ class BackgroundScheduleContractTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 (await ledger.describe_pending_settlements())["pending_total"], 0
             )
+
+    async def test_pending_settlement_is_immediately_replayable_with_business_retry_preserved(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "state.db"
+            _create_background_ledger_schema(db_path)
+            ledger = BackgroundTaskLedger(db_path)
+            lease = await ledger.claim(
+                task_family="long_term_memory",
+                scope_id="chat-retry",
+                input_fingerprint="immediate-replay",
+            )
+            self.assertIsNotNone(lease)
+            original_finish = ledger.finish
+
+            async def _fail_finish(*_args, **_kwargs):
+                raise OSError("sqlite unavailable")
+
+            ledger.finish = _fail_finish
+            self.assertFalse(
+                await ledger.finish_with_recovery(
+                    lease,
+                    run_id="memory-run-immediate",
+                    status="retry_wait",
+                    error="provider busy",
+                    retry_after_seconds=600.0,
+                )
+            )
+            ledger.finish = original_finish
+            db = sqlite3.connect(db_path)
+            try:
+                run_id, settlement_raw, next_retry_at = db.execute(
+                    "SELECT run_id, settlement_json, next_retry_at "
+                    "FROM background_task_pending_settlements"
+                ).fetchone()
+            finally:
+                db.close()
+            self.assertEqual(run_id, "memory-run-immediate")
+            self.assertEqual(
+                json.loads(settlement_raw)["retry_after_seconds"], 600.0
+            )
+            self.assertLessEqual(next_retry_at, time.time())
+
+            replay = await ledger.replay_pending_settlements()
+            self.assertEqual(replay["replayed"], 1)
+            row = (await ledger.list_recent(task_family="long_term_memory", limit=1))[0]
+            self.assertEqual(row["status"], "retry_wait")
+            self.assertGreater(row["lease_until"], time.time() + 540.0)
+
+    async def test_pending_settlement_ttl_is_enforced_by_recovery_worker(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "state.db"
+            _create_background_ledger_schema(db_path)
+            ledger = BackgroundTaskLedger(db_path)
+            lease = await ledger.claim(
+                task_family="dream",
+                scope_id="__global__",
+                input_fingerprint="expired-settlement",
+            )
+            self.assertIsNotNone(lease)
+            await ledger.enqueue_pending_settlement(
+                lease,
+                run_id="dream-expired",
+                status="succeeded",
+            )
+            db = sqlite3.connect(db_path)
+            try:
+                db.execute(
+                    "UPDATE background_task_pending_settlements SET created_at=?",
+                    (time.time() - ledger.PENDING_SETTLEMENT_TTL_SECONDS - 1.0,),
+                )
+                db.commit()
+            finally:
+                db.close()
+
+            replay = await ledger.replay_pending_settlements()
+            self.assertEqual(replay["expired"], 1)
+            self.assertEqual(
+                (await ledger.describe_pending_settlements())["pending_total"], 0
+            )
+
+    async def test_proactive_stop_performs_final_pending_settlement_replay(self):
+        calls = []
+
+        class _Ledger:
+            async def replay_pending_settlements(self, **_kwargs):
+                calls.append("replay")
+                return {"replayed": 1, "failed": 0, "superseded": 0, "expired": 0}
+
+        task = ProactiveTask.__new__(ProactiveTask)
+        task.scheduled_scenario_service = None
+        task._is_running = True
+        task._task = None
+        task._settlement_recovery_task = None
+        task._background_tasks = set()
+        task._maintenance_tasks = {}
+        task._lease_settlement_tasks = set()
+        task._kernel_signal_tasks = {}
+        task._task_ledger = _Ledger()
+        task.proactive_dispatcher = SimpleNamespace(shutdown=lambda: asyncio.sleep(0))
+        task._persist_profile_scheduler_state = lambda: asyncio.sleep(0)
+
+        await task.stop()
+
+        self.assertEqual(calls, ["replay"])
+
+    async def test_memory_and_dream_settlements_provide_nonempty_run_ids(self):
+        memory_settlements = []
+
+        class _MemoryLedger:
+            async def claim(self, **_kwargs):
+                return TaskLease(
+                    "memory-task",
+                    "long_term_memory",
+                    "chat-run-id",
+                    "memory-token",
+                    time.time() + 300.0,
+                    0,
+                )
+
+            async def finish_with_recovery(self, _lease, *, run_id="", **_kwargs):
+                memory_settlements.append(run_id)
+                return True
+
+        class _Summarizer:
+            async def summarize_session(self, **_kwargs):
+                return {"summary": "ok"}
+
+        pipeline = MemoryTurnPipeline(
+            context=None,
+            gateway=SimpleNamespace(),
+            engine=SimpleNamespace(),
+            session_summarizer=_Summarizer(),
+            instant_gate=SimpleNamespace(),
+            config=SimpleNamespace(
+                memory=SimpleNamespace(
+                    summary_threshold=1,
+                    maintenance_concurrency=1,
+                    long_term_memory_cooldown_sec=0,
+                )
+            ),
+            task_ledger=_MemoryLedger(),
+        )
+        pipeline._session_history_buffer["chat-run-id"] = {
+            "buffer": ["user: one", "assistant: two"],
+            "buffered_turn_ids": ["turn-1"],
+            "last_update": time.time(),
+            "cooldown_until": 0.0,
+            "failures": 0,
+            "last_run_at": 0.0,
+        }
+        result = await pipeline.run_maintenance_for_session("chat-run-id", force=True)
+        self.assertTrue(result["performed"])
+        self.assertTrue(memory_settlements[0].startswith("long_term_memory_"))
+
+        from astrmai.proactive.dream_scheduler import DreamScheduler
+
+        dream_settlements = []
+
+        class _DreamLedger:
+            async def finish_with_recovery(self, _lease, *, run_id="", **_kwargs):
+                dream_settlements.append(run_id)
+                return True
+
+        scheduler = DreamScheduler(
+            context=SimpleNamespace(),
+            memory_engine=None,
+            config=SimpleNamespace(life=SimpleNamespace(dream_interval_min=1)),
+            semaphore=asyncio.Semaphore(1),
+        )
+        scheduler._task_ledger = _DreamLedger()
+        dream_lease = TaskLease(
+            "dream-task",
+            "dream",
+            "__global__",
+            "dream-token",
+            time.time() + 300.0,
+            0,
+        )
+        self.assertTrue(
+            await scheduler._finish_task_lease(
+                "chat-dream",
+                None,
+                dream_lease,
+                status="succeeded",
+            )
+        )
+        self.assertEqual(dream_settlements, ["dream_chat-dream_dream-task"])
 
     async def test_proactive_metadata_llm_call_uses_shared_background_budget(self):
         calls = []

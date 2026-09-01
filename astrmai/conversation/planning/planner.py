@@ -107,6 +107,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         cognitive_loop=None,
         visual_cortex=None,
         image_resolver=None,
+        owner_registry=None,
     ):
         self.gateway = gateway
         self.config = gateway.config
@@ -123,6 +124,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         self.conversation_history_service = conversation_history_service
         self.visual_cortex = visual_cortex
         self.image_resolver = image_resolver
+        self.owner_registry = owner_registry
         self.agency_runtime = AgencyRuntimeStore()
         self.agency_reflection_bridge = AgencyReflectionBridge(memory_engine)
         self.conversation_continuity = ConversationContinuityStore()
@@ -887,9 +889,37 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         if not getattr(self, "agency_reflection_bridge", None):
             return
         try:
-            safe_create_task(self.agency_reflection_bridge.maybe_flush(self.agency_runtime, chat_id))
+            self._track_background_owner(
+                self.agency_reflection_bridge.maybe_flush(self.agency_runtime, chat_id),
+                task_family="planner.agency_reflection",
+                scope_id=chat_id,
+                name=f"astrmai:planner:agency-reflection:{chat_id}",
+            )
         except RuntimeError:
             pass
+
+    def _track_background_owner(
+        self,
+        awaitable,
+        *,
+        task_family: str,
+        scope_id: str,
+        name: str,
+    ) -> asyncio.Task:
+        task = safe_create_task(awaitable, name=name)
+        registry = getattr(self, "owner_registry", None)
+        register = getattr(registry, "register", None)
+        if callable(register):
+            register(
+                task,
+                task_family=task_family,
+                scope_id=scope_id or "GLOBAL",
+                run_id=f"planner-{time.time_ns()}",
+                owner="Planner",
+                generation=getattr(registry, "generation", 0),
+                cancel_status="cancelled",
+            )
+        return task
 
     def _remember_cognitive_decision(self, chat_id: str, decision: CognitiveDecision | None, fallback_reason: str = "") -> None:
         if decision is None:
@@ -2021,12 +2051,15 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         )
         if self.context_compaction is not None:
             try:
-                safe_create_task(
+                self._track_background_owner(
                     self.context_compaction.schedule_compaction_evaluation(
                         chat_id,
                         focus_context=focus_context,
                         message_source="assistant",
-                    )
+                    ),
+                    task_family="planner.compaction_evaluation",
+                    scope_id=chat_id,
+                    name=f"astrmai:planner:compaction:{chat_id}",
                 )
             except Exception as exc:
                 logger.debug(f"[Planner] dialogue compaction degraded: {exc}")

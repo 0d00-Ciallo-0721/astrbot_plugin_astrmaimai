@@ -234,6 +234,87 @@ class BackgroundTaskOwnerRegistryTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         self.assertEqual(registry.describe(include_terminal=False)["active"], 0)
 
+    async def test_kernel_observability_task_is_registered(self):
+        from astrmai.conversation.loop.chat_loop_kernel import ChatLoopKernel
+
+        recorded = asyncio.Event()
+
+        class _Hub:
+            async def record(self, **_kwargs):
+                recorded.set()
+
+        registry = BackgroundTaskOwnerRegistry(generation=9)
+        kernel = ChatLoopKernel(
+            observability_hub=_Hub(),
+            owner_registry=registry,
+        )
+        kernel._emit_due_selection_observability(
+            {
+                "selected": [],
+                "skipped_by_batch": [],
+                "poll_mode": "IDLE",
+                "batch_plan": {},
+                "batch_pressure": {},
+            }
+        )
+        await asyncio.wait_for(recorded.wait(), timeout=1.0)
+        await asyncio.sleep(0)
+
+        record = next(
+            item
+            for item in registry.describe()["tasks"]
+            if item["task_family"] == "kernel.observability.due_selection"
+        )
+        self.assertEqual(record["scope_id"], "GLOBAL")
+        self.assertEqual(record["generation"], 9)
+        self.assertTrue(record["run_id"])
+        self.assertEqual(record["status"], "succeeded")
+
+    async def test_compaction_and_planner_tasks_are_registered(self):
+        from astrmai.conversation.attention.context_compaction import (
+            CompactionResult,
+            ContextCompactionEngine,
+        )
+        from astrmai.conversation.planning.planner import Planner
+
+        registry = BackgroundTaskOwnerRegistry(generation=11)
+        compaction = ContextCompactionEngine(
+            None,
+            owner_registry=registry,
+        )
+
+        async def _compact(chat_id, focus_context=None):
+            await asyncio.sleep(0)
+            return CompactionResult(chat_id=chat_id, skipped_reason="test")
+
+        compaction.compaction_executor.maybe_compact = _compact
+        result = await compaction.schedule_compaction_evaluation("chat-owner")
+        self.assertEqual(result.chat_id, "chat-owner")
+
+        planner = Planner.__new__(Planner)
+        planner.owner_registry = registry
+        planner_task = planner._track_background_owner(
+            asyncio.sleep(0),
+            task_family="planner.test",
+            scope_id="chat-owner",
+            name="planner-owner-test",
+        )
+        await planner_task
+        await asyncio.sleep(0)
+
+        records = registry.describe()["tasks"]
+        compaction_record = next(
+            item for item in records if item["task_family"] == "conversation.compaction"
+        )
+        planner_record = next(
+            item for item in records if item["task_family"] == "planner.test"
+        )
+        for record in (compaction_record, planner_record):
+            self.assertEqual(record["scope_id"], "chat-owner")
+            self.assertEqual(record["generation"], 11)
+            self.assertTrue(record["run_id"])
+            self.assertEqual(record["status"], "succeeded")
+
 
 if __name__ == "__main__":
     unittest.main()

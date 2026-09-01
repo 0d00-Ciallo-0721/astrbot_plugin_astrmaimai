@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import re
 import time
+import uuid
 from time import monotonic
 from dataclasses import dataclass
 from typing import Any
@@ -186,6 +188,7 @@ class ContextCompactionEngine(CompactionProviderMixin):
         provider_id: str = "",
         gateway: Any = None,
         background_task_budget: Any = None,
+        owner_registry: Any = None,
     ):
         self.dialogue_store = dialogue_store
         self.compaction_trigger_segments = int(compaction_trigger_segments or 40)
@@ -195,6 +198,7 @@ class ContextCompactionEngine(CompactionProviderMixin):
         self.provider_id = str(provider_id or "")
         self.gateway = gateway
         self.background_task_budget = background_task_budget
+        self.owner_registry = owner_registry
         self._cooldown_by_chat: dict[str, float] = {}
         self._success_cooldown_seconds = 20.0
         self._failure_cooldown_seconds = 10.0
@@ -319,7 +323,10 @@ class ContextCompactionEngine(CompactionProviderMixin):
                 pending_eval_nodes=list(state.get("pending_eval_nodes", []) or []),
                 pending_eval_nodes_count=len(list(state.get("pending_eval_nodes", []) or [])),
             )
-        task = self._create_task(self.compaction_executor.maybe_compact(chat_id, focus_context=focus_context))
+        task = self._create_task(
+            self.compaction_executor.maybe_compact(chat_id, focus_context=focus_context),
+            chat_id=chat_id,
+        )
         self._pending_tasks[chat_id] = task
         try:
             return await task
@@ -327,11 +334,21 @@ class ContextCompactionEngine(CompactionProviderMixin):
             if self._pending_tasks.get(chat_id) is task:
                 self._pending_tasks.pop(chat_id, None)
 
-    @staticmethod
-    def _create_task(coro):
-        import asyncio
-
-        return asyncio.create_task(coro)
+    def _create_task(self, coro, *, chat_id: str = "GLOBAL"):
+        task = asyncio.create_task(coro)
+        registry = getattr(self, "owner_registry", None)
+        register = getattr(registry, "register", None)
+        if callable(register):
+            register(
+                task,
+                task_family="conversation.compaction",
+                scope_id=chat_id or "GLOBAL",
+                run_id=f"compaction-{uuid.uuid4().hex[:12]}",
+                owner="ContextCompactionEngine",
+                generation=getattr(registry, "generation", 0),
+                cancel_status="cancelled",
+            )
+        return task
 
     def _state_for_chat(self, chat_id: str) -> dict[str, Any]:
         return self._chat_states.setdefault(

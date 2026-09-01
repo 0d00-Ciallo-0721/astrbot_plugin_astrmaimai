@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import time
+import uuid
 from time import monotonic
 from copy import deepcopy
 from typing import Any, Awaitable, Callable
@@ -159,12 +161,14 @@ class ChatLoopKernel:
         heartbeat_handler: HeartbeatHandler | None = None,
         state_store: ChatLoopStateStore | None = None,
         observability_hub: RuntimeObservabilityHub | None = None,
+        owner_registry: Any = None,
     ) -> None:
         self.runtime_coordinator = runtime_coordinator
         self._message_handler = message_handler
         self._heartbeat_handler = heartbeat_handler
         self._state_store = state_store or ChatLoopStateStore()
         self.observability_hub = observability_hub
+        self.owner_registry = owner_registry
         self._dispatch_bridges: dict[str, DispatchBridge] = {}
         self.group_reply_wait_manager = None
         self.private_chat_manager = None
@@ -178,6 +182,29 @@ class ChatLoopKernel:
         self._maintenance_idle_rounds = 0
         self._maintenance_quota_pressure_rounds = 0
         self._scheduler_policy_profile_name = self.DEFAULT_SCHEDULER_PROFILE_NAME
+
+    def _track_owner_task(
+        self,
+        awaitable: Any,
+        *,
+        task_family: str,
+        scope_id: str,
+        name: str,
+    ) -> asyncio.Task[Any]:
+        task = safe_create_task(awaitable, name=name)
+        registry = getattr(self, "owner_registry", None)
+        register = getattr(registry, "register", None)
+        if callable(register):
+            register(
+                task,
+                task_family=task_family,
+                scope_id=scope_id or "GLOBAL",
+                run_id=f"kernel-{uuid.uuid4().hex[:12]}",
+                owner="ChatLoopKernel",
+                generation=getattr(registry, "generation", 0),
+                cancel_status="cancelled",
+            )
+        return task
 
     def bind_message_handler(self, handler: MessageHandler | None) -> None:
         self._message_handler = handler
@@ -2249,7 +2276,7 @@ class ChatLoopKernel:
             "selected": selected,
             "skipped_by_batch": skipped,
         }
-        safe_create_task(
+        self._track_owner_task(
             hub.record(
                 domain="scheduler",
                 kind="heartbeat",
@@ -2273,7 +2300,10 @@ class ChatLoopKernel:
                 },
                 detail=common_detail,
                 raw=dict(report or {}),
-            )
+            ),
+            task_family="kernel.observability.due_selection",
+            scope_id="GLOBAL",
+            name="astrmai:kernel:due-selection-observability",
         )
 
     def _emit_tick_observability(
@@ -2310,7 +2340,7 @@ class ChatLoopKernel:
         if metadata.get("poll_mode"):
             summary_bits.append(f"poll={metadata.get('poll_mode')}")
         title = action.replace("_", " ").title() if action else "Scheduler tick"
-        safe_create_task(
+        self._track_owner_task(
             hub.record(
                 domain="scheduler",
                 kind=kind,
@@ -2354,7 +2384,10 @@ class ChatLoopKernel:
                     "pre_state_summary": dict(pre_state_summary or {}),
                     "post_state_summary": self._summarize_state(state),
                 },
-            )
+            ),
+            task_family="kernel.observability.tick",
+            scope_id=str(state.chat_id or "GLOBAL"),
+            name="astrmai:kernel:tick-observability",
         )
 
     def _apply_wait_arm(

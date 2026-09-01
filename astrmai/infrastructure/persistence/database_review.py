@@ -79,11 +79,31 @@ class ReviewPersistenceMixin:
                 if manager is None:
                     runtime_lifecycle = getattr(getattr(self, "runtime", None), "lifecycle", None)
                     manager = getattr(runtime_lifecycle, "manager", None)
+                awaitable = self._save_pattern_to_canonical_async(pattern)
+                scope_id = str(getattr(pattern, "group_id", "") or "GLOBAL")
+                run_id = f"pattern-save-{getattr(pattern, 'id', '') or time.time_ns()}"
                 if manager is not None and hasattr(manager, "track_task"):
-                    task = manager.track_task(self._save_pattern_to_canonical_async(pattern))
+                    task = manager.track_task(
+                        awaitable,
+                        task_family="learning.pattern.canonical_save",
+                        scope_id=scope_id,
+                        run_id=run_id,
+                        owner="DatabaseReview",
+                    )
                 else:
-                    # ponytail: fire-and-forget canonical write from async context
-                    task = asyncio.create_task(self._save_pattern_to_canonical_async(pattern))
+                    registry = getattr(self, "owner_registry", None)
+                    track = getattr(registry, "track", None)
+                    if callable(track):
+                        task = track(
+                            awaitable,
+                            task_family="learning.pattern.canonical_save",
+                            scope_id=scope_id,
+                            run_id=run_id,
+                            owner="DatabaseReview",
+                            name=f"astrmai:pattern-save:{scope_id}",
+                        )
+                    else:
+                        task = asyncio.create_task(awaitable)
                 task.add_done_callback(
                     lambda t, p=pattern: (
                         logger.exception(f"[DatabaseReview] canonical save failed for pattern {getattr(p, 'id', '?')}")

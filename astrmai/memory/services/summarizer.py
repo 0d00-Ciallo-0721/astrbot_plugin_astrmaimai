@@ -34,12 +34,28 @@ class ChatHistorySummarizer(SessionMemorySummarizer):
         if self._running:
             return
         self._running = True
-        self._periodic_task = safe_create_task(self._periodic_check_loop())
+        self._periodic_task = safe_create_task(
+            self._periodic_check_loop(),
+            name="astrmai:memory:compat-summarizer",
+        )
+        register = getattr(getattr(self.engine, "owner_registry", None), "register", None)
+        if callable(register):
+            registry = self.engine.owner_registry
+            register(
+                self._periodic_task,
+                task_family="memory.compat_summarizer",
+                scope_id="GLOBAL",
+                run_id=f"memory-compat-summarizer-{uuid4_short()}",
+                owner="ChatHistorySummarizer",
+                generation=getattr(registry, "generation", 0),
+                cancel_status="cancelled",
+            )
 
     async def stop(self):
         self._running = False
         if self._periodic_task and not self._periodic_task.done():
             self._periodic_task.cancel()
+            await asyncio.gather(self._periodic_task, return_exceptions=True)
 
     async def describe_session_eligibility(self, chat_id: str) -> Dict:
         pipeline = getattr(self.engine, "memory_pipeline", None)

@@ -10,7 +10,11 @@ from pathlib import Path
 from astrbot.api import logger
 from astrbot.api.event import MessageChain
 from ..infrastructure.runtime.outbound_send_guard import outbound_send_allowed
-from ..infrastructure.runtime.background_task_ledger import BackgroundTaskLedger, TaskLease
+from ..infrastructure.runtime.background_task_ledger import (
+    BackgroundTaskLedger,
+    TaskLease,
+    settle_task_lease,
+)
 from ..infrastructure.persistence.dream_completion_outbox import DreamCompletionOutboxStore
 
 
@@ -198,8 +202,13 @@ class DreamScheduler:
             active_lease = await self._claim_task_lease(request_key, pending)
         if active_lease is None:
             return False
-        finished = await self._task_ledger.finish(
+        run_id = str((pending or {}).get("run_id") or "").strip()
+        if not run_id:
+            run_id = f"dream_{request_key}_{active_lease.task_id}"
+        finished = await settle_task_lease(
+            self._task_ledger,
             active_lease,
+            run_id=run_id,
             status=status,
             error=error,
             retry_after_seconds=retry_after_seconds,

@@ -216,6 +216,7 @@ class PluginBootstrap:
         bind_event_bus_registry = getattr(event_bus, "bind_owner_registry", None)
         if callable(bind_event_bus_registry):
             bind_event_bus_registry(getattr(runtime, "owner_registry", None))
+        db_service.owner_registry = getattr(runtime, "owner_registry", None)
         memory_engine = MemoryEngine(
             self.context,
             gateway,
@@ -297,6 +298,7 @@ class PluginBootstrap:
                 provider_id=getattr(conversation_settings, "compaction_provider_id", ""),
                 gateway=gateway,
                 background_task_budget=getattr(runtime, "background_task_budget", None),
+                owner_registry=getattr(runtime, "owner_registry", None),
             )
         db_service.context_compaction = compaction
         gateway.context_compaction = compaction
@@ -425,6 +427,7 @@ class PluginBootstrap:
             conversation_history_service=runtime.conversation_history_service,
             visual_cortex=runtime.visual_cortex,
             image_resolver=runtime.image_resolver,
+            owner_registry=getattr(runtime, "owner_registry", None),
         )
         system2_runner = System2Runner(runtime)
         self._bind_learning_collaboration(runtime, evolution)
@@ -531,6 +534,7 @@ class PluginBootstrap:
             runtime_coordinator=runtime.runtime_coordinator,
             message_handler=runtime.attention_gate.process_event if runtime.attention_gate is not None else None,
             observability_hub=runtime.observability_hub,
+            owner_registry=getattr(runtime, "owner_registry", None),
         )
         kernel.bind_signal_sources(
             group_reply_wait_manager=runtime.group_reply_wait_manager,

@@ -2524,8 +2524,7 @@ class VisionMessageAnalyzeTool(FunctionTool[AstrAgentContext]):
             or getattr(event, "session_id", "")
             or "global"
         )
-        analysis_task = asyncio.create_task(
-            self.visual_cortex.analyze_image_path(
+        analysis_awaitable = self.visual_cortex.analyze_image_path(
                 f"tool:{message_id}:{image_index - 1}",
                 selected_image.local_path,
                 scope_id=chat_id,
@@ -2538,7 +2537,16 @@ class VisionMessageAnalyzeTool(FunctionTool[AstrAgentContext]):
                     "source_ref": selected_image.source_ref,
                 },
             )
-        )
+        track_visual_task = getattr(self.visual_cortex, "_track_task", None)
+        if callable(track_visual_task):
+            analysis_task = track_visual_task(
+                analysis_awaitable,
+                name=f"astrmai:vision:tool-analysis:{message_id}:{image_index - 1}",
+                task_family="vision.tool_analysis",
+                scope_id=chat_id,
+            )
+        else:
+            analysis_task = asyncio.create_task(analysis_awaitable)
         try:
             analysis = await asyncio.wait_for(
                 asyncio.shield(analysis_task),

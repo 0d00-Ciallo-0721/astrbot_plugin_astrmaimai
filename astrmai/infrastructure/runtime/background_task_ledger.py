@@ -375,7 +375,7 @@ class BackgroundTaskLedger:
         """Persist a settlement that could not be written immediately."""
         await self._ensure_pending_settlement_schema()
         now = time.time()
-        retry_delay = (
+        business_retry_delay = (
             max(0.0, float(retry_after_seconds))
             if retry_after_seconds is not None
             else 30.0 if str(status or "").strip().lower() == "retry_wait" else 0.0
@@ -384,9 +384,10 @@ class BackgroundTaskLedger:
             "checkpoint_after": checkpoint_after or {},
             "llm_call_count": max(0, int(llm_call_count or 0)),
             "error": str(error or "")[:500],
-            "retry_after_seconds": retry_delay,
+            "retry_after_seconds": business_retry_delay,
         }
         async with connect_aiosqlite(self.db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
             await db.execute(
                 "DELETE FROM background_task_pending_settlements WHERE created_at < ?",
                 (now - self.PENDING_SETTLEMENT_TTL_SECONDS,),
@@ -417,7 +418,7 @@ class BackgroundTaskLedger:
                     str(run_id or ""),
                     str(status or "retry_wait"),
                     json.dumps(payload, ensure_ascii=False, default=str),
-                    now + retry_delay,
+                    now,
                     now,
                     now,
                     str(error or "")[:500],
@@ -433,6 +434,13 @@ class BackgroundTaskLedger:
         await self._ensure_pending_settlement_schema()
         now = time.time()
         async with connect_aiosqlite(self.db_path) as db:
+            expired_cursor = await db.execute(
+                "DELETE FROM background_task_pending_settlements WHERE created_at < ?",
+                (now - self.PENDING_SETTLEMENT_TTL_SECONDS,),
+            )
+            expired = int(expired_cursor.rowcount or 0)
+            await expired_cursor.close()
+            await db.commit()
             cursor = await db.execute(
                 "SELECT task_id, lease_token, run_id, status, settlement_json, attempts "
                 "FROM background_task_pending_settlements "
@@ -511,7 +519,12 @@ class BackgroundTaskLedger:
                     (next_attempt, now + min(3600.0, 30.0 * (2 ** min(next_attempt, 6))), now, error, str(task_id), str(lease_token)),
                 )
                 await db.commit()
-        return {"replayed": replayed, "failed": failed, "superseded": superseded}
+        return {
+            "replayed": replayed,
+            "failed": failed,
+            "superseded": superseded,
+            "expired": expired,
+        }
 
     async def describe_pending_settlements(self) -> dict[str, Any]:
         await self._ensure_pending_settlement_schema()
@@ -718,4 +731,4 @@ class BackgroundTaskLedger:
         return result
 
 
-__all__ = ["BackgroundTaskLedger", "TaskLease"]
+__all__ = ["BackgroundTaskLedger", "TaskLease", "settle_task_lease"]
