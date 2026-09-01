@@ -3,19 +3,28 @@ from __future__ import annotations
 import asyncio
 from collections import Counter
 from dataclasses import dataclass
+import inspect
+import json
+from pathlib import Path
 import random
 import time
 from time import monotonic
+import uuid
 
 from astrbot.api import logger
 
 from ..conversation.runtime.architecture_rollout import rollout_enabled
 from ..infrastructure.context_economy import PromptTemplateId
 from ..infrastructure.runtime.background_task_budget import (
+    BackgroundTaskBudget,
     BackgroundTaskQueueFull,
     BackgroundTaskQueueTimeout,
 )
 from ..infrastructure.runtime.lane_manager import LaneKey
+from ..infrastructure.runtime.background_task_ledger import (
+    BackgroundTaskLedger,
+    TaskLease,
+)
 from ..learning.profiling.nickname_generator import NicknameGenerator
 from ..learning.profiling.profile_generator import ProfileGenerator
 from ..memory.dream.dream_agent import DreamAgent
@@ -72,13 +81,21 @@ class ProactiveTask:
         self.memory_engine = memory_engine
         self.reflector = reflector
         self.runtime_coordinator = runtime_coordinator
-        self.background_task_budget = background_task_budget
+        self.config = config if config else gateway.config
+        self.background_task_budget = background_task_budget or self._build_local_background_budget(
+            self.config
+        )
+        task_db_path = getattr(persistence, "db_path", None)
+        self._task_ledger = BackgroundTaskLedger(task_db_path) if task_db_path else None
+        self.expression_governance_runner = None
         self.auto_check_task = None
         self.reflect_tracker = None
-        self.config = config if config else gateway.config
         self._is_running = False
         self._task = None
         self._background_tasks: set[asyncio.Task] = set()
+        self._lease_settlement_tasks: set[asyncio.Task] = set()
+        self._maintenance_tasks: dict[tuple[str, str], asyncio.Task] = {}
+        self._kernel_signal_tasks: dict[tuple[str, str], asyncio.Task] = {}
         self._bg_semaphore = asyncio.Semaphore(2)
         self._profile_semaphore = asyncio.Semaphore(1)
         self._profiling_user_ids: set[str] = set()
@@ -96,6 +113,8 @@ class ProactiveTask:
             "profile_claim_release_pending": 0,
         }
         self._last_profile_run = 0.0
+        self._last_proactive_scan = 0.0
+        self._background_task_stats: dict[str, dict[str, int | float]] = {}
         self._last_diary_date = ""
         self._diary_pending_date = ""
         self._last_global_maintenance_run = 0.0
@@ -192,8 +211,50 @@ class ProactiveTask:
             memory_engine=memory_engine,
             semaphore=self._bg_semaphore,
         )
-        self.dream_generator = DreamGenerator(gateway, config=self.config)
+        self.dream_generator = DreamGenerator(
+            gateway,
+            config=self.config,
+            background_task_budget=getattr(self, "background_task_budget", None),
+        )
         self.dream_agent = None
+
+    def _profile_scheduler_state_path(self) -> Path | None:
+        cache_dir = getattr(getattr(self, "persistence", None), "cache_dir", None)
+        if cache_dir is None:
+            return None
+        return Path(cache_dir) / "proactive_scheduler_state.json"
+
+    def _load_profile_scheduler_state(self) -> None:
+        path = self._profile_scheduler_state_path()
+        if path is None or not path.exists():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self._last_profile_run = float(payload.get("last_profile_run", 0.0) or 0.0)
+            self._last_proactive_scan = float(payload.get("last_proactive_scan", 0.0) or 0.0)
+        except Exception as exc:
+            logger.debug(f"[ProactiveTask] scheduler state restore degraded: {exc}")
+
+    async def _persist_profile_scheduler_state(self) -> None:
+        path = self._profile_scheduler_state_path()
+        if path is None:
+            return
+        payload = {
+            "last_profile_run": self._last_profile_run,
+            "last_proactive_scan": self._last_proactive_scan,
+            "updated_at": time.time(),
+        }
+
+        def _write() -> None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(path)
+
+        try:
+            await asyncio.to_thread(_write)
+        except Exception as exc:
+            logger.debug(f"[ProactiveTask] scheduler state persist degraded: {exc}")
 
     def refresh_config(self, config) -> None:
         self.config = config if config is not None else getattr(self.gateway, "config", None)
@@ -228,14 +289,76 @@ class ProactiveTask:
     ) -> str:
         if task_family == "profile":
             self._profile_stat_inc("profile_generation_requests")
-        return await self.gateway.call_proactive_task(
-            prompt=prompt,
-            system_prompt=system_prompt,
-            lane_key=LaneKey(subsystem="bg", task_family=task_family, scope_id=scope_id or "global", scope_kind="global"),
-            base_origin="",
-            persona_id=getattr(self.config.persona, "persona_id", "") or "global",
-            template_envelope=template_envelope,
+        async def _call():
+            return await self.gateway.call_proactive_task(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                lane_key=LaneKey(subsystem="bg", task_family=task_family, scope_id=scope_id or "global", scope_kind="global"),
+                base_origin="",
+                persona_id=getattr(self.config.persona, "persona_id", "") or "global",
+                template_envelope=template_envelope,
+            )
+
+        budget = getattr(self, "background_task_budget", None)
+        if budget is None:
+            return await _call()
+        return await budget.run(
+            _call,
+            task_name=f"proactive.{task_family}",
+            scope_id=str(scope_id or "global"),
+            defer_release_on_timeout=True,
         )
+
+    async def _call_background_lane_with_metadata(
+        self,
+        task_family: str,
+        scope_id: str,
+        prompt: str,
+        system_prompt: str = "",
+        template_envelope=None,
+    ) -> tuple[str, str]:
+        gateway = getattr(self, "gateway", None)
+        caller = getattr(gateway, "call_proactive_task_result", None)
+        if not callable(caller):
+            text = await self._call_background_lane(
+                task_family,
+                scope_id,
+                prompt,
+                system_prompt=system_prompt,
+                template_envelope=template_envelope,
+            )
+            return text, ""
+        if task_family == "profile":
+            self._profile_stat_inc("profile_generation_requests")
+        async def _call():
+            return await caller(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                lane_key=LaneKey(
+                    subsystem="bg",
+                    task_family=task_family,
+                    scope_id=scope_id or "global",
+                    scope_kind="global",
+                ),
+                base_origin="",
+                persona_id=getattr(self.config.persona, "persona_id", "") or "global",
+                template_envelope=template_envelope,
+            )
+
+        budget = getattr(self, "background_task_budget", None)
+        result = (
+            await _call()
+            if budget is None
+            else await budget.run(
+                _call,
+                task_name=f"proactive.{task_family}",
+                scope_id=str(scope_id or "global"),
+                defer_release_on_timeout=True,
+            )
+        )
+        if isinstance(result, str):
+            return result, ""
+        return str(getattr(result, "text", "") or ""), str(getattr(result, "model_id", "") or "")
 
     def _profile_stat_inc(self, key: str, amount: int = 1) -> None:
         stats = getattr(self, "_profiling_stats", None)
@@ -360,6 +483,16 @@ class ProactiveTask:
     async def start(self):
         if self._is_running:
             return
+        if self._task_ledger is not None:
+            try:
+                recovered = await self._task_ledger.recover_expired_leases()
+                if recovered:
+                    logger.info(
+                        "[ProactiveTask] recovered expired background leases count=%s",
+                        recovered,
+                    )
+            except Exception as exc:
+                logger.warning("[ProactiveTask] background lease recovery degraded: %s", exc)
         resume_scenarios = getattr(
             getattr(self, "scheduled_scenario_service", None),
             "resume",
@@ -372,6 +505,7 @@ class ProactiveTask:
             logger.warning("[ProactiveTask] dispatcher is still draining; start deferred")
             return
         self._is_running = True
+        self._load_profile_scheduler_state()
         self._last_global_maintenance_run = monotonic()
         self._scheduler_poll_mode = "FAST"
         self._scheduler_poll_interval_seconds = self.FAST_POLL_INTERVAL_SECONDS
@@ -411,6 +545,7 @@ class ProactiveTask:
         if callable(request_shutdown):
             request_shutdown()
         self._is_running = False
+        await self._persist_profile_scheduler_state()
         try:
             await self.proactive_dispatcher.shutdown()
         except Exception as exc:
@@ -429,6 +564,16 @@ class ProactiveTask:
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             self._background_tasks.difference_update(tasks)
+        maintenance_tasks = getattr(self, "_maintenance_tasks", None)
+        if isinstance(maintenance_tasks, dict):
+            maintenance_tasks.clear()
+        settlement_tasks = getattr(self, "_lease_settlement_tasks", None)
+        if isinstance(settlement_tasks, set) and settlement_tasks:
+            await asyncio.gather(*list(settlement_tasks), return_exceptions=True)
+            settlement_tasks.clear()
+        kernel_signal_tasks = getattr(self, "_kernel_signal_tasks", None)
+        if isinstance(kernel_signal_tasks, dict):
+            kernel_signal_tasks.clear()
         clear_memory_claims = getattr(getattr(self, "scheduled_scenario_service", None), "clear_memory_claims", None)
         if callable(clear_memory_claims):
             clear_memory_claims()
@@ -455,6 +600,10 @@ class ProactiveTask:
 
     def set_db_service(self, db_service):
         self._db_service = db_service
+        if self._task_ledger is None:
+            db_path = getattr(getattr(db_service, "persistence", None), "db_path", None)
+            if db_path:
+                self._task_ledger = BackgroundTaskLedger(db_path)
         if self._is_running and self.dream_agent is None:
             self._bind_dream_dependencies()
 
@@ -473,11 +622,11 @@ class ProactiveTask:
                 context_compaction=getattr(self.state_engine, "context_compaction", None),
             )
         if hasattr(chat_loop_kernel, "bind_dispatch_bridge"):
-            chat_loop_kernel.bind_dispatch_bridge("PROACTIVE_WAKEUP", self.handle_wakeup_signal)
-            chat_loop_kernel.bind_dispatch_bridge("HEARTFLOW_EVALUATE", self.handle_heartflow_signal)
-            chat_loop_kernel.bind_dispatch_bridge("DREAM_MAINTENANCE", self.handle_dream_signal)
-            chat_loop_kernel.bind_dispatch_bridge("MEMORY_MAINTENANCE", self.handle_memory_signal)
-            chat_loop_kernel.bind_dispatch_bridge("COMPACTION_EVALUATE", self.handle_compaction_signal)
+            chat_loop_kernel.bind_dispatch_bridge("PROACTIVE_WAKEUP", self.enqueue_wakeup_signal)
+            chat_loop_kernel.bind_dispatch_bridge("HEARTFLOW_EVALUATE", self.enqueue_heartflow_signal)
+            chat_loop_kernel.bind_dispatch_bridge("DREAM_MAINTENANCE", self.enqueue_dream_signal)
+            chat_loop_kernel.bind_dispatch_bridge("MEMORY_MAINTENANCE", self.enqueue_memory_signal)
+            chat_loop_kernel.bind_dispatch_bridge("COMPACTION_EVALUATE", self.enqueue_compaction_signal)
 
     def _bind_dream_dependencies(self):
         self.dream_agent = DreamAgent(
@@ -485,6 +634,7 @@ class ProactiveTask:
             db_service=self._db_service,
             memory_engine=self.memory_engine,
             config=self.config,
+            background_task_budget=getattr(self, "background_task_budget", None),
         )
         promotion_engine = MemoryPromotionEngine(self.memory_engine)
         self.dream_scheduler.bind_dependencies(
@@ -500,28 +650,418 @@ class ProactiveTask:
         *,
         task_name: str = "proactive",
         scope_id: str = "GLOBAL",
+        task_lease: TaskLease | None = None,
+        checkpoint_after: Any = None,
+        llm_call_count: Any = 0,
+        cancel_status: str = "retry_wait",
     ):
         budget = getattr(self, "background_task_budget", None)
-        if budget is not None:
-            coro = budget.run(
+        if budget is None:
+            budget = self._build_local_background_budget(getattr(self, "config", None))
+            self.background_task_budget = budget
+        async def _run_budgeted():
+            return await budget.run(
                 awaitable_factory,
                 task_name=task_name,
                 scope_id=scope_id,
                 defer_release_on_timeout=True,
             )
-        else:
-            coro = awaitable_factory()
+
+        coro = _run_budgeted()
+        base_coro = coro
+        if task_lease is not None and self._task_ledger is not None:
+            async def _finish_lease(**kwargs) -> bool:
+                for attempt in range(3):
+                    try:
+                        changed = await self._task_ledger.finish(task_lease, **kwargs)
+                        if changed or attempt == 2:
+                            return bool(changed)
+                    except Exception as exc:
+                        if attempt == 2:
+                            logger.warning(
+                                "[ProactiveTask] background lease settlement failed task=%s: %s",
+                                getattr(task_lease, "task_id", ""),
+                                exc,
+                            )
+                            return False
+                    await asyncio.sleep(0)
+                return False
+
+            async def _run_and_settle_lease():
+                try:
+                    result = await base_coro
+                except asyncio.CancelledError:
+                    await _finish_lease(
+                        status=cancel_status,
+                        error="cancelled",
+                    )
+                    raise
+                except (BackgroundTaskQueueFull, BackgroundTaskQueueTimeout) as exc:
+                    await _finish_lease(
+                        status="retry_wait",
+                        error=str(exc),
+                        retry_after_seconds=300.0,
+                    )
+                    raise
+                except Exception as exc:
+                    await _finish_lease(
+                        status="retry_wait",
+                        error=str(exc),
+                        retry_after_seconds=900.0,
+                    )
+                    raise
+                resolved_checkpoint = (
+                    checkpoint_after(result)
+                    if callable(checkpoint_after)
+                    else checkpoint_after or {"completed": True}
+                )
+                resolved_llm_calls = (
+                    llm_call_count(result)
+                    if callable(llm_call_count)
+                    else llm_call_count
+                )
+                await _finish_lease(
+                    status="succeeded",
+                    checkpoint_after=resolved_checkpoint,
+                    llm_call_count=max(0, int(resolved_llm_calls or 0)),
+                )
+                return result
+
+            coro = _run_and_settle_lease()
         task = asyncio.create_task(coro)
         task._astrmai_task_name = task_name
+        task._astrmai_scope_id = str(scope_id or "")
+        task._astrmai_started_at = time.time()
         self._background_tasks.add(task)
         task.add_done_callback(self._handle_task_result)
+        if task_lease is not None and cancel_status != "retry_wait":
+            def _settle_unstarted_cancel(completed: asyncio.Task) -> None:
+                if not completed.cancelled() or self._task_ledger is None:
+                    return
+                close = getattr(coro, "close", None)
+                if callable(close):
+                    close()
+                close_base = getattr(base_coro, "close", None)
+                if callable(close_base):
+                    close_base()
+                async def _settle() -> None:
+                    try:
+                        await _finish_lease(
+                            status=cancel_status,
+                            error="cancelled_before_start",
+                        )
+                    except Exception:
+                        logger.debug(
+                            "[ProactiveTask] pre-start cancellation settlement degraded task=%s",
+                            task_name,
+                        )
+                settlement = asyncio.create_task(_settle())
+                settlement_tasks = getattr(self, "_lease_settlement_tasks", None)
+                if not isinstance(settlement_tasks, set):
+                    settlement_tasks = set()
+                    self._lease_settlement_tasks = settlement_tasks
+                settlement_tasks.add(settlement)
+                settlement.add_done_callback(settlement_tasks.discard)
+            task.add_done_callback(_settle_unstarted_cancel)
         return task
+
+    async def _enqueue_managed_maintenance(
+        self,
+        *,
+        task_family: str,
+        scope_id: str,
+        awaitable_factory,
+        lease_seconds: float = 900.0,
+    ) -> dict:
+        """Submit a maintenance job through the shared budget and ledger.
+
+        The scheduler is called frequently, so this helper owns the per-scope
+        de-duplication and keeps the actual service coroutine out of the
+        scheduler's critical path.  A ledger lease is authoritative when
+        available; the in-process map covers hosts without a persistence DB.
+        """
+        family = str(task_family or "").strip() or "maintenance"
+        scope = str(scope_id or "").strip() or "global"
+        key = (family, scope)
+        tasks = getattr(self, "_maintenance_tasks", None)
+        if not isinstance(tasks, dict):
+            tasks = {}
+            self._maintenance_tasks = tasks
+        active = tasks.get(key)
+        if active is not None and not active.done():
+            return {
+                "queued": False,
+                "reason": "already_queued",
+                "task_family": family,
+                "scope_id": scope,
+            }
+        run_id = f"{family}_{uuid.uuid4().hex}"
+        if getattr(self, "_is_running", True) is False:
+            task_ledger = getattr(self, "_task_ledger", None)
+            task_id = ""
+            if task_ledger is not None and hasattr(task_ledger, "record_rejected"):
+                try:
+                    task_id = await task_ledger.record_rejected(
+                        task_family=family,
+                        scope_id=scope,
+                        run_id=run_id,
+                        error="shutdown",
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "[ProactiveTask] maintenance rejection recording degraded task=%s: %s",
+                        family,
+                        exc,
+                    )
+            return {
+                "queued": False,
+                "reason": "shutdown_rejected",
+                "status": "rejected",
+                "task_family": family,
+                "scope_id": scope,
+                "run_id": run_id,
+                "task_id": task_id,
+            }
+
+        task_ledger = getattr(self, "_task_ledger", None)
+        task_lease = None
+        if task_ledger is not None:
+            try:
+                task_lease = await task_ledger.claim(
+                    task_family=family,
+                    scope_id=scope,
+                    input_fingerprint=f"{family}:{scope}",
+                    lease_seconds=lease_seconds,
+                    payload={"run_id": run_id, "task_family": family, "scope_id": scope},
+                    checkpoint_before={"run_id": run_id},
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[ProactiveTask] maintenance lease claim degraded task=%s scope=%s: %s",
+                    family,
+                    scope,
+                    exc,
+                )
+                return {
+                    "queued": False,
+                    "reason": "lease_error",
+                    "status": "rejected",
+                    "task_family": family,
+                    "scope_id": scope,
+                    "run_id": run_id,
+                }
+            if task_lease is None:
+                return {
+                    "queued": False,
+                    "reason": "lease_busy",
+                    "status": "retry_wait",
+                    "task_family": family,
+                    "scope_id": scope,
+                }
+            if getattr(self, "_is_running", True) is False:
+                try:
+                    await task_ledger.finish(
+                        task_lease,
+                        status="shutdown",
+                        error="shutdown_after_claim",
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "[ProactiveTask] post-claim shutdown settlement degraded task=%s: %s",
+                        family,
+                        exc,
+                    )
+                return {
+                    "queued": False,
+                    "reason": "shutdown_rejected",
+                    "status": "shutdown",
+                    "task_family": family,
+                    "scope_id": scope,
+                    "run_id": run_id,
+                    "task_id": task_lease.task_id,
+                }
+
+        def _checkpoint(result):
+            checkpoint = {"run_id": run_id, "completed": True}
+            if isinstance(result, dict):
+                checkpoint["result"] = {
+                    key: value for key, value in result.items()
+                    if key in {"processed", "errors", "physically_deleted", "projection_deleted"}
+                }
+            return checkpoint
+
+        try:
+            task = self._fire_background_task(
+                awaitable_factory,
+                task_name=family,
+                scope_id=scope,
+                task_lease=task_lease,
+                checkpoint_after=_checkpoint,
+                cancel_status="cancelled",
+            )
+        except Exception as exc:
+            if task_lease is not None and task_ledger is not None:
+                try:
+                    await task_ledger.finish(
+                        task_lease,
+                        status="failed",
+                        error=str(exc),
+                    )
+                except Exception:
+                    logger.debug(
+                        "[ProactiveTask] maintenance lease settlement degraded task=%s",
+                        family,
+                    )
+            return {
+                "queued": False,
+                "reason": "schedule_error",
+                "status": "failed",
+                "task_family": family,
+                "scope_id": scope,
+                "run_id": run_id,
+            }
+        task._astrmai_run_id = run_id
+        task._astrmai_task_family = family
+        tasks[key] = task
+
+        def _clear_maintenance_task(completed: asyncio.Task) -> None:
+            if tasks.get(key) is completed:
+                tasks.pop(key, None)
+
+        task.add_done_callback(_clear_maintenance_task)
+        return {
+            "queued": True,
+            "reason": "background_dispatch_queued",
+            "status": "running",
+            "task_family": family,
+            "scope_id": scope,
+            "run_id": run_id,
+            "task_id": getattr(task_lease, "task_id", "") if task_lease else "",
+        }
+
+    @staticmethod
+    def _build_local_background_budget(config) -> BackgroundTaskBudget:
+        infra = getattr(config, "infra", None)
+        return BackgroundTaskBudget(
+            int(getattr(infra, "background_task_concurrency", 2) or 2),
+            max_queue=int(getattr(infra, "background_task_queue_limit", 64) or 0),
+            wait_timeout_sec=float(
+                getattr(infra, "background_task_wait_timeout_sec", 120.0) or 120.0
+            ),
+            execution_timeout_sec=float(
+                getattr(infra, "background_task_execution_timeout_sec", 300.0) or 300.0
+            ),
+        )
+
+    async def _enqueue_kernel_signal(
+        self,
+        action: str,
+        handler,
+        chat_id: str,
+        snapshot,
+        decision,
+    ) -> dict:
+        key = (str(action), str(chat_id or ""))
+        tasks = getattr(self, "_kernel_signal_tasks", None)
+        if not isinstance(tasks, dict):
+            tasks = {}
+            self._kernel_signal_tasks = tasks
+        active = tasks.get(key)
+        if active is not None and not active.done():
+            return {
+                "chat_id": str(chat_id or ""),
+                "action": str(action),
+                "dispatch_mode": "queued_background",
+                "bridge": str(action),
+                "queued": False,
+                "reason": "already_queued",
+            }
+
+        task_name = "proactive." + str(action or "signal").lower()
+        task_lease = None
+        task_ledger = getattr(self, "_task_ledger", None)
+        if task_ledger is not None:
+            task_lease = await task_ledger.claim(
+                task_family=task_name,
+                scope_id=str(chat_id or ""),
+                input_fingerprint="",
+                lease_seconds=300.0,
+                payload={"action": str(action or ""), "chat_id": str(chat_id or "")},
+            )
+            if task_lease is None:
+                return {
+                    "chat_id": str(chat_id or ""),
+                    "action": str(action),
+                    "dispatch_mode": "queued_background",
+                    "bridge": str(action),
+                    "queued": False,
+                    "reason": "lease_busy",
+                }
+        task = self._fire_background_task(
+            lambda: handler(chat_id, snapshot, decision),
+            task_name=task_name,
+            scope_id=str(chat_id or ""),
+            task_lease=task_lease,
+            cancel_status="cancelled",
+        )
+        tasks[key] = task
+
+        def clear_signal_task(completed: asyncio.Task) -> None:
+            if tasks.get(key) is completed:
+                tasks.pop(key, None)
+
+        task.add_done_callback(clear_signal_task)
+        return {
+            "chat_id": str(chat_id or ""),
+            "action": str(action),
+            "dispatch_mode": "queued_background",
+            "bridge": str(action),
+            "queued": True,
+            "reason": "background_dispatch_queued",
+        }
+
+    async def enqueue_wakeup_signal(self, chat_id: str, snapshot, decision) -> dict:
+        return await self._enqueue_kernel_signal(
+            "PROACTIVE_WAKEUP", self.handle_wakeup_signal, chat_id, snapshot, decision
+        )
+
+    async def enqueue_heartflow_signal(self, chat_id: str, snapshot, decision) -> dict:
+        return await self._enqueue_kernel_signal(
+            "HEARTFLOW_EVALUATE", self.handle_heartflow_signal, chat_id, snapshot, decision
+        )
+
+    async def enqueue_dream_signal(self, chat_id: str, snapshot, decision) -> dict:
+        return await self._enqueue_kernel_signal(
+            "DREAM_MAINTENANCE", self.handle_dream_signal, chat_id, snapshot, decision
+        )
+
+    async def enqueue_memory_signal(self, chat_id: str, snapshot, decision) -> dict:
+        return await self._enqueue_kernel_signal(
+            "MEMORY_MAINTENANCE", self.handle_memory_signal, chat_id, snapshot, decision
+        )
+
+    async def enqueue_compaction_signal(self, chat_id: str, snapshot, decision) -> dict:
+        return await self._enqueue_kernel_signal(
+            "COMPACTION_EVALUATE", self.handle_compaction_signal, chat_id, snapshot, decision
+        )
 
     def _handle_task_result(self, task: asyncio.Task):
         self._background_tasks.discard(task)
+        task_name = str(getattr(task, "_astrmai_task_name", "proactive") or "proactive")
+        started_at = float(getattr(task, "_astrmai_started_at", 0.0) or 0.0)
+        duration_ms = max(0.0, (time.time() - started_at) * 1000.0) if started_at else 0.0
+        stats = self._background_task_stats.setdefault(
+            task_name,
+            {"completed": 0, "failed": 0, "cancelled": 0, "last_duration_ms": 0.0},
+        )
+        stats["last_duration_ms"] = duration_ms
         try:
+            if task.cancelled():
+                stats["cancelled"] = int(stats.get("cancelled", 0) or 0) + 1
+                return
             exc = task.exception()
             if exc:
+                stats["failed"] = int(stats.get("failed", 0) or 0) + 1
                 if isinstance(exc, (BackgroundTaskQueueFull, BackgroundTaskQueueTimeout)):
                     if getattr(task, "_astrmai_task_name", "") == "proactive.profile":
                         self._profile_stat_inc("profile_budget_rejected")
@@ -539,8 +1079,14 @@ class ProactiveTask:
                         logger.warning(f"[ProactiveTask] background task skipped: {exc}")
                 else:
                     logger.error(f"[Proactive Task Error] {exc}", exc_info=exc)
+            else:
+                stats["completed"] = int(stats.get("completed", 0) or 0) + 1
+                logger.info(
+                    f"[ProactiveTask] background job completed task={task_name} "
+                    f"scope={getattr(task, '_astrmai_scope_id', '')} duration_ms={duration_ms:.1f}"
+                )
         except asyncio.CancelledError:
-            pass
+            stats["cancelled"] = int(stats.get("cancelled", 0) or 0) + 1
 
     async def _load_persona_summary(self) -> str:
         persona_id = getattr(getattr(self.config, "persona", None), "persona_id", "") or "global"
@@ -555,11 +1101,34 @@ class ProactiveTask:
         persona_data = cache.get(persona_id, {}) if isinstance(cache, dict) else {}
         return str(persona_data.get("summary", "") or "").strip()
 
-    async def _save_user_profile(self, profile) -> None:
+    async def _save_user_profile(self, profile, *, revision: dict | None = None) -> None:
         try:
             await self.persistence.save_user_profile(profile)
         except TypeError:
             await self.persistence.save_user_profile(getattr(profile, "user_id", ""), profile)
+        recorder = getattr(getattr(self, "_db_service", None), "record_user_profile_revision_async", None)
+        if revision is not None and callable(recorder):
+            try:
+                payload = {
+                    "user_id": str(getattr(profile, "user_id", "") or ""),
+                    "source": "proactive_profile",
+                    "summary": str(getattr(profile, "persona_analysis", "") or ""),
+                    "tags": list(getattr(profile, "tags", []) or []),
+                    "memory_points": list(getattr(profile, "memory_points", []) or []),
+                    "created_at": time.time(),
+                    **revision,
+                }
+                await recorder(payload)
+                purger = getattr(getattr(self, "_db_service", None), "purge_user_profile_revisions_async", None)
+                if callable(purger):
+                    await purger(
+                        user_id=payload["user_id"],
+                        keep_latest=12,
+                        max_age_days=180,
+                        batch_size=100,
+                    )
+            except Exception as exc:
+                logger.debug("[Life] profile revision persistence degraded: %s", exc)
 
     async def _select_group_profile_target(self, chat_id: str) -> tuple[str, str, int] | None:
         db_service = self._db_service
@@ -602,6 +1171,7 @@ class ProactiveTask:
         return top_user_id, display_names.get(top_user_id, ""), int(top_count)
 
     async def _generate_persona_analysis(self, profile) -> bool | None:
+        profile_run_id = f"profile_{uuid.uuid4().hex[:20]}"
         recent_summary = ""
         if hasattr(self.state_engine, "user_profile_service"):
             recent_summary = self.state_engine.user_profile_service.build_recent_interaction_summary(profile)
@@ -613,7 +1183,7 @@ class ProactiveTask:
                 PromptTemplateId.PROFILE_GENERATION,
                 self.profile_generator.build_template_payload(profile, summary),
             )
-            result = await self._call_background_lane(
+            result, model_id = await self._call_background_lane_with_metadata(
                 "profile",
                 str(getattr(profile, "user_id", profile.name)),
                 envelope.prompt,
@@ -624,8 +1194,19 @@ class ProactiveTask:
             prompt = self.profile_generator.build_prompt(profile, summary)
             if prompt is None:  # ponytail: skip when no new messages
                 return None
-            result = await self._call_background_lane("profile", str(getattr(profile, "user_id", profile.name)), prompt)
+            result, model_id = await self._call_background_lane_with_metadata(
+                "profile",
+                str(getattr(profile, "user_id", profile.name)),
+                prompt,
+            )
         parsed = self.profile_generator.parse_result(result)
+        if str(parsed.get("parse_status", "parsed") or "parsed") != "parsed":
+            self._profile_stat_inc("profile_schema_invalid")
+            logger.warning(
+                "[Life] persona profiling output rejected: "
+                f"status={parsed.get('parse_status', 'unknown')} user={getattr(profile, 'user_id', '')}"
+            )
+            return False
         analysis = parsed["analysis"]
         tags = parsed["tags"]
         memory_points = parsed["memory_points"]
@@ -652,7 +1233,14 @@ class ProactiveTask:
             profile.message_count_for_profiling = 0
             profile.last_persona_gen_time = time.time()
             profile.is_dirty = True
-        await self._save_user_profile(profile)
+        await self._save_user_profile(
+            profile,
+            revision={
+                "run_id": profile_run_id,
+                "model_id": model_id,
+                "changed_fields": ["persona_analysis", "tags", "memory_points"],
+            },
+        )
         logger.info(
             f"[Life] persona profiling completed for {getattr(profile, 'name', '')}: "
             f"tags={len(tags)} memory_points={len(memory_points)}"
@@ -670,7 +1258,7 @@ class ProactiveTask:
                 PromptTemplateId.PROFILE_NICKNAME_GENERATION,
                 self.nickname_generator.build_template_payload(profile, summary),
             )
-            result = await self._call_background_lane(
+            result, model_id = await self._call_background_lane_with_metadata(
                 "profile",
                 str(getattr(profile, "user_id", profile.name)),
                 envelope.prompt,
@@ -679,8 +1267,20 @@ class ProactiveTask:
             )
         else:
             prompt = self.nickname_generator.build_prompt(profile, summary)
-            result = await self._call_background_lane("profile", str(getattr(profile, "user_id", profile.name)), prompt)
+            result, model_id = await self._call_background_lane_with_metadata(
+                "profile",
+                str(getattr(profile, "user_id", profile.name)),
+                prompt,
+            )
         nickname, reason = self.nickname_generator.parse_result(result)
+        if str(getattr(self.nickname_generator, "last_parse_status", "parsed") or "parsed") != "parsed":
+            self._profile_stat_inc("profile_schema_invalid")
+            logger.warning(
+                "[Life] nickname output rejected: "
+                f"status={getattr(self.nickname_generator, 'last_parse_status', 'unknown')} "
+                f"user={getattr(profile, 'user_id', '')}"
+            )
+            return False
         nickname = self.nickname_generator.choose(getattr(profile, "name", ""), preferred=nickname)
         if not nickname:
             return False
@@ -693,11 +1293,23 @@ class ProactiveTask:
             profile.nickname_reason = reason
             profile.is_known = True
             profile.is_dirty = True
-        await self._save_user_profile(profile)
+        await self._save_user_profile(
+            profile,
+            revision={
+                "run_id": f"profile_{uuid.uuid4().hex[:20]}",
+                "model_id": model_id,
+                "changed_fields": ["nickname", "nickname_reason", "is_known"],
+            },
+        )
         logger.info(f"[Life] nickname generated for {getattr(profile, 'name', '')}: {nickname}")
         return True
 
     async def _run_profiling_task(self):
+        report = {
+            "profile_count": 0,
+            "nickname_count": 0,
+            "llm_call_count": 0,
+        }
         async with self._profile_semaphore:
             await self._retry_pending_profile_claim_releases()
             for state in self.state_engine.get_active_states():
@@ -784,9 +1396,12 @@ class ProactiveTask:
                 try:
                     if nickname_due:
                         try:
+                            report["llm_call_count"] += 1
                             nickname_ok = await self._generate_nickname(profile)
                             if nickname_ok is False:
                                 await self._record_profile_generation_failure(profile, "nickname")
+                            elif nickname_ok:
+                                report["nickname_count"] += 1
                         except asyncio.CancelledError:
                             raise
                         except Exception as exc:
@@ -794,9 +1409,12 @@ class ProactiveTask:
                             logger.error(f"[Life] nickname task degraded for {getattr(profile, 'name', '')}: {exc}")
                     if analysis_due:
                         try:
+                            report["llm_call_count"] += 1
                             analysis_ok = await self._generate_persona_analysis(profile)
                             if analysis_ok is False:
                                 await self._record_profile_generation_failure(profile, "profile")
+                            elif analysis_ok:
+                                report["profile_count"] += 1
                         except asyncio.CancelledError:
                             raise
                         except Exception as exc:
@@ -810,19 +1428,14 @@ class ProactiveTask:
                     finally:
                         active_user_ids.discard(user_id)
                         self._profile_stat_inc("profile_generation_inflight", -1)
+        return report
 
     async def _run_reflection_tasks(self):
         enable_exp_mine = getattr(self.config.evolution, "enable_expression_mining", True) if hasattr(self.config, "evolution") else True
-        if not self.reflector or not enable_exp_mine:
+        runner = getattr(self, "expression_governance_runner", None)
+        if runner is None or not enable_exp_mine:
             return
-        for state in self.state_engine.get_active_states():
-            if not getattr(state, "chat_id", None):
-                continue
-            await self.reflector.reflect_batch(state.chat_id)
-            await self.reflector.auto_audit(state.chat_id)
-            if self.auto_check_task:
-                await self.auto_check_task.run_once(state.chat_id)
-        await self.review_dispatcher.dispatch_pending()
+        await runner.run_once()
 
     async def _run_daily_diary_task_with_jitter(self, diary_date: str):
         try:
@@ -991,6 +1604,34 @@ class ProactiveTask:
             self._persistent_due_scan_degraded_reason = "kernel_unavailable"
             self._set_scheduler_poll_mode("IDLE")
             return []
+        now_ts = time.time()
+        proactive_interval = max(
+            300.0,
+            float(getattr(getattr(self.config, "life", None), "proactive_scan_interval_sec", 3600) or 3600),
+        )
+        proactive_scan_lease = None
+        proactive_scan_due = now_ts - self._last_proactive_scan >= proactive_interval
+        if self._task_ledger is not None:
+            try:
+                proactive_scan_lease = await self._task_ledger.claim(
+                    task_family="proactive_scan",
+                    scope_id="__global__",
+                    input_fingerprint="",
+                    lease_seconds=300.0,
+                    min_interval_seconds=proactive_interval,
+                    checkpoint_before={
+                        "last_scan_at": self._last_proactive_scan,
+                    },
+                    payload={"interval_seconds": proactive_interval},
+                )
+                proactive_scan_due = proactive_scan_lease is not None
+            except Exception as exc:
+                logger.debug(
+                    f"[ProactiveTask] proactive scan ledger degraded: {exc}"
+                )
+        if proactive_scan_due:
+            self._last_proactive_scan = now_ts
+            await self._persist_profile_scheduler_state()
         active_chat_ids: list[str] = []
         if self.runtime_coordinator is not None and hasattr(self.runtime_coordinator, "list_active_chats"):
             try:
@@ -1002,7 +1643,7 @@ class ProactiveTask:
         self._persistent_due_scan_degraded_reason = ""
         persistent_due_chat_ids: list[str] = []
         due_loader = getattr(self.state_engine, "list_due_proactive_chat_ids", None)
-        if self._persistent_due_scan_enabled and callable(due_loader):
+        if proactive_scan_due and self._persistent_due_scan_enabled and callable(due_loader):
             try:
                 persistent_due_chat_ids = list(
                     await due_loader(now=time.time(), limit=self.HEARTBEAT_MAX_BATCH * 4) or []
@@ -1010,7 +1651,7 @@ class ProactiveTask:
             except Exception as exc:
                 self._persistent_due_scan_degraded_reason = exc.__class__.__name__
                 logger.warning(f"[ProactiveTask] persisted proactive due scan degraded: {exc}")
-        elif self._persistent_due_scan_enabled:
+        elif proactive_scan_due and self._persistent_due_scan_enabled:
             self._persistent_due_scan_degraded_reason = "due_loader_unavailable"
 
         candidate_sources: dict[str, str] = {}
@@ -1093,7 +1734,30 @@ class ProactiveTask:
         try:
             for chat_id in due_chat_ids:
                 try:
-                    tick = await self.chat_loop_kernel.tick(chat_id=str(chat_id or ""), trigger="heartbeat")
+                    tick_kwargs = {
+                        "chat_id": str(chat_id or ""),
+                        "trigger": "heartbeat",
+                    }
+                    # Keep compatibility with host/test kernels predating the
+                    # optional proactive-signal suppression flag.
+                    try:
+                        supports_proactive_flag = "include_proactive" in inspect.signature(self.chat_loop_kernel.tick).parameters
+                    except (TypeError, ValueError):
+                        # Unknown signatures are treated as legacy kernels so
+                        # a compatibility adapter is never broken by a new kwarg.
+                        supports_proactive_flag = False
+                    if supports_proactive_flag:
+                        tick_kwargs["include_proactive"] = proactive_scan_due
+                    try:
+                        supports_maintenance_flag = "include_maintenance" in inspect.signature(self.chat_loop_kernel.tick).parameters
+                    except (TypeError, ValueError):
+                        supports_maintenance_flag = False
+                    if supports_maintenance_flag:
+                        # Heartbeats only inspect maintenance state on the
+                        # configured proactive scan cadence; they never run
+                        # Memory/Dream/Compaction on every poll tick.
+                        tick_kwargs["include_maintenance"] = proactive_scan_due
+                    tick = await self.chat_loop_kernel.tick(**tick_kwargs)
                     results.append(
                         {
                             "chat_id": str(chat_id or ""),
@@ -1118,25 +1782,52 @@ class ProactiveTask:
         else:
             self._last_maintenance_budget_used = int(selection_report.get("maintenance_budget_used", 0) or 0)
             self._last_maintenance_budget_remaining = int(selection_report.get("maintenance_budget_remaining", 0) or 0)
+        if proactive_scan_lease is not None:
+            await self._task_ledger.finish(
+                proactive_scan_lease,
+                status="succeeded",
+                checkpoint_after={
+                    "active_candidates": self._last_active_candidate_count,
+                    "persistent_due_candidates": self._last_persistent_due_candidate_count,
+                    "selected": len(due_chat_ids),
+                    "completed_at": time.time(),
+                },
+                llm_call_count=0,
+            )
         return results
 
     async def _run_maintenance_cycle(self) -> None:
         try:
-            await self.decay_service.run_once()
+            await self._enqueue_managed_maintenance(
+                task_family="decay",
+                scope_id="global",
+                awaitable_factory=self.decay_service.run_once,
+            )
         except Exception as exc:
             logger.error(f"[ProactiveTask] decay maintenance degraded: {exc}")
         try:
-            await self._run_memory_store_maintenance()
+            await self._enqueue_managed_maintenance(
+                task_family="memory_maintenance",
+                scope_id="global",
+                awaitable_factory=self._run_memory_store_maintenance,
+            )
         except Exception as exc:
             logger.error(f"[ProactiveTask] memory store maintenance degraded: {exc}")
         try:
-            await self.group_signin_service.run_once()
+            await self._enqueue_managed_maintenance(
+                task_family="group_signin",
+                scope_id="global",
+                awaitable_factory=self.group_signin_service.run_once,
+            )
         except Exception as exc:
             logger.error(f"[ProactiveTask] group signin maintenance degraded: {exc}")
         try:
-            self._fire_background_task(
-                lambda: self.heartflow_topic_digest_service.run_once(self.heartflow_manager),
-                task_name="proactive.heartflow",
+            await self._enqueue_managed_maintenance(
+                task_family="heartflow_digest",
+                scope_id="global",
+                awaitable_factory=lambda: self.heartflow_topic_digest_service.run_once(
+                    self.heartflow_manager
+                ),
             )
         except Exception as exc:
             logger.error(f"[ProactiveTask] heartflow topic digest scheduling degraded: {exc}")
@@ -1196,18 +1887,55 @@ class ProactiveTask:
                     self._last_global_maintenance_run = now
                     await self._run_maintenance_cycle()
 
-                if now - self._last_profile_run > 3600:
+                profile_interval = max(
+                    300.0,
+                    float(getattr(getattr(self.config, "life", None), "profile_scan_interval_sec", 7200) or 7200),
+                )
+                profile_scan_due = now - self._last_profile_run >= profile_interval
+                profile_scan_lease = None
+                if profile_scan_due and self._task_ledger is not None:
+                    try:
+                        profile_scan_lease = await self._task_ledger.claim(
+                            task_family="profile_scan",
+                            scope_id="__global__",
+                            input_fingerprint="",
+                            lease_seconds=1800.0,
+                            min_interval_seconds=profile_interval,
+                            checkpoint_before={
+                                "last_scan_at": self._last_profile_run,
+                            },
+                            payload={"interval_seconds": profile_interval},
+                        )
+                        profile_scan_due = profile_scan_lease is not None
+                    except Exception as exc:
+                        logger.debug(
+                            f"[ProactiveTask] profile scan ledger degraded: {exc}"
+                        )
+                if profile_scan_due:
                     self._last_profile_run = now
-                    self._fire_background_task(self._run_profiling_task, task_name="proactive.profile")
+                    await self._persist_profile_scheduler_state()
+                    self._fire_background_task(
+                        self._run_profiling_task,
+                        task_name="proactive.profile",
+                        task_lease=profile_scan_lease,
+                        checkpoint_after=lambda result: dict(result or {}),
+                        llm_call_count=lambda result: int(
+                            dict(result or {}).get("llm_call_count", 0) or 0
+                        ),
+                    )
 
                 if run_maintenance and self.diary_service.should_run(self._last_diary_date, now):
                     diary_date = time.strftime("%Y-%m-%d", time.localtime(now))
                     if self._diary_pending_date != diary_date:
-                        self._diary_pending_date = diary_date
-                        self._fire_background_task(
-                            lambda: self._run_daily_diary_task_with_jitter(diary_date),
-                            task_name="proactive.diary",
+                        diary_dispatch = await self._enqueue_managed_maintenance(
+                            task_family="diary",
+                            scope_id="global",
+                            awaitable_factory=lambda: self._run_daily_diary_task_with_jitter(
+                                diary_date
+                            ),
                         )
+                        if diary_dispatch.get("queued"):
+                            self._diary_pending_date = diary_date
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -1244,6 +1972,9 @@ class ProactiveTask:
             "last_diary_date": self._last_diary_date,
             "diary_pending_date": self._diary_pending_date,
             "background_tasks": len(self._background_tasks),
+            "background_task_stats": {
+                key: dict(value) for key, value in self._background_task_stats.items()
+            },
             "profiling_active_users": len(getattr(self, "_profiling_user_ids", set())),
             "profile_cooldown_skipped": int(getattr(self, "_profiling_stats", {}).get("profile_cooldown_skipped", 0) or 0),
             "profile_duplicate_skipped": int(getattr(self, "_profiling_stats", {}).get("profile_duplicate_skipped", 0) or 0),
@@ -1266,6 +1997,12 @@ class ProactiveTask:
             "heartbeat_mode": "kernel_mediated",
             "scheduler_poll_mode": self._scheduler_poll_mode,
             "scheduler_poll_interval": self._scheduler_poll_interval_seconds,
+            "profile_scan_interval_seconds": float(
+                getattr(getattr(self.config, "life", None), "profile_scan_interval_sec", 7200) or 7200
+            ),
+            "proactive_scan_interval_seconds": float(
+                getattr(getattr(self.config, "life", None), "proactive_scan_interval_sec", 3600) or 3600
+            ),
             "global_maintenance_interval": self.GLOBAL_MAINTENANCE_INTERVAL_SECONDS,
             "due_chat_count": self._last_due_chat_count,
             "skipped_not_due_count": self._last_skipped_not_due_count,
