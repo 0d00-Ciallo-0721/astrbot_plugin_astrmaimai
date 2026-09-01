@@ -3818,7 +3818,7 @@ class AttentionGate:
                     if burst_deadline <= time.monotonic():
                         budget_getter = getattr(self.private_turn_coordinator, "vision_total_budget_sec", None)
                         burst_budget = float(budget_getter()) if callable(budget_getter) else 180.0
-                        burst_deadline = time.monotonic() + max(1.0, burst_budget)
+                        burst_deadline = time.monotonic() + max(0.0, burst_budget)
                         session.vision_burst_deadline = burst_deadline
                     try:
                         vision_outcome = await self.private_turn_coordinator.prepare_batch(

@@ -10,7 +10,10 @@ from typing import Any
 from astrbot.api import logger
 
 from ...infrastructure.runtime.trace_runtime import debug_trace
-from ...infrastructure.runtime.turn_call_ledger import record_vision_observation
+from ...infrastructure.runtime.turn_call_ledger import (
+    clamp_timeout_to_turn_budget,
+    record_vision_observation,
+)
 from ...multimodal.vision_prompt import normalize_vision_result, render_vision_record
 from ..vision_state import classify_vision_failure_text, vision_analysis_observation_facts
 
@@ -79,12 +82,17 @@ class PrivateTurnCoordinator:
         return "timeout_fallback"
 
     def _vision_total_timeout(self) -> float:
-        return max(
+        configured = max(
             0.1,
             float(
                 getattr(self._timing_config(), "vision_barrier_total_timeout_sec", 300.0)
                 or 300.0
             ),
+        )
+        return clamp_timeout_to_turn_budget(
+            None,
+            configured,
+            reserve_for_reply=True,
         )
 
     def _vision_analysis_timeout(self) -> float:

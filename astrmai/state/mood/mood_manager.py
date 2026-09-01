@@ -7,6 +7,7 @@ from astrbot.api import logger
 from ...infrastructure.gateway import GlobalModelGateway
 from ...infrastructure.gateway.json_utils import parse_json_contract
 from ...infrastructure.runtime.lane_manager import LaneKey
+from ...infrastructure.runtime.turn_call_ledger import clamp_timeout_to_turn_budget
 from ...shared.emotion_tags import build_emotion_tag_catalog
 
 
@@ -45,7 +46,11 @@ class MoodManager:
             configured = float(getattr(timing, "mood_analysis_timeout_sec", 30.0) or 30.0)
         except (TypeError, ValueError):
             configured = 30.0
-        return max(0.1, configured)
+        return clamp_timeout_to_turn_budget(
+            None,
+            max(0.1, configured),
+            reserve_for_reply=True,
+        )
 
     @staticmethod
     def _build_emotion_mapping(config) -> dict[str, str]:

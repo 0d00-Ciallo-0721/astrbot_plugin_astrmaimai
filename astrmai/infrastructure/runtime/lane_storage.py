@@ -5,6 +5,7 @@ from typing import Any, List, Optional
 
 from astrbot.api import logger
 
+from .turn_call_ledger import clamp_timeout_to_turn_budget
 from .runtime_contracts import VisibleReplyArtifact
 
 
@@ -30,9 +31,14 @@ class LaneStorageMixin:
     def _lane_timeout(self, name: str, default: float) -> float:
         timing = getattr(getattr(self, "config", None), "timing", None)
         try:
-            return max(0.1, float(getattr(timing, name, default) or default))
+            configured = max(0.1, float(getattr(timing, name, default) or default))
         except (TypeError, ValueError):
-            return default
+            configured = max(0.1, float(default))
+        return clamp_timeout_to_turn_budget(
+            None,
+            configured,
+            reserve_for_reply=True,
+        )
 
     async def _ensure_lane_with_timeout(self, **kwargs):
         return await asyncio.wait_for(

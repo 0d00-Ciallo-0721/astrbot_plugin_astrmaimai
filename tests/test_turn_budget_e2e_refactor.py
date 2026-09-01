@@ -17,12 +17,14 @@ from types import SimpleNamespace
 from astrmai.conversation.attention.private_turn_coordinator import PrivateTurnCoordinator
 from astrmai.conversation.execution.executor import ConcurrentExecutor
 from astrmai.infrastructure.gateway.gateway_lane import GatewayLaneMixin
+from astrmai.infrastructure.runtime.lane_storage import LaneStorageMixin
 from astrmai.infrastructure.runtime.turn_call_ledger import (
     configure_turn_budget,
     turn_telemetry_scope,
     turn_telemetry_snapshot,
 )
 from astrmai.presentation.events.message_entry import _configure_turn_budget
+from astrmai.state.mood.mood_manager import MoodManager
 
 
 class _Event:
@@ -149,6 +151,54 @@ class VisionSidePathBudgetTests(unittest.TestCase):
         coordinator._vision_total_timeout = lambda: 180.0
 
         self.assertAlmostEqual(coordinator.vision_total_budget_sec(), 180.0, places=3)
+
+    def test_coordinator_burst_budget_is_capped_by_remaining_turn_budget(self):
+        coordinator = PrivateTurnCoordinator.__new__(PrivateTurnCoordinator)
+        coordinator.config = SimpleNamespace(
+            timing=SimpleNamespace(vision_barrier_total_timeout_sec=300.0)
+        )
+        event = _Event()
+
+        async def _run():
+            with turn_telemetry_scope(event):
+                configure_turn_budget(event, total_budget_sec=100.0, main_reply_reserve_sec=90.0)
+                return coordinator.vision_total_budget_sec()
+
+        effective = asyncio.run(_run())
+        self.assertLessEqual(effective, 10.0)
+        self.assertGreater(effective, 0.0)
+
+
+class MoodAnalysisBudgetTests(unittest.TestCase):
+    def test_mood_analysis_timeout_is_capped_by_remaining_turn_budget(self):
+        manager = MoodManager.__new__(MoodManager)
+        manager.config = SimpleNamespace(timing=SimpleNamespace(mood_analysis_timeout_sec=30.0))
+        event = _Event()
+
+        async def _run():
+            with turn_telemetry_scope(event):
+                configure_turn_budget(event, total_budget_sec=100.0, main_reply_reserve_sec=90.0)
+                return manager._analysis_timeout_seconds()
+
+        effective = asyncio.run(_run())
+        self.assertLessEqual(effective, 10.0)
+        self.assertGreater(effective, 0.0)
+
+
+class LaneStorageBudgetTests(unittest.TestCase):
+    def test_transcript_lane_prepare_timeout_is_capped_by_remaining_turn_budget(self):
+        storage = LaneStorageMixin.__new__(LaneStorageMixin)
+        storage.config = SimpleNamespace(timing=SimpleNamespace(lane_prepare_timeout_sec=20.0))
+        event = _Event()
+
+        async def _run():
+            with turn_telemetry_scope(event):
+                configure_turn_budget(event, total_budget_sec=100.0, main_reply_reserve_sec=90.0)
+                return storage._lane_timeout("lane_prepare_timeout_sec", 20.0)
+
+        effective = asyncio.run(_run())
+        self.assertLessEqual(effective, 10.0)
+        self.assertGreater(effective, 0.0)
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ from astrbot.api.event import AstrMessageEvent
 
 from ...infrastructure.gateway.json_utils import parse_json_contract
 from ...infrastructure.runtime.lane_manager import LaneKey
+from ...infrastructure.runtime.turn_call_ledger import clamp_timeout_to_turn_budget
 from ..contracts.prompt_envelope import PromptEnvelope
 from ..contracts.turn_context import ensure_turn_context, get_turn_context
 from .member_action_intent import detect_member_action_candidate, normalize_member_action_purpose
@@ -229,9 +230,14 @@ class CognitiveLoop:
             return None
         try:
             self._write_gate_state(event, gate, ran=True)
+            timeout_sec = clamp_timeout_to_turn_budget(
+                event,
+                self._soft_timeout_seconds(),
+                reserve_for_reply=True,
+            )
             return await asyncio.wait_for(
                 self._decide_inner(event=event, prompt_envelope=prompt_envelope),
-                timeout=self._soft_timeout_seconds(),
+                timeout=timeout_sec,
             )
         except asyncio.TimeoutError:
             logger.info(f"[{event.unified_msg_origin}] CognitiveLoop timeout; fallback to planner default flow.")

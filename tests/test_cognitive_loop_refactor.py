@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from tests.original_ported.helpers import _install_astrbot_stubs
 
@@ -153,6 +154,30 @@ class CognitiveLoopRefactorTests(unittest.TestCase):
         loop = self.mod.CognitiveLoop(gateway, config=config)
 
         self.assertEqual(loop._soft_timeout_seconds(), 123.0)
+
+    def test_cognitive_loop_timeout_is_capped_by_remaining_turn_budget(self):
+        from astrmai.infrastructure.runtime.turn_call_ledger import configure_turn_budget
+
+        gateway = _FakeGateway([{"action": "reply"}])
+        config = SimpleNamespace(timing=SimpleNamespace(cognitive_loop_timeout_sec=123.0))
+        loop = self.mod.CognitiveLoop(gateway, config=config)
+        event = _FakeEvent("为什么会这样？")
+        configure_turn_budget(event, total_budget_sec=100.0, main_reply_reserve_sec=90.0)
+        observed = {}
+
+        async def _capture_timeout(awaitable, *, timeout):
+            observed["timeout"] = timeout
+            return await awaitable
+
+        async def _run():
+            with patch.object(self.mod.asyncio, "wait_for", side_effect=_capture_timeout):
+                return await loop.decide(event=event)
+
+        decision = asyncio.run(_run())
+
+        self.assertIsNotNone(decision)
+        self.assertLessEqual(observed["timeout"], 10.0)
+        self.assertGreater(observed["timeout"], 0.0)
 
     def test_cognitive_loop_semantically_confirms_member_action_without_inventing_identity(self):
         gateway = _FakeGateway(
