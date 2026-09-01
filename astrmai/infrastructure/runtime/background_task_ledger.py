@@ -24,6 +24,9 @@ class TaskLease:
 class BackgroundTaskLedger:
     """SQLite-backed per-family/scope lease and task state store."""
 
+    PENDING_SETTLEMENT_MAX = 1024
+    PENDING_SETTLEMENT_TTL_SECONDS = 7 * 24 * 3600.0
+
     ACTIVE_STATUSES = frozenset({"queued", "claimed", "running", "retry_wait"})
     TERMINAL_STATUSES = frozenset({
         "succeeded", "failed", "exhausted", "stale", "shutdown", "rejected", "expired", "cancelled",
@@ -32,6 +35,27 @@ class BackgroundTaskLedger:
 
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = str(db_path)
+
+    async def _ensure_pending_settlement_schema(self) -> None:
+        async with connect_aiosqlite(self.db_path) as db:
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS background_task_pending_settlements (
+                    task_id TEXT NOT NULL,
+                    lease_token TEXT NOT NULL,
+                    run_id TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL,
+                    settlement_json TEXT NOT NULL DEFAULT '{}',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_retry_at REAL NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL DEFAULT 0,
+                    updated_at REAL NOT NULL DEFAULT 0,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY(task_id, lease_token)
+                )
+                """
+            )
+            await db.commit()
 
     async def claim(
         self,
@@ -220,6 +244,154 @@ class BackgroundTaskLedger:
             )
             await db.commit()
         return task_id
+
+    async def enqueue_pending_settlement(
+        self,
+        lease: TaskLease,
+        *,
+        run_id: str = "",
+        status: str,
+        checkpoint_after: dict[str, Any] | None = None,
+        llm_call_count: int = 0,
+        error: str = "",
+        retry_after_seconds: float | None = None,
+    ) -> bool:
+        """Persist a settlement that could not be written immediately."""
+        await self._ensure_pending_settlement_schema()
+        now = time.time()
+        retry_delay = (
+            max(0.0, float(retry_after_seconds))
+            if retry_after_seconds is not None
+            else 30.0 if str(status or "").strip().lower() == "retry_wait" else 0.0
+        )
+        payload = {
+            "checkpoint_after": checkpoint_after or {},
+            "llm_call_count": max(0, int(llm_call_count or 0)),
+            "error": str(error or "")[:500],
+            "retry_after_seconds": retry_delay,
+        }
+        async with connect_aiosqlite(self.db_path) as db:
+            await db.execute(
+                "DELETE FROM background_task_pending_settlements WHERE created_at < ?",
+                (now - self.PENDING_SETTLEMENT_TTL_SECONDS,),
+            )
+            count_cursor = await db.execute(
+                "SELECT COUNT(*) FROM background_task_pending_settlements"
+            )
+            pending_count = int((await count_cursor.fetchone())[0] or 0)
+            await count_cursor.close()
+            if pending_count >= self.PENDING_SETTLEMENT_MAX:
+                await db.commit()
+                return False
+            cursor = await db.execute(
+                """
+                INSERT INTO background_task_pending_settlements(
+                    task_id, lease_token, run_id, status, settlement_json,
+                    attempts, next_retry_at, created_at, updated_at, last_error
+                ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+                ON CONFLICT(task_id, lease_token) DO UPDATE SET
+                    run_id=excluded.run_id, status=excluded.status,
+                    settlement_json=excluded.settlement_json,
+                    next_retry_at=excluded.next_retry_at,
+                    updated_at=excluded.updated_at, last_error=excluded.last_error
+                """,
+                (
+                    lease.task_id,
+                    lease.lease_token,
+                    str(run_id or ""),
+                    str(status or "retry_wait"),
+                    json.dumps(payload, ensure_ascii=False, default=str),
+                    now + retry_delay,
+                    now,
+                    now,
+                    str(error or "")[:500],
+                ),
+            )
+            await db.commit()
+            changed = int(cursor.rowcount or 0) > 0
+            await cursor.close()
+        return changed
+
+    async def replay_pending_settlements(self, *, limit: int = 100) -> dict[str, int]:
+        """Retry durable lease settlements and retain failures for later runs."""
+        await self._ensure_pending_settlement_schema()
+        now = time.time()
+        async with connect_aiosqlite(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT task_id, lease_token, run_id, status, settlement_json, attempts "
+                "FROM background_task_pending_settlements "
+                "WHERE next_retry_at <= ? ORDER BY created_at ASC LIMIT ?",
+                (now, max(1, min(int(limit), 500))),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+        replayed = 0
+        failed = 0
+        for task_id, lease_token, run_id, status, settlement_raw, attempts in rows:
+            try:
+                payload = json.loads(str(settlement_raw or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            lease = TaskLease(
+                str(task_id), "", "", str(lease_token), 0.0, int(attempts or 0)
+            )
+            try:
+                async with connect_aiosqlite(self.db_path) as db:
+                    task_cursor = await db.execute(
+                        "SELECT task_family, scope_id FROM background_task_ledger WHERE task_id=?",
+                        (str(task_id),),
+                    )
+                    task_row = await task_cursor.fetchone()
+                    await task_cursor.close()
+                if task_row is not None:
+                    lease = TaskLease(
+                        str(task_id), str(task_row[0] or ""), str(task_row[1] or ""),
+                        str(lease_token), 0.0, int(attempts or 0),
+                    )
+                changed = await self.finish(
+                    lease,
+                    status=str(status or "retry_wait"),
+                    checkpoint_after=dict(payload.get("checkpoint_after") or {}),
+                    llm_call_count=int(payload.get("llm_call_count", 0) or 0),
+                    error=str(payload.get("error") or ""),
+                    retry_after_seconds=float(payload.get("retry_after_seconds", 0.0) or 0.0),
+                )
+                if changed:
+                    async with connect_aiosqlite(self.db_path) as db:
+                        await db.execute(
+                            "DELETE FROM background_task_pending_settlements WHERE task_id=? AND lease_token=?",
+                            (str(task_id), str(lease_token)),
+                        )
+                        await db.commit()
+                    replayed += 1
+                    continue
+            except Exception as exc:
+                error = str(exc)[:500]
+            failed += 1
+            next_attempt = int(attempts or 0) + 1
+            async with connect_aiosqlite(self.db_path) as db:
+                await db.execute(
+                    "UPDATE background_task_pending_settlements SET attempts=?, next_retry_at=?, updated_at=?, last_error=? WHERE task_id=? AND lease_token=?",
+                    (next_attempt, now + min(3600.0, 30.0 * (2 ** min(next_attempt, 6))), now, error, str(task_id), str(lease_token)),
+                )
+                await db.commit()
+        return {"replayed": replayed, "failed": failed}
+
+    async def describe_pending_settlements(self) -> dict[str, Any]:
+        await self._ensure_pending_settlement_schema()
+        now = time.time()
+        async with connect_aiosqlite(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT COUNT(*), MIN(created_at) FROM background_task_pending_settlements"
+            )
+            count, oldest = await cursor.fetchone()
+            await cursor.close()
+        oldest_value = float(oldest or 0.0)
+        return {
+            "pending_total": int(count or 0),
+            "oldest_age_ms": round(max(0.0, now - oldest_value) * 1000.0, 1)
+            if oldest_value else 0.0,
+        }
 
     async def recover_expired_leases(self, *, task_family: str = "", scope_id: str = "") -> int:
         """Fence expired workers so a new process can safely reclaim work.

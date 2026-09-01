@@ -455,6 +455,75 @@ class BackgroundScheduleContractTests(unittest.IsolatedAsyncioTestCase):
         await running
         self.assertEqual(ledger.calls, 3)
 
+    async def test_pending_lease_settlement_persists_and_replays(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "state.db"
+            _create_background_ledger_schema(db_path)
+            ledger = BackgroundTaskLedger(db_path)
+            lease = await ledger.claim(
+                task_family="decay",
+                scope_id="global",
+                input_fingerprint="pending",
+            )
+            self.assertIsNotNone(lease)
+            self.assertTrue(
+                await ledger.enqueue_pending_settlement(
+                    lease,
+                    run_id="decay-run-1",
+                    status="succeeded",
+                    checkpoint_after={"run_id": "decay-run-1"},
+                    retry_after_seconds=0,
+                )
+            )
+            pending = await ledger.describe_pending_settlements()
+            self.assertEqual(pending["pending_total"], 1)
+            replay = await ledger.replay_pending_settlements()
+            self.assertEqual(replay["replayed"], 1)
+            self.assertEqual(
+                (await ledger.describe_pending_settlements())["pending_total"], 0
+            )
+            row = (await ledger.list_recent(task_family="decay", limit=1))[0]
+            self.assertEqual(row["status"], "succeeded")
+
+    async def test_finish_failures_enqueue_pending_settlement_for_recovery(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "state.db"
+            _create_background_ledger_schema(db_path)
+            ledger = BackgroundTaskLedger(db_path)
+            lease = await ledger.claim(
+                task_family="diary", scope_id="global", input_fingerprint="recover"
+            )
+            original_finish = ledger.finish
+
+            async def _fail_finish(*_args, **_kwargs):
+                raise OSError("sqlite unavailable")
+
+            ledger.finish = _fail_finish
+            task = ProactiveTask.__new__(ProactiveTask)
+            task._task_ledger = ledger
+            task._background_tasks = set()
+            task._lease_settlement_tasks = set()
+            task._background_task_stats = {}
+            task.background_task_budget = BackgroundTaskBudget(limit=1)
+            task._handle_task_result = lambda completed: task._background_tasks.discard(completed)
+            running = task._fire_background_task(
+                lambda: asyncio.sleep(0, result={}),
+                task_name="diary",
+                scope_id="global",
+                task_lease=lease,
+                run_id="diary-recover-1",
+                cancel_status="cancelled",
+            )
+            await running
+            ledger.finish = original_finish
+            pending = await ledger.describe_pending_settlements()
+            self.assertEqual(pending["pending_total"], 1)
+            replay = await ledger.replay_pending_settlements()
+            self.assertEqual(replay["replayed"], 1)
+            self.assertEqual(
+                (await ledger.describe_pending_settlements())["pending_total"], 0
+            )
+
     async def test_proactive_metadata_llm_call_uses_shared_background_budget(self):
         calls = []
 

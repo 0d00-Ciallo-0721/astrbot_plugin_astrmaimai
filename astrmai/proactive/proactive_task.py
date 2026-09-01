@@ -493,6 +493,16 @@ class ProactiveTask:
                     )
             except Exception as exc:
                 logger.warning("[ProactiveTask] background lease recovery degraded: %s", exc)
+            try:
+                replay = await self._task_ledger.replay_pending_settlements(limit=100)
+                if replay.get("replayed") or replay.get("failed"):
+                    logger.info(
+                        "[ProactiveTask] pending lease settlements replayed=%s failed=%s",
+                        replay.get("replayed", 0),
+                        replay.get("failed", 0),
+                    )
+            except Exception as exc:
+                logger.warning("[ProactiveTask] pending lease settlement replay degraded: %s", exc)
         resume_scenarios = getattr(
             getattr(self, "scheduled_scenario_service", None),
             "resume",
@@ -654,6 +664,7 @@ class ProactiveTask:
         checkpoint_after: Any = None,
         llm_call_count: Any = 0,
         cancel_status: str = "retry_wait",
+        run_id: str = "",
     ):
         budget = getattr(self, "background_task_budget", None)
         if budget is None:
@@ -671,18 +682,40 @@ class ProactiveTask:
         base_coro = coro
         if task_lease is not None and self._task_ledger is not None:
             async def _finish_lease(**kwargs) -> bool:
+                last_error = None
                 for attempt in range(3):
                     try:
                         changed = await self._task_ledger.finish(task_lease, **kwargs)
                         if changed or attempt == 2:
                             return bool(changed)
                     except Exception as exc:
+                        last_error = exc
                         if attempt == 2:
                             logger.warning(
                                 "[ProactiveTask] background lease settlement failed task=%s: %s",
                                 getattr(task_lease, "task_id", ""),
                                 exc,
                             )
+                            enqueue_pending = getattr(
+                                self._task_ledger, "enqueue_pending_settlement", None
+                            )
+                            if callable(enqueue_pending):
+                                try:
+                                    await enqueue_pending(
+                                        task_lease,
+                                        run_id=run_id,
+                                        status=str(kwargs.get("status") or "retry_wait"),
+                                        checkpoint_after=kwargs.get("checkpoint_after"),
+                                        llm_call_count=kwargs.get("llm_call_count", 0),
+                                        error=str(kwargs.get("error") or last_error),
+                                        retry_after_seconds=kwargs.get("retry_after_seconds"),
+                                    )
+                                except Exception as pending_exc:
+                                    logger.error(
+                                        "[ProactiveTask] pending lease settlement persistence failed task=%s: %s",
+                                        getattr(task_lease, "task_id", ""),
+                                        pending_exc,
+                                    )
                             return False
                     await asyncio.sleep(0)
                 return False
@@ -898,6 +931,7 @@ class ProactiveTask:
                 task_lease=task_lease,
                 checkpoint_after=_checkpoint,
                 cancel_status="cancelled",
+                run_id=run_id,
             )
         except Exception as exc:
             if task_lease is not None and task_ledger is not None:
@@ -1797,6 +1831,12 @@ class ProactiveTask:
         return results
 
     async def _run_maintenance_cycle(self) -> None:
+        task_ledger = getattr(self, "_task_ledger", None)
+        if task_ledger is not None:
+            try:
+                await task_ledger.replay_pending_settlements(limit=100)
+            except Exception as exc:
+                logger.debug("[ProactiveTask] pending lease settlement replay degraded: %s", exc)
         try:
             await self._enqueue_managed_maintenance(
                 task_family="decay",
