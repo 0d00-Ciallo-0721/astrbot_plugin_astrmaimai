@@ -11,7 +11,7 @@ from ...infrastructure.runtime.background_task_budget import (
     BackgroundTaskQueueFull,
     BackgroundTaskQueueTimeout,
 )
-from ...infrastructure.runtime.background_task_ledger import BackgroundTaskLedger
+from ...infrastructure.runtime.background_task_ledger import BackgroundTaskLedger, settle_task_lease
 
 
 class ExpressionGovernanceRunner:
@@ -193,13 +193,20 @@ class ExpressionGovernanceRunner:
             try:
                 result = await awaitable_factory()
                 if lease is not None:
-                    await self._task_ledger.finish(lease, status="succeeded")
+                    await settle_task_lease(
+                        self._task_ledger,
+                        lease,
+                        run_id=f"{task_name}:{scope_id}",
+                        status="succeeded",
+                    )
                 return result
             except asyncio.CancelledError:
                 if lease is not None:
                     await asyncio.shield(
-                        self._task_ledger.finish(
+                        settle_task_lease(
+                            self._task_ledger,
                             lease,
+                            run_id=f"{task_name}:{scope_id}",
                             status="retry_wait",
                             error="cancelled",
                             retry_after_seconds=0.0,
@@ -208,8 +215,10 @@ class ExpressionGovernanceRunner:
                 raise
             except (BackgroundTaskQueueFull, BackgroundTaskQueueTimeout) as exc:
                 if lease is not None:
-                    await self._task_ledger.finish(
+                    await settle_task_lease(
+                        self._task_ledger,
                         lease,
+                        run_id=f"{task_name}:{scope_id}",
                         status="retry_wait",
                         error=str(exc),
                         retry_after_seconds=self.RETRY_POLL_INTERVAL_SECONDS,
@@ -219,7 +228,13 @@ class ExpressionGovernanceRunner:
                 )
             except Exception as exc:
                 if lease is not None:
-                    await self._task_ledger.finish(lease, status="failed", error=str(exc))
+                    await settle_task_lease(
+                        self._task_ledger,
+                        lease,
+                        run_id=f"{task_name}:{scope_id}",
+                        status="failed",
+                        error=str(exc),
+                    )
                 logger.warning(
                     f"[ExpressionGovernanceRunner] {task_name} failed for {scope_id}: {exc}"
                 )
@@ -232,13 +247,20 @@ class ExpressionGovernanceRunner:
                 defer_release_on_timeout=True,
             )
             if lease is not None:
-                await self._task_ledger.finish(lease, status="succeeded")
+                await settle_task_lease(
+                    self._task_ledger,
+                    lease,
+                    run_id=f"{task_name}:{scope_id}",
+                    status="succeeded",
+                )
             return result
         except asyncio.CancelledError:
             if lease is not None:
                 await asyncio.shield(
-                    self._task_ledger.finish(
+                    settle_task_lease(
+                        self._task_ledger,
                         lease,
+                        run_id=f"{task_name}:{scope_id}",
                         status="retry_wait",
                         error="cancelled",
                         retry_after_seconds=0.0,
@@ -247,8 +269,10 @@ class ExpressionGovernanceRunner:
             raise
         except (BackgroundTaskQueueFull, BackgroundTaskQueueTimeout) as exc:
             if lease is not None:
-                await self._task_ledger.finish(
+                await settle_task_lease(
+                    self._task_ledger,
                     lease,
+                    run_id=f"{task_name}:{scope_id}",
                     status="retry_wait",
                     error=str(exc),
                     retry_after_seconds=self.RETRY_POLL_INTERVAL_SECONDS,
@@ -259,7 +283,13 @@ class ExpressionGovernanceRunner:
             return None
         except Exception as exc:
             if lease is not None:
-                await self._task_ledger.finish(lease, status="failed", error=str(exc))
+                await settle_task_lease(
+                    self._task_ledger,
+                    lease,
+                    run_id=f"{task_name}:{scope_id}",
+                    status="failed",
+                    error=str(exc),
+                )
             logger.warning(
                 f"[ExpressionGovernanceRunner] {task_name} failed for {scope_id}: {exc}"
             )

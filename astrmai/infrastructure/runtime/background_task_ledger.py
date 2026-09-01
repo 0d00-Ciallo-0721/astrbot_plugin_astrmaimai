@@ -21,6 +21,48 @@ class TaskLease:
     retry_count: int
 
 
+async def settle_task_lease(
+    ledger: Any,
+    lease: TaskLease,
+    *,
+    run_id: str = "",
+    **kwargs: Any,
+) -> bool:
+    """Use durable settlement when supported, preserving legacy adapters."""
+    settle = getattr(ledger, "finish_with_recovery", None)
+    if callable(settle):
+        return bool(await settle(lease, run_id=run_id, **kwargs))
+    finish = getattr(ledger, "finish")
+    last_error = ""
+    for attempt in range(3):
+        try:
+            changed = await finish(lease, **kwargs)
+            if changed:
+                return True
+            last_error = "lease settlement CAS did not change a row"
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            last_error = str(exc)[:500]
+        if attempt < 2:
+            await asyncio.sleep(0)
+    enqueue = getattr(ledger, "enqueue_pending_settlement", None)
+    if callable(enqueue):
+        try:
+            await enqueue(
+                lease,
+                run_id=run_id,
+                status=str(kwargs.get("status") or "failed"),
+                checkpoint_after=kwargs.get("checkpoint_after"),
+                llm_call_count=kwargs.get("llm_call_count", 0),
+                error=str(kwargs.get("error") or last_error),
+                retry_after_seconds=kwargs.get("retry_after_seconds"),
+            )
+        except Exception:
+            pass
+    return False
+
+
 class BackgroundTaskLedger:
     """SQLite-backed per-family/scope lease and task state store."""
 
@@ -208,6 +250,80 @@ class BackgroundTaskLedger:
             await cursor.close()
         return changed
 
+    async def _lease_is_current(self, lease: TaskLease) -> bool | None:
+        """Return whether a lease still owns its ledger row.
+
+        ``None`` means the database could not be inspected and must be treated
+        as a transient persistence failure by the recovery path.
+        """
+        try:
+            async with connect_aiosqlite(self.db_path) as db:
+                cursor = await db.execute(
+                    "SELECT lease_token FROM background_task_ledger WHERE task_id=?",
+                    (lease.task_id,),
+                )
+                row = await cursor.fetchone()
+                await cursor.close()
+            return row is not None and str(row[0] or "") == str(lease.lease_token or "")
+        except Exception:
+            return None
+
+    async def finish_with_recovery(
+        self,
+        lease: TaskLease,
+        *,
+        run_id: str = "",
+        max_attempts: int = 3,
+        **kwargs: Any,
+    ) -> bool:
+        """Settle a lease and durably retain failures for a later replay.
+
+        This is the single caller-facing settlement entry point.  ``finish``
+        remains the low-level CAS operation so stale tokens can never mutate a
+        newer lease.  A confirmed stale token is recorded as superseded and is
+        removed by the replay worker instead of being retried forever.
+        """
+        attempts = max(1, min(int(max_attempts or 3), 5))
+        last_error = ""
+        for attempt in range(attempts):
+            try:
+                changed = await self.finish(lease, **kwargs)
+                if changed:
+                    return True
+                current = await self._lease_is_current(lease)
+                if current is False:
+                    await self.enqueue_pending_settlement(
+                        lease,
+                        run_id=run_id,
+                        status="superseded",
+                        error="lease_superseded",
+                    )
+                    return False
+                last_error = "lease settlement CAS did not change a row"
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_error = str(exc)[:500]
+            if attempt + 1 < attempts:
+                await asyncio.sleep(0)
+        try:
+            await self.enqueue_pending_settlement(
+                lease,
+                run_id=run_id,
+                status=str(kwargs.get("status") or "failed"),
+                checkpoint_after=kwargs.get("checkpoint_after"),
+                llm_call_count=kwargs.get("llm_call_count", 0),
+                error=str(kwargs.get("error") or last_error),
+                retry_after_seconds=kwargs.get("retry_after_seconds"),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # The caller receives a failed settlement result; the original
+            # lease remains protected by its expiry fence if the DB is down.
+            pass
+        return False
+
     async def record_rejected(
         self,
         *,
@@ -327,6 +443,7 @@ class BackgroundTaskLedger:
             await cursor.close()
         replayed = 0
         failed = 0
+        superseded = 0
         for task_id, lease_token, run_id, status, settlement_raw, attempts in rows:
             try:
                 payload = json.loads(str(settlement_raw or "{}"))
@@ -336,6 +453,15 @@ class BackgroundTaskLedger:
                 str(task_id), "", "", str(lease_token), 0.0, int(attempts or 0)
             )
             try:
+                if str(status or "").strip().lower() == "superseded":
+                    async with connect_aiosqlite(self.db_path) as db:
+                        await db.execute(
+                            "DELETE FROM background_task_pending_settlements WHERE task_id=? AND lease_token=?",
+                            (str(task_id), str(lease_token)),
+                        )
+                        await db.commit()
+                    superseded += 1
+                    continue
                 async with connect_aiosqlite(self.db_path) as db:
                     task_cursor = await db.execute(
                         "SELECT task_family, scope_id FROM background_task_ledger WHERE task_id=?",
@@ -365,6 +491,16 @@ class BackgroundTaskLedger:
                         await db.commit()
                     replayed += 1
                     continue
+                current = await self._lease_is_current(lease)
+                if current is False:
+                    async with connect_aiosqlite(self.db_path) as db:
+                        await db.execute(
+                            "DELETE FROM background_task_pending_settlements WHERE task_id=? AND lease_token=?",
+                            (str(task_id), str(lease_token)),
+                        )
+                        await db.commit()
+                    superseded += 1
+                    continue
             except Exception as exc:
                 error = str(exc)[:500]
             failed += 1
@@ -375,7 +511,7 @@ class BackgroundTaskLedger:
                     (next_attempt, now + min(3600.0, 30.0 * (2 ** min(next_attempt, 6))), now, error, str(task_id), str(lease_token)),
                 )
                 await db.commit()
-        return {"replayed": replayed, "failed": failed}
+        return {"replayed": replayed, "failed": failed, "superseded": superseded}
 
     async def describe_pending_settlements(self) -> dict[str, Any]:
         await self._ensure_pending_settlement_schema()

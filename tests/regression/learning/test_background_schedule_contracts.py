@@ -524,6 +524,72 @@ class BackgroundScheduleContractTests(unittest.IsolatedAsyncioTestCase):
                 (await ledger.describe_pending_settlements())["pending_total"], 0
             )
 
+    async def test_finish_with_recovery_persists_after_all_immediate_attempts_fail(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "state.db"
+            _create_background_ledger_schema(db_path)
+            ledger = BackgroundTaskLedger(db_path)
+            lease = await ledger.claim(
+                task_family="decay", scope_id="global", input_fingerprint="finish-recovery"
+            )
+            self.assertIsNotNone(lease)
+            original_finish = ledger.finish
+
+            async def _fail_finish(*_args, **_kwargs):
+                raise OSError("sqlite unavailable")
+
+            ledger.finish = _fail_finish
+            self.assertFalse(
+                await ledger.finish_with_recovery(
+                    lease,
+                    run_id="decay-run-recovery",
+                    status="retry_wait",
+                    error="provider busy",
+                    retry_after_seconds=0,
+                )
+            )
+            ledger.finish = original_finish
+            pending = await ledger.describe_pending_settlements()
+            self.assertEqual(pending["pending_total"], 1)
+            replay = await ledger.replay_pending_settlements()
+            self.assertEqual(replay["replayed"], 1)
+            self.assertEqual(
+                (await ledger.describe_pending_settlements())["pending_total"], 0
+            )
+
+    async def test_pending_settlement_old_lease_is_marked_superseded(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "state.db"
+            _create_background_ledger_schema(db_path)
+            ledger = BackgroundTaskLedger(db_path)
+            lease = await ledger.claim(
+                task_family="profile_scan", scope_id="global", input_fingerprint="aba"
+            )
+            self.assertIsNotNone(lease)
+            self.assertTrue(
+                await ledger.enqueue_pending_settlement(
+                    lease,
+                    run_id="profile-old",
+                    status="succeeded",
+                )
+            )
+            import sqlite3
+
+            db = sqlite3.connect(db_path)
+            try:
+                db.execute(
+                    "UPDATE background_task_ledger SET lease_token=? WHERE task_id=?",
+                    ("new-lease-token", lease.task_id),
+                )
+                db.commit()
+            finally:
+                db.close()
+            replay = await ledger.replay_pending_settlements()
+            self.assertEqual(replay["superseded"], 1)
+            self.assertEqual(
+                (await ledger.describe_pending_settlements())["pending_total"], 0
+            )
+
     async def test_proactive_metadata_llm_call_uses_shared_background_budget(self):
         calls = []
 

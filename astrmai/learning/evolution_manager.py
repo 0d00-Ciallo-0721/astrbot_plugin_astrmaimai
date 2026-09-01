@@ -28,7 +28,7 @@ from .contracts.learning_events import (
 )
 from .contracts.learning_envelope import LearningMessageEnvelope
 from ..infrastructure.persistence.learning_ingest_outbox import LearningIngressOutboxStore
-from ..infrastructure.runtime.background_task_ledger import BackgroundTaskLedger
+from ..infrastructure.runtime.background_task_ledger import BackgroundTaskLedger, settle_task_lease
 from .logging.bot_reply_recorder import BotReplyRecorder
 from .logging.message_recorder import MessageRecorder
 from .dedup import GLOBAL_JARGON_SESSION_ID, jargon_fingerprint, normalize_jargon_term
@@ -330,13 +330,17 @@ class EvolutionManager:
         group_id: str,
         previous_mining_at: float,
         lease,
+        *,
+        run_id: str = "",
     ) -> None:
         normalized = str(group_id or "")
         self._last_mining_at[normalized] = float(previous_mining_at or 0.0)
         await self._persist_mining_timestamp(normalized, previous_mining_at)
         if self._task_ledger is not None and lease is not None:
-            await self._task_ledger.finish(
+            await settle_task_lease(
+                self._task_ledger,
                 lease,
+                run_id=run_id,
                 status="retry_wait",
                 error="cancelled",
                 retry_after_seconds=0.0,
@@ -972,16 +976,20 @@ class EvolutionManager:
             report["purged_at"] = time.time()
             self._last_message_log_purge = report
             if lease is not None:
-                await self._task_ledger.finish(
+                await settle_task_lease(
+                    self._task_ledger,
                     lease,
+                    run_id=f"retention-{int(time.time())}",
                     status="succeeded",
                     checkpoint_after={"deleted": int(report.get("deleted", 0) or 0)},
                 )
             return dict(report)
         except Exception as exc:
             if lease is not None:
-                await self._task_ledger.finish(
+                await settle_task_lease(
+                    self._task_ledger,
                     lease,
+                    run_id=f"retention-{int(time.time())}",
                     status="retry_wait",
                     error=str(exc),
                     retry_after_seconds=3600.0,
@@ -2336,8 +2344,10 @@ class EvolutionManager:
                     self._last_mining_at[str(group_id)] = previous_mining_at
                     await self._persist_mining_timestamp(group_id, previous_mining_at)
                 if lease is not None:
-                    await self._task_ledger.finish(
+                    await settle_task_lease(
+                        self._task_ledger,
                         lease,
+                        run_id=run_id,
                         status="retry_wait" if all_failed else "succeeded",
                         error="all_pipelines_failed" if all_failed else "",
                         retry_after_seconds=self._backlog_failure_cooldown() if all_failed else 0.0,
@@ -2348,6 +2358,7 @@ class EvolutionManager:
                         group_id,
                         previous_mining_at,
                         lease,
+                        run_id=run_id,
                     )
                 )
                 raise
@@ -2355,8 +2366,10 @@ class EvolutionManager:
                 self._last_mining_at[str(group_id)] = previous_mining_at
                 await self._persist_mining_timestamp(group_id, previous_mining_at)
                 if lease is not None:
-                    await self._task_ledger.finish(
+                    await settle_task_lease(
+                        self._task_ledger,
                         lease,
+                        run_id=run_id,
                         status="retry_wait",
                         error=str(exc),
                         retry_after_seconds=self._backlog_failure_cooldown(),
@@ -2499,8 +2512,10 @@ class EvolutionManager:
                     self._last_mining_at[group_id] = previous_mining_at
                     await self._persist_mining_timestamp(group_id, previous_mining_at)
                 if lease is not None:
-                    await self._task_ledger.finish(
+                    await settle_task_lease(
+                        self._task_ledger,
                         lease,
+                        run_id=run_id,
                         status="retry_wait" if all_failed else "succeeded",
                         error="all_pipelines_failed" if all_failed else "",
                         retry_after_seconds=self._backlog_failure_cooldown() if all_failed else 0.0,
@@ -2535,12 +2550,15 @@ class EvolutionManager:
                             group_id,
                             previous_mining_at,
                             lease,
+                            run_id=run_id,
                         )
                     )
                 elif self._task_ledger is not None and lease is not None:
                     await asyncio.shield(
-                        self._task_ledger.finish(
+                        settle_task_lease(
+                            self._task_ledger,
                             lease,
+                            run_id=run_id,
                             status="retry_wait",
                             error="cancelled",
                             retry_after_seconds=0.0,
@@ -2552,8 +2570,10 @@ class EvolutionManager:
                     self._last_mining_at[group_id] = previous_mining_at
                     await self._persist_mining_timestamp(group_id, previous_mining_at)
                 if self._task_ledger is not None and lease is not None:
-                    await self._task_ledger.finish(
+                    await settle_task_lease(
+                        self._task_ledger,
                         lease,
+                        run_id=run_id,
                         status="retry_wait",
                         error=str(exc),
                         retry_after_seconds=self._backlog_failure_cooldown(),
