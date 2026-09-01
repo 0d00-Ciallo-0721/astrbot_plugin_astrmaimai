@@ -179,6 +179,9 @@ class AttentionGate:
         self._deferred_attention_outbox = AttentionDeferredOutboxStore(deferred_db_path)
         self._deferred_persist_tasks: set[asyncio.Task] = set()
         self._deferred_persist_by_work: dict[str, asyncio.Task] = {}
+        self._deferred_pending_persistence: dict[str, dict[str, Any]] = {}
+        self._deferred_persistence_failure_count = 0
+        self._deferred_persistence_last_error = ""
         self._deferred_attention_terminal_statuses = frozenset(
             {
                 "replayed",
@@ -309,10 +312,26 @@ class AttentionGate:
         async def _persist() -> None:
             try:
                 await store.enqueue(payload, event_data=event_data)
+                self._deferred_pending_persistence.pop(work_id, None)
             except asyncio.CancelledError:
+                if self._workers_shutdown:
+                    self._deferred_pending_persistence[work_id] = {
+                        "operation": "enqueue",
+                        "item": payload,
+                        "event_data": event_data,
+                        "failed_at": time.time(),
+                    }
                 raise
             except Exception as exc:
-                logger.debug("[Attention] deferred outbox enqueue degraded: %s", exc)
+                self._deferred_pending_persistence[work_id] = {
+                    "operation": "enqueue",
+                    "item": payload,
+                    "event_data": event_data,
+                    "failed_at": time.time(),
+                }
+                self._deferred_persistence_failure_count += 1
+                self._deferred_persistence_last_error = str(exc)[:500]
+                logger.warning("[Attention] deferred outbox enqueue pending retry: %s", exc)
 
         task = asyncio.create_task(_persist(), name=f"attention-deferred-persist:{work_id}")
         self._deferred_persist_tasks.add(task)
@@ -349,7 +368,7 @@ class AttentionGate:
             if pending is not None and not pending.done():
                 await asyncio.gather(pending, return_exceptions=True)
             try:
-                await store.finish(
+                changed = await store.finish(
                     work_id,
                     lease_token=token,
                     status="retry_wait" if status == "shutdown" else status,
@@ -357,8 +376,36 @@ class AttentionGate:
                     next_retry_at=time.time() if status == "shutdown" else 0.0,
                     error=reason,
                 )
+                if not changed:
+                    raise RuntimeError("deferred outbox settlement lease was not current")
+                self._deferred_pending_persistence.pop(work_id, None)
+            except asyncio.CancelledError:
+                if self._workers_shutdown:
+                    self._deferred_pending_persistence[work_id] = {
+                        "operation": "finish",
+                        "work_id": work_id,
+                        "lease_token": token,
+                        "status": "retry_wait" if status == "shutdown" else status,
+                        "attempts": int(item.get("attempts", 0) or 0),
+                        "next_retry_at": time.time() if status == "shutdown" else 0.0,
+                        "error": reason,
+                        "failed_at": time.time(),
+                    }
+                raise
             except Exception as exc:
-                logger.debug("[Attention] deferred outbox settlement degraded: %s", exc)
+                self._deferred_pending_persistence[work_id] = {
+                    "operation": "finish",
+                    "work_id": work_id,
+                    "lease_token": token,
+                    "status": "retry_wait" if status == "shutdown" else status,
+                    "attempts": int(item.get("attempts", 0) or 0),
+                    "next_retry_at": time.time() if status == "shutdown" else 0.0,
+                    "error": reason,
+                    "failed_at": time.time(),
+                }
+                self._deferred_persistence_failure_count += 1
+                self._deferred_persistence_last_error = str(exc)[:500]
+                logger.warning("[Attention] deferred outbox settlement pending retry: %s", exc)
 
         task = asyncio.create_task(_finish(), name=f"attention-deferred-finish:{work_id}")
         self._deferred_persist_tasks.add(task)
@@ -370,14 +417,28 @@ class AttentionGate:
             scope_id=str(item.get("chat_id") or "GLOBAL"),
             run_id=f"attention-deferred-finish-{work_id}",
         )
-        task.add_done_callback(lambda completed: self._deferred_persist_tasks.discard(completed))
+
+        def _done(completed: asyncio.Task) -> None:
+            self._deferred_persist_tasks.discard(completed)
+            self._background_tasks.discard(completed)
+            if self._deferred_persist_by_work.get(work_id) is completed:
+                self._deferred_persist_by_work.pop(work_id, None)
+            try:
+                completed.exception()
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        task.add_done_callback(_done)
 
     async def _restore_deferred_attention(self) -> None:
         store = getattr(self, "_deferred_attention_outbox", None)
         if store is None or not getattr(store, "db_path", "") or self._workers_shutdown:
             return
         try:
-            rows = await store.claim_due(limit=max(1, int(self._deferred_attention_config("attention_deferred_queue_max", 128))))
+            rows = await store.claim_due(
+                limit=max(1, int(self._deferred_attention_config("attention_deferred_queue_max", 128))),
+                include_future=True,
+            )
         except Exception as exc:
             logger.debug("[Attention] deferred outbox restore degraded: %s", exc)
             return
@@ -386,6 +447,13 @@ class AttentionGate:
             if not work_id or work_id in self._deferred_attention_work:
                 continue
             event = _SyntheticExternalEvent(dict(row.get("event_data") or {}))
+            turn_thread_id = str(row.get("turn_thread_id") or "")
+            turn_generation = int(row.get("turn_generation", 0) or 0)
+            if turn_thread_id or turn_generation:
+                event.set_extra(
+                    "astrmai_turn_identity",
+                    SimpleNamespace(thread_id=turn_thread_id, generation=turn_generation),
+                )
             now = time.time()
             if float(row.get("expires_at", now) or now) <= now:
                 await store.finish(work_id, lease_token=str(row.get("lease_token") or ""), status="expired", error="ttl_expired")
@@ -405,8 +473,8 @@ class AttentionGate:
                 "session_identity": None,
                 "worker_generation": int(row.get("worker_generation", 0) or 0),
                 "shutdown_generation": int(self._shutdown_generation),
-                "turn_thread_id": str(row.get("turn_thread_id") or ""),
-                "turn_generation": int(row.get("turn_generation", 0) or 0),
+                "turn_thread_id": turn_thread_id,
+                "turn_generation": turn_generation,
                 "_outbox_lease_token": str(row.get("lease_token") or ""),
                 "_terminal_status": None,
             }
@@ -421,7 +489,10 @@ class AttentionGate:
     def _schedule_deferred_restore(self) -> None:
         if not getattr(getattr(self, "_deferred_attention_outbox", None), "db_path", ""):
             return
-        task = asyncio.create_task(self._restore_deferred_attention(), name="attention-deferred-restore")
+        try:
+            task = asyncio.create_task(self._restore_deferred_attention(), name="attention-deferred-restore")
+        except RuntimeError:
+            return
         self._background_tasks.add(task)
         self._register_owner_task(
             task,
@@ -429,6 +500,15 @@ class AttentionGate:
             scope_id="GLOBAL",
             run_id=f"attention-deferred-restore-{self._shutdown_generation}",
         )
+
+        def _done(completed: asyncio.Task) -> None:
+            self._background_tasks.discard(completed)
+            try:
+                completed.exception()
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        task.add_done_callback(_done)
 
     def refresh_config(self, config):
         self.config = config
@@ -638,6 +718,24 @@ class AttentionGate:
             "attention_deferred_dispatcher_last_error": self._deferred_attention_dispatcher_last_error,
             "attention_deferred_last_enqueued_at": float(self._deferred_attention_last_enqueued_at),
             "attention_deferred_last_terminal_at": float(self._deferred_attention_last_terminal_at),
+            "attention_deferred_persistence_failed_total": int(self._deferred_persistence_failure_count),
+            "attention_deferred_pending_persistence": len(self._deferred_pending_persistence),
+            "attention_deferred_persistence_oldest_failure_age_ms": round(
+                max(
+                    0.0,
+                    now
+                    - min(
+                        (
+                            float(item.get("failed_at", now) or now)
+                            for item in self._deferred_pending_persistence.values()
+                        ),
+                        default=now,
+                    ),
+                )
+                * 1000.0,
+                3,
+            ),
+            "attention_deferred_persistence_last_error": self._deferred_persistence_last_error,
             "attention_queue_degradation_total": int(sum(self._queue_degradation_counts.values())),
             "attention_queue_degradation_by_kind": dict(self._queue_degradation_counts),
         }
@@ -650,6 +748,48 @@ class AttentionGate:
     def mark_runtime_started(self) -> None:
         """Record the successful runtime transition used by startup warmup."""
         self._runtime_started_monotonic = time.monotonic()
+        self._schedule_pending_persistence_retry()
+        self._schedule_deferred_restore()
+
+    def _schedule_pending_persistence_retry(self) -> None:
+        if self._workers_shutdown or not self._deferred_pending_persistence:
+            return
+        try:
+            task = asyncio.create_task(self._retry_pending_persistence(), name="attention-deferred-persistence-retry")
+        except RuntimeError:
+            return
+        self._background_tasks.add(task)
+        self._register_owner_task(task, task_family="attention.deferred.persistence", scope_id="GLOBAL", run_id=f"attention-deferred-persistence-retry-{self._shutdown_generation}")
+
+        def _done(completed: asyncio.Task) -> None:
+            self._background_tasks.discard(completed)
+            try:
+                completed.exception()
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        task.add_done_callback(_done)
+
+    async def _retry_pending_persistence(self) -> None:
+        store = self._deferred_attention_outbox
+        for key, pending in list(self._deferred_pending_persistence.items()):
+            if self._workers_shutdown:
+                return
+            try:
+                if pending.get("operation") == "enqueue":
+                    await store.enqueue(pending["item"], event_data=pending.get("event_data", {}))
+                else:
+                    await store.finish(
+                        pending["work_id"],
+                        lease_token=pending.get("lease_token", ""),
+                        status=pending.get("status", "retry_wait"),
+                        attempts=pending.get("attempts", 0),
+                        next_retry_at=pending.get("next_retry_at", 0.0),
+                        error=pending.get("error", ""),
+                    )
+                self._deferred_pending_persistence.pop(key, None)
+            except Exception as exc:
+                self._deferred_persistence_last_error = str(exc)[:500]
 
     def _startup_warmup_remaining(self) -> float:
         started = self._runtime_started_monotonic
@@ -743,6 +883,15 @@ class AttentionGate:
         self._deferred_attention_work.clear()
         self._deferred_messages.clear()
         self._proactive_dispatching.clear()
+        pending_persistence = [
+            task for task in self._deferred_persist_tasks if not task.done()
+        ]
+        if pending_persistence:
+            done, pending = await asyncio.wait(pending_persistence, timeout=2.0)
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
         return cancelled
 
     def _prepare_group_attention_topic(
@@ -1315,6 +1464,7 @@ class AttentionGate:
             "_terminal_status": None,
         }
         self._deferred_attention_work[work_id] = item
+        self._schedule_deferred_persist(item)
         self._deferred_attention_counts["total"] += 1
         self._deferred_attention_counts[f"kind:{item['task_name']}"] += 1
         self._deferred_attention_last_enqueued_at = now
@@ -1348,6 +1498,7 @@ class AttentionGate:
             if previous:
                 return False
             item["_terminal_status"] = status
+            self._schedule_deferred_finish(item, status, reason or "")
         self._deferred_attention_counts[status] += 1
         self._deferred_attention_last_terminal_at = time.time()
         event = item.get("event") if isinstance(item, dict) else None
@@ -1539,6 +1690,7 @@ class AttentionGate:
                 else:
                     backoff = min(15.0, 1.0 * (2 ** (item["attempts"] - 1)))
                     item["next_retry_at"] = time.monotonic() + backoff
+                    self._schedule_deferred_persist(item)
                     self._deferred_attention_dispatcher_last_progress_at = time.time()
                     logger.warning(
                         "[Attention] deferred replay delayed after queue admission failure "

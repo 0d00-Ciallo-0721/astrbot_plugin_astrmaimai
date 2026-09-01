@@ -48,12 +48,14 @@ class PersonaSummarizer:
         config=None,
         memory_engine=None,
         background_task_budget=None,
+        owner_registry=None,
     ):
         self.persistence = persistence
         self.gateway = gateway
         self.config = config if config else gateway.config
         self.memory_engine = memory_engine
         self.background_task_budget = background_task_budget or BackgroundTaskBudget()
+        self.owner_registry = owner_registry
         # 加载持久化缓存
         self.cache = self.persistence.load_persona_cache()
         # 运行时任务锁
@@ -68,6 +70,20 @@ class PersonaSummarizer:
         self._lock = asyncio.Lock()
         self._manual_update_lock = asyncio.Lock()
         self.prompt_registry = getattr(getattr(gateway, "context_economy", None), "templates", None)
+
+    def _track_background_task(self, awaitable, *, name: str, task_family: str, scope_id: str) -> asyncio.Task:
+        task = safe_create_task(awaitable, name=name, track_set=self._background_tasks)
+        registry = self.owner_registry
+        if registry is not None:
+            registry.register(
+                task,
+                task_family=task_family,
+                scope_id=scope_id,
+                run_id=f"persona-{uuid.uuid4().hex}",
+                owner="PersonaSummarizer",
+                generation=getattr(registry, "generation", None),
+            )
+        return task
 
     def refresh_config(self, config) -> None:
         self.config = config
@@ -133,10 +149,11 @@ class PersonaSummarizer:
         if self._closed:
             return None
         generation = self._cache_generations.setdefault(cache_key, 0)
-        task = safe_create_task(
+        task = self._track_background_task(
             self._run_enrichment_until_complete(original_prompt, cache_key),
             name=f"persona-shards:{cache_key}",
-            track_set=self._background_tasks,
+            task_family="persona.shards",
+            scope_id=cache_key,
         )
         setattr(task, "_astrmai_persona_generation", generation)
         task.add_done_callback(self._handle_background_task_result)
@@ -845,10 +862,11 @@ Rules:
         async with self._lock:
             task = self.pending_core_tasks.get(cache_key)
             if task is None or task.done():
-                task = safe_create_task(
+                task = self._track_background_task(
                     self._initialize_core(original_prompt, cache_key),
                     name=f"persona-core:{cache_key}",
-                    track_set=self._background_tasks,
+                    task_family="persona.core",
+                    scope_id=cache_key,
                 )
                 self.pending_core_tasks[cache_key] = task
         try:
@@ -1125,7 +1143,7 @@ Rules:
                 "_staging_key": staging_key,
                 "_original_timestamp": original_timestamp,
             }
-            task = safe_create_task(
+            task = self._track_background_task(
                 self._run_full_regeneration(
                     clean_key,
                     staging_key,
@@ -1134,7 +1152,8 @@ Rules:
                     clear_manual_overrides=bool(clear_manual_overrides),
                 ),
                 name=f"persona-regeneration:{clean_key}",
-                track_set=self._background_tasks,
+                task_family="persona.regeneration",
+                scope_id=clean_key,
             )
             self.regeneration_tasks[clean_key] = task
             task.add_done_callback(

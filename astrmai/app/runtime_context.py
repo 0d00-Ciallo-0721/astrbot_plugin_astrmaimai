@@ -448,6 +448,8 @@ class PluginRuntimeContext:
             self.group_reread_observer,
             self.reread_action_dispatcher,
             self.external_result_dispatcher,
+            self.visual_cortex,
+            self.persona_summarizer,
             self.event_bus,
             self.owner_registry,
         )

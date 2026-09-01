@@ -1,5 +1,6 @@
 # astrmai/infra/event_bus.py
 import asyncio
+import uuid
 from typing import Callable, List, Dict, Any
 
 from ...shared.helpers.plugin_helpers import safe_create_task
@@ -45,6 +46,24 @@ class EventBus:
         self._worker_tasks: set = set()  # ponytail: worker-only tracking (R8)
         self._pending_stop_tasks: set = set()
         self._generation = 0
+        self._owner_registry = None
+
+    def bind_owner_registry(self, owner_registry) -> None:
+        self._owner_registry = owner_registry
+
+    def _track_background_task(self, awaitable, *, name: str, task_family: str) -> asyncio.Task:
+        task = safe_create_task(awaitable, name=name, track_set=self._background_tasks)
+        registry = self._owner_registry
+        if registry is not None:
+            registry.register(
+                task,
+                task_family=task_family,
+                scope_id="GLOBAL",
+                run_id=f"eventbus-{uuid.uuid4().hex}",
+                owner="EventBus",
+                generation=getattr(registry, "generation", None),
+            )
+        return task
 
     # ==========================
     # 基础 Event 触发机制 (遗留兼容)
@@ -70,10 +89,10 @@ class EventBus:
     def trigger_knowledge_update(self):
         self.knowledge_updated.set()
         try:
-            safe_create_task(
+            self._track_background_task(
                 self._clear_knowledge_after_publish(),
                 name="eventbus:knowledge_update",
-                track_set=self._background_tasks,
+                task_family="eventbus.knowledge_update",
             )
         except RuntimeError:
             pass
@@ -168,10 +187,10 @@ class EventBus:
                     try:
                         # 🟢 [核心修复 Bug 3] Fire-and-Forget 模式：绝对不要在此处 await 阻塞 Worker！
                         if asyncio.iscoroutinefunction(callback):
-                            safe_create_task(
+                            self._track_background_task(
                                 callback(data),
                                 name=f"eventbus:{topic}",
-                                track_set=self._background_tasks,
+                                task_family="eventbus.callback",
                             )
                         else:
                             callback(data)
@@ -194,8 +213,7 @@ class EventBus:
             active = sum(1 for t in list(self._worker_tasks) if not t.done())
             needed = 3 - active
             for _ in range(max(0, needed)):
-                t = safe_create_task(self._worker_loop())
-                self._background_tasks.add(t)
+                t = self._track_background_task(self._worker_loop(), name="eventbus:worker", task_family="eventbus.worker")
                 self._worker_tasks.add(t)
             if needed > 0:
                 logger.warning(f"[EventBus] restarted {needed} worker(s), now {active + needed} total")
@@ -215,11 +233,9 @@ class EventBus:
         if not self._workers_started:
             self._workers_started = True
             for _ in range(3):  # 拉起 3 个稳定常驻 Worker
-                task = safe_create_task(self._worker_loop())
-                self._background_tasks.add(task)
+                task = self._track_background_task(self._worker_loop(), name="eventbus:worker", task_family="eventbus.worker")
                 self._worker_tasks.add(task)
-            t = safe_create_task(self._worker_health_check())  # 健康检查
-            self._background_tasks.add(t)
+            self._track_background_task(self._worker_health_check(), name="eventbus:health", task_family="eventbus.health")
         
         try:
             # 使用 nowait 防止高频事件反向阻塞关键请求链路，溢出时告警

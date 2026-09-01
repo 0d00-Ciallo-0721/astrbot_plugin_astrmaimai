@@ -5,11 +5,15 @@ import importlib
 import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 from types import SimpleNamespace
 
 from tests.helpers.astrbot_stubs import install_astrbot_stubs
 from tests.helpers.attention_stubs import install_attention_stubs
+from astrmai.infrastructure.persistence.attention_deferred_outbox import (
+    AttentionDeferredOutboxStore,
+)
 
 
 class _Event:
@@ -305,6 +309,195 @@ class AttentionDeferredQueueTests(unittest.TestCase):
         self.assertFalse(accepted)
         self.assertEqual(status, "rejected")
         self.assertEqual(self.gate.describe_status()["attention_deferred_rejected_total"], 1)
+
+    def test_deferred_enqueue_persists_and_shutdown_keeps_retryable_record(self):
+        async def run():
+            db_path = Path(self.temp_dir.name) / "attention.db"
+            store = AttentionDeferredOutboxStore(db_path)
+            self.gate._deferred_attention_outbox = store
+            self.gate.config.attention.attention_deferred_backoff_sec = 30.0
+            event = _Event()
+            accepted = self.gate._defer_attention_work(
+                event=event,
+                task_name="attention.system2",
+                retry_factory=lambda: asyncio.sleep(0),
+                reason="queue_timeout",
+            )
+            self.assertTrue(accepted)
+            await asyncio.sleep(0)
+            pending = list(self.gate._deferred_persist_tasks)
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            before = await store.describe()
+            self.assertEqual(before["queued"], 1)
+            await self.gate.shutdown_workers()
+            after = await store.describe()
+            return before, after
+
+        before, after = asyncio.run(run())
+        self.assertEqual(before["queued"], 1)
+        self.assertEqual(after["queued"], 1)
+
+    def test_deferred_restore_rehydrates_future_work_and_turn_identity(self):
+        async def run():
+            db_path = Path(self.temp_dir.name) / "attention-restore.db"
+            store = AttentionDeferredOutboxStore(db_path)
+            now = time.time()
+            await store.enqueue(
+                {
+                    "work_id": "attention-deferred-restore-1",
+                    "chat_id": "default:GroupMessage:deferred",
+                    "task_name": "attention.system2",
+                    "reason": "queue_timeout",
+                    "turn_thread_id": "thread-restore",
+                    "turn_generation": 7,
+                    "worker_generation": 2,
+                    "attempts": 1,
+                    "max_attempts": 3,
+                    "next_retry_at_wall": now + 30.0,
+                    "expires_at": now + 300.0,
+                },
+                event_data={
+                    "message_str": "restored",
+                    "unified_msg_origin": "default:GroupMessage:deferred",
+                },
+            )
+            self.gate._deferred_attention_outbox = store
+            await self.gate._restore_deferred_attention()
+            item = self.gate._deferred_attention_work["attention-deferred-restore-1"]
+            identity = item["event"].get_extra("astrmai_turn_identity")
+            self.assertEqual(identity.thread_id, "thread-restore")
+            self.assertEqual(identity.generation, 7)
+            self.assertEqual(item["attempts"], 1)
+            await self.gate.shutdown_workers()
+
+        asyncio.run(run())
+
+    def test_deferred_terminal_transition_removes_persisted_record(self):
+        async def run():
+            db_path = Path(self.temp_dir.name) / "attention-terminal.db"
+            store = AttentionDeferredOutboxStore(db_path)
+            self.gate._deferred_attention_outbox = store
+            self.gate.config.attention.attention_deferred_backoff_sec = 30.0
+            event = _Event()
+            self.assertTrue(
+                self.gate._defer_attention_work(
+                    event=event,
+                    task_name="attention.system2",
+                    retry_factory=lambda: asyncio.sleep(0),
+                    reason="queue_timeout",
+                )
+            )
+            await asyncio.sleep(0)
+            pending = list(self.gate._deferred_persist_tasks)
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            item = next(iter(self.gate._deferred_attention_work.values()))
+            self.gate._set_deferred_terminal(item, "expired", reason="ttl_expired")
+            pending = list(self.gate._deferred_persist_tasks)
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            description = await store.describe()
+            await self.gate.shutdown_workers()
+            return description
+
+        self.assertEqual(asyncio.run(run())["total"], 0)
+
+    def test_deferred_enqueue_failure_is_retained_and_retried(self):
+        async def run():
+            class FlakyStore:
+                db_path = "memory"
+
+                def __init__(self):
+                    self.calls = 0
+
+                async def enqueue(self, item, *, event_data):
+                    self.calls += 1
+                    if self.calls == 1:
+                        raise TimeoutError("sqlite busy")
+                    return True
+
+            store = FlakyStore()
+            self.gate._deferred_attention_outbox = store
+            item = {
+                "work_id": "persist-failure-1",
+                "chat_id": "chat-1",
+                "task_name": "attention.system2",
+                "reason": "queue_timeout",
+                "event": _Event(),
+                "next_retry_at": time.monotonic(),
+                "expires_at": time.time() + 60.0,
+            }
+            self.gate._schedule_deferred_persist(item)
+            await asyncio.gather(*list(self.gate._deferred_persist_tasks), return_exceptions=True)
+            self.assertEqual(len(self.gate._deferred_pending_persistence), 1)
+            self.gate.mark_runtime_started()
+            retry_tasks = [task for task in self.gate._background_tasks if task not in self.gate._deferred_persist_tasks]
+            if retry_tasks:
+                await asyncio.gather(*retry_tasks, return_exceptions=True)
+            self.assertEqual(store.calls, 2)
+            self.assertEqual(self.gate._deferred_pending_persistence, {})
+
+        asyncio.run(run())
+
+    def test_deferred_finish_failure_is_retained_and_retried(self):
+        async def run():
+            class FlakyStore:
+                db_path = "memory"
+
+                def __init__(self):
+                    self.calls = 0
+
+                async def finish(self, *args, **kwargs):
+                    self.calls += 1
+                    if self.calls == 1:
+                        raise TimeoutError("sqlite busy")
+                    return True
+
+            store = FlakyStore()
+            self.gate._deferred_attention_outbox = store
+            item = {
+                "work_id": "finish-failure-1",
+                "chat_id": "chat-1",
+                "attempts": 1,
+                "_outbox_lease_token": "lease-1",
+            }
+            self.gate._schedule_deferred_finish(item, "replayed", reason="ok")
+            await asyncio.gather(*list(self.gate._deferred_persist_tasks), return_exceptions=True)
+            self.assertEqual(len(self.gate._deferred_pending_persistence), 1)
+            await self.gate._retry_pending_persistence()
+            self.assertEqual(store.calls, 2)
+            self.assertEqual(self.gate._deferred_pending_persistence, {})
+
+        asyncio.run(run())
+
+    def test_deferred_persistence_cancelled_during_shutdown_is_retained(self):
+        async def run():
+            class BlockingStore:
+                db_path = "memory"
+
+                async def enqueue(self, item, *, event_data):
+                    await asyncio.Event().wait()
+
+            self.gate._deferred_attention_outbox = BlockingStore()
+            item = {
+                "work_id": "persist-cancelled-1",
+                "chat_id": "chat-1",
+                "task_name": "attention.system2",
+                "reason": "queue_timeout",
+                "event": _Event(),
+                "next_retry_at": time.monotonic(),
+                "expires_at": time.time() + 60.0,
+            }
+            self.gate._schedule_deferred_persist(item)
+            await asyncio.sleep(0)
+            self.gate.request_shutdown()
+            task = next(iter(self.gate._deferred_persist_tasks))
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            self.assertIn("persist-cancelled-1", self.gate._deferred_pending_persistence)
+
+        asyncio.run(run())
 
     def test_deferred_ttl_expiry_is_terminal(self):
         async def run():

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import uuid
 
 from astrbot.api import logger
 from ...shared.helpers.plugin_helpers import safe_create_task
@@ -28,6 +29,7 @@ class ExpressionGovernanceRunner:
         interval_seconds: int = 21600,
         config=None,
         background_task_budget=None,
+        owner_registry=None,
     ):
         self.state_engine = state_engine
         self.pattern_service = pattern_service
@@ -37,6 +39,7 @@ class ExpressionGovernanceRunner:
         self.review_dispatcher = review_dispatcher
         self.config = config
         self.background_task_budget = background_task_budget or BackgroundTaskBudget()
+        self.owner_registry = owner_registry
         self.interval_seconds = max(int(interval_seconds or 60), 15)
         self._is_running = False
         self._task = None
@@ -73,7 +76,16 @@ class ExpressionGovernanceRunner:
                     exc,
                 )
         self._is_running = True
-        self._task = safe_create_task(self._loop())
+        self._task = safe_create_task(self._loop(), name="governance:runner")
+        if self.owner_registry is not None:
+            self.owner_registry.register(
+                self._task,
+                task_family="governance.scheduler",
+                scope_id="GLOBAL",
+                run_id=f"governance-{uuid.uuid4().hex}",
+                owner="ExpressionGovernanceRunner",
+                generation=getattr(self.owner_registry, "generation", None),
+            )
 
     async def stop(self):
         self._is_running = False

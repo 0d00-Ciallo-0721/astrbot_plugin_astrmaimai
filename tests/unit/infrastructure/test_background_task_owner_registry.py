@@ -8,6 +8,10 @@ from astrmai.infrastructure.runtime.background_task_owner_registry import (
 from astrmai.memory.services.memory_turn_pipeline import MemoryTurnPipeline
 from astrmai.memory.services.memory_index_projector import MemoryIndexProjector
 from astrmai.conversation.ingress.external_result_dispatcher import ExternalResultDispatcher
+from astrmai.infrastructure.runtime.event_bus import EventBus
+from astrmai.multimodal.visual_cortex import VisualCortex
+from astrmai.learning.review.expression_governance_runner import ExpressionGovernanceRunner
+from astrmai.memory.persona.persona_summarizer import PersonaSummarizer
 
 
 class BackgroundTaskOwnerRegistryTests(unittest.IsolatedAsyncioTestCase):
@@ -159,6 +163,75 @@ class BackgroundTaskOwnerRegistryTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         records = registry.describe()["tasks"]
         self.assertTrue(any(item["task_family"] == "external_result.dispatch" for item in records))
+        self.assertEqual(registry.describe(include_terminal=False)["active"], 0)
+
+    async def test_event_bus_workers_and_callbacks_are_registered(self):
+        bus = EventBus()
+        await bus.stop(timeout_sec=0.1)
+        registry = BackgroundTaskOwnerRegistry(generation=4)
+        bus.bind_owner_registry(registry)
+        seen = asyncio.Event()
+
+        async def callback(_payload):
+            seen.set()
+
+        bus.subscribe(bus.TOPIC_KNOWLEDGE_UPDATED, callback)
+        bus.trigger_knowledge_update()
+        await asyncio.wait_for(seen.wait(), timeout=1.0)
+        await asyncio.sleep(0)
+        families = {item["task_family"] for item in registry.describe()["tasks"]}
+        self.assertIn("eventbus.knowledge_update", families)
+        self.assertIn("eventbus.worker", families)
+        await bus.stop(timeout_sec=0.2)
+        await asyncio.sleep(0)
+        self.assertEqual(registry.describe(include_terminal=False)["active"], 0)
+
+    async def test_visual_cortex_worker_and_analysis_are_registered(self):
+        registry = BackgroundTaskOwnerRegistry(generation=2)
+        cortex = VisualCortex(SimpleNamespace(), None, owner_registry=registry)
+        cortex.start()
+        await asyncio.sleep(0)
+        self.assertTrue(any(item["task_family"] == "vision.worker" for item in registry.describe()["tasks"]))
+        worker = cortex._worker_task
+        cortex.stop()
+        if worker is not None:
+            await worker
+        await asyncio.sleep(0)
+        self.assertEqual(registry.describe(include_terminal=False)["active"], 0)
+
+    async def test_governance_scheduler_is_registered_and_stopped(self):
+        registry = BackgroundTaskOwnerRegistry(generation=1)
+        runner = ExpressionGovernanceRunner(
+            state_engine=SimpleNamespace(),
+            interval_seconds=15,
+            owner_registry=registry,
+        )
+        await runner.start()
+        await asyncio.sleep(0)
+        record = next(item for item in registry.describe()["tasks"] if item["task_family"] == "governance.scheduler")
+        self.assertEqual(record["scope_id"], "GLOBAL")
+        self.assertTrue(record["run_id"])
+        await runner.stop()
+        await asyncio.sleep(0)
+        self.assertEqual(registry.describe(include_terminal=False)["active"], 0)
+
+    async def test_persona_background_tasks_are_registered(self):
+        registry = BackgroundTaskOwnerRegistry(generation=5)
+        persistence = SimpleNamespace(load_persona_cache=lambda: {})
+        gateway = SimpleNamespace(config=SimpleNamespace())
+        summarizer = PersonaSummarizer(persistence, gateway, owner_registry=registry)
+
+        async def fake_enrichment(*_args, **_kwargs):
+            await asyncio.sleep(10)
+
+        summarizer._run_enrichment_until_complete = fake_enrichment
+        task = summarizer._start_shard_task("prompt", "session")
+        self.assertIsNotNone(task)
+        await asyncio.sleep(0)
+        record = next(item for item in registry.describe()["tasks"] if item["task_family"] == "persona.shards")
+        self.assertEqual(record["scope_id"], "session")
+        await summarizer.stop()
+        await asyncio.sleep(0)
         self.assertEqual(registry.describe(include_terminal=False)["active"], 0)
 
 

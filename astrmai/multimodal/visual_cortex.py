@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -36,7 +37,7 @@ class VisionAnalysisCoolingDown(RuntimeError):
 class VisualCortex:
     """Refactoring-side multimodal worker owning image queue and vision analysis."""
 
-    def __init__(self, gateway, db_service, *, config=None, asset_dir: str | Path | None = None):
+    def __init__(self, gateway, db_service, *, config=None, asset_dir: str | Path | None = None, owner_registry=None):
         self.gateway = gateway
         self.db_service = db_service
         self.config = config
@@ -47,6 +48,21 @@ class VisualCortex:
         self._inflight: dict[str, asyncio.Task] = {}
         self._failure_cooldowns: dict[str, tuple[float, str]] = {}
         self._last_cleanup_at = 0.0
+        self.owner_registry = owner_registry
+
+    def _track_task(self, awaitable, *, name: str, task_family: str, scope_id: str) -> asyncio.Task:
+        task = safe_create_task(awaitable, name=name)
+        registry = self.owner_registry
+        if registry is not None:
+            registry.register(
+                task,
+                task_family=task_family,
+                scope_id=scope_id,
+                run_id=f"vision-{uuid.uuid4().hex}",
+                owner="VisualCortex",
+                generation=getattr(registry, "generation", None),
+            )
+        return task
 
     def _default_asset_dir(self) -> Path:
         persistence = getattr(self.db_service, "persistence", None)
@@ -170,7 +186,12 @@ class VisualCortex:
 
     def start(self):
         if self._worker_task is None or self._worker_task.done():
-            self._worker_task = safe_create_task(self._worker())
+            self._worker_task = self._track_task(
+                self._worker(),
+                name="visual-cortex:worker",
+                task_family="vision.worker",
+                scope_id="GLOBAL",
+            )
             logger.info("[AstrMai-VisualCortex] async multimodal worker started.")
 
     def stop(self):
@@ -821,13 +842,16 @@ class VisualCortex:
             async with self._inflight_lock:
                 task = self._inflight.get(identity.asset_id)
                 if task is None or task.done():
-                    task = asyncio.create_task(
+                    task = self._track_task(
                         self._run_vision_analysis(
                             identity,
                             image_path,
                             scope_id,
                             timeout_override,
-                        )
+                        ),
+                        name=f"visual-cortex:analysis:{identity.asset_id[:12]}",
+                        task_family="vision.analysis",
+                        scope_id=scope_id,
                     )
                     self._inflight[identity.asset_id] = task
                     task.add_done_callback(

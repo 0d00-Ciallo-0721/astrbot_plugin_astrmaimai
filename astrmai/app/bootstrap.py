@@ -213,6 +213,9 @@ class PluginBootstrap:
     ) -> tuple[EventBus, MemoryEngine, RuntimeObservabilityHub]:
         embedding_models = getattr(runtime.config.provider, "embedding_models", [])
         event_bus = EventBus()
+        bind_event_bus_registry = getattr(event_bus, "bind_owner_registry", None)
+        if callable(bind_event_bus_registry):
+            bind_event_bus_registry(getattr(runtime, "owner_registry", None))
         memory_engine = MemoryEngine(
             self.context,
             gateway,
@@ -338,6 +341,7 @@ class PluginBootstrap:
                     db_service,
                     config=runtime.config,
                     asset_dir=visual_asset_dir,
+                    owner_registry=getattr(runtime, "owner_registry", None),
                 )
             except Exception as exc:
                 self._record_optional_failure(runtime, "multimodal.visual_cortex", exc)
@@ -391,6 +395,7 @@ class PluginBootstrap:
             runtime.gateway,
             memory_engine=runtime.memory_engine,
             background_task_budget=getattr(runtime, "background_task_budget", None),
+            owner_registry=getattr(runtime, "owner_registry", None),
         )
         context_engine = ContextEngine(runtime.db_service, persona_summarizer)
         react_retriever = ReActRetriever(
@@ -623,6 +628,7 @@ class PluginBootstrap:
             interval_seconds=getattr(getattr(runtime.config, "evolution", None), "review_runner_interval_sec", 60),
             config=runtime.config,
             background_task_budget=getattr(runtime, "background_task_budget", None),
+            owner_registry=getattr(runtime, "owner_registry", None),
         )
         if runtime.system2_planner is not None:
             runtime.system2_planner.reflector = reflector

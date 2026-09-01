@@ -80,7 +80,9 @@ class AttentionDeferredOutboxStore:
                     worker_generation=excluded.worker_generation,
                     attempts=excluded.attempts, max_attempts=excluded.max_attempts,
                     next_retry_at=excluded.next_retry_at, expires_at=excluded.expires_at,
-                    status='queued', lease_token='', lease_until=0,
+                    status=attention_deferred_outbox.status,
+                    lease_token=attention_deferred_outbox.lease_token,
+                    lease_until=attention_deferred_outbox.lease_until,
                     updated_at=excluded.updated_at, last_error=''
                 """,
                 (
@@ -103,7 +105,13 @@ class AttentionDeferredOutboxStore:
             await db.commit()
         return True
 
-    async def claim_due(self, *, limit: int = 32, lease_seconds: float = 60.0) -> list[dict[str, Any]]:
+    async def claim_due(
+        self,
+        *,
+        limit: int = 32,
+        lease_seconds: float = 60.0,
+        include_future: bool = False,
+    ) -> list[dict[str, Any]]:
         if not self.db_path:
             return []
         await self._ensure_schema()
@@ -116,13 +124,18 @@ class AttentionDeferredOutboxStore:
                 "WHERE status='inflight' AND lease_until > 0 AND lease_until <= ?",
                 (now, now),
             )
-            cursor = await db.execute(
+            query = (
                 "SELECT work_id, chat_id, task_name, reason, event_json, turn_thread_id, "
                 "turn_generation, worker_generation, attempts, max_attempts, next_retry_at, expires_at "
-                "FROM attention_deferred_outbox WHERE status='queued' AND next_retry_at <= ? "
-                "ORDER BY next_retry_at ASC, created_at ASC LIMIT ?",
-                (now, max(1, min(int(limit), 128))),
+                "FROM attention_deferred_outbox WHERE status='queued'"
             )
+            params: list[Any] = []
+            if not include_future:
+                query += " AND next_retry_at <= ?"
+                params.append(now)
+            query += " ORDER BY next_retry_at ASC, created_at ASC LIMIT ?"
+            params.append(max(1, min(int(limit), 128)))
+            cursor = await db.execute(query, params)
             rows = await cursor.fetchall()
             await cursor.close()
             if rows:
