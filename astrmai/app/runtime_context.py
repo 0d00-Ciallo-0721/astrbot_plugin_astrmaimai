@@ -9,6 +9,11 @@ from typing import Any, Awaitable, Callable
 from ..shared.constants.defaults import InfrastructureSettings, build_infrastructure_settings
 from ..infrastructure.runtime.background_task_budget import BackgroundTaskBudget
 from ..infrastructure.runtime.background_task_owner_registry import BackgroundTaskOwnerRegistry
+from ..infrastructure.runtime.lifecycle_state import (
+    RuntimeLifecycleState,
+    can_transition,
+    normalize_lifecycle_state,
+)
 from ..infrastructure.runtime.runtime_status_schema import build_runtime_status_schema
 
 System2Callback = Callable[[Any, list[Any] | None], Awaitable[Any]]
@@ -119,11 +124,67 @@ class RuntimeStatus:
     shutdown_late_cleanup_deadline: float = 0.0
     shutdown_late_cleanup_task_count: int = 0
     degraded_components: dict[str, str] = field(default_factory=dict)
+    lifecycle_state: str = RuntimeLifecycleState.CREATED.value
+    lifecycle_state_revision: int = 0
+    lifecycle_transition_errors: list[dict[str, Any]] = field(default_factory=list)
+    lifecycle_transition_history: list[dict[str, Any]] = field(default_factory=list)
     # ponytail: threading.Lock is safe here (sync-only during bootstrap, not held across await)
     _degraded_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def set_phase(self, phase: str) -> None:
         self.boot_phase = phase
+
+    def transition_lifecycle_state(
+        self,
+        target: str | RuntimeLifecycleState,
+        *,
+        reason: str = "",
+        expected_generation: int | None = None,
+    ) -> bool:
+        target_value = normalize_lifecycle_state(target)
+        current_value = normalize_lifecycle_state(self.lifecycle_state)
+        error: str | None = None
+        if target_value is None or current_value is None:
+            error = "invalid_state"
+        elif expected_generation is not None:
+            try:
+                generation_mismatch = int(expected_generation) != int(self.runtime_generation)
+            except (TypeError, ValueError):
+                error = "invalid_generation"
+            else:
+                if generation_mismatch:
+                    error = "generation_mismatch"
+        if error is None and not can_transition(current_value, target_value):
+            error = "invalid_transition"
+        if error is None:
+            if current_value == target_value:
+                return True
+            self.lifecycle_state = target_value
+            self.lifecycle_state_revision += 1
+            self.lifecycle_transition_history.append(
+                {
+                    "from": current_value,
+                    "to": target_value,
+                    "reason": str(reason or "")[:200],
+                    "revision": self.lifecycle_state_revision,
+                    "generation": int(self.runtime_generation),
+                    "at": time.time(),
+                }
+            )
+            self.lifecycle_transition_history = self.lifecycle_transition_history[-64:]
+            return True
+        self.lifecycle_transition_errors.append(
+            {
+                "from": current_value or str(self.lifecycle_state),
+                "to": target_value or str(target),
+                "reason": str(reason or "")[:200],
+                "error": error,
+                "generation": int(self.runtime_generation),
+                "at": time.time(),
+            }
+        )
+        self.lifecycle_transition_errors = self.lifecycle_transition_errors[-64:]
+        return False
 
     def mark_degraded(self, component: str, reason: str) -> None:
         with self._degraded_lock:
@@ -174,6 +235,10 @@ class RuntimeStatus:
             "shutdown_late_cleanup_deadline": self.shutdown_late_cleanup_deadline,
             "shutdown_late_cleanup_task_count": self.shutdown_late_cleanup_task_count,
             "degraded_components": self._snapshot_degraded(),
+            "lifecycle_state": self.lifecycle_state,
+            "lifecycle_state_revision": self.lifecycle_state_revision,
+            "lifecycle_transition_errors": list(self.lifecycle_transition_errors),
+            "lifecycle_transition_history": list(self.lifecycle_transition_history),
         }
 
     def _snapshot_degraded(self) -> dict[str, str]:
@@ -255,6 +320,19 @@ class PluginRuntimeContext:
 
     def set_boot_phase(self, phase: str) -> None:
         self.status.set_phase(phase)
+
+    def transition_lifecycle_state(
+        self,
+        target: str | RuntimeLifecycleState,
+        *,
+        reason: str = "",
+        expected_generation: int | None = None,
+    ) -> bool:
+        return self.status.transition_lifecycle_state(
+            target,
+            reason=reason,
+            expected_generation=expected_generation,
+        )
 
     def mark_degraded(self, component: str, reason: str) -> None:
         self.status.mark_degraded(component, reason)

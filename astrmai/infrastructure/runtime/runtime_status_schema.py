@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 from typing import Any, Mapping
 from urllib.parse import urlsplit, urlunsplit
 
+from .lifecycle_state import normalize_lifecycle_state
+
 RUNTIME_STATUS_SCHEMA_VERSION = 1
 
 
@@ -406,8 +408,12 @@ def build_runtime_status_schema(
     telemetry_waits = aggregate_stage_waits(traces)
     has_trace_source = traces is not None
 
-    lifecycle = "unknown"
-    if runtime.get("shutdown_final_status") == "degraded":
+    lifecycle = normalize_lifecycle_state(runtime.get("lifecycle_state", "")) or "unknown"
+    if runtime.get("lifecycle_state") and lifecycle == "unknown":
+        validation_errors.append("runtime_status.lifecycle_state:invalid_state")
+    elif lifecycle != "unknown":
+        pass
+    elif runtime.get("shutdown_final_status") == "degraded":
         lifecycle = "degraded"
     elif runtime.get("is_running") and runtime.get("accepting_events"):
         lifecycle = "ready"

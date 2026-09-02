@@ -35,6 +35,78 @@ class PluginLifecycleManager:
         self._persistence_dispose_task: asyncio.Task[Any] | None = None
         self.runtime.lifecycle.manager = self
 
+    def _transition_lifecycle_state(self, target: str, *, reason: str = "") -> bool:
+        """Mirror lifecycle boundaries into the validated runtime state model."""
+        transition = getattr(self.runtime, "transition_lifecycle_state", None)
+        if not callable(transition):
+            return True
+        status = getattr(self.runtime, "status", None)
+        generation = getattr(status, "runtime_generation", None)
+        try:
+            result = transition(
+                target,
+                reason=reason,
+                expected_generation=generation,
+            )
+        except TypeError:
+            result = transition(target)
+        except Exception as exc:
+            logger.warning(
+                "[AstrMai] lifecycle state transition degraded target=%s error=%s",
+                target,
+                exc,
+            )
+            return False
+        if result is False:
+            logger.warning(
+                "[AstrMai] lifecycle state transition rejected target=%s reason=%s",
+                target,
+                reason,
+            )
+            return False
+        return True
+
+    def _transition_shutdown_complete(
+        self,
+        *,
+        budget: Any = None,
+        pending_report: dict[str, Any] | None = None,
+        reason: str,
+    ) -> bool:
+        """Allow shutdown completion only after every tracked owner is quiescent."""
+        self._bootstrap_legacy_shutdown_state()
+        report = pending_report
+        if report is None:
+            report = self._shutdown_pending_report(budget, include_late_task=True)
+        try:
+            remaining = int(report.get("remaining", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            remaining = 1
+        if remaining > 0 or report.get("unknown_components"):
+            logger.warning(
+                "[AstrMai] shutdown completion rejected while work remains: %s",
+                report.get("remaining_by_kind", {}),
+            )
+            return False
+        return self._transition_lifecycle_state("shutdown_complete", reason=reason)
+
+    def _bootstrap_legacy_shutdown_state(self) -> None:
+        """Lift legacy flag-only fixtures into the validated shutdown path."""
+        status = getattr(self.runtime, "status", None)
+        if status is None or not callable(getattr(status, "transition_lifecycle_state", None)):
+            return
+        if (
+            getattr(status, "lifecycle_state", "") == "created"
+            and getattr(status, "is_running", False)
+            and getattr(status, "lifecycle_started", False)
+        ):
+            self._transition_lifecycle_state("initializing", reason="legacy_status_bootstrap")
+            self._transition_lifecycle_state("ready", reason="legacy_status_bootstrap")
+        current = getattr(status, "lifecycle_state", "")
+        if current in {"initializing", "ready", "degraded", "retry_wait"}:
+            self._transition_lifecycle_state("shutdown_requested", reason="legacy_shutdown_bootstrap")
+            self._transition_lifecycle_state("draining", reason="legacy_shutdown_bootstrap")
+
     def track_task(
         self,
         coro: Any,
@@ -95,6 +167,7 @@ class PluginLifecycleManager:
                 (time.monotonic() - started) * 1000.0, 1
             )
             self.runtime.mark_degraded("memory.engine", str(exc))
+            self._transition_lifecycle_state("degraded", reason="memory_initialize_failed")
             logger.warning(f"[AstrMai] Memory engine start degraded: {exc}")
 
     # G4/PL-10: 只有"显式重新初始化插件实例"才允许复位终止闩锁。
@@ -139,6 +212,12 @@ class PluginLifecycleManager:
         self.runtime.status.reload_wait_ms = 0.0
         self.runtime.status.reload_wait_timeout = False
         self.runtime.status.reload_wait_error = ""
+        if not self._transition_lifecycle_state(
+            "initializing",
+            reason=f"startup:{str(source or 'unknown')[:80]}",
+        ):
+            self.runtime.mark_degraded("lifecycle.state", "startup_initializing_transition_rejected")
+            return
         self.runtime.set_boot_phase("lifecycle.starting")
         attention_gate = getattr(self.runtime, "attention_gate", None)
         reset_attention = getattr(attention_gate, "reset_runtime_state", None)
@@ -148,7 +227,22 @@ class PluginLifecycleManager:
         resume_external_dispatcher = getattr(external_result_dispatcher, "resume", None)
         if callable(resume_external_dispatcher):
             resume_external_dispatcher()
-        self._startup_task = self.track_task(self._complete_startup())
+        self._startup_task = self.track_task(self._run_startup())
+
+    async def _run_startup(self) -> None:
+        """Convert unhandled startup failures into an explicit failed state."""
+        try:
+            await self._complete_startup()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.runtime.status.accepting_events = False
+            self.runtime.status.is_running = False
+            self.runtime.status.lifecycle_started = False
+            self.runtime.status.startup_blocked_reason = "startup_failed"
+            self.runtime.mark_degraded("lifecycle.startup", str(exc)[:500])
+            self._transition_lifecycle_state("failed", reason="startup_exception")
+            logger.exception("[AstrMai] startup failed: %s", exc)
 
     async def _prepare_reinitialize(self) -> bool:
         if getattr(self, "_shutdown_dependency_close_errors", None):
@@ -270,6 +364,10 @@ class PluginLifecycleManager:
             mark_degraded = getattr(self.runtime, "mark_degraded", None)
             if callable(mark_degraded):
                 mark_degraded("lifecycle.reinitialize", f"{stage}: {detail}"[:500])
+            self._transition_lifecycle_state(
+                "degraded",
+                reason=f"reinitialize_rollback:{stage}",
+            )
             logger.warning(
                 f"[AstrMai] runtime reinitialize rolled back stage={stage} "
                 f"error={detail} rollback_errors={rollback_errors}"
@@ -437,6 +535,7 @@ class PluginLifecycleManager:
             status.reload_wait_error = registration_error
             self.runtime.set_boot_phase("lifecycle.reload_deferred")
             self.runtime.mark_degraded("runtime.reload_fence", registration_error)
+            self._transition_lifecycle_state("degraded", reason="reload_registration_failed")
             logger.warning("[AstrMai] startup deferred: runtime registration failed: %s", registration_error)
             return False
         if facade is not None and registration is None:
@@ -448,6 +547,7 @@ class PluginLifecycleManager:
             status.reload_wait_error = reason
             self.runtime.set_boot_phase("lifecycle.reload_deferred")
             self.runtime.mark_degraded("runtime.reload_fence", reason)
+            self._transition_lifecycle_state("degraded", reason="reload_registration_missing")
             logger.warning("[AstrMai] startup deferred: %s", reason)
             return False
         if registration is not None:
@@ -462,6 +562,7 @@ class PluginLifecycleManager:
                 status.reload_wait_error = reason
                 self.runtime.set_boot_phase("lifecycle.reload_deferred")
                 self.runtime.mark_degraded("runtime.reload_fence", reason)
+                self._transition_lifecycle_state("degraded", reason="reload_generation_invalid")
                 return False
         if handle is not None:
             timeout = self._shutdown_timing("hot_reload_startup_wait_sec", 10.0)
@@ -487,6 +588,7 @@ class PluginLifecycleManager:
                 status.startup_retry_at = time.time() + max(1.0, timeout)
                 self.runtime.set_boot_phase("lifecycle.reload_deferred")
                 self.runtime.mark_degraded("runtime.reload_fence", reason)
+                self._transition_lifecycle_state("retry_wait", reason="reload_previous_termination_pending")
                 logger.warning("[AstrMai] startup deferred until previous facade terminates: %s", reason)
                 return False
             status.reload_wait_timeout = False
@@ -497,6 +599,7 @@ class PluginLifecycleManager:
                 self.runtime.status.startup_blocked_reason = "runtime_generation_not_current"
                 self.runtime.set_boot_phase("lifecycle.reload_deferred")
                 self.runtime.mark_degraded("runtime.reload_fence", "facade generation was superseded")
+                self._transition_lifecycle_state("degraded", reason="reload_generation_superseded")
                 return False
             store = getattr(self.runtime, "dialogue_store", None)
             if store is not None:
@@ -507,6 +610,7 @@ class PluginLifecycleManager:
                     )
                 except Exception as exc:
                     self.runtime.mark_degraded("runtime.reload_fence", f"dialogue store lease bind failed: {exc}")
+                    self._transition_lifecycle_state("degraded", reason="reload_resource_guard_bind_failed")
                     return False
         return True
 
@@ -553,6 +657,11 @@ class PluginLifecycleManager:
         logger.info("[AstrMai] boot phase: workmode guard started")
 
         self.runtime.status.lifecycle_started = True
+        if not self._transition_lifecycle_state("ready", reason="startup_complete"):
+            self.runtime.status.lifecycle_started = False
+            self.runtime.status.accepting_events = False
+            self.runtime.mark_degraded("lifecycle.state", "startup_ready_transition_rejected")
+            return
         self.runtime.status.accepting_events = True
         attention_gate = getattr(self.runtime, "attention_gate", None)
         mark_attention_started = getattr(attention_gate, "mark_runtime_started", None)
@@ -578,6 +687,7 @@ class PluginLifecycleManager:
         startup_started = time.monotonic()
         delay = initial_delay
         while not self._shutdown_requested:
+            self._transition_lifecycle_state("initializing", reason="persona_retry")
             if startup_timeout > 0 and time.monotonic() - startup_started >= startup_timeout:
                 self.runtime.status.persona_state = "core_failed"
                 self.runtime.status.persona_persisted = False
@@ -585,6 +695,7 @@ class PluginLifecycleManager:
                 self.runtime.status.startup_retry_at = 0.0
                 self.runtime.set_boot_phase("lifecycle.persona_timeout")
                 self.runtime.mark_degraded("persona.core", "startup_timeout")
+                self._transition_lifecycle_state("retry_wait", reason="persona_startup_timeout")
                 return False
             self.runtime.status.persona_state = "core_initializing"
             self.runtime.status.persona_last_error = ""
@@ -627,6 +738,7 @@ class PluginLifecycleManager:
                 self.runtime.status.startup_retry_at = 0.0
                 self.runtime.set_boot_phase("lifecycle.persona_timeout")
                 self.runtime.mark_degraded("persona.core", "startup_timeout")
+                self._transition_lifecycle_state("retry_wait", reason="persona_startup_timeout")
                 return False
             except Exception as exc:
                 self.runtime.status.persona_state = "core_failed"
@@ -636,6 +748,7 @@ class PluginLifecycleManager:
                 self.runtime.status.startup_retry_at = time.time() + delay
                 self.runtime.set_boot_phase("lifecycle.persona_timeout")
                 self.runtime.mark_degraded("persona.core", str(exc))
+                self._transition_lifecycle_state("retry_wait", reason="persona_core_retry")
                 logger.warning(
                     f"[AstrMai] persona core initialization failed; retrying in {delay:.1f}s: {exc}"
                 )
@@ -1001,6 +1114,10 @@ class PluginLifecycleManager:
         self.runtime.status.shutdown_generation = int(
             getattr(self.runtime.status, "shutdown_generation", 0) or 0
         ) + 1
+        self._transition_lifecycle_state(
+            "shutdown_requested",
+            reason="shutdown_requested",
+        )
         self.runtime.set_boot_phase("shutdown.start")
         event_bus = getattr(self.runtime, "event_bus", None)
         trigger_abort = getattr(event_bus, "trigger_abort", None)
@@ -1029,6 +1146,7 @@ class PluginLifecycleManager:
             self.runtime.status.shutdown_pending_drain = True
             self.runtime.status.shutdown_forced_termination_risk = True
             self.runtime.set_boot_phase("shutdown.degraded")
+            self._transition_lifecycle_state("degraded", reason="late_cleanup_cancelled")
             self.runtime.mark_degraded("shutdown.cleanup_cancelled", "late_cleanup_cancelled")
         try:
             task.exception()
@@ -1100,6 +1218,7 @@ class PluginLifecycleManager:
                             self.runtime.status.shutdown_final_status = "degraded"
                             self.runtime.status.shutdown_forced_termination_risk = True
                             self.runtime.set_boot_phase("shutdown.degraded")
+                            self._transition_lifecycle_state("degraded", reason="reread_late_cleanup_failed")
                             self.runtime.mark_degraded("shutdown.reread_late_cleanup", str(exc))
                             logger.warning(f"[AstrMai] late reread cleanup degraded: {exc}")
                             return
@@ -1834,6 +1953,10 @@ class PluginLifecycleManager:
             started = time.monotonic()
             self._shutdown_started_monotonic = started
             self.begin_shutdown()
+            self._transition_lifecycle_state(
+                "draining",
+                reason="shutdown_drain_started",
+            )
             self.runtime.status.shutdown_started_at = time.time()
             self.runtime.status.shutdown_stage_stats = {}
             self.runtime.status.shutdown_isolated_tasks = 0
@@ -1899,6 +2022,7 @@ class PluginLifecycleManager:
                 dependency_errors = list(getattr(self, "_shutdown_dependency_close_errors", []) or [])
                 if dependency_errors:
                     self.runtime.set_boot_phase("shutdown.degraded")
+                    self._transition_lifecycle_state("degraded", reason="shutdown_dependency_close_failed")
                     self.runtime.status.shutdown_pending_drain = False
                     self.runtime.status.shutdown_final_status = "degraded"
                     self.runtime.status.shutdown_forced_termination_risk = True
@@ -1944,10 +2068,20 @@ class PluginLifecycleManager:
                         default="",
                     )
                     self.runtime.set_boot_phase("shutdown.complete")
-                    self.runtime.status.shutdown_final_status = "complete"
-                    self.runtime.status.shutdown_pending_drain = False
-                    self.runtime.status.shutdown_forced_termination_risk = False
-                    self._termination_complete = True
+                    if self._transition_shutdown_complete(
+                        budget=final_budget,
+                        pending_report=final_pending,
+                        reason="shutdown_complete",
+                    ):
+                        self.runtime.status.shutdown_final_status = "complete"
+                        self.runtime.status.shutdown_pending_drain = False
+                        self.runtime.status.shutdown_forced_termination_risk = False
+                        self._termination_complete = True
+                    else:
+                        self.runtime.status.shutdown_final_status = "degraded"
+                        self.runtime.status.shutdown_pending_drain = True
+                        self.runtime.status.shutdown_forced_termination_risk = True
+                        self._termination_complete = False
                     logger.info(
                         f"[AstrMai] shutdown complete elapsed_ms={elapsed_ms:.1f} "
                         f"isolated={self.runtime.status.shutdown_isolated_tasks} "
@@ -1955,6 +2089,7 @@ class PluginLifecycleManager:
                     )
 
     async def _terminate_impl(self) -> None:
+        self._bootstrap_legacy_shutdown_state()
         self._shutdown_dependency_close_errors = []
         budget = getattr(self.runtime, "background_task_budget", None)
         initial_fence_errors = self._apply_shutdown_fences()
@@ -2275,9 +2410,11 @@ class PluginLifecycleManager:
             self.runtime.status.shutdown_pending_drain = False
             self.runtime.status.shutdown_forced_termination_risk = True
             self.runtime.set_boot_phase("shutdown.degraded")
+            self._transition_lifecycle_state("degraded", reason="shutdown_dependency_close_failed")
             self._termination_complete = False
 
     def _schedule_late_shutdown_cleanup(self, budget: Any) -> None:
+        self._bootstrap_legacy_shutdown_state()
         existing = getattr(self, "_late_shutdown_cleanup_task", None)
         if existing is not None and not existing.done():
             return
@@ -2408,6 +2545,10 @@ class PluginLifecycleManager:
                     "status": "pending_drain" if retryable_pending else "degraded",
                     "errors": list(close_errors),
                 }
+                self._transition_lifecycle_state(
+                    "degraded" if not retryable_pending else "draining",
+                    reason="late_dependency_close_failed",
+                )
                 self.runtime.set_boot_phase(
                     "shutdown.pending_drain" if retryable_pending else "shutdown.degraded"
                 )
@@ -2430,7 +2571,18 @@ class PluginLifecycleManager:
                 self.runtime.status.shutdown_completed_at = time.time()
                 self.runtime.status.last_shutdown_elapsed_ms = round(elapsed_ms, 3)
                 self.runtime.set_boot_phase("shutdown.complete")
-                self._termination_complete = True
+                if self._transition_shutdown_complete(
+                    budget=budget,
+                    reason="late_cleanup_complete",
+                ):
+                    self._termination_complete = True
+                else:
+                    self._shutdown_pending_drain = True
+                    self.runtime.status.shutdown_pending_drain = True
+                    self.runtime.status.shutdown_final_status = "degraded"
+                    self.runtime.status.shutdown_forced_termination_risk = True
+                    self._termination_complete = False
+                    return False
                 logger.info(f"[AstrMai] deferred shutdown cleanup complete elapsed_ms={elapsed_ms:.1f}")
                 return True
 
@@ -2505,6 +2657,7 @@ class PluginLifecycleManager:
                         "error": f"{type(exc).__name__}: {exc}"[:500],
                     }
                     self.runtime.set_boot_phase("shutdown.degraded")
+                    self._transition_lifecycle_state("degraded", reason="late_cleanup_watcher_failed")
                     self.runtime.mark_degraded("shutdown.late_cleanup_watcher", str(exc))
                     logger.warning(f"[AstrMai] late shutdown watcher degraded; retrying: {exc}")
                     await asyncio.sleep(0.1)
@@ -2539,6 +2692,7 @@ class PluginLifecycleManager:
                 self.runtime.status.shutdown_pending_drain = True
                 self.runtime.status.shutdown_forced_termination_risk = True
                 self.runtime.set_boot_phase("shutdown.degraded")
+                self._transition_lifecycle_state("degraded", reason="late_cleanup_deadline_reached")
                 self.runtime.mark_degraded(
                     "shutdown.late_cleanup",
                     f"physical_background_work_remaining={pending.get('remaining', 0)}",
@@ -2569,6 +2723,7 @@ class PluginLifecycleManager:
                 self.runtime.status.shutdown_pending_drain = True
                 self.runtime.status.shutdown_forced_termination_risk = True
                 self.runtime.set_boot_phase("shutdown.degraded")
+                self._transition_lifecycle_state("degraded", reason="late_dependency_retry_exhausted")
                 watcher = asyncio.create_task(
                     _watch_late_shutdown_cleanup(),
                     name="astrmai:shutdown:late-cleanup-watcher",
@@ -2587,6 +2742,7 @@ class PluginLifecycleManager:
             self.runtime.status.shutdown_pending_drain = True
             self.runtime.status.shutdown_forced_termination_risk = True
             self.runtime.set_boot_phase("shutdown.degraded")
+            self._transition_lifecycle_state("degraded", reason="late_cleanup_schedule_failed")
             self.runtime.mark_degraded("shutdown.cleanup_cancelled", "late_cleanup_schedule_failed")
             logger.warning(f"[AstrMai] late shutdown cleanup scheduling degraded: {exc}")
             return
