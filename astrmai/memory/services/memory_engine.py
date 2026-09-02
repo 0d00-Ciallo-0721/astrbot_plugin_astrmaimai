@@ -195,6 +195,7 @@ class MemoryEngine:
         self._vector_resource_descriptor_persistence_status = "unknown"
         self._vector_resource_descriptor_persistence_failures = 0
         self._vector_resource_descriptor_last_error = ""
+        self._consistency_repair_diagnostics: dict[str, Any] = {}
         self._vector_orphan_indexes: dict[str, dict[str, Any]] = {}
         self._vector_startup_scan_status = "unknown"
         self._vector_startup_scan_error = ""
@@ -3956,6 +3957,7 @@ class MemoryEngine:
             **self._vector_resource_diagnostics(),
             **self._overflow_retirement_diagnostics(),
             **self._index_delete_repair_diagnostics(),
+            **dict(self._consistency_repair_diagnostics or {}),
         }
 
     def describe_vector_status(self) -> dict[str, Any]:
@@ -4070,6 +4072,7 @@ class MemoryEngine:
                 "projection_replay_error": self._projection_replay_error,
                 "projection_replay_completed_at": self._projection_replay_completed_at or None,
                 **self._vector_resource_diagnostics(),
+                "consistency_repair_diagnostics": dict(self._consistency_repair_diagnostics or {}),
             }
         )
         runtime.update(self._index_delete_repair_diagnostics())

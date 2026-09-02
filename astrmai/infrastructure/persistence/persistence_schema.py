@@ -405,6 +405,28 @@ _MIGRATIONS: list[tuple[int, str]] = [
         revision INTEGER NOT NULL DEFAULT 0
     )"""),
     (126, "CREATE INDEX IF NOT EXISTS ix_vector_resource_descriptors_role ON vector_resource_descriptors(role, generation)"),
+    (127, """CREATE TABLE IF NOT EXISTS memory_consistency_repairs (
+        repair_id TEXT PRIMARY KEY,
+        mismatch_kind TEXT NOT NULL DEFAULT 'unknown_resource',
+        memory_id TEXT NOT NULL DEFAULT '',
+        document_id TEXT NOT NULL DEFAULT '',
+        faiss_id TEXT NOT NULL DEFAULT '',
+        generation INTEGER,
+        expected_revision INTEGER,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        max_attempts INTEGER NOT NULL DEFAULT 3,
+        next_retry_at REAL NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'pending',
+        last_error TEXT NOT NULL DEFAULT '',
+        lease_owner TEXT NOT NULL DEFAULT '',
+        lease_token TEXT NOT NULL DEFAULT '',
+        lease_until REAL NOT NULL DEFAULT 0,
+        lease_revision INTEGER NOT NULL DEFAULT 0,
+        created_at REAL NOT NULL DEFAULT 0,
+        updated_at REAL NOT NULL DEFAULT 0,
+        revision INTEGER NOT NULL DEFAULT 0
+    )"""),
+    (128, "CREATE INDEX IF NOT EXISTS ix_memory_consistency_repairs_due ON memory_consistency_repairs(status, next_retry_at, lease_until)"),
 ]
 
 

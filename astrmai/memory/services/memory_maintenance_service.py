@@ -190,7 +190,8 @@ class MemoryMaintenanceService:
             report["errors"].append(f"expression_pattern_cleanup:{exc}")
         if self.index_projector:
             try:
-                consistency = await self.index_projector.check_consistency()
+                audit = getattr(self.index_projector, "audit_consistency", None)
+                consistency = await audit() if callable(audit) else await self.index_projector.check_consistency()
                 consistency_error = str(consistency.get("error") or "").strip()
                 missing = list(consistency.get("missing_projection_ids", []) or [])
                 orphan = list(consistency.get("orphan_projection_ids", []) or [])
@@ -226,6 +227,12 @@ class MemoryMaintenanceService:
                         "duplicate_before": len(duplicate),
                         "remaining_pending": int(consistency.get("pending_projection_count", 0) or 0),
                     }
+                process_repairs = getattr(self.index_projector, "process_consistency_repairs", None)
+                if callable(process_repairs):
+                    report["consistency_repairs"] = await process_repairs(
+                        limit=max(1, min(int(policy.get("consistency_repair_limit", 8)), 64)),
+                        lease_owner=f"maintenance:{id(self)}",
+                    )
             except Exception as exc:
                 report["errors"].append(f"index_projection_repair:{type(exc).__name__}")
         # Keep vector index-delete metadata healthy during normal maintenance,
@@ -243,6 +250,15 @@ class MemoryMaintenanceService:
                     report["index_delete_repair_cleanup"] = int(await cleanup_repairs() or 0)
             except Exception as exc:
                 report["errors"].append(f"index_delete_repair_maintenance:{type(exc).__name__}")
+        try:
+            queue_diagnostics = getattr(self.store, "consistency_repair_diagnostics", None)
+            if callable(queue_diagnostics):
+                queue_report = await queue_diagnostics()
+                report.update(queue_report)
+                if projector_engine is not None:
+                    projector_engine._consistency_repair_diagnostics = dict(queue_report)
+        except Exception as exc:
+            report["errors"].append(f"consistency_repair_diagnostics:{type(exc).__name__}")
         return report
 
     async def soft_delete(self, memory_id: str, *, reason: str = "") -> int:

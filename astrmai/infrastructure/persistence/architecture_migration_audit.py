@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 
-LATEST_ARCHITECTURE_SCHEMA_VERSION = 126
+LATEST_ARCHITECTURE_SCHEMA_VERSION = 128
 
 MESSAGELOG_REQUIRED_COLUMNS = (
     "event_id",

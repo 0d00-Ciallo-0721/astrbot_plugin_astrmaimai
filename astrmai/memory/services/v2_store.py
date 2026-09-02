@@ -59,6 +59,9 @@ class MemoryV2Store:
         self.index_projector = None
         self._session_locks: dict[str, asyncio.Lock] = {}
         self._session_locks_guard = asyncio.Lock()
+        self._consistency_lease_conflict_total = 0
+        self._consistency_lease_stale_total = 0
+        self._consistency_persistence_failures = 0
 
     @staticmethod
     def _resolve_search_limit(top_k: int, candidate_limit: int | None) -> int:
@@ -363,6 +366,33 @@ class MemoryV2Store:
                 "CREATE INDEX IF NOT EXISTS ix_vector_resource_descriptors_role "
                 "ON vector_resource_descriptors(role, generation)"
             )
+            await db.execute(
+                """CREATE TABLE IF NOT EXISTS memory_consistency_repairs (
+                    repair_id TEXT PRIMARY KEY,
+                    mismatch_kind TEXT NOT NULL DEFAULT 'unknown_resource',
+                    memory_id TEXT NOT NULL DEFAULT '',
+                    document_id TEXT NOT NULL DEFAULT '',
+                    faiss_id TEXT NOT NULL DEFAULT '',
+                    generation INTEGER,
+                    expected_revision INTEGER,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    max_attempts INTEGER NOT NULL DEFAULT 3,
+                    next_retry_at REAL NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    last_error TEXT NOT NULL DEFAULT '',
+                    lease_owner TEXT NOT NULL DEFAULT '',
+                    lease_token TEXT NOT NULL DEFAULT '',
+                    lease_until REAL NOT NULL DEFAULT 0,
+                    lease_revision INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL DEFAULT 0,
+                    updated_at REAL NOT NULL DEFAULT 0,
+                    revision INTEGER NOT NULL DEFAULT 0
+                )"""
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS ix_memory_consistency_repairs_due "
+                "ON memory_consistency_repairs(status, next_retry_at, lease_until)"
+            )
             outbox_columns_cursor = await db.execute("PRAGMA table_info(memory_projection_outbox)")
             outbox_columns = {str(row[1]) for row in await outbox_columns_cursor.fetchall()}
             if "revision" not in outbox_columns:
@@ -399,6 +429,95 @@ class MemoryV2Store:
             await self._ensure_fts_projection(db)
             await db.commit()
         self._initialized = True
+
+    async def enqueue_consistency_repair(self, mismatch_kind: str, *, memory_id: str = "", document_id: str = "", faiss_id: str = "", generation: int | None = None, expected_revision: int | None = None, max_attempts: int = 3) -> str:
+        """Persist one idempotent consistency repair descriptor."""
+        await self.initialize()
+        repair_id = ":".join(
+            (
+                str(mismatch_kind or "unknown_resource"),
+                str(memory_id or document_id or faiss_id or "global"),
+                f"g{generation if generation is not None else 'unknown'}",
+                f"r{expected_revision if expected_revision is not None else 'unknown'}",
+            )
+        )
+        now = self._now()
+        try:
+            async with connect_aiosqlite(self.db_path) as db:
+                await db.execute("""INSERT INTO memory_consistency_repairs(repair_id,mismatch_kind,memory_id,document_id,faiss_id,generation,expected_revision,max_attempts,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(repair_id) DO NOTHING""", (repair_id, str(mismatch_kind or "unknown_resource"), str(memory_id or ""), str(document_id or ""), str(faiss_id or ""), generation, expected_revision, max(1, int(max_attempts or 3)), now, now))
+                await db.commit()
+        except Exception:
+            self._consistency_persistence_failures += 1
+            raise
+        return repair_id
+
+    async def claim_consistency_repair(self, repair_id: str, *, lease_owner: str, lease_sec: float = 30.0) -> dict[str, Any] | None:
+        await self.initialize()
+        token = uuid.uuid4().hex
+        now = self._now(); lease_until = now + max(0.1, float(lease_sec or 30.0))
+        async with connect_aiosqlite(self.db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute("SELECT revision,status,lease_until,attempts,max_attempts,next_retry_at FROM memory_consistency_repairs WHERE repair_id = ?", (str(repair_id),))
+            row = await cursor.fetchone()
+            status = str(row[1] or "pending") if row else "missing"
+            if (
+                not row
+                or status in {"completed", "repair_exhausted", "blocked"}
+                or (float(row[2] or 0) > now and status in {"leased", "repairing"})
+                or (float(row[5] or 0) > now and status == "retry_wait")
+                or (int(row[3] or 0) >= int(row[4] or 0) and status == "retry_wait")
+            ):
+                self._consistency_lease_conflict_total += 1
+                await db.commit(); return None
+            revision = int(row[0] or 0) + 1
+            updated = await db.execute("UPDATE memory_consistency_repairs SET status='leased',lease_owner=?,lease_token=?,lease_until=?,lease_revision=?,revision=?,attempts=attempts+1,updated_at=? WHERE repair_id=? AND revision=?", (str(lease_owner), token, lease_until, revision, revision, now, str(repair_id), int(row[0] or 0)))
+            await db.commit()
+            if getattr(updated, "rowcount", 0) != 1:
+                self._consistency_lease_stale_total += 1
+                return None
+        return {"repair_id": str(repair_id), "lease_owner": str(lease_owner), "lease_token": token, "lease_until": lease_until, "revision": revision}
+
+    async def finish_consistency_repair(self, repair_id: str, *, lease_token: str, status: str = "completed", error: str = "", retry_delay_sec: float | None = None) -> bool:
+        await self.initialize()
+        if status not in {"completed", "retry_wait", "repair_exhausted", "blocked"}: return False
+        try:
+            async with connect_aiosqlite(self.db_path) as db:
+                now = self._now()
+                delay = max(0.0, float(retry_delay_sec or 0.0))
+                cursor = await db.execute("UPDATE memory_consistency_repairs SET status=?,last_error=?,next_retry_at=CASE WHEN ?='retry_wait' THEN ? ELSE next_retry_at END,lease_owner='',lease_token='',lease_until=0,revision=revision+1,updated_at=? WHERE repair_id=? AND lease_token=? AND status IN ('leased','repairing')", (status, str(error or "")[:500], status, now + delay, now, str(repair_id), str(lease_token)))
+                await db.commit()
+                ok = bool(getattr(cursor, "rowcount", 0) == 1)
+                if not ok:
+                    self._consistency_lease_stale_total += 1
+                return ok
+        except Exception:
+            self._consistency_persistence_failures += 1
+            raise
+
+    async def list_due_consistency_repairs(self, *, limit: int = 16) -> list[dict[str, Any]]:
+        """Return bounded repair metadata whose retry window is open."""
+        await self.initialize()
+        now = self._now()
+        async with connect_aiosqlite(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT repair_id,mismatch_kind,memory_id,document_id,faiss_id,generation,expected_revision,attempts,max_attempts,status,last_error,next_retry_at,revision "
+                "FROM memory_consistency_repairs WHERE (status='pending' OR (status='retry_wait' AND next_retry_at<=?) OR (status IN ('leased','repairing') AND lease_until<=?)) "
+                "AND status NOT IN ('completed','repair_exhausted','blocked') ORDER BY next_retry_at,created_at LIMIT ?",
+                (now, now, max(1, min(int(limit or 16), 256))),
+            )
+            rows = await cursor.fetchall()
+        keys = ("repair_id","mismatch_kind","memory_id","document_id","faiss_id","generation","expected_revision","attempts","max_attempts","status","last_error","next_retry_at","revision")
+        return [dict(zip(keys, row)) for row in rows]
+
+    async def consistency_repair_diagnostics(self) -> dict[str, Any]:
+        await self.initialize()
+        async with connect_aiosqlite(self.db_path) as db:
+            cursor = await db.execute("SELECT status,created_at,last_error FROM memory_consistency_repairs"); rows = await cursor.fetchall()
+        counts = {status: sum(str(row[0] or "") == status for row in rows) for status in ("pending", "leased", "retry_wait", "repairing", "completed", "repair_exhausted", "blocked")}
+        now = self._now()
+        ages = [max(0.0, now - float(row[1] or now)) for row in rows if row[1]]
+        return {"repair_queue_total": len(rows), **{f"repair_queue_{k}": v for k, v in counts.items()}, "oldest_repair_age_ms": (max(ages) * 1000.0 if ages else None), "last_repair_error": next((str(row[2]) for row in reversed(rows) if row[2]), "") or None, "repair_lease_conflict_total": self._consistency_lease_conflict_total, "repair_lease_stale_total": self._consistency_lease_stale_total, "repair_persistence_failures": self._consistency_persistence_failures}
 
     async def schedule_projection_retry(
         self,

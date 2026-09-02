@@ -9,6 +9,7 @@ from astrbot.api import logger
 
 from ..contracts.memory_query import MemoryWriteRequest
 from ...infrastructure.runtime.background_task_budget import BackgroundTaskQueueFull
+from ...infrastructure.persistence.sqlite_helpers import connect_aiosqlite
 
 
 class MemoryIndexProjector:
@@ -1395,6 +1396,165 @@ class MemoryIndexProjector:
         repaired["remaining_pending"] = len(self._pending_projection_ids)
         repaired["remaining_pending_reasons"] = dict(self._pending_projection_reasons)
         return repaired
+
+    async def audit_consistency(self) -> dict:
+        """Read-only four-way consistency audit with durable repair enqueue."""
+        started = time.monotonic()
+        report = await self.check_consistency()
+        report.setdefault("mismatch_records", [])
+        kinds = {
+            "missing_documents": [], "orphan_documents": [], "missing_fts": [],
+            "orphan_fts": [], "missing_faiss": list(report.get("document_ids_missing_from_faiss") or []),
+            "orphan_faiss": list(report.get("faiss_ids_missing_from_documents") or []),
+            "revision_mismatch": [], "generation_mismatch": [], "dimension_mismatch": [], "unknown_resource": [],
+        }
+        for memory_id in report.get("missing_projection_ids", []) or []:
+            kinds["missing_faiss"].append(memory_id)
+        # Reconcile persisted resource descriptors against the generation and
+        # physical dimension currently admitted by the engine.  This remains
+        # diagnostic-only; publishing/cleanup decisions stay behind the
+        # existing generation fence.
+        try:
+            current_generation = getattr(self.engine, "_vector_generation", None)
+            current_dimension = getattr(self.engine, "_vector_query_dimension", None)
+            if current_dimension is None:
+                current_dimension = getattr(self.engine, "_configured_vector_dimension", None)
+            for descriptor in list(getattr(self.engine, "_vector_resource_descriptors", {}).values() or []):
+                resource_id = str(descriptor.get("resource_id") or "")
+                if not resource_id:
+                    continue
+                generation = descriptor.get("generation")
+                if (
+                    descriptor.get("role") == "active"
+                    and current_generation is not None
+                    and generation is not None
+                    and int(generation) != int(current_generation)
+                ):
+                    kinds["generation_mismatch"].append(resource_id)
+                physical_dimension = descriptor.get("physical_dimension")
+                if (
+                    current_dimension is not None
+                    and physical_dimension is not None
+                    and int(physical_dimension) != int(current_dimension)
+                ):
+                    kinds["dimension_mismatch"].append(resource_id)
+                if descriptor.get("resource_status") in {"unknown", "degraded"}:
+                    kinds["unknown_resource"].append(resource_id)
+        except (TypeError, ValueError, AttributeError):
+            kinds["unknown_resource"].append("descriptor")
+        try:
+            store = self.engine.v2_store
+            await store.initialize()
+            async with connect_aiosqlite(store.db_path) as db:
+                canonical = {str(row[0]) for row in await (await db.execute("SELECT id FROM canonical_memories WHERE status != 'deleted'")).fetchall()}
+                fts_rows = await (await db.execute("SELECT memory_id, COUNT(*) FROM canonical_fts GROUP BY memory_id")).fetchall()
+                fts = {str(row[0]) for row in fts_rows}
+                duplicate_fts = {str(row[0]) for row in fts_rows if int(row[1] or 0) > 1}
+            kinds["missing_fts"] = sorted(canonical - fts)
+            kinds["orphan_fts"] = sorted(fts - canonical)
+            # Duplicate FTS rows are represented as an orphan-style repair so
+            # existing queue consumers can safely deduplicate them.
+            kinds["orphan_fts"].extend(sorted(duplicate_fts))
+            projection_ids = {str(item[1]) for item in await self._projection_rows()}
+            kinds["missing_documents"] = sorted(canonical - projection_ids)
+            kinds["orphan_documents"] = sorted(projection_ids - canonical)
+        except Exception as exc:
+            report["error"] = report.get("error") or f"audit_query:{type(exc).__name__}"
+            kinds["unknown_resource"].append("fts")
+        enqueue = getattr(self.engine.v2_store, "enqueue_consistency_repair", None)
+        for kind, ids in kinds.items():
+            for item in ids:
+                record = {"mismatch_kind": kind, "memory_id": str(item)}
+                report["mismatch_records"].append(record)
+                if callable(enqueue):
+                    try:
+                        await enqueue(kind, memory_id=str(item), generation=getattr(self.engine, "_vector_generation", None))
+                    except Exception as exc:
+                        report.setdefault("repair_enqueue_errors", []).append(type(exc).__name__)
+        report["consistency_audit_status"] = "degraded" if report.get("error") else "completed"
+        report["consistency_audit_elapsed_ms"] = round((time.monotonic() - started) * 1000.0, 1)
+        report["consistency_mismatch_total"] = len(report["mismatch_records"])
+        report["consistency_mismatch_by_kind"] = {key: len(value) for key, value in kinds.items() if value}
+        return report
+
+    async def process_consistency_repairs(self, *, limit: int = 8, lease_owner: str = "memory-maintenance") -> dict:
+        """Process a bounded set of durable repairs without blocking a maintenance cycle."""
+        store = self.engine.v2_store
+        list_due = getattr(store, "list_due_consistency_repairs", None)
+        claim = getattr(store, "claim_consistency_repair", None)
+        finish = getattr(store, "finish_consistency_repair", None)
+        if not all(callable(item) for item in (list_due, claim, finish)):
+            return {"attempted": 0, "completed": 0, "failed": 0, "blocked": 0}
+        result = {"attempted": 0, "completed": 0, "failed": 0, "blocked": 0, "settlement_failed": 0, "settlement_errors": []}
+        for item in await list_due(limit=limit):
+            claimed = await claim(str(item.get("repair_id")), lease_owner=lease_owner)
+            if not claimed:
+                continue
+            result["attempted"] += 1
+            kind = str(item.get("mismatch_kind") or "unknown_resource")
+            memory_id = str(item.get("memory_id") or "")
+            status = "completed"
+            error = ""
+            blocked_result = False
+            try:
+                if kind == "missing_fts" and memory_id:
+                    async with connect_aiosqlite(store.db_path) as db:
+                        await store._sync_fts(db, memory_id)
+                        await db.commit()
+                elif kind == "missing_faiss" and memory_id:
+                    repair_generation = item.get("generation")
+                    current_generation = getattr(self.engine, "_vector_generation", None)
+                    if (
+                        repair_generation is not None
+                        and current_generation is not None
+                        and int(repair_generation) != int(current_generation)
+                    ):
+                        status = "blocked"
+                        error = "generation mismatch"
+                        blocked_result = True
+                    elif not getattr(self.engine, "retriever", None):
+                        raise RuntimeError("retriever not ready")
+                    elif not await self.project(memory_id):
+                        raise RuntimeError("faiss projection unavailable")
+                elif kind == "orphan_fts" and memory_id:
+                    async with connect_aiosqlite(store.db_path) as db:
+                        cursor = await db.execute(
+                            "SELECT 1 FROM canonical_memories WHERE id = ? AND status != 'deleted' LIMIT 1",
+                            (memory_id,),
+                        )
+                        if await cursor.fetchone():
+                            await store._sync_fts(db, memory_id)
+                        else:
+                            await db.execute("DELETE FROM canonical_fts WHERE memory_id = ?", (memory_id,))
+                        await db.commit()
+                else:
+                    status = "blocked"
+                    blocked_result = True
+            except Exception as exc:
+                attempts = int(item.get("attempts") or 0) + 1
+                max_attempts = int(item.get("max_attempts") or 3)
+                status = "repair_exhausted" if attempts >= max_attempts else "retry_wait"
+                error = f"{type(exc).__name__}: {exc}"[:500]
+                result["failed"] += 1
+            try:
+                settled = await finish(
+                    str(item.get("repair_id")),
+                    lease_token=str(claimed.get("lease_token") or ""),
+                    status=status,
+                    error=error,
+                    retry_delay_sec=min(900.0, float(2 ** max(0, int(item.get("attempts") or 1)))) if status == "retry_wait" else None,
+                )
+            except Exception as exc:
+                settled = False
+                result["settlement_errors"].append(f"{type(exc).__name__}: {exc}"[:240])
+            if not settled:
+                result["settlement_failed"] += 1
+                continue
+            if status == "completed":
+                result["completed"] += 1
+            elif blocked_result:
+                result["blocked"] += 1
+        return result
 
     async def _clear_projected_documents(self, *, session_id: str = "") -> int:
         if not hasattr(self.engine, "_execute_documents_write"):
