@@ -284,6 +284,9 @@ class PluginBootstrap:
                 hot_zone_ttl_seconds=getattr(conversation_settings, "hot_zone_ttl_seconds", 30.0),
                 warm_zone_ttl_seconds=getattr(conversation_settings, "warm_zone_ttl_seconds", 300.0),
                 warm_zone_max_tokens=getattr(conversation_settings, "warm_zone_max_tokens", 1200),
+                pending_direct_ttl_seconds=getattr(
+                    conversation_settings, "group_pending_direct_ttl_sec", 1200.0
+                ),
                 snapshot_dir=snapshot_dir,
             )
         db_service.dialogue_store = dialogue_store

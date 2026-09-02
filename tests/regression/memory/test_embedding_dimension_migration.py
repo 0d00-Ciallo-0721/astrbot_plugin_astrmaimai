@@ -64,6 +64,48 @@ class EmbeddingDimensionMigrationTests(unittest.TestCase):
             self.assertIsNone(engine._load_published_vector_index(["embedding-v2"], expected_dimension=1024))
         self.assertEqual(engine._vector_dimension_check_status, "unknown")
 
+    def test_legacy_manifest_without_identity_requires_new_generation(self):
+        engine = self._engine()
+        index_path = engine._new_vector_index_path(5)
+        index_path.write_bytes(b"placeholder")
+        engine._publish_vector_index_manifest(index_path, ["embedding-v2"], dimension=1024)
+        with patch.object(engine, "_index_file_dimension", return_value=(1024, "fake.index.d")):
+            self.assertIsNone(
+                engine._load_published_vector_index(["embedding-v2"], expected_dimension=1024)
+            )
+        self.assertEqual(engine._vector_identity_check_status, "identity_unknown")
+        payload = __import__("json").loads(engine._vector_manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload.get("api_base_fingerprint"), "")
+
+    def test_manifest_identity_match_allows_runtime_reuse(self):
+        config = SimpleNamespace(
+            provider=SimpleNamespace(
+                id="embedding-v2",
+                api_base="https://embedding.example/v1?token=redacted",
+                embedding_models=["embedding-v2"],
+            ),
+            memory=SimpleNamespace(recall_top_k=5),
+        )
+        engine = self.engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+        engine.data_path = Path(self.temp_dir.name)
+        index_path = engine._new_vector_index_path(5)
+        index_path.write_bytes(b"placeholder")
+        engine._publish_vector_index_manifest(
+            index_path,
+            ["embedding-v2"],
+            dimension=1024,
+            provider_source_id="embedding-v2",
+            api_base_fingerprint=engine._api_base_fingerprint(config.provider, config),
+        )
+        with patch.object(engine, "_index_file_dimension", return_value=(1024, "fake.index.d")):
+            self.assertEqual(
+                engine._load_published_vector_index(
+                    ["embedding-v2"], expected_dimension=1024, provider=config.provider
+                ),
+                index_path,
+            )
+        self.assertEqual(engine._vector_identity_check_status, "matched")
+
     def test_dimension_probe_is_single_flight_and_validates_vector(self):
         engine = self._engine()
         calls = []

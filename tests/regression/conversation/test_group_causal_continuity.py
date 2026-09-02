@@ -8,7 +8,10 @@ from astrmai.conversation.attention.group_context_snapshot import (
     GroupContextSnapshotBuilder,
     is_group_direct_correction,
 )
-from astrmai.conversation.attention.group_dialogue_store import GroupDialogueStore
+from astrmai.conversation.attention.group_dialogue_store import (
+    GroupDialogueStore,
+    PendingDirectItem,
+)
 from astrmai.conversation.contracts.committed_reply import (
     CommittedBotTurn,
     ReplyCommitStatus,
@@ -567,3 +570,53 @@ def test_committed_reply_records_bot_target_source_and_stance():
     assert turns[-1].stance == "reject"
     assert incidents[-1].stance == "reject"
     assert pending[-1].status == "answered"
+
+
+def test_pending_direct_snapshot_drops_expired_and_old_generation_items(tmp_path):
+    async def run():
+        now = time.time()
+        source = GroupDialogueStore(
+            snapshot_dir=tmp_path,
+            pending_direct_ttl_seconds=1200,
+        )
+        source.runtime_generation = 7
+        source._pending_direct["chat"] = [
+            PendingDirectItem(
+                pending_id="fresh",
+                event_id="fresh-event",
+                speaker_id="u",
+                speaker_name="User",
+                content="fresh",
+                created_at=now,
+                updated_at=now,
+            ),
+            PendingDirectItem(
+                pending_id="expired",
+                event_id="expired-event",
+                speaker_id="u",
+                speaker_name="User",
+                content="expired",
+                created_at=now - 5000,
+                updated_at=now - 5000,
+            ),
+        ]
+        assert await source.persist_snapshot()
+
+        restored_store = GroupDialogueStore(
+            snapshot_dir=tmp_path,
+            pending_direct_ttl_seconds=1200,
+        )
+        restored_store.runtime_generation = 8
+        await restored_store.restore_snapshot()
+        diagnostics = restored_store.snapshot_restore_diagnostics()
+        pending = await restored_store.get_pending_direct_items(
+            "chat",
+            current_sender_id="u",
+            ttl_seconds=1200,
+        )
+        return diagnostics, pending
+
+    diagnostics, pending = asyncio.run(run())
+    assert pending == []
+    assert diagnostics["dropped_generation_count"] == 1
+    assert diagnostics["dropped_expired_count"] == 1

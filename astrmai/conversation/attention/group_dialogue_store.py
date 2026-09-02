@@ -160,11 +160,15 @@ class GroupDialogueStore:
         hot_zone_ttl_seconds: float = 30.0,
         warm_zone_ttl_seconds: float = 300.0,
         warm_zone_max_tokens: int = 1200,
+        pending_direct_ttl_seconds: float = 1200.0,
         snapshot_dir: Any = None,
     ):
         self.hot_zone_ttl_seconds = float(hot_zone_ttl_seconds or 30.0)
         self.warm_zone_ttl_seconds = float(warm_zone_ttl_seconds or 300.0)
         self.warm_zone_max_tokens = int(warm_zone_max_tokens or 1200)
+        self.pending_direct_ttl_seconds = max(
+            60.0, float(pending_direct_ttl_seconds or 1200.0)
+        )
         self.snapshot_dir = snapshot_dir
         self._threads: dict[str, DialogueThread] = {}
         self._social_states: dict[str, list[GroupSocialStateItem]] = {}
@@ -178,6 +182,12 @@ class GroupDialogueStore:
         # the shared-resource lease.  Kept optional for standalone stores/tests.
         self.runtime_generation: int = 0
         self.runtime_resource_guard: Any = None
+        self._last_restore_diagnostics: dict[str, int] = {
+            "restored_count": 0,
+            "dropped_expired_count": 0,
+            "dropped_generation_count": 0,
+            "invalid_count": 0,
+        }
 
     def _get_thread(self, chat_id: str) -> DialogueThread:
         thread = self._threads.get(chat_id)
@@ -1233,6 +1243,13 @@ class GroupDialogueStore:
             int(self.runtime_generation or 0),
         )
         now = time.time()
+        current_generation = int(self.runtime_generation or 0)
+        diagnostics = {
+            "restored_count": 0,
+            "dropped_expired_count": 0,
+            "dropped_generation_count": 0,
+            "invalid_count": 0,
+        }
         restored = 0
         restored_chat_ids: set[str] = set()
         for chat_id, chat_payload in dict(payload.get("chats", {}) or {}).items():
@@ -1299,14 +1316,30 @@ class GroupDialogueStore:
                     key = self._resolve_chat_key(chat_id)
                 except ValueError:
                     continue
-                items = [
-                    item
-                    for item in (
-                        deserializer(item_payload)
-                        for item_payload in list(items_payload or [])
-                    )
-                    if item is not None
-                ][-80:]
+                items = []
+                for item_payload in list(items_payload or []):
+                    item = deserializer(item_payload)
+                    if item is None:
+                        diagnostics["invalid_count"] += 1
+                        continue
+                    if payload_key == "pending_direct":
+                        status = str(getattr(item, "status", "") or "").strip().lower()
+                        if status != "pending":
+                            diagnostics["invalid_count"] += 1
+                            continue
+                        updated_at = float(
+                            getattr(item, "updated_at", 0.0)
+                            or getattr(item, "created_at", 0.0)
+                            or 0.0
+                        )
+                        if now - updated_at > self.pending_direct_ttl_seconds:
+                            diagnostics["dropped_expired_count"] += 1
+                            continue
+                        if writer_generation != current_generation:
+                            diagnostics["dropped_generation_count"] += 1
+                            continue
+                    items.append(item)
+                items = items[-80:]
                 if not items:
                     continue
                 async with self._lock:
@@ -1327,6 +1360,7 @@ class GroupDialogueStore:
                         existing.setdefault(item_id, item)
                     target[key] = list(existing.values())[-80:]
                 restored_causal += 1
+                diagnostics["restored_count"] += len(items)
                 restored_chat_ids.add(key)
                 if restored_causal % 16 == 0:
                     await asyncio.sleep(0.001)
@@ -1340,13 +1374,20 @@ class GroupDialogueStore:
                     )
                 except (TypeError, ValueError):
                     continue
+        diagnostics["restored_count"] += restored + restored_social
+        self._last_restore_diagnostics = diagnostics
         if restored:
             logger.info(f"[DialogueStore] restored context snapshot for {restored} chats")
         if restored_social:
             logger.info(f"[DialogueStore] restored social state for {restored_social} chats")
         if restored_causal:
             logger.info(f"[DialogueStore] restored causal state for {restored_causal} scopes")
+        logger.info("[DialogueStore] snapshot restore diagnostics: %s", diagnostics)
         return len(restored_chat_ids)
+
+    def snapshot_restore_diagnostics(self) -> dict[str, int]:
+        """Return the last restore counters without mutating snapshot state."""
+        return dict(self._last_restore_diagnostics)
 
     async def set_cold_summary(self, chat_id: str, summary: str) -> None:
         async with self._lock:

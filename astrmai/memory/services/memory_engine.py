@@ -244,6 +244,7 @@ class MemoryEngine:
         self._startup_last_yield = time.monotonic()
         self._startup_yield_count = 0
         self._vector_dimension_check_status = "unknown"
+        self._vector_identity_check_status = "unknown"
         self._vector_dimension_source = "unknown"
         self._vector_query_dimension: int | None = None
         self._configured_vector_dimension = self._configured_embedding_dimension(self.config)
@@ -1034,6 +1035,7 @@ class MemoryEngine:
         self,
         embedding_models: list[str],
         expected_dimension: int | None = None,
+        provider: Any = None,
     ) -> Path | None:
         try:
             payload = json.loads(self._vector_manifest_path.read_text(encoding="utf-8"))
@@ -1068,26 +1070,43 @@ class MemoryEngine:
                 return None
             self._vector_dimension_source = source
             self._vector_dimension_check_status = "matched"
+            manifest_source = str(payload.get("provider_source_id") or "").strip()
+            manifest_api_fingerprint = str(payload.get("api_base_fingerprint") or "").strip()
+            provider = provider or self._resolve_embedding_provider(
+                embedding_models[0] if embedding_models else ""
+            )
+            expected_source = self._provider_source_id(
+                provider,
+                embedding_models[0] if embedding_models else "",
+            )
+            expected_api_fingerprint = self._api_base_fingerprint(provider, self.config)
+            identity_complete = bool(manifest_source and manifest_api_fingerprint)
+            if not identity_complete:
+                self._vector_identity_check_status = "identity_unknown"
+                # Bootstrap supplies an expected dimension and is the only
+                # runtime reuse path.  A legacy manifest without historical
+                # provider/API identity must be rebuilt in a new generation;
+                # never infer or persist that identity from current config.
+                if expected_dimension is not None:
+                    return None
+            elif (
+                not expected_source
+                or not expected_api_fingerprint
+                or manifest_source != expected_source
+                or manifest_api_fingerprint != expected_api_fingerprint
+            ):
+                self._vector_identity_check_status = "mismatch"
+                if expected_dimension is not None:
+                    return None
+            else:
+                self._vector_identity_check_status = "matched"
             if (
                 payload.get("dimension") != actual_dimension
-                or not payload.get("provider_source_id")
-                or not payload.get("api_base_fingerprint")
                 or payload.get("generation") is None
                 or not payload.get("status")
             ):
                 try:
                     payload["dimension"] = int(actual_dimension)
-                    provider = self._resolve_embedding_provider(
-                        embedding_models[0] if embedding_models else ""
-                    )
-                    if not payload.get("provider_source_id"):
-                        payload["provider_source_id"] = self._provider_source_id(
-                            provider, embedding_models[0] if embedding_models else ""
-                        )
-                    if not payload.get("api_base_fingerprint"):
-                        payload["api_base_fingerprint"] = self._api_base_fingerprint(
-                            provider, self.config
-                        )
                     payload.setdefault("generation", int(getattr(self, "_vector_generation", 0) or 0))
                     payload.setdefault("document_count", None)
                     payload.setdefault("vector_count", None)
@@ -3722,6 +3741,7 @@ class MemoryEngine:
                         self._load_published_vector_index,
                         unique_models,
                         query_dimension,
+                        provider_instance,
                     )
                     if query_dimension is not None
                     else None
@@ -4647,6 +4667,7 @@ class MemoryEngine:
                 "configured_dimension": self._configured_vector_dimension,
                 "dimension_source": self._vector_dimension_source,
                 "dimension_check_status": self._vector_dimension_check_status,
+                "identity_check_status": self._vector_identity_check_status,
                 "configuration_error": self._vector_configuration_error,
                 "migration_state": self._vector_state,
                 "migration_generation": int(self._vector_generation),

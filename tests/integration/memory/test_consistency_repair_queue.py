@@ -213,6 +213,45 @@ asyncio.run(main())
         self.assertGreaterEqual(report["consistency_mismatch_by_kind"].get("dimension_mismatch", 0), 1)
         self.assertGreaterEqual(report["consistency_mismatch_by_kind"].get("unknown_resource", 0), 1)
 
+    def test_snapshot_ratio_uses_active_and_projectable_sets_only(self):
+        async def run():
+            await self.store.initialize()
+            async with __import__("astrmai.infrastructure.persistence.sqlite_helpers", fromlist=["connect_aiosqlite"]).connect_aiosqlite(self.store.db_path) as db:
+                for index in range(788):
+                    status = "active" if index < 63 else "review_pending"
+                    await db.execute(
+                        "INSERT INTO canonical_memories(id,status,content,visibility) VALUES (?, ?, ?, ?)",
+                        (f"memory-{index}", status, f"content-{index}", "auto_and_tool"),
+                    )
+                for index in range(63):
+                    await db.execute(
+                        "INSERT INTO canonical_fts(memory_id,content) VALUES (?, ?)",
+                        (f"memory-{index}", f"content-{index}"),
+                    )
+                await db.commit()
+
+            class Engine:
+                v2_store = self.store
+                _vector_generation = 1
+
+                async def _run_documents_query(self, *_args, **_kwargs):
+                    return [
+                        (index + 1, json.dumps({"canonical_id": f"memory-{index}"}))
+                        for index in range(63)
+                    ] + [
+                        (index + 1000, json.dumps({"legacy": True}))
+                        for index in range(7)
+                    ]
+
+            from astrmai.memory.services.memory_index_projector import MemoryIndexProjector
+            return await MemoryIndexProjector(Engine()).audit_consistency()
+
+        report = asyncio.run(run())
+        by_kind = report["consistency_mismatch_by_kind"]
+        self.assertEqual(by_kind.get("missing_fts", 0), 0)
+        self.assertEqual(by_kind.get("missing_documents", 0), 0)
+        self.assertLess(report["consistency_mismatch_total"], 20)
+
     def test_repair_failure_enters_retry_wait_then_exhausted(self):
         async def run():
             rid = await self.store.enqueue_consistency_repair("missing_faiss", memory_id="retry", max_attempts=2)

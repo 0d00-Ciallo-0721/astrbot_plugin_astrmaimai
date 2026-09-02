@@ -1324,7 +1324,14 @@ class MemoryIndexProjector:
             report["canonical_projectable_count"] = len(projectable_ids)
             projection_rows = await self._projection_rows()
             report["projection_count"] = len(projection_rows)
-            document_ids = {int(doc_id) for doc_id, _ in projection_rows}
+            # Legacy documents may still exist for inactive/non-projectable
+            # memories.  Faiss must only be compared with the current
+            # projectable canonical set, otherwise those legacy rows appear
+            # as false Faiss orphans/missing vectors during startup audit.
+            projectable_projection_rows = [
+                row for row in projection_rows if str(row[1]) in projectable_ids
+            ]
+            document_ids = {int(doc_id) for doc_id, _ in projectable_projection_rows}
             faiss_ids = await self._faiss_id_set()
             if faiss_ids is not None:
                 report["faiss_id_set_observed"] = True
@@ -1340,7 +1347,9 @@ class MemoryIndexProjector:
                 try:
                     report["faiss_index_count"] = int(ntotal)
                     report["faiss_index_count_observed"] = True
-                    report["faiss_index_count_delta_vs_projection"] = int(ntotal) - len(projection_rows)
+                    report["faiss_index_count_delta_vs_projection"] = int(ntotal) - len(
+                        projectable_projection_rows
+                    )
                 except (TypeError, ValueError):
                     pass
             by_canonical: dict[str, list[int]] = {}
@@ -1404,10 +1413,24 @@ class MemoryIndexProjector:
         report.setdefault("mismatch_records", [])
         kinds = {
             "missing_documents": [], "orphan_documents": [], "missing_fts": [],
-            "orphan_fts": [], "missing_faiss": list(report.get("document_ids_missing_from_faiss") or []),
+            "orphan_fts": [], "missing_faiss": [],
             "orphan_faiss": list(report.get("faiss_ids_missing_from_documents") or []),
             "revision_mismatch": [], "generation_mismatch": [], "dimension_mismatch": [], "unknown_resource": [],
         }
+        missing_document_ids = {
+            str(item) for item in (report.get("document_ids_missing_from_faiss") or [])
+        }
+        if missing_document_ids:
+            try:
+                document_to_canonical = {
+                    str(doc_id): str(canonical_id)
+                    for doc_id, canonical_id in await self._projection_rows()
+                }
+                kinds["missing_faiss"] = sorted(
+                    document_to_canonical.get(item, item) for item in missing_document_ids
+                )
+            except Exception:
+                kinds["missing_faiss"] = sorted(missing_document_ids)
         for memory_id in report.get("missing_projection_ids", []) or []:
             kinds["missing_faiss"].append(memory_id)
         # Reconcile persisted resource descriptors against the generation and
@@ -1446,7 +1469,10 @@ class MemoryIndexProjector:
             store = self.engine.v2_store
             await store.initialize()
             async with connect_aiosqlite(store.db_path) as db:
-                canonical = {str(row[0]) for row in await (await db.execute("SELECT id FROM canonical_memories WHERE status != 'deleted'")).fetchall()}
+                active_rows = await (
+                    await db.execute("SELECT id FROM canonical_memories WHERE status = 'active'")
+                ).fetchall()
+                canonical = {str(row[0]) for row in active_rows}
                 fts_rows = await (await db.execute("SELECT memory_id, COUNT(*) FROM canonical_fts GROUP BY memory_id")).fetchall()
                 fts = {str(row[0]) for row in fts_rows}
                 duplicate_fts = {str(row[0]) for row in fts_rows if int(row[1] or 0) > 1}
@@ -1455,9 +1481,11 @@ class MemoryIndexProjector:
             # Duplicate FTS rows are represented as an orphan-style repair so
             # existing queue consumers can safely deduplicate them.
             kinds["orphan_fts"].extend(sorted(duplicate_fts))
+            projectable = await store.list_projectable()
+            projectable_ids = {str(item.id) for item in projectable}
             projection_ids = {str(item[1]) for item in await self._projection_rows()}
-            kinds["missing_documents"] = sorted(canonical - projection_ids)
-            kinds["orphan_documents"] = sorted(projection_ids - canonical)
+            kinds["missing_documents"] = sorted(projectable_ids - projection_ids)
+            kinds["orphan_documents"] = sorted(projection_ids - projectable_ids)
         except Exception as exc:
             report["error"] = report.get("error") or f"audit_query:{type(exc).__name__}"
             kinds["unknown_resource"].append("fts")
