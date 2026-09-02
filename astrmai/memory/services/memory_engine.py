@@ -189,6 +189,18 @@ class MemoryEngine:
         self._vector_index_delete_repair_persistence_executor: ThreadPoolExecutor | None = None
         self._vector_index_delete_repair_persistence_futures: set[Future] = set()
         self._vector_index_delete_repair_last_error = ""
+        self._vector_resource_descriptors: dict[str, dict[str, Any]] = {}
+        self._vector_resource_descriptor_pending_persistence: dict[str, dict[str, Any]] = {}
+        self._vector_resource_descriptor_persistence_tasks: set[asyncio.Task] = set()
+        self._vector_resource_descriptor_persistence_status = "unknown"
+        self._vector_resource_descriptor_persistence_failures = 0
+        self._vector_resource_descriptor_last_error = ""
+        self._vector_orphan_indexes: dict[str, dict[str, Any]] = {}
+        self._vector_startup_scan_status = "unknown"
+        self._vector_startup_scan_error = ""
+        self._vector_startup_scan_elapsed_ms: float | None = None
+        self._vector_generation_mismatch_count = 0
+        self._vector_protected_index_count = 0
         self._vector_retirement_overflow_capacity_limit = 0
         self._vector_retirement_overflow_capacity_blocked = False
         self._vector_retirement_overflow_capacity_rejected_total = 0
@@ -405,6 +417,450 @@ class MemoryEngine:
     @property
     def _vector_manifest_path(self) -> Path:
         return self.data_path / "vector_index_manifest.json"
+
+    @staticmethod
+    def _vector_resource_descriptor_columns() -> tuple[str, ...]:
+        return (
+            "resource_id", "generation", "role", "index_path", "embedding_model",
+            "provider_source", "api_base_fingerprint", "physical_dimension",
+            "document_count", "vector_count", "resource_status", "created_at",
+            "updated_at", "last_close_status", "last_repair_status", "revision",
+        )
+
+    def _vector_resource_id(self, index_path: str | Path) -> str:
+        try:
+            normalized = str(Path(index_path).resolve()).casefold()
+        except OSError:
+            normalized = str(index_path).casefold()
+        return f"vector-{hashlib.sha256(normalized.encode('utf-8', 'ignore')).hexdigest()[:24]}"
+
+    def _ensure_vector_resource_descriptor_schema_sync(self) -> None:
+        db_path = self._index_delete_repair_db_path()
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(db_path, timeout=5.0) as db:
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS vector_resource_descriptors (
+                    resource_id TEXT PRIMARY KEY,
+                    generation INTEGER NOT NULL DEFAULT 0,
+                    role TEXT NOT NULL DEFAULT 'unknown',
+                    index_path TEXT NOT NULL DEFAULT '',
+                    embedding_model TEXT NOT NULL DEFAULT '',
+                    provider_source TEXT NOT NULL DEFAULT '',
+                    api_base_fingerprint TEXT NOT NULL DEFAULT '',
+                    physical_dimension INTEGER,
+                    document_count INTEGER,
+                    vector_count INTEGER,
+                    resource_status TEXT NOT NULL DEFAULT 'unknown',
+                    created_at REAL NOT NULL DEFAULT 0,
+                    updated_at REAL NOT NULL DEFAULT 0,
+                    last_close_status TEXT NOT NULL DEFAULT '',
+                    last_repair_status TEXT NOT NULL DEFAULT '',
+                    revision INTEGER NOT NULL DEFAULT 0
+                )"""
+            )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS ix_vector_resource_descriptors_role "
+                "ON vector_resource_descriptors(role, generation)"
+            )
+            db.commit()
+
+    def _persist_vector_resource_descriptor_sync(self, snapshot: dict[str, Any]) -> bool:
+        self._ensure_vector_resource_descriptor_schema_sync()
+        columns = self._vector_resource_descriptor_columns()
+        values = tuple(snapshot.get(column) for column in columns)
+        with sqlite3.connect(self._index_delete_repair_db_path(), timeout=5.0) as db:
+            db.execute("BEGIN IMMEDIATE")
+            current = db.execute(
+                "SELECT generation, revision FROM vector_resource_descriptors WHERE resource_id = ?",
+                (snapshot.get("resource_id"),),
+            ).fetchone()
+            if current is not None and (
+                int(snapshot.get("generation", 0) or 0) < int(current[0] or 0)
+                or int(snapshot.get("revision", 0) or 0) < int(current[1] or 0)
+            ):
+                db.rollback()
+                return False
+            if current is None:
+                placeholders = ",".join("?" for _ in values)
+                db.execute(
+                    f"INSERT INTO vector_resource_descriptors ({','.join(columns)}) VALUES ({placeholders})",
+                    values,
+                )
+            else:
+                assignments = ",".join(f"{column} = ?" for column in columns[1:])
+                db.execute(
+                    f"UPDATE vector_resource_descriptors SET {assignments} "
+                    "WHERE resource_id = ? AND generation <= ? AND revision <= ?",
+                    values[1:] + (
+                        snapshot.get("resource_id"),
+                        int(snapshot.get("generation", 0) or 0),
+                        int(snapshot.get("revision", 0) or 0),
+                    ),
+                )
+            db.commit()
+        return True
+
+    def _queue_vector_resource_descriptor_persist(self, descriptor: dict[str, Any]) -> None:
+        snapshot = {
+            column: descriptor.get(column)
+            for column in self._vector_resource_descriptor_columns()
+        }
+        resource_id = str(snapshot.get("resource_id") or "")
+        self._vector_resource_descriptor_pending_persistence[resource_id] = snapshot
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            try:
+                self._persist_vector_resource_descriptor_sync(snapshot)
+            except Exception as exc:
+                self._vector_resource_descriptor_persistence_status = "pending"
+                self._vector_resource_descriptor_persistence_failures += 1
+                self._vector_resource_descriptor_last_error = f"{type(exc).__name__}: {exc}"[:500]
+            else:
+                self._vector_resource_descriptor_pending_persistence.pop(resource_id, None)
+                self._vector_resource_descriptor_persistence_status = "ok"
+            return
+
+        async def _persist() -> None:
+            await asyncio.to_thread(self._persist_vector_resource_descriptor_sync, snapshot)
+
+        task = loop.create_task(_persist(), name="astrmai-vector-resource-descriptor-persist")
+        self._vector_resource_descriptor_persistence_tasks.add(task)
+
+        def _done(done: asyncio.Task) -> None:
+            self._vector_resource_descriptor_persistence_tasks.discard(done)
+            try:
+                done.result()
+            except asyncio.CancelledError:
+                self._vector_resource_descriptor_persistence_status = "pending"
+            except Exception as exc:
+                self._vector_resource_descriptor_persistence_status = "pending"
+                self._vector_resource_descriptor_persistence_failures += 1
+                self._vector_resource_descriptor_last_error = f"{type(exc).__name__}: {exc}"[:500]
+            else:
+                current = self._vector_resource_descriptor_pending_persistence.get(resource_id)
+                if current is snapshot:
+                    self._vector_resource_descriptor_pending_persistence.pop(resource_id, None)
+                self._vector_resource_descriptor_persistence_status = "ok"
+
+        task.add_done_callback(_done)
+
+    def _record_vector_resource_descriptor(
+        self,
+        index_path: str | Path,
+        *,
+        role: str,
+        generation: int | None,
+        resource_status: str,
+        resource_id: str = "",
+        embedding_model: str = "",
+        provider_source: str = "",
+        api_base_fingerprint: str = "",
+        physical_dimension: int | None = None,
+        document_count: int | None = None,
+        vector_count: int | None = None,
+        last_close_status: str = "",
+        last_repair_status: str = "",
+    ) -> dict[str, Any]:
+        if role not in {"active", "candidate", "retired", "overflow"}:
+            raise ValueError(f"unsupported vector resource role: {role}")
+        now = time.time()
+        path = str(Path(index_path).resolve())
+        resource_id = resource_id or self._vector_resource_id(path)
+        with self._vector_registry_lock:
+            current = self._vector_resource_descriptors.get(resource_id)
+            incoming_generation = int(generation or 0)
+            if current is not None and incoming_generation < int(current.get("generation", 0) or 0):
+                return current
+            descriptor = {
+                "resource_id": resource_id,
+                "generation": incoming_generation,
+                "role": role,
+                "index_path": path,
+                "embedding_model": str(embedding_model or ""),
+                "provider_source": str(provider_source or ""),
+                "api_base_fingerprint": str(api_base_fingerprint or ""),
+                "physical_dimension": physical_dimension,
+                "document_count": document_count,
+                "vector_count": vector_count,
+                "resource_status": str(resource_status or "unknown"),
+                "created_at": float((current or {}).get("created_at") or now),
+                "updated_at": now,
+                "last_close_status": str(last_close_status or (current or {}).get("last_close_status") or ""),
+                "last_repair_status": str(last_repair_status or (current or {}).get("last_repair_status") or ""),
+                "revision": int((current or {}).get("revision", -1) or 0) + 1,
+            }
+            self._vector_resource_descriptors[resource_id] = descriptor
+        self._queue_vector_resource_descriptor_persist(descriptor)
+        return descriptor
+
+    def _load_vector_resource_descriptors_sync(self) -> list[dict[str, Any]]:
+        self._ensure_vector_resource_descriptor_schema_sync()
+        columns = self._vector_resource_descriptor_columns()
+        with sqlite3.connect(self._index_delete_repair_db_path(), timeout=5.0) as db:
+            db.row_factory = sqlite3.Row
+            return [
+                dict(row)
+                for row in db.execute(
+                    f"SELECT {','.join(columns)} FROM vector_resource_descriptors"
+                ).fetchall()
+            ]
+
+    async def _load_vector_resource_descriptors(self) -> None:
+        try:
+            rows = await asyncio.to_thread(self._load_vector_resource_descriptors_sync)
+        except Exception as exc:
+            self._vector_resource_descriptor_persistence_status = "failed"
+            self._vector_resource_descriptor_persistence_failures += 1
+            self._vector_resource_descriptor_last_error = f"{type(exc).__name__}: {exc}"[:500]
+            return
+        with self._vector_registry_lock:
+            for row in rows:
+                resource_id = str(row.get("resource_id") or "")
+                current = self._vector_resource_descriptors.get(resource_id)
+                if resource_id and (
+                    current is None
+                    or int(row.get("revision", 0) or 0) > int(current.get("revision", 0) or 0)
+                ):
+                    self._vector_resource_descriptors[resource_id] = row
+        self._vector_resource_descriptor_persistence_status = "ok"
+
+    async def _flush_vector_resource_descriptor_persistence(self) -> None:
+        pending = list(self._vector_resource_descriptor_pending_persistence.values())
+        for snapshot in pending:
+            try:
+                await asyncio.to_thread(self._persist_vector_resource_descriptor_sync, snapshot)
+            except Exception as exc:
+                self._vector_resource_descriptor_persistence_status = "pending"
+                self._vector_resource_descriptor_persistence_failures += 1
+                self._vector_resource_descriptor_last_error = f"{type(exc).__name__}: {exc}"[:500]
+                continue
+            resource_id = str(snapshot.get("resource_id") or "")
+            current = self._vector_resource_descriptor_pending_persistence.get(resource_id)
+            if current is snapshot:
+                self._vector_resource_descriptor_pending_persistence.pop(resource_id, None)
+        if not self._vector_resource_descriptor_pending_persistence:
+            self._vector_resource_descriptor_persistence_status = "ok"
+
+    def _protected_descriptor_paths(self) -> set[str]:
+        protected: set[str] = set()
+        with self._vector_registry_lock:
+            descriptors = list(self._vector_resource_descriptors.values())
+            candidate_paths = set(self._vector_candidate_paths)
+        for descriptor in descriptors:
+            if descriptor.get("role") in {"active", "candidate"}:
+                try:
+                    protected.add(str(Path(str(descriptor.get("index_path") or "")).resolve()))
+                except OSError:
+                    continue
+        protected.update(candidate_paths)
+        active_path = str(getattr(self, "_vector_index_path", "") or "")
+        if active_path:
+            protected.add(str(Path(active_path).resolve()))
+        return protected
+
+    async def _scan_vector_resources_on_startup(self) -> None:
+        started = time.monotonic()
+        self._vector_startup_scan_status = "scanning"
+        self._vector_startup_scan_error = ""
+        budget = max(0.05, self._timing_value("vector_startup_scan_timeout_sec", 2.0))
+        try:
+            await asyncio.wait_for(asyncio.to_thread(self._scan_vector_resources_sync), timeout=budget)
+        except asyncio.TimeoutError:
+            self._vector_startup_scan_status = "degraded"
+            self._vector_startup_scan_error = "startup_scan_timeout"
+            self._vector_state = "degraded"
+        except Exception as exc:
+            self._vector_startup_scan_status = "degraded"
+            self._vector_startup_scan_error = f"{type(exc).__name__}: {exc}"[:500]
+            self._vector_state = "degraded"
+        else:
+            self._vector_startup_scan_status = (
+                "degraded" if any(
+                    item.get("status") in {"unknown", "pending_inspection", "cleanup_blocked"}
+                    for item in self._vector_orphan_indexes.values()
+                ) else "completed"
+            )
+            if self._vector_startup_scan_status == "degraded":
+                self._vector_state = "degraded"
+        finally:
+            self._vector_startup_scan_elapsed_ms = round(
+                (time.monotonic() - started) * 1000.0, 1
+            )
+
+    def _scan_vector_resources_sync(self) -> None:
+        with self._vector_registry_lock:
+            descriptors = [dict(item) for item in self._vector_resource_descriptors.values()]
+        # The legacy single-file manifest is authoritative for the active path
+        # when a process starts before the descriptor registry has been flushed.
+        try:
+            manifest = json.loads(self._vector_manifest_path.read_text(encoding="utf-8"))
+            file_name = str(manifest.get("file_name") or manifest.get("index_file") or "").strip()
+            if file_name and Path(file_name).name == file_name:
+                manifest_path = str((self.data_path / file_name).resolve())
+                if not any(str(item.get("index_path") or "") == manifest_path for item in descriptors):
+                    descriptors.append({
+                        "resource_id": str(manifest.get("resource_id") or self._vector_resource_id(manifest_path)),
+                        "generation": int(manifest.get("generation", 0) or 0),
+                        "role": "active",
+                        "index_path": manifest_path,
+                        "embedding_model": str((manifest.get("embedding_models") or [""])[0] or ""),
+                        "provider_source": str(manifest.get("provider_source_id") or ""),
+                        "api_base_fingerprint": str(manifest.get("api_base_fingerprint") or ""),
+                        "physical_dimension": manifest.get("dimension"),
+                        "resource_status": "active",
+                    })
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            manifest = None
+        by_path: dict[str, list[dict[str, Any]]] = {}
+        for descriptor in descriptors:
+            path = str(descriptor.get("index_path") or "")
+            if not path:
+                continue
+            try:
+                resolved = str(Path(path).resolve())
+            except OSError:
+                continue
+            by_path.setdefault(resolved, []).append(descriptor)
+        active_descriptors = [item for item in descriptors if item.get("role") == "active"]
+        current_generation = max(
+            (int(item.get("generation", 0) or 0) for item in active_descriptors),
+            default=int(getattr(self, "_vector_generation", 0) or 0),
+        )
+        protected = self._protected_descriptor_paths()
+        protected.update(
+            str(Path(str(item.get("index_path") or "")).resolve())
+            for item in descriptors
+            if item.get("role") in {"active", "candidate"} and item.get("index_path")
+        )
+        orphan_indexes: dict[str, dict[str, Any]] = {}
+        generation_mismatches = 0
+        # Vector indexes are intentionally stored directly under data_path;
+        # nested directories are not part of the current storage contract.
+        for candidate in self.data_path.glob("*.index"):
+            try:
+                if not candidate.is_file():
+                    continue
+                resolved = str(candidate.resolve())
+            except OSError as exc:
+                orphan_indexes[str(candidate)] = {
+                    "index_path": str(candidate),
+                    "status": "pending_inspection",
+                    "last_error": f"{type(exc).__name__}: {exc}"[:500],
+                }
+                continue
+            matches = by_path.get(resolved, [])
+            if resolved in protected:
+                mismatch = any(
+                    item.get("role") == "candidate"
+                    and int(item.get("generation", 0) or 0) != current_generation
+                    for item in matches
+                )
+                if mismatch:
+                    generation_mismatches += 1
+                orphan_indexes[resolved] = {
+                    "index_path": resolved,
+                    "status": "cleanup_blocked" if mismatch else "protected",
+                }
+                continue
+            cleanup = next(
+                (
+                    item for item in matches
+                    if item.get("role") in {"retired", "overflow"}
+                    and int(item.get("generation", 0) or 0) < current_generation
+                ),
+                None,
+            )
+            if cleanup is not None:
+                if str(cleanup.get("resource_status") or "") == "repair_exhausted" or str(
+                    cleanup.get("last_repair_status") or ""
+                ) == "repair_exhausted":
+                    orphan_indexes[resolved] = {
+                        "index_path": resolved,
+                        "resource_id": cleanup.get("resource_id"),
+                        "status": "repair_exhausted",
+                    }
+                    continue
+                orphan_indexes[resolved] = {
+                    "index_path": resolved,
+                    "resource_id": cleanup.get("resource_id"),
+                    "status": "cleanup_allowed",
+                }
+                self._schedule_vector_index_delete_repair(
+                    resolved,
+                    stack_id=f"resource-{cleanup.get('resource_id')}",
+                    generation=int(cleanup.get("generation", 0) or 0),
+                )
+                continue
+            if matches:
+                generation_mismatches += int(any(
+                    int(item.get("generation", 0) or 0) != current_generation
+                    for item in matches
+                ))
+                status = "cleanup_blocked"
+            else:
+                status = "unknown"
+            orphan_indexes[resolved] = {"index_path": resolved, "status": status}
+        with self._vector_registry_lock:
+            self._vector_orphan_indexes = orphan_indexes
+            self._vector_generation_mismatch_count = generation_mismatches
+            self._vector_protected_index_count = sum(
+                item.get("status") == "protected" for item in orphan_indexes.values()
+            )
+
+    def _vector_resource_diagnostics(self) -> dict[str, Any]:
+        with self._vector_registry_lock:
+            descriptors = list(self._vector_resource_descriptors.values())
+            orphans = list(self._vector_orphan_indexes.values())
+            pending = len(self._vector_resource_descriptor_pending_persistence)
+        roles = {role: sum(1 for item in descriptors if item.get("role") == role)
+                 for role in ("active", "candidate", "retired", "overflow")}
+        return {
+            "resource_descriptor_count": len(descriptors),
+            "resource_descriptor_persistence_status": str(self._vector_resource_descriptor_persistence_status or "unknown"),
+            "resource_descriptor_persistence_failures": int(self._vector_resource_descriptor_persistence_failures or 0),
+            "resource_descriptor_persistence_pending": pending,
+            "active_resource_count": roles["active"],
+            "candidate_resource_count": roles["candidate"],
+            "retired_resource_count": roles["retired"],
+            "overflow_resource_count": roles["overflow"],
+            "orphan_index_count": len(orphans),
+            "orphan_cleanup_pending": sum(item.get("status") in {"pending_inspection", "cleanup_allowed"} for item in orphans),
+            "orphan_cleanup_blocked": sum(item.get("status") in {"unknown", "cleanup_blocked", "protected"} for item in orphans),
+            "orphan_cleanup_exhausted": sum(item.get("status") == "repair_exhausted" for item in orphans),
+            "protected_index_count": int(self._vector_protected_index_count or 0),
+            "generation_mismatch_count": int(self._vector_generation_mismatch_count or 0),
+            "startup_scan_status": str(self._vector_startup_scan_status or "unknown"),
+            "startup_scan_error": str(self._vector_startup_scan_error or "") or None,
+            "startup_scan_elapsed_ms": self._vector_startup_scan_elapsed_ms,
+            "resource_descriptor_last_error": str(self._vector_resource_descriptor_last_error or "") or None,
+            "orphan_indexes": [
+                {"index_path": Path(str(item.get("index_path") or "")).name,
+                 "status": str(item.get("status") or "unknown"),
+                 "resource_id": item.get("resource_id")}
+                for item in orphans
+            ],
+        }
+
+    def _update_vector_resource_repair_status(self, index_path: str, status: str) -> None:
+        try:
+            resolved = str(Path(index_path).resolve())
+        except OSError:
+            resolved = str(index_path)
+        with self._vector_registry_lock:
+            matches = [
+                dict(item) for item in self._vector_resource_descriptors.values()
+                if str(item.get("index_path") or "") == resolved
+            ]
+        for descriptor in matches:
+            self._record_vector_resource_descriptor(
+                resolved,
+                role=str(descriptor.get("role") or "retired"),
+                generation=int(descriptor.get("generation", 0) or 0),
+                resource_id=str(descriptor.get("resource_id") or ""),
+                resource_status=str(descriptor.get("resource_status") or "retired"),
+                last_repair_status=status,
+            )
 
     @staticmethod
     def _index_dimension(index_or_db: Any) -> tuple[int | None, str]:
@@ -636,6 +1092,24 @@ class MemoryEngine:
                         f"[AstrMai] descriptor_backfill_failed: {type(exc).__name__}: {exc!r}"
                     )
             self._vector_index_descriptor = dict(payload)
+            if payload.get("role") == "active" or payload.get("resource_id"):
+                try:
+                    self._record_vector_resource_descriptor(
+                        index_path,
+                        role=str(payload.get("role") or "active"),
+                        generation=payload.get("generation"),
+                        resource_id=str(payload.get("resource_id") or ""),
+                        embedding_model=(embedding_models[0] if embedding_models else ""),
+                        provider_source=str(payload.get("provider_source_id") or ""),
+                        api_base_fingerprint=str(payload.get("api_base_fingerprint") or ""),
+                        physical_dimension=actual_dimension,
+                        document_count=payload.get("document_count"),
+                        vector_count=payload.get("vector_count"),
+                        resource_status="active",
+                        last_close_status="open",
+                    )
+                except (OSError, TypeError, ValueError):
+                    pass
             return index_path
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             self._vector_dimension_check_status = "unknown"
@@ -670,6 +1144,9 @@ class MemoryEngine:
             created_at=created_at,
             status=status,
         ).to_dict()
+        payload["resource_id"] = self._vector_resource_id(index_path)
+        payload["role"] = "active"
+        payload["resource_status"] = "active"
         manifest_path = self._vector_manifest_path
         temporary_path = manifest_path.with_name(
             f"{manifest_path.name}.{uuid.uuid4().hex}.tmp"
@@ -680,6 +1157,20 @@ class MemoryEngine:
         )
         os.replace(temporary_path, manifest_path)
         self._vector_index_descriptor = dict(payload)
+        self._record_vector_resource_descriptor(
+            index_path,
+            role="active",
+            generation=payload.get("generation"),
+            resource_id=payload.get("resource_id", ""),
+            embedding_model=(embedding_models[0] if embedding_models else ""),
+            provider_source=provider_source_id,
+            api_base_fingerprint=api_base_fingerprint,
+            physical_dimension=dimension,
+            document_count=document_count,
+            vector_count=vector_count,
+            resource_status="active",
+            last_close_status="open",
+        )
 
     def _cleanup_stale_vector_indexes(
         self,
@@ -830,8 +1321,10 @@ class MemoryEngine:
         self._startup_last_yield = time.monotonic()
         self._startup_yield_count = 0
         await self.v2_store.initialize()
+        await self._load_vector_resource_descriptors()
         await self._load_index_delete_repairs()
         await self._flush_index_delete_repair_persistence()
+        await self._scan_vector_resources_on_startup()
         await self._startup_checkpoint(force=True)
         self.index_projector = MemoryIndexProjector(self)
         self.v2_store.index_projector = self.index_projector
@@ -1473,6 +1966,13 @@ class MemoryEngine:
                 delete_index=delete_index,
             )
             return False
+        self._record_vector_resource_descriptor(
+            index_path or "",
+            role="retired",
+            generation=generation,
+            resource_id=stack_id,
+            resource_status="retired_pending",
+        ) if index_path else None
         self._schedule_vector_retirement_attempt(stack_id)
         return True
 
@@ -1540,6 +2040,14 @@ class MemoryEngine:
                 self._vector_state = "degraded"
                 if len(self._retired_vector_overflow_capacity_stacks) > capacity_limit:
                     stack["capacity_over_limit"] = True
+        if index_path:
+            self._record_vector_resource_descriptor(
+                index_path,
+                role="overflow",
+                generation=None,
+                resource_id=stack_id,
+                resource_status="overflow_pending",
+            )
         self._schedule_overflow_vector_retirement_attempt(stack_id)
 
     def _overflow_stack(self, stack_id: str) -> dict[str, Any] | None:
@@ -1567,6 +2075,16 @@ class MemoryEngine:
             except OSError:
                 with self._vector_registry_lock:
                     self._vector_candidate_paths.discard(retired_path)
+        if retired_path:
+            self._record_vector_resource_descriptor(
+                retired_path,
+                role="retired",
+                generation=stack.get("generation"),
+                resource_id=stack_id,
+                resource_status="closed",
+                last_close_status="closed",
+                last_repair_status="pending" if stack.get("delete_index") else "none",
+            )
         if stack.get("delete_index") and retired_path:
             self._schedule_vector_index_delete_repair(
                 retired_path,
@@ -1658,12 +2176,15 @@ class MemoryEngine:
                 self._vector_index_delete_repair_persistence_futures.add(future)
                 self._vector_index_delete_repair_pending_persistence[str(snapshot.get("repair_id"))] = snapshot
             def _sync_done(done: Future) -> None:
-                self._vector_index_delete_repair_persistence_futures.discard(done)
                 try:
                     done.result()
+                    self._vector_index_delete_repair_persistence_futures.discard(done)
                     self._vector_index_delete_repair_persistence_status = "ok"
                     self._vector_index_delete_repair_pending_persistence.pop(str(snapshot.get("repair_id")), None)
                 except Exception as exc:
+                    # Keep failed futures visible until the pending snapshot is
+                    # successfully flushed; this preserves a durable owner
+                    # for diagnostics and late cleanup.
                     self._vector_index_delete_repair_persistence_failures += 1
                     self._vector_index_delete_repair_persistence_status = "failed"
                     self._vector_index_delete_repair_last_error = f"{type(exc).__name__}: {exc}"[:500]
@@ -1982,9 +2503,9 @@ class MemoryEngine:
             self._bump_index_delete_repair(repair)
             path = str(repair.get("index_path") or "")
             generation = repair.get("generation")
-            active_path = str(getattr(self, "_vector_index_path", "") or "")
             current_generation = int(getattr(self, "_vector_generation", 0) or 0)
-            if path and active_path and Path(path).resolve() == Path(active_path).resolve():
+            protected_paths = self._protected_descriptor_paths()
+            if path and str(Path(path).resolve()) in protected_paths:
                 repair["status"] = "retry_wait"
                 repair["last_error"] = "active_index_protected"
                 repair["next_retry_at"] = time.monotonic() + self._retirement_retry_delay(
@@ -1993,15 +2514,16 @@ class MemoryEngine:
                 repair["_attempt_inflight"] = False
                 self._bump_index_delete_repair(repair)
                 return False
-        if not Path(path).exists():
-            with self._vector_registry_lock:
-                repair = self._vector_index_delete_repairs.get(repair_id)
-                if repair is not None:
-                    repair["status"] = "deleted"
-                    repair["last_error"] = ""
-                    repair["_attempt_inflight"] = False
-                    self._bump_index_delete_repair(repair)
-            return True
+            if not Path(path).exists():
+                with self._vector_registry_lock:
+                    repair = self._vector_index_delete_repairs.get(repair_id)
+                    if repair is not None:
+                        repair["status"] = "deleted"
+                        repair["last_error"] = ""
+                        repair["_attempt_inflight"] = False
+                        self._bump_index_delete_repair(repair)
+                self._update_vector_resource_repair_status(path, "deleted")
+                return True
         try:
             Path(path).unlink(missing_ok=True)
         except OSError as exc:
@@ -2021,6 +2543,7 @@ class MemoryEngine:
                     repair["status"] = "repair_exhausted"
                 repair["_attempt_inflight"] = False
                 self._bump_index_delete_repair(repair)
+            self._update_vector_resource_repair_status(path, str(repair.get("status") or "retry_wait"))
             return False
         with self._vector_registry_lock:
             repair = self._vector_index_delete_repairs.get(repair_id)
@@ -2029,6 +2552,7 @@ class MemoryEngine:
                 repair["last_error"] = ""
                 repair["_attempt_inflight"] = False
                 self._bump_index_delete_repair(repair)
+        self._update_vector_resource_repair_status(path, "deleted")
         return True
 
     def _run_vector_index_delete_repair_sync(self, repair_id: str) -> None:
@@ -2528,6 +3052,16 @@ class MemoryEngine:
             except OSError:
                 with self._vector_registry_lock:
                     self._vector_candidate_paths.discard(retired_path)
+        if retired_path:
+            self._record_vector_resource_descriptor(
+                retired_path,
+                role="overflow",
+                generation=stack.get("generation"),
+                resource_id=stack_id,
+                resource_status="closed",
+                last_close_status="closed",
+                last_repair_status="pending" if stack.get("delete_index") else "none",
+            )
         if stack.get("delete_index") and retired_path:
             self._schedule_vector_index_delete_repair(
                 retired_path,
@@ -3009,6 +3543,16 @@ class MemoryEngine:
 
             lifecycle.index_path = candidate_index_path
             lifecycle.discard_index = rebuild_required
+            self._record_vector_resource_descriptor(
+                candidate_index_path,
+                role="candidate",
+                generation=generation,
+                resource_status="candidate_building",
+                embedding_model=(unique_models[0] if unique_models else ""),
+                provider_source=str(probe.get("provider_source_id") or ""),
+                api_base_fingerprint=self._api_base_fingerprint(provider_instance, self.config),
+                physical_dimension=query_dimension,
+            )
             candidate_db, candidate_retriever, candidate_hybrid, candidate_projector = await _make_candidate(
                 candidate_index_path
             )
@@ -3409,6 +3953,7 @@ class MemoryEngine:
                 int(bool(stack.get("physical_timeout_exceeded")))
                 for stack in retired_stacks
             ),
+            **self._vector_resource_diagnostics(),
             **self._overflow_retirement_diagnostics(),
             **self._index_delete_repair_diagnostics(),
         }
@@ -3524,6 +4069,7 @@ class MemoryEngine:
                 "projection_replay_status": self._projection_replay_status,
                 "projection_replay_error": self._projection_replay_error,
                 "projection_replay_completed_at": self._projection_replay_completed_at or None,
+                **self._vector_resource_diagnostics(),
             }
         )
         runtime.update(self._index_delete_repair_diagnostics())

@@ -147,7 +147,7 @@ def test_v121_adds_learning_ingest_lease_token_to_existing_outbox(tmp_path):
         version = int(db.execute("PRAGMA user_version").fetchone()[0])
 
     assert "lease_token" in columns
-    assert version == 124
+    assert version == LATEST_ARCHITECTURE_SCHEMA_VERSION
 
 
 def test_v122_creates_qq_action_ledger(tmp_path):
@@ -161,7 +161,7 @@ def test_v122_creates_qq_action_ledger(tmp_path):
         }
         version = int(db.execute("PRAGMA user_version").fetchone()[0])
 
-    assert version == 124
+    assert version == LATEST_ARCHITECTURE_SCHEMA_VERSION
     assert {
         "transport_idempotency_key",
         "action_instance_id",
@@ -201,7 +201,7 @@ def test_async_v122_creates_qq_action_ledger(tmp_path):
 
     columns, version = asyncio.run(run())
 
-    assert version == 124
+    assert version == LATEST_ARCHITECTURE_SCHEMA_VERSION
     assert "transport_idempotency_key" in columns
 
 

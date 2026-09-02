@@ -386,6 +386,25 @@ _MIGRATIONS: list[tuple[int, str]] = [
         updated_at REAL NOT NULL DEFAULT 0
     )"""),
     (124, "CREATE INDEX IF NOT EXISTS ix_vector_index_delete_repairs_due ON vector_index_delete_repairs(status, next_retry_at)"),
+    (125, """CREATE TABLE IF NOT EXISTS vector_resource_descriptors (
+        resource_id TEXT PRIMARY KEY,
+        generation INTEGER NOT NULL DEFAULT 0,
+        role TEXT NOT NULL DEFAULT 'unknown',
+        index_path TEXT NOT NULL DEFAULT '',
+        embedding_model TEXT NOT NULL DEFAULT '',
+        provider_source TEXT NOT NULL DEFAULT '',
+        api_base_fingerprint TEXT NOT NULL DEFAULT '',
+        physical_dimension INTEGER,
+        document_count INTEGER,
+        vector_count INTEGER,
+        resource_status TEXT NOT NULL DEFAULT 'unknown',
+        created_at REAL NOT NULL DEFAULT 0,
+        updated_at REAL NOT NULL DEFAULT 0,
+        last_close_status TEXT NOT NULL DEFAULT '',
+        last_repair_status TEXT NOT NULL DEFAULT '',
+        revision INTEGER NOT NULL DEFAULT 0
+    )"""),
+    (126, "CREATE INDEX IF NOT EXISTS ix_vector_resource_descriptors_role ON vector_resource_descriptors(role, generation)"),
 ]
 
 
