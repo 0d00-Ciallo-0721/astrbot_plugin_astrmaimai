@@ -37,6 +37,13 @@ from ...state.relationship.affection_router import AffectionRouter
 from ..contracts.focus_context import FreshnessState, ReplyMode
 from ..contracts.reply_artifact import OutboundPolicy, VisibleReplyArtifact
 from ..contracts.committed_reply import CommittedBotTurn
+from ..contracts.turn_outcome import (
+    claim_text_output,
+    record_text_failed,
+    record_text_sent,
+    release_text_output,
+)
+from ..concurrency.controls import resolve_conversation_concurrency_flags
 from .text_segmenter import TextSegmenter
 
 
@@ -143,10 +150,39 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
         window_events: list = None,
         anchor_event: AstrMessageEvent = None,
         pending_actions: list = None,
+        outcome_kind: str = "reply",
     ):
         debug_trace(event, "execution.reply.enter", chat_id=chat_id, raw_preview=preview_text(str(raw_text or ""), 120))
         if not raw_text:
             return VisibleReplyArtifact("", [], "", blocked_reason="empty_reply")
+
+        normalized_outcome_kind = (
+            "fallback" if str(outcome_kind or "").strip() == "fallback" else "reply"
+        )
+        concurrency_flags = resolve_conversation_concurrency_flags(self.config)
+        track_turn_outcome = not (
+            normalized_outcome_kind == "reply"
+            and not concurrency_flags.send_claim_enabled
+        )
+        if track_turn_outcome and not claim_text_output(event, normalized_outcome_kind).allowed:
+            debug_trace(
+                event,
+                "reply.duplicate_final_blocked"
+                if normalized_outcome_kind == "reply"
+                else "reply.duplicate_fallback_blocked",
+                chat_id=chat_id,
+                reason="turn_outcome_terminal",
+            )
+            artifact = VisibleReplyArtifact(
+                "",
+                [],
+                "",
+                blocked_reason="turn_outcome_terminal",
+                metadata={"send_status": "duplicate_blocked"},
+            )
+            event.set_extra("astrmai_reply_delivery_status", "cancelled")
+            event.set_extra("astrmai_reply_delivery_failure_reason", "turn_outcome_terminal")
+            return artifact
 
         with observe_stage(event, "reply.prepare") as prepare_stage:
             reply_mode = self._resolve_reply_mode(event)
@@ -173,6 +209,8 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
             metadata=artifact.metadata,
         )
         if artifact.blocked:
+            if track_turn_outcome:
+                release_text_output(event, normalized_outcome_kind)
             event.set_extra("astrmai_reply_delivery_status", "cancelled")
             event.set_extra(
                 "astrmai_reply_delivery_failure_reason",
@@ -187,6 +225,8 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
             )
             return artifact
         if freshness_state == FreshnessState.EXPIRED:
+            if track_turn_outcome:
+                release_text_output(event, normalized_outcome_kind)
             event.set_extra("astrmai_reply_delivery_status", "stale")
             event.set_extra(
                 "astrmai_reply_delivery_failure_reason",
@@ -213,10 +253,25 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
             "reply.send",
             metadata={"planned_segment_count": len(artifact.segments or [])},
         ) as send_stage:
-            sent = await self._send_segments(event, chat_id, artifact, at_targets)
+            try:
+                sent = await self._send_segments(event, chat_id, artifact, at_targets)
+            except asyncio.CancelledError:
+                if track_turn_outcome:
+                    release_text_output(event, normalized_outcome_kind)
+                raise
             send_stage["sent"] = bool(sent)
             send_stage["sent_segment_count"] = int(artifact.metadata.get("sent_segment_count", 0) or 0)
         if not sent:
+            if track_turn_outcome:
+                release_text_output(event, normalized_outcome_kind)
+                record_text_failed(
+                    event,
+                    str(
+                        artifact.metadata.get("send_failure_reason", "")
+                        or artifact.blocked_reason
+                        or "send_failed"
+                    ),
+                )
             event.set_extra("astrmai_reply_delivery_status", "failed")
             event.set_extra(
                 "astrmai_reply_delivery_failure_reason",
@@ -260,6 +315,15 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
             reply_completed=True,
             metadata=artifact.metadata,
         )
+        if track_turn_outcome:
+            record_text_sent(
+                event,
+                segments=int(
+                    artifact.metadata.get("sent_segment_count", len(artifact.segments or []))
+                    or 0
+                ),
+                kind=normalized_outcome_kind,
+            )
         try:
             await self.qq_action_dispatcher.commit(
                 event,

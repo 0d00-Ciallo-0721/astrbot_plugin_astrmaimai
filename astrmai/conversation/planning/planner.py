@@ -13,6 +13,7 @@ from astrbot.api.event import AstrMessageEvent
 
 from ..contracts.dialog_history_policy import DialogHistoryPolicy
 from ..contracts.turn_context import build_turn_trace_summary, ensure_turn_context
+from ..contracts.turn_outcome import claim_completion_callback, settle_completion_callback
 from ..contracts.vision_candidate import VisionCandidate, load_vision_candidates
 from ..vision_state import (
     classify_autonomous_vision_need,
@@ -2067,9 +2068,8 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
     async def _finalize_proactive_event(self, event: AstrMessageEvent, reply_text: str | None = None) -> None:
         if not bool(event.get_extra("astrmai_is_proactive_event", False)):
             return
-        if bool(event.get_extra("astrmai_proactive_completed", False)):
+        if not claim_completion_callback(event).allowed:
             return
-        event.set_extra("astrmai_proactive_completed", True)
         reply_sent = bool(event.get_extra("astrmai_reply_sent", False)) or bool(reply_text)
         reply_preview = str(reply_text or "")[:160]
         turn_context = ensure_turn_context(event)
@@ -2096,13 +2096,21 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                 if not reply_sent and not getattr(decision, "blocked_reason", ""):
                     setattr(decision, "blocked_reason", "planner_no_reply")
         callback = event.get_extra("astrmai_proactive_completion_callback", None)
+        callback_succeeded = True
         if callable(callback):
             try:
                 result = callback(reply_sent, reply_preview)
                 if inspect.isawaitable(result):
-                    await result
+                    result = await result
+                callback_succeeded = result is not False
+            except asyncio.CancelledError:
+                callback_succeeded = False
+                settle_completion_callback(event, succeeded=False)
+                raise
             except Exception as exc:
+                callback_succeeded = False
                 logger.debug(f"[Proactive] completion callback degraded: {exc}")
+        settle_completion_callback(event, succeeded=callback_succeeded)
 
     async def _prepare_plan_context(
         self,

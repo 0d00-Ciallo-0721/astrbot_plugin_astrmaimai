@@ -29,6 +29,19 @@ class _TimeoutSendApi(_Api):
         return {"status": "ok"}
 
 
+class _CancelDuringSendApi(_Api):
+    def __init__(self):
+        super().__init__()
+        self.started = asyncio.Event()
+
+    async def call_action(self, action, **kwargs):
+        self.calls.append((action, kwargs))
+        if action == "send_poke":
+            self.started.set()
+            await asyncio.Event().wait()
+        return {"status": "ok"}
+
+
 class _BrokenClaimStore:
     async def claim(self, *_args, **_kwargs):
         raise RuntimeError("ledger unavailable")
@@ -127,6 +140,51 @@ class QQActionDispatcherTests(unittest.TestCase):
         )
         statuses = [item["status"] for item in event.get_extra("astrmai_qq_action_results")]
         self.assertEqual(statuses, ["sending", "sent", "sending", "sent", "skipped", "skipped"])
+
+    def test_turn_outcome_blocks_action_after_dispatcher_replacement(self):
+        event = _Event()
+        event.set_extra(
+            "astrmai_pending_actions",
+            [{"action": "poke", "target_id": "123", "group_id": "456"}],
+        )
+        first = self.mod.QQActionDispatcher(self.config, _Coordinator())
+        second = self.mod.QQActionDispatcher(self.config, _Coordinator())
+
+        asyncio.run(first.commit(event, "ff:GroupMessage:456", send_key="turn-1"))
+        asyncio.run(second.commit(event, "ff:GroupMessage:456", send_key="turn-1"))
+
+        self.assertEqual(len(event.bot.api.calls), 1)
+        outcome = event.get_extra("astrmai_turn_outcome", {})
+        self.assertTrue(outcome["tool_actions_sent"])
+        self.assertEqual(outcome["tool_action_count"], 1)
+
+    def test_cancel_after_send_started_marks_action_uncertain(self):
+        event = _Event()
+        api = _CancelDuringSendApi()
+        event.bot.api = api
+        event.set_extra("astrmai_pending_actions", [{"action": "poke", "target_id": "123"}])
+        store = self._persistent_store()
+        dispatcher = self.mod.QQActionDispatcher(
+            self.config,
+            _Coordinator(),
+            action_store=store,
+        )
+
+        async def _run():
+            task = asyncio.create_task(
+                dispatcher.commit(event, "ff:FriendMessage:123", send_key="turn-cancel-send")
+            )
+            await api.started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(_run())
+        outcome = event.get_extra("astrmai_turn_outcome", {})
+        self.assertEqual(len(outcome.get("uncertain_tool_action_keys", [])), 1)
+        key = outcome["uncertain_tool_action_keys"][0]
+        row = asyncio.run(store.get(key))
+        self.assertEqual(row["status"], "uncertain")
 
     def test_stale_turn_never_calls_napcat(self):
         event = _Event()

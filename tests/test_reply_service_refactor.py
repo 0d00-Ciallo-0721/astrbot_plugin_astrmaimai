@@ -140,6 +140,50 @@ class RefactoredReplyServiceTests(unittest.TestCase):
         )
         self.assertTrue(all(stage["status"] == "success" for stage in stages))
 
+    def test_completed_reply_blocks_later_fallback_send(self):
+        service = self._service()
+        service._settle_post_send = _noop_post_send
+        event = FakeEvent("user-1", "Alice", "hello")
+
+        first = asyncio.run(
+            service.handle_reply(event, "normal", event.unified_msg_origin)
+        )
+        second = asyncio.run(
+            service.handle_reply(
+                event,
+                "fallback",
+                event.unified_msg_origin,
+                outcome_kind="fallback",
+            )
+        )
+
+        self.assertTrue(first.sent)
+        self.assertFalse(second.sent)
+        self.assertEqual(second.blocked_reason, "turn_outcome_terminal")
+        self.assertEqual(len(service.state_engine.gateway.context.sent), 1)
+
+    def test_completed_fallback_blocks_later_normal_reply(self):
+        service = self._service()
+        service._settle_post_send = _noop_post_send
+        event = FakeEvent("user-1", "Alice", "hello")
+
+        first = asyncio.run(
+            service.handle_reply(
+                event,
+                "fallback",
+                event.unified_msg_origin,
+                outcome_kind="fallback",
+            )
+        )
+        second = asyncio.run(
+            service.handle_reply(event, "normal", event.unified_msg_origin)
+        )
+
+        self.assertTrue(first.sent)
+        self.assertFalse(second.sent)
+        self.assertEqual(second.blocked_reason, "turn_outcome_terminal")
+        self.assertEqual(len(service.state_engine.gateway.context.sent), 1)
+
     def test_private_overdue_reply_is_allowed_without_newer_activity(self):
         service = self._service()
         event_ts = time.time() - 10.0
@@ -915,6 +959,25 @@ class RefactoredReplyServiceTests(unittest.TestCase):
         self.assertEqual(mirrored, [])
         self.assertFalse(artifact.sent)
         self.assertEqual(artifact.blocked_reason, "send_failed")
+
+    def test_cancelled_send_releases_turn_outcome_claim(self):
+        state_engine = FakeStateEngine()
+        service = self.reply_mod.ReplyService(
+            state_engine=state_engine,
+            mood_manager=SimpleNamespace(),
+        )
+
+        async def _send_cancelled(*args, **kwargs):
+            raise asyncio.CancelledError
+
+        service._send_segments = _send_cancelled
+        event = FakeEvent("user-1", "Alice", "send-cancelled")
+
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(service.handle_reply(event, "cancel me", event.unified_msg_origin))
+
+        outcome = event.get_extra("astrmai_turn_outcome", {})
+        self.assertEqual(outcome.get("output_claim"), "")
 
     def test_successful_send_commits_group_dialogue_after_delivery(self):
         from astrmai.conversation.attention.group_dialogue_store import (

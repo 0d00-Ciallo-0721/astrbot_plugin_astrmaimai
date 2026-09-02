@@ -17,6 +17,19 @@ import astrbot.api.message_components as Comp
 from ..contracts.conversation_event import ConversationEvent
 from ..contracts.dialog_history_policy import DialogHistoryPolicy
 from ..contracts.turn_context import ensure_turn_context
+from ..contracts.turn_outcome import (
+    can_deferred_replay,
+    claim_deferred_replay,
+    claim_text_output,
+    claim_completion_callback,
+    mark_deferred_replayed,
+    mark_system2_handled,
+    record_text_sent,
+    release_text_output,
+    release_deferred_replay,
+    record_text_failed,
+    settle_completion_callback,
+)
 from ..contracts.turn_identity import TurnIdentity, build_p0_thread_id
 from ..threading.group_thread_resolver import resolve_group_thread
 from ...infrastructure.compat.legacy_compat import emit_legacy_focus_thread_extras
@@ -1553,6 +1566,18 @@ class AttentionGate:
             return "shutdown"
         event = item.get("event")
         if event is not None and hasattr(event, "get_extra"):
+            if not can_deferred_replay(event).allowed:
+                outcome = event.get_extra("astrmai_turn_outcome", {})
+                status = str(
+                    outcome.get("terminal_status", "")
+                    if isinstance(outcome, dict)
+                    else ""
+                )
+                if status in {"completed", "fallback"}:
+                    return "skipped_already_terminal"
+                if status in {"shutdown", "cancelled", "budget_exhausted", "superseded"}:
+                    return status
+                return "failed"
             status = str(event.get_extra("astrmai_execution_status", "") or "")
             if status in {"sent", "completed", "stale_drop", "shutdown_rejected", "cancelled"}:
                 if status in {"sent", "completed"}:
@@ -1660,6 +1685,15 @@ class AttentionGate:
                 item["attempts"] = 1
                 max_attempts = 1
                 item["max_attempts"] = 1
+            event = item.get("event")
+            replay_claimed = False
+            if event is not None and hasattr(event, "get_extra"):
+                replay_decision = claim_deferred_replay(event)
+                if not replay_decision.allowed:
+                    self._deferred_attention_work.pop(item_key, None)
+                    self._set_deferred_terminal(item, "skipped", reason=replay_decision.reason)
+                    continue
+                replay_claimed = True
             self._deferred_attention_counts["replay_attempts"] += 1
             self._deferred_attention_dispatcher_last_progress_at = time.time()
             logger.info(
@@ -1682,8 +1716,11 @@ class AttentionGate:
                 event = item.get("event")
                 if event is not None and hasattr(event, "set_extra"):
                     event.set_extra("deferred_replayed_at", time.time())
+                    mark_deferred_replayed(event, reply_sent=bool(event.get_extra("astrmai_reply_sent", False)))
                 self._set_deferred_terminal(item, "replayed", reason="replay_succeeded")
             except (BackgroundTaskQueueTimeout, asyncio.TimeoutError):
+                if replay_claimed and event is not None:
+                    release_deferred_replay(event)
                 if item["attempts"] >= max_attempts:
                     self._deferred_attention_work.pop(item_key, None)
                     self._set_deferred_terminal(item, "exhausted", reason="replay_attempts_exhausted")
@@ -1698,8 +1735,12 @@ class AttentionGate:
                         f"queue_depth={len(self._deferred_attention_work)}"
                     )
             except asyncio.CancelledError:
+                if replay_claimed and event is not None:
+                    release_deferred_replay(event)
                 raise
             except Exception as exc:
+                if replay_claimed and event is not None:
+                    release_deferred_replay(event)
                 self._deferred_attention_work.pop(item_key, None)
                 self._set_deferred_terminal(
                     item,
@@ -2638,13 +2679,23 @@ class AttentionGate:
         turn = event.get_extra("astrmai_turn_identity", None)
         if coordinator is not None and hasattr(coordinator, "is_current_turn"):
             if not await coordinator.is_current_turn(turn):
+                mark_system2_handled(event, "superseded_turn")
                 return
         if event.get_extra("astrmai_system2_failure_handled", False):
             return
-        event.set_extra("astrmai_system2_failure_handled", True)
         reply_sent = bool(event.get_extra("astrmai_reply_sent", False))
         is_proactive = bool(event.get_extra("astrmai_is_proactive_event", False))
-        if not reply_sent and not is_proactive and hasattr(event, "send") and hasattr(event, "plain_result"):
+        fallback_claimed = (
+            not reply_sent
+            and not is_proactive
+            and hasattr(event, "send")
+            and hasattr(event, "plain_result")
+            and claim_text_output(event, "fallback").allowed
+        )
+        mark_system2_handled(event, type(exc).__name__)
+        if (
+            fallback_claimed
+        ):
             fallback_text = str(
                 getattr(getattr(self.config, "reply", None), "fallback_text", "")
                 or "（陷入了短暂的沉默...）"
@@ -2653,19 +2704,31 @@ class AttentionGate:
                 if not outbound_send_allowed(event):
                     return
                 await event.send(event.plain_result(fallback_text))
-                event.set_extra("astrmai_reply_sent", True)
+                record_text_sent(event, segments=1, kind="fallback", reason="system2_failure_fallback")
                 reply_sent = True
+            except asyncio.CancelledError:
+                release_text_output(event, "fallback")
+                raise
             except Exception as send_exc:
+                release_text_output(event, "fallback")
+                record_text_failed(event, f"system2_fallback:{type(send_exc).__name__}")
                 logger.error(f"[AttentionGate] failed to send System2 fallback: {send_exc}")
         callback = event.get_extra("astrmai_proactive_completion_callback", None)
-        if callback is not None and not event.get_extra("astrmai_proactive_completed", False):
-            event.set_extra("astrmai_proactive_completed", True)
+        if callback is not None and claim_completion_callback(event).allowed:
+            callback_succeeded = True
             try:
                 result = callback(reply_sent, "")
                 if inspect.isawaitable(result):
-                    await result
+                    result = await result
+                callback_succeeded = result is not False
+            except asyncio.CancelledError:
+                callback_succeeded = False
+                raise
             except Exception as callback_exc:
+                callback_succeeded = False
                 logger.error(f"[AttentionGate] proactive completion callback failed: {callback_exc}")
+            finally:
+                settle_completion_callback(event, succeeded=callback_succeeded)
 
     async def _record_dialogue_segment_from_event(self, chat_id: str, event: AstrMessageEvent) -> None:
         store = getattr(self, "dialogue_store", None)
@@ -3000,7 +3063,7 @@ class AttentionGate:
     async def _complete_proactive_candidate(self, event: AstrMessageEvent, *, reason: str) -> None:
         if not bool(event.get_extra("astrmai_is_proactive_event", False)):
             return
-        if bool(event.get_extra("astrmai_proactive_completed", False)):
+        if not claim_completion_callback(event).allowed:
             return
         ledger = event.get_extra("astrmai_proactive_stage_ledger", [])
         normalized_reason = str(reason or "proactive_candidate_skipped")
@@ -3016,7 +3079,6 @@ class AttentionGate:
                 else "proactive.sensor"
             )
             append_proactive_stage(event, stage, "blocked", normalized_reason)
-        event.set_extra("astrmai_proactive_completed", True)
         decision = event.get_extra("astrmai_proactive_dispatch_decision", None)
         if decision is not None:
             if isinstance(decision, dict):
@@ -3030,13 +3092,21 @@ class AttentionGate:
                 setattr(decision, "status", "skipped")
                 setattr(decision, "blocked_reason", normalized_reason)
         callback = event.get_extra("astrmai_proactive_completion_callback", None)
-        if callable(callback):
-            try:
+        callback_succeeded = True
+        try:
+            if callable(callback):
                 result = callback(False, "")
                 if inspect.isawaitable(result):
-                    await result
-            except Exception as exc:
-                logger.debug(f"[AttentionGate] proactive completion callback degraded: {exc}")
+                    result = await result
+                callback_succeeded = result is not False
+        except asyncio.CancelledError:
+            callback_succeeded = False
+            raise
+        except Exception as exc:
+            callback_succeeded = False
+            logger.debug(f"[AttentionGate] proactive completion callback degraded: {exc}")
+        finally:
+            settle_completion_callback(event, succeeded=callback_succeeded)
 
     async def _apply_primary_mood_update(self, event: AstrMessageEvent, chat_id: str, msg_str: str) -> None:
         if (
@@ -3704,12 +3774,20 @@ class AttentionGate:
             if not outbound_send_allowed(event):
                 event.set_extra("astrmai_topic_confirmation_send_rejected", True)
                 return False
+            if not claim_text_output(event, "reply").allowed:
+                event.set_extra("astrmai_topic_confirmation_send_rejected", True)
+                return False
             await event.send(event.plain_result(safe_text))
-            event.set_extra("astrmai_reply_sent", True)
+            record_text_sent(event, segments=1, kind="reply", reason="topic_confirmation_sent")
             event.set_extra("astrmai_topic_confirmation_sent", True)
             event.set_extra("astrmai_topic_confirmation_sent_text", safe_text)
             return True
+        except asyncio.CancelledError:
+            release_text_output(event, "reply")
+            raise
         except Exception as exc:
+            release_text_output(event, "reply")
+            record_text_failed(event, f"topic_confirmation:{type(exc).__name__}")
             logger.warning(f"[AttentionGate] private topic confirmation send failed: {exc}")
             return False
 
@@ -3728,11 +3806,18 @@ class AttentionGate:
         try:
             if not outbound_send_allowed(event):
                 return None
+            if not claim_text_output(event, "reply").allowed:
+                return None
             await event.send(event.plain_result(text))
-            event.set_extra("astrmai_reply_sent", True)
+            record_text_sent(event, segments=1, kind="reply", reason="vision_failure_notice")
             event.set_extra("astrmai_vision_failure_notice_sent", True)
             return text
+        except asyncio.CancelledError:
+            release_text_output(event, "reply")
+            raise
         except Exception as exc:
+            release_text_output(event, "reply")
+            record_text_failed(event, f"vision_failure_notice:{type(exc).__name__}")
             logger.warning(f"[AttentionGate] required vision failure notice send failed: {exc}")
             return None
 

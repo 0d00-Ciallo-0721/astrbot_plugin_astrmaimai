@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import time
 import hashlib
+import asyncio
 from typing import Any
 
 from astrbot.api import logger
 
 from ..contracts.qq_action import PendingQQAction, canonical_action_type
+from ..contracts.turn_outcome import claim_tool_action, record_tool_action_result, release_tool_action
 from ..planning.tool_contracts import get_tool_capability, canonical_tool_name, record_tool_lifecycle
 from ...infrastructure.runtime.outbound_send_guard import outbound_send_allowed
 
@@ -428,7 +430,18 @@ class QQActionDispatcher:
             result_kwargs = self._action_identity(action, turn_key, trace_id)
             key = result_kwargs["transport_idempotency_key"]
             lease_token = ""
+            if not claim_tool_action(event, key).allowed:
+                self._append_result(
+                    event,
+                    action,
+                    "skipped",
+                    "turn_outcome_terminal",
+                    failure_kind="duplicate_prevented",
+                    **result_kwargs,
+                )
+                continue
             if not outbound_send_allowed(event):
+                release_tool_action(event, key)
                 self._append_result(event, action, "skipped", "shutdown_rejected", failure_kind="shutdown", **result_kwargs)
                 record_tool_lifecycle(
                     event,
@@ -440,6 +453,7 @@ class QQActionDispatcher:
                 )
                 continue
             if key in self._executed_keys:
+                release_tool_action(event, key)
                 self._append_result(event, action, "skipped", "duplicate", failure_kind="duplicate_prevented", **result_kwargs)
                 record_tool_lifecycle(
                     event,
@@ -461,7 +475,11 @@ class QQActionDispatcher:
                         turn_id=result_kwargs["turn_id"],
                         trace_id=result_kwargs["trace_id"],
                     )
+                except asyncio.CancelledError:
+                    release_tool_action(event, key)
+                    raise
                 except Exception as exc:
+                    release_tool_action(event, key)
                     logger.warning(
                         f"[QQActionDispatcher] durable claim failed for {action.action_type}: {exc}"
                     )
@@ -483,6 +501,9 @@ class QQActionDispatcher:
                     )
                     continue
                 if not claim.acquired:
+                    release_tool_action(event, key)
+                    if claim.status == "uncertain":
+                        record_tool_action_result(event, key, "uncertain")
                     if claim.status == "sent":
                         detail = "duplicate"
                         failure_kind = "duplicate_prevented"
@@ -510,8 +531,10 @@ class QQActionDispatcher:
                     )
                     continue
                 lease_token = claim.lease_token
+            send_started = False
             try:
                 self._append_result(event, action, "sending", **result_kwargs)
+                send_started = True
                 await self._commit_one(api, event, action, chat_id=chat_id, send_key=send_key)
                 self._executed_keys[key] = time.time()
                 if self.action_store is not None:
@@ -547,12 +570,41 @@ class QQActionDispatcher:
                             failure_kind="uncertain",
                             **result_kwargs,
                         )
+                        record_tool_action_result(event, key, "uncertain")
                         continue
                 self._append_result(event, action, "sent", **result_kwargs)
+                record_tool_action_result(event, key, "sent")
                 logger.info(
                     f"[QQActionDispatcher] committed action={action.action_type} "
                     f"target={action.target_id or action.group_id or action.message_id or 'current'}"
                 )
+            except asyncio.CancelledError:
+                release_tool_action(event, key)
+                if self.action_store is not None and lease_token:
+                    try:
+                        if send_started:
+                            await self.action_store.mark_uncertain(
+                                key,
+                                "cancelled_after_send_started",
+                                lease_token=lease_token,
+                            )
+                        else:
+                            await self.action_store.mark_failed(
+                                key,
+                                "cancelled_before_send",
+                                lease_token=lease_token,
+                            )
+                    except Exception:
+                        logger.debug(
+                            "[QQActionDispatcher] cancelled action ledger settlement degraded",
+                            exc_info=True,
+                        )
+                record_tool_action_result(
+                    event,
+                    key,
+                    "uncertain" if send_started else "failed",
+                )
+                raise
             except Exception as exc:
                 logger.warning(f"[QQActionDispatcher] {action.action_type} failed: {exc}")
                 detail = str(exc)
@@ -592,6 +644,7 @@ class QQActionDispatcher:
                     failure_kind=failure_kind,
                     **result_kwargs,
                 )
+                record_tool_action_result(event, key, status)
                 record_tool_lifecycle(
                     event,
                     self._tool_name(action.action_type),

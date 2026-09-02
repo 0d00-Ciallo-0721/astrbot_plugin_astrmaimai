@@ -145,6 +145,31 @@ class GroupRereadTests(unittest.TestCase):
         self.assertIn("Bot 先前", decision.explanation)
         self.assertEqual(decision.participant_ids[0], "bot-1")
 
+    def test_completed_turn_outcome_blocks_reread_text(self):
+        from astrmai.conversation.contracts.turn_outcome import record_text_sent
+        from astrmai.conversation.contracts.reread import RereadActionRequest
+
+        event = _Event("早", sender_id="user-1", message_id="m-1")
+        record_text_sent(event, segments=1, kind="reply")
+        context = _Context()
+        dispatcher = self.dispatcher_mod.RereadActionDispatcher(
+            context=context,
+            config=self.config,
+        )
+        request = RereadActionRequest(
+            chat_id=event.unified_msg_origin,
+            text="早",
+            fingerprint="fingerprint-1",
+            trigger_kind="group_reread_active",
+            source_event_ids=("m-1",),
+        )
+
+        result = asyncio.run(dispatcher.dispatch(event, request))
+
+        self.assertEqual(result.status, "duplicate")
+        self.assertEqual(result.detail, "turn_outcome_terminal")
+        self.assertEqual(context.sent, [])
+
     def test_reply_service_records_normal_bot_text_as_seed(self):
         observer = self.observer_mod.GroupRereadObserver(config=self.config)
         event = _Event("收到", sender_id="user-0", message_id="inbound-1")

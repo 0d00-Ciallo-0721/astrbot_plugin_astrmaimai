@@ -11,6 +11,12 @@ from astrbot.api.event import MessageChain
 import astrbot.api.message_components as Comp
 
 from ..contracts.reread import RereadActionRequest, RereadDispatchResult
+from ..contracts.turn_outcome import (
+    claim_text_output,
+    record_text_failed,
+    record_text_sent,
+    release_text_output,
+)
 from ...infrastructure.runtime.outbound_send_guard import outbound_send_allowed
 
 
@@ -546,15 +552,19 @@ class RereadActionDispatcher:
         if context is None or not hasattr(context, "send_message"):
             await self._restore_observer_pending(request.chat_id)
             return RereadDispatchResult("failed", detail="context_unavailable")
+        if not claim_text_output(event, "reread").allowed:
+            return RereadDispatchResult("duplicate", detail="turn_outcome_terminal")
         coordinator = self.runtime_coordinator
         send_key = self._send_key(request)
         claim_owned = False
         observer_token = None
         send_completed = False
+        send_started = False
         outbound_ids: tuple[str, ...] = ()
         try:
             if coordinator is not None and hasattr(coordinator, "claim_send"):
                 if not await coordinator.claim_send(request.chat_id, send_key):
+                    release_text_output(event, "reread")
                     return RereadDispatchResult("duplicate", detail="send_claim_exists")
                 claim_owned = True
             if self.reread_observer is not None and hasattr(self.reread_observer, "claim_dispatch"):
@@ -562,6 +572,7 @@ class RereadActionDispatcher:
                 if not observer_token:
                     if claim_owned:
                         await self._rollback_send_claim(request.chat_id, send_key, "reread_cooldown")
+                    release_text_output(event, "reread")
                     await self._restore_observer_pending(request.chat_id, observer_token)
                     return RereadDispatchResult("cooldown", detail="group_reread_cooldown")
             turn = event.get_extra("astrmai_turn_identity", None) if hasattr(event, "get_extra") else None
@@ -569,6 +580,7 @@ class RereadActionDispatcher:
                 if not await coordinator.is_current_turn(turn):
                     if claim_owned:
                         await self._rollback_send_claim(request.chat_id, send_key, "stale_turn")
+                    release_text_output(event, "reread")
                     restored = await self._restore_observer_pending(request.chat_id, observer_token)
                     if not restored:
                         await self._release_observer_claim(request.chat_id, observer_token)
@@ -576,12 +588,14 @@ class RereadActionDispatcher:
             if not outbound_send_allowed(event):
                 if claim_owned:
                     await self._rollback_send_claim(request.chat_id, send_key, "shutdown_rejected")
+                release_text_output(event, "reread")
                 restored = await self._restore_observer_pending(request.chat_id, observer_token)
                 if not restored:
                     await self._release_observer_claim(request.chat_id, observer_token)
                 return RereadDispatchResult("shutdown", detail="shutdown_rejected")
             chain = MessageChain()
             chain.chain.append(Comp.Plain(request.text))
+            send_started = True
             result = await context.send_message(getattr(event, "unified_msg_origin", request.chat_id), chain)
             outbound_ids = () if result is None or isinstance(result, bool) else (str(result),)
             send_completed = True
@@ -602,12 +616,14 @@ class RereadActionDispatcher:
                 event.set_extra("astrmai_group_reread_dispatched", True)
                 event.set_extra("astrmai_reread_trigger_kind", request.trigger_kind)
                 event.set_extra("astrmai_reread_outbound_message_ids", list(outbound_ids))
+            record_text_sent(event, segments=1, kind="reread", reason="reread_sent")
             logger.info("[RereadAction] sent kind=%s chat=%s", request.trigger_kind, request.chat_id)
             detail = "" if settlement_ok else "settlement_degraded"
             if hasattr(event, "set_extra") and detail:
                 event.set_extra("astrmai_reread_settlement_status", detail)
             return RereadDispatchResult("sent", outbound_ids, detail=detail)
         except asyncio.CancelledError:
+            release_text_output(event, "reread")
             if not send_completed:
                 if claim_owned:
                     await self._rollback_send_claim(request.chat_id, send_key, "cancelled")
@@ -639,6 +655,9 @@ class RereadActionDispatcher:
                 detail="" if settlement_ok else "settlement_degraded",
             )
         except Exception as exc:
+            release_text_output(event, "reread")
+            if send_started:
+                record_text_failed(event, f"reread:{type(exc).__name__}")
             if send_completed:
                 logger.error(
                     "[RereadAction] send succeeded but settlement failed chat=%s kind=%s",

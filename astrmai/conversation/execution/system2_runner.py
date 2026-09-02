@@ -14,6 +14,7 @@ from ...infrastructure.runtime.turn_call_ledger import (
     clamp_timeout_to_turn_budget,
     finish_stage,
 )
+from ..contracts.turn_outcome import mark_system2_handled
 from .followup_manager import FollowupManager
 
 
@@ -96,6 +97,7 @@ class System2Runner:
         except asyncio.TimeoutError:
             finish_stage(main_event, energy_stage, status="timeout", reason="queue_timeout")
             main_event.set_extra("astrmai_execution_status", "queue_timeout")
+            mark_system2_handled(main_event, "system2_queue_timeout")
             main_event.set_extra("astrmai_queue_timeout_stage", "system2.energy_prepare")
             raise System2QueueTimeout("system2.energy_prepare")
         except asyncio.CancelledError:
@@ -325,6 +327,7 @@ class System2Runner:
             return False
         except asyncio.CancelledError:
             lock_exc_info = sys.exc_info()
+            mark_system2_handled(main_event, "system2_cancelled")
             finish_stage(main_event, lock_stage, status="cancelled", reason="acquire_cancelled")
             raise
         except Exception as exc:

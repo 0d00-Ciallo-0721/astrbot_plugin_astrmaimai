@@ -2637,7 +2637,30 @@ class ConcurrentExecutor:
             return None
         fallback_msg = getattr(self.config.reply, "fallback_text", "(temporary silence...)")
         try:
-            artifact = await self.reply_engine.handle_reply(event, fallback_msg, chat_id)
+            handle_reply = self.reply_engine.handle_reply
+            try:
+                signature = inspect.signature(handle_reply)
+            except (TypeError, ValueError):
+                signature = None
+            supports_outcome_kind = bool(
+                signature
+                and (
+                    "outcome_kind" in signature.parameters
+                    or any(
+                        parameter.kind is inspect.Parameter.VAR_KEYWORD
+                        for parameter in signature.parameters.values()
+                    )
+                )
+            )
+            if supports_outcome_kind:
+                artifact = await handle_reply(
+                    event,
+                    fallback_msg,
+                    chat_id,
+                    outcome_kind="fallback",
+                )
+            else:
+                artifact = await handle_reply(event, fallback_msg, chat_id)
             sent = bool(getattr(artifact, "sent", False)) if artifact is not None else True
         except Exception as exc:
             sent = False
