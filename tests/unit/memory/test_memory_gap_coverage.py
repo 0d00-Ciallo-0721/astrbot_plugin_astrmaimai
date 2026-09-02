@@ -11,7 +11,7 @@ import unittest
 from concurrent.futures import Future
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from tests.helpers.astrbot_stubs import install_astrbot_stubs
 
@@ -1703,6 +1703,358 @@ class MemoryGapCoverageTests(unittest.TestCase):
         asyncio.run(run())
 
         self.assertFalse(engine._retired_vector_stacks)
+
+    def test_overflow_retirement_retries_and_deletes_index_only_after_close(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=["embedding"]),
+            memory=SimpleNamespace(recall_top_k=5),
+            timing=SimpleNamespace(
+                vector_retirement_registry_limit=1,
+                vector_retirement_overflow_registry_limit=1,
+                vector_retirement_retry_base_sec=0.01,
+                vector_retirement_retry_max_sec=0.01,
+                vector_retirement_retry_max_attempts=3,
+                shutdown_cancel_grace_sec=0.05,
+            ),
+        )
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+        engine._retired_vector_stacks["full"] = {"status": "closing"}
+        index_path = Path(self.temp_dir.name) / "overflow.index"
+        index_path.write_bytes(b"candidate")
+
+        class _Retriever:
+            def __init__(self):
+                self.calls = 0
+
+            async def close(self, **_kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    return False
+                return True
+
+        retriever = _Retriever()
+
+        async def run():
+            self.assertFalse(
+                engine._schedule_vector_stack_retirement(
+                    retriever,
+                    None,
+                    index_path=index_path,
+                    generation=2,
+                    delete_index=True,
+                )
+            )
+            self.assertEqual(len(engine._retired_vector_overflow_stacks), 1)
+            stack_id = next(iter(engine._retired_vector_overflow_stacks))
+            await asyncio.sleep(0.03)
+            stack = engine._overflow_stack(stack_id)
+            self.assertIsNotNone(stack)
+            self.assertIn(stack["status"], {"retry_wait", "closing"})
+            self.assertTrue(index_path.exists())
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline and engine._overflow_stack(stack_id) is not None:
+                await asyncio.sleep(0.02)
+            self.assertIsNone(engine._overflow_stack(stack_id))
+            self.assertFalse(index_path.exists())
+            self.assertGreaterEqual(retriever.calls, 2)
+
+        asyncio.run(run())
+
+    def test_overflow_retirement_exception_keeps_reference_and_exhausts(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=["embedding"]),
+            memory=SimpleNamespace(recall_top_k=5),
+            timing=SimpleNamespace(
+                vector_retirement_registry_limit=1,
+                vector_retirement_overflow_registry_limit=1,
+                vector_retirement_retry_base_sec=0.01,
+                vector_retirement_retry_max_sec=0.01,
+                vector_retirement_retry_max_attempts=2,
+            ),
+        )
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+        engine._retired_vector_stacks["full"] = {"status": "closing"}
+
+        class _Retriever:
+            def __init__(self):
+                self.calls = 0
+
+            async def close(self, **_kwargs):
+                self.calls += 1
+                raise RuntimeError("close failed")
+
+        retriever = _Retriever()
+
+        async def run():
+            engine._schedule_vector_stack_retirement(retriever, None, generation=2)
+            stack_id = next(iter(engine._retired_vector_overflow_stacks))
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                stack = engine._overflow_stack(stack_id)
+                if stack and stack.get("status") == "retirement_retry_exhausted":
+                    break
+                await asyncio.sleep(0.02)
+            stack = engine._overflow_stack(stack_id)
+            self.assertIsNotNone(stack)
+            self.assertEqual(stack["status"], "retirement_retry_exhausted")
+            self.assertGreaterEqual(retriever.calls, 2)
+            diagnostics = engine.describe_shutdown_owners()
+            self.assertEqual(diagnostics["vector_retirement_overflow_exhausted"], 1)
+            self.assertTrue(diagnostics["vector_retirement_overflow_last_error"])
+
+        asyncio.run(run())
+
+    def test_overflow_retirement_without_event_loop_tracks_physical_future(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=["embedding"]),
+            memory=SimpleNamespace(recall_top_k=5),
+            timing=SimpleNamespace(
+                vector_retirement_registry_limit=1,
+                vector_retirement_overflow_registry_limit=1,
+                vector_retirement_retry_base_sec=0.01,
+                vector_retirement_retry_max_sec=0.01,
+                vector_retirement_retry_max_attempts=2,
+            ),
+        )
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+        engine._retired_vector_stacks["full"] = {"status": "closing"}
+
+        class _Retriever:
+            def __init__(self):
+                self.release = threading.Event()
+
+            def close(self, **_kwargs):
+                self.release.wait(timeout=1.0)
+                return True
+
+        retriever = _Retriever()
+        engine._schedule_vector_stack_retirement(retriever, None, generation=2)
+        self.assertEqual(len(engine._retired_vector_overflow_stacks), 1)
+        stack_id = next(iter(engine._retired_vector_overflow_stacks))
+        stack = engine._overflow_stack(stack_id)
+        self.assertIsNotNone(stack["sync_future"])
+        self.assertFalse(stack["sync_future"].done())
+        retriever.release.set()
+        self.assertTrue(stack["sync_future"].result(timeout=1.0))
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline and engine._overflow_stack(stack_id) is not None:
+            time.sleep(0.01)
+        self.assertIsNone(engine._overflow_stack(stack_id))
+        executor = engine._vector_sync_retirement_executor
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+            engine._vector_sync_retirement_executor = None
+
+    def test_overflow_and_normal_retirement_share_resource_close_owner(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=["embedding"]),
+            memory=SimpleNamespace(recall_top_k=5),
+            timing=SimpleNamespace(
+                vector_retirement_registry_limit=1,
+                vector_retirement_overflow_registry_limit=1,
+                shutdown_cancel_grace_sec=0.05,
+            ),
+        )
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+
+        class _Retriever:
+            def __init__(self):
+                self.calls = 0
+
+            async def close(self, **_kwargs):
+                self.calls += 1
+                await asyncio.sleep(0.02)
+                return True
+
+        retriever = _Retriever()
+
+        async def run():
+            engine._schedule_vector_stack_retirement(retriever, None, generation=1)
+            await asyncio.sleep(0)
+            engine._schedule_vector_stack_retirement(retriever, None, generation=2)
+            await asyncio.sleep(0.05)
+            await engine._close_overflow_vector_stacks(timeout_sec=0.1)
+            await engine._close_retired_vector_stacks(timeout_sec=0.1)
+            self.assertEqual(retriever.calls, 1)
+            self.assertFalse(engine._retired_vector_stacks)
+            self.assertFalse(engine._retired_vector_overflow_stacks)
+
+        asyncio.run(run())
+
+    def test_overflow_capacity_rejection_retains_reference_and_is_diagnosable(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=["embedding"]),
+            memory=SimpleNamespace(recall_top_k=5),
+            timing=SimpleNamespace(
+                vector_retirement_registry_limit=1,
+                vector_retirement_overflow_registry_limit=1,
+                vector_retirement_retry_max_attempts=1,
+                shutdown_cancel_grace_sec=0.01,
+            ),
+        )
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+        engine._retired_vector_stacks["full"] = {"status": "closing"}
+
+        class _Retriever:
+            async def close(self, **_kwargs):
+                await asyncio.sleep(0.1)
+                return True
+
+        first = _Retriever()
+        second = _Retriever()
+
+        async def run():
+            engine._schedule_vector_stack_retirement(first, None, generation=1)
+            engine._schedule_vector_stack_retirement(second, None, generation=2)
+            diagnostics = engine.describe_shutdown_owners()
+            self.assertEqual(diagnostics["vector_retirement_overflow_capacity_rejected"], 1)
+            self.assertGreaterEqual(diagnostics["vector_retirement_overflow_count"], 2)
+            self.assertTrue(diagnostics["vector_retirement_overflow_stacks"])
+            self.assertTrue(engine._vector_retirement_overflow_capacity_blocked)
+            await engine.close_background_resources()
+            await asyncio.sleep(0.15)
+            self.assertTrue(engine._retired_vector_overflow_capacity_stacks)
+            self.assertTrue(engine._vector_retirement_overflow_capacity_blocked)
+
+        asyncio.run(run())
+
+    def test_overflow_shutdown_cancellation_is_retried_by_late_cleanup(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=["embedding"]),
+            memory=SimpleNamespace(recall_top_k=5),
+            timing=SimpleNamespace(
+                vector_retirement_registry_limit=1,
+                vector_retirement_overflow_registry_limit=1,
+                vector_retirement_retry_max_attempts=3,
+            ),
+        )
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+        engine._retired_vector_stacks["full"] = {"status": "closing"}
+
+        class _Retriever:
+            def __init__(self):
+                self.calls = 0
+
+            async def close(self, **_kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    await asyncio.sleep(60)
+                return True
+
+        retriever = _Retriever()
+
+        async def run():
+            async def _close(_retriever, _faiss_db, *, timeout_sec):
+                if retriever.calls == 0:
+                    retriever.calls += 1
+                    await asyncio.sleep(60)
+                retriever.calls += 1
+                return True
+
+            engine._await_vector_stack_close = _close
+            engine._schedule_vector_stack_retirement(retriever, None, generation=1)
+            stack_id = next(iter(engine._retired_vector_overflow_stacks))
+            stack = engine._overflow_stack(stack_id)
+            await asyncio.sleep(0)
+            self.assertIsNotNone(stack["task"])
+            engine.begin_shutdown()
+            task = stack["task"]
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await asyncio.sleep(0)
+            self.assertEqual(stack["status"], "retry_wait")
+            stack["next_retry_at"] = 0.0
+            self.assertTrue(await engine._close_overflow_vector_stacks(timeout_sec=0.1))
+            self.assertIsNone(engine._overflow_stack(stack_id))
+            self.assertEqual(retriever.calls, 2)
+
+        asyncio.run(run())
+
+    def test_overflow_late_cleanup_failures_reach_exhausted_state(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=["embedding"]),
+            memory=SimpleNamespace(recall_top_k=5),
+            timing=SimpleNamespace(
+                vector_retirement_retry_max_attempts=2,
+            ),
+        )
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+        stack = {
+            "stack_id": "overflow-late",
+            "retriever": object(),
+            "faiss_db": None,
+            "index_path": "",
+            "delete_index": False,
+            "attempts": 0,
+            "max_attempts": 2,
+            "next_retry_at": 0.0,
+            "status": "retry_wait",
+            "last_error": "",
+            "created_at": time.time(),
+            "updated_at": time.time(),
+            "task": None,
+            "sync_future": None,
+        }
+        engine._retired_vector_overflow_stacks[stack["stack_id"]] = stack
+        engine._await_vector_stack_close = AsyncMock(return_value=False)
+
+        async def run():
+            self.assertFalse(await engine._close_overflow_vector_stacks(timeout_sec=0.1))
+            self.assertEqual(stack["status"], "retry_wait")
+            stack["next_retry_at"] = 0.0
+            self.assertFalse(await engine._close_overflow_vector_stacks(timeout_sec=0.1))
+            self.assertEqual(stack["status"], "retirement_retry_exhausted")
+            self.assertEqual(stack["attempts"], 2)
+            self.assertEqual(engine.describe_shutdown_owners()["vector_retirement_overflow_exhausted"], 1)
+
+        asyncio.run(run())
+
+    def test_overflow_emergency_capacity_limit_retains_all_references(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=["embedding"]),
+            memory=SimpleNamespace(recall_top_k=5),
+            timing=SimpleNamespace(
+                vector_retirement_registry_limit=1,
+                vector_retirement_overflow_registry_limit=1,
+                vector_retirement_overflow_capacity_limit=1,
+                vector_retirement_retry_max_attempts=1,
+            ),
+        )
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+        engine._retired_vector_stacks["full"] = {"status": "closing"}
+
+        class _Retriever:
+            async def close(self, **_kwargs):
+                await asyncio.sleep(60)
+                return True
+
+        retrievers = [_Retriever() for _ in range(3)]
+
+        async def run():
+            for retriever in retrievers:
+                engine._schedule_vector_stack_retirement(retriever, None, generation=1)
+            diagnostics = engine.describe_shutdown_owners()
+            self.assertEqual(diagnostics["vector_retirement_overflow_capacity_limit"], 1)
+            self.assertGreaterEqual(diagnostics["vector_retirement_overflow_capacity_over_limit"], 1)
+            self.assertEqual(diagnostics["vector_retirement_overflow_capacity_rejected"], 2)
+            self.assertEqual(len(engine._retired_vector_overflow_capacity_stacks), 2)
+            self.assertTrue(all(stack.get("retriever") is not None for stack in engine._retired_vector_overflow_capacity_stacks.values()))
+            engine.begin_shutdown()
+            tasks = [stack.get("task") for stack in engine._retired_vector_overflow_capacity_stacks.values()]
+            for task in tasks:
+                if task is not None and not task.done():
+                    task.cancel()
+            await asyncio.gather(*(task for task in tasks if task is not None), return_exceptions=True)
+
+        asyncio.run(run())
 
     def test_memory_engine_vector_generation_cleanup_keeps_current_and_one_history(self):
         memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")

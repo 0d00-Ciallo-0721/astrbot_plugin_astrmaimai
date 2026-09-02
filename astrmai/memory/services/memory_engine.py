@@ -172,6 +172,12 @@ class MemoryEngine:
         self._vector_candidate_build_tasks: set[asyncio.Task] = set()
         self._vector_candidate_paths: set[str] = set()
         self._retired_vector_stacks: dict[str, dict[str, Any]] = {}
+        self._retired_vector_overflow_stacks: dict[str, dict[str, Any]] = {}
+        self._retired_vector_overflow_capacity_stacks: dict[str, dict[str, Any]] = {}
+        self._vector_retirement_overflow_capacity_limit = 0
+        self._vector_retirement_overflow_capacity_blocked = False
+        self._vector_retirement_overflow_capacity_rejected_total = 0
+        self._vector_retirement_overflow_last_error = ""
         self._vector_retirement_capacity_rejected_total = 0
         self._vector_physical_timeout_exceeded_total = 0
         self._vector_registry_lock = threading.RLock()
@@ -1461,7 +1467,449 @@ class MemoryEngine:
         index_path=None,
         delete_index: bool = False,
     ) -> None:
-        """Close an overflow stack without retaining it in the retired registry."""
+        """Track and retry a stack rejected by the primary retirement registry."""
+        stack_id = f"overflow-{uuid.uuid4().hex}"
+        now = time.time()
+        overflow_limit = max(
+            1,
+            int(
+                self._timing_value(
+                    "vector_retirement_overflow_registry_limit",
+                    self._timing_value("vector_retirement_registry_limit", 32.0),
+                )
+            ),
+        )
+        capacity_limit = max(
+            overflow_limit,
+            int(
+                self._timing_value(
+                    "vector_retirement_overflow_capacity_limit",
+                    max(overflow_limit * 2, 64.0),
+                )
+            ),
+        )
+        stack = {
+            "stack_id": stack_id,
+            "retriever": retriever,
+            "faiss_db": faiss_db,
+            "index_path": str(index_path) if index_path else "",
+            "delete_index": bool(delete_index),
+            "attempts": 0,
+            "max_attempts": max(
+                1,
+                int(self._timing_value("vector_retirement_retry_max_attempts", 5.0)),
+            ),
+            "next_retry_at": 0.0,
+            "status": "pending",
+            "last_error": "",
+            "created_at": now,
+            "updated_at": now,
+            "task": None,
+            "sync_future": None,
+            "capacity_limit": capacity_limit,
+        }
+        with self._vector_registry_lock:
+            self._vector_retirement_overflow_capacity_limit = capacity_limit
+            if len(self._retired_vector_overflow_stacks) < overflow_limit:
+                self._retired_vector_overflow_stacks[stack_id] = stack
+            else:
+                # Keep the reference in an explicit emergency registry rather
+                # than silently dropping it.  Once this path is reached,
+                # cutover is considered degraded until the resource closes.
+                stack["status"] = "capacity_rejected"
+                self._retired_vector_overflow_capacity_stacks[stack_id] = stack
+                self._vector_retirement_overflow_capacity_blocked = True
+                self._vector_retirement_overflow_capacity_rejected_total += 1
+                self._vector_state = "degraded"
+                if len(self._retired_vector_overflow_capacity_stacks) > capacity_limit:
+                    stack["capacity_over_limit"] = True
+        self._schedule_overflow_vector_retirement_attempt(stack_id)
+
+    def _overflow_stack(self, stack_id: str) -> dict[str, Any] | None:
+        with self._vector_registry_lock:
+            return (
+                self._retired_vector_overflow_stacks.get(stack_id)
+                or self._retired_vector_overflow_capacity_stacks.get(stack_id)
+            )
+
+    def _finalize_overflow_vector_stack(self, stack_id: str) -> None:
+        with self._vector_registry_lock:
+            stack = (
+                self._retired_vector_overflow_stacks.pop(stack_id, None)
+                or self._retired_vector_overflow_capacity_stacks.pop(stack_id, None)
+                or {}
+            )
+            if not self._retired_vector_overflow_capacity_stacks:
+                self._vector_retirement_overflow_capacity_blocked = False
+        self._forget_vector_stack_close(stack.get("retriever"), stack.get("faiss_db"))
+        retired_path = str(stack.get("index_path") or "").strip()
+        if retired_path:
+            try:
+                with self._vector_registry_lock:
+                    self._vector_candidate_paths.discard(str(Path(retired_path).resolve()))
+            except OSError:
+                with self._vector_registry_lock:
+                    self._vector_candidate_paths.discard(retired_path)
+        if stack.get("delete_index") and retired_path:
+            try:
+                Path(retired_path).unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning(f"[AstrMai] overflow vector index cleanup degraded: {exc}")
+
+    def _schedule_overflow_vector_retirement_attempt(self, stack_id: str) -> None:
+        with self._vector_registry_lock:
+            stack = self._overflow_stack(stack_id)
+            if not stack or stack.get("task") is not None or stack.get("sync_future") is not None:
+                return
+            if not getattr(self, "_accepting_vector_work", True):
+                # Shutdown/late-cleanup owns retries after the producer fence.
+                # Do not create a new background task once admission is closed.
+                stack["status"] = "retry_wait"
+                stack["updated_at"] = time.time()
+                return
+            if int(stack.get("attempts", 0) or 0) >= int(stack.get("max_attempts", 1) or 1):
+                stack["status"] = "retirement_retry_exhausted"
+                stack["updated_at"] = time.time()
+                return
+            delay = max(
+                0.0,
+                float(stack.get("next_retry_at", 0.0) or 0.0) - time.monotonic(),
+            )
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._schedule_sync_overflow_vector_retirement(stack_id)
+            return
+        if loop.is_closed():
+            self._schedule_sync_overflow_vector_retirement(stack_id)
+            return
+
+        async def _retire() -> bool:
+            if delay:
+                await asyncio.sleep(delay)
+            if not getattr(self, "_accepting_vector_work", True):
+                return False
+            with self._vector_registry_lock:
+                current = self._overflow_stack(stack_id)
+                if current is not stack:
+                    return False
+                stack["attempts"] = int(stack.get("attempts", 0) or 0) + 1
+                stack["status"] = "closing"
+                stack["updated_at"] = time.time()
+            return await self._await_vector_stack_close(
+                stack.get("retriever"),
+                stack.get("faiss_db"),
+                timeout_sec=self._vector_close_timeout_sec(),
+            )
+
+        task = loop.create_task(_retire(), name="astrmai-vector-overflow-retirement")
+        with self._vector_registry_lock:
+            current = self._overflow_stack(stack_id)
+            if current is not stack or stack.get("task") is not None:
+                task.cancel()
+                return
+            stack["task"] = task
+            stack["updated_at"] = time.time()
+            self._vector_retirement_tasks.add(task)
+
+        def _consume(done: asyncio.Task) -> None:
+            retry_after_cancel = False
+            with self._vector_registry_lock:
+                self._vector_retirement_tasks.discard(done)
+                current = self._overflow_stack(stack_id)
+                if current is not stack or stack.get("task") is not done:
+                    return
+                stack["task"] = None
+                stack["updated_at"] = time.time()
+                if done.cancelled():
+                    stack["status"] = "retry_wait"
+                    stack["last_error"] = "cancelled"
+                    stack["next_retry_at"] = max(
+                        time.monotonic()
+                        + self._retirement_retry_delay(int(stack.get("attempts", 0) or 0)),
+                        self._vector_stack_close_retry_after(stack) + 0.001,
+                    )
+                    retry_after_cancel = bool(getattr(self, "_accepting_vector_work", True))
+            if done.cancelled():
+                if retry_after_cancel:
+                    self._schedule_overflow_vector_retirement_attempt(stack_id)
+                return
+            try:
+                closed = bool(done.result())
+            except Exception as exc:
+                closed = False
+                with self._vector_registry_lock:
+                    stack["last_error"] = f"{type(exc).__name__}: {exc}"[:500]
+                    self._vector_retirement_overflow_last_error = stack["last_error"]
+            if closed:
+                self._finalize_overflow_vector_stack(stack_id)
+                return
+            with self._vector_registry_lock:
+                stack["status"] = "retry_wait"
+                stack["last_error"] = stack.get("last_error") or "close_failed"
+                self._vector_retirement_overflow_last_error = stack["last_error"]
+                stack["next_retry_at"] = max(
+                    time.monotonic()
+                    + self._retirement_retry_delay(int(stack.get("attempts", 0) or 0)),
+                    self._vector_stack_close_retry_after(stack) + 0.001,
+                )
+                exhausted = int(stack.get("attempts", 0) or 0) >= int(
+                    stack.get("max_attempts", 1) or 1
+                )
+                if exhausted:
+                    stack["status"] = "retirement_retry_exhausted"
+            if not exhausted and getattr(self, "_accepting_vector_work", True):
+                self._schedule_overflow_vector_retirement_attempt(stack_id)
+
+        task.add_done_callback(_consume)
+
+    def _schedule_sync_overflow_vector_retirement(self, stack_id: str) -> None:
+        with self._vector_registry_lock:
+            stack = self._overflow_stack(stack_id)
+            if not stack or stack.get("sync_future") is not None or stack.get("task") is not None:
+                return
+            executor = self._vector_sync_retirement_executor
+            if executor is None:
+                executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="astrmai-vector-retire")
+                self._vector_sync_retirement_executor = executor
+            future: Future = Future()
+            stack["sync_future"] = future
+            self._vector_sync_retirement_futures.add(future)
+
+        def _run() -> None:
+            try:
+                while True:
+                    with self._vector_registry_lock:
+                        if int(stack.get("attempts", 0) or 0) >= int(stack.get("max_attempts", 1) or 1):
+                            stack["status"] = "retirement_retry_exhausted"
+                            stack["updated_at"] = time.time()
+                            future.set_result(False)
+                            return
+                        stack["attempts"] = int(stack.get("attempts", 0) or 0) + 1
+                        stack["status"] = "closing"
+                        stack["updated_at"] = time.time()
+                    closed = self._close_vector_stack_physical(
+                        stack.get("retriever"),
+                        stack.get("faiss_db"),
+                        timeout_sec=self._vector_close_timeout_sec(),
+                    )
+                    if closed:
+                        future.set_result(True)
+                        return
+                    with self._vector_registry_lock:
+                        stack["status"] = "retry_wait"
+                        stack["last_error"] = "close_failed"
+                        self._vector_retirement_overflow_last_error = "close_failed"
+                        stack["next_retry_at"] = time.monotonic() + self._retirement_retry_delay(
+                            int(stack.get("attempts", 0) or 0)
+                        )
+                        stack["updated_at"] = time.time()
+                        exhausted = int(stack.get("attempts", 0) or 0) >= int(
+                            stack.get("max_attempts", 1) or 1
+                        )
+                    if exhausted:
+                        with self._vector_registry_lock:
+                            stack["status"] = "retirement_retry_exhausted"
+                        future.set_result(False)
+                        return
+                    time.sleep(max(0.0, float(stack["next_retry_at"] - time.monotonic())))
+            except BaseException as exc:
+                with self._vector_registry_lock:
+                    stack["status"] = "retry_wait"
+                    stack["last_error"] = f"{type(exc).__name__}: {exc}"[:500]
+                    self._vector_retirement_overflow_last_error = stack["last_error"]
+                    stack["updated_at"] = time.time()
+                if not future.done():
+                    future.set_result(False)
+
+        future_worker = executor.submit(_run)
+        # Keep the physical owner future in the existing registry; the worker
+        # future is only an executor implementation detail.
+        del future_worker
+
+        def _consume(done: Future) -> None:
+            with self._vector_registry_lock:
+                self._vector_sync_retirement_futures.discard(done)
+                current = self._overflow_stack(stack_id)
+                if current is not stack or stack.get("sync_future") is not done:
+                    return
+                stack["sync_future"] = None
+                stack["updated_at"] = time.time()
+            try:
+                closed = bool(done.result())
+            except Exception as exc:
+                closed = False
+                with self._vector_registry_lock:
+                    stack["last_error"] = f"{type(exc).__name__}: {exc}"[:500]
+                    self._vector_retirement_overflow_last_error = stack["last_error"]
+            if closed:
+                self._finalize_overflow_vector_stack(stack_id)
+
+        future.add_done_callback(_consume)
+
+    async def _close_overflow_vector_stacks(self, *, timeout_sec: float | None = None) -> bool:
+        """Retry overflow retirement during shutdown/late cleanup.
+
+        Runtime retirement tasks stop scheduling once the vector-work fence is
+        closed.  This method is called repeatedly by lifecycle late cleanup and
+        therefore owns retry-wait settlement after shutdown without creating a
+        second cleanup abstraction.
+        """
+        all_closed = True
+        with self._vector_registry_lock:
+            stacks = list(self._retired_vector_overflow_stacks.items()) + list(
+                self._retired_vector_overflow_capacity_stacks.items()
+            )
+        for stack_id, stack in stacks:
+            active_owner = None
+            with self._vector_registry_lock:
+                current = self._overflow_stack(stack_id)
+                if current is not stack:
+                    continue
+                if stack.get("status") == "retirement_retry_exhausted":
+                    all_closed = False
+                    continue
+                active_owner = stack.get("task") or stack.get("sync_future")
+                if active_owner is not None:
+                    all_closed = False
+            if active_owner is not None:
+                try:
+                    if isinstance(active_owner, asyncio.Task):
+                        await asyncio.wait_for(
+                            asyncio.shield(active_owner),
+                            timeout=timeout_sec,
+                        )
+                    else:
+                        await asyncio.wait_for(
+                            asyncio.shield(asyncio.wrap_future(active_owner)),
+                            timeout=timeout_sec,
+                        )
+                except asyncio.TimeoutError:
+                    continue
+                except asyncio.CancelledError:
+                    owner_cancelled = bool(
+                        getattr(active_owner, "cancelled", lambda: False)()
+                    )
+                    if not owner_cancelled:
+                        raise
+                    continue
+                except Exception:
+                    pass
+                # A completed owner schedules its registry callback for the
+                # next loop turn; allow that callback to clear the stack before
+                # deciding whether a new close attempt is needed.
+                await asyncio.sleep(0)
+                with self._vector_registry_lock:
+                    if self._overflow_stack(stack_id) is not stack:
+                        continue
+                    if stack.get("task") is not None or stack.get("sync_future") is not None:
+                        continue
+                    if stack.get("status") == "retirement_retry_exhausted":
+                        all_closed = False
+                        continue
+            with self._vector_registry_lock:
+                if self._overflow_stack(stack_id) is not stack:
+                    continue
+                if float(stack.get("next_retry_at", 0.0) or 0.0) > time.monotonic():
+                    all_closed = False
+                    continue
+                attempts = int(stack.get("attempts", 0) or 0)
+                max_attempts = int(stack.get("max_attempts", 1) or 1)
+                if attempts >= max_attempts:
+                    stack["status"] = "retirement_retry_exhausted"
+                    stack["updated_at"] = time.time()
+                    all_closed = False
+                    continue
+                stack["attempts"] = attempts + 1
+                stack["status"] = "closing"
+                stack["updated_at"] = time.time()
+            try:
+                closed = await self._await_vector_stack_close(
+                    stack.get("retriever"),
+                    stack.get("faiss_db"),
+                    timeout_sec=timeout_sec,
+                )
+            except asyncio.CancelledError:
+                with self._vector_registry_lock:
+                    current = self._overflow_stack(stack_id)
+                    if current is stack:
+                        stack["status"] = "retry_wait"
+                        stack["last_error"] = "cancelled"
+                        stack["next_retry_at"] = time.monotonic() + self._retirement_retry_delay(
+                            int(stack.get("attempts", 0) or 0)
+                        )
+                        stack["updated_at"] = time.time()
+                raise
+            except Exception as exc:
+                closed = False
+                with self._vector_registry_lock:
+                    current = self._overflow_stack(stack_id)
+                    if current is stack:
+                        stack["last_error"] = f"{type(exc).__name__}: {exc}"[:500]
+                        self._vector_retirement_overflow_last_error = stack["last_error"]
+            if closed:
+                self._finalize_overflow_vector_stack(stack_id)
+            else:
+                with self._vector_registry_lock:
+                    current = self._overflow_stack(stack_id)
+                    if current is stack:
+                        stack["status"] = "retry_wait"
+                        stack["last_error"] = stack.get("last_error") or "close_failed"
+                        self._vector_retirement_overflow_last_error = stack["last_error"]
+                        stack["next_retry_at"] = max(
+                            time.monotonic()
+                            + self._retirement_retry_delay(int(stack.get("attempts", 0) or 0)),
+                            self._vector_stack_close_retry_after(stack) + 0.001,
+                        )
+                        if int(stack.get("attempts", 0) or 0) >= int(
+                            stack.get("max_attempts", 1) or 1
+                        ):
+                            stack["status"] = "retirement_retry_exhausted"
+                        stack["updated_at"] = time.time()
+                all_closed = False
+        return all_closed
+
+    def _overflow_retirement_diagnostics(self) -> dict[str, Any]:
+        with self._vector_registry_lock:
+            stacks = list(self._retired_vector_overflow_stacks.values()) + list(
+                self._retired_vector_overflow_capacity_stacks.values()
+            )
+        now = time.time()
+        statuses = [str(stack.get("status") or "pending") for stack in stacks]
+        pending = sum(status in {"pending", "closing", "capacity_rejected"} for status in statuses)
+        retry_wait = sum(status == "retry_wait" for status in statuses)
+        exhausted = sum(status == "retirement_retry_exhausted" for status in statuses)
+        oldest = min((float(stack.get("created_at") or now) for stack in stacks), default=now)
+        paths = [
+            {
+                "stack_id": str(stack.get("stack_id") or ""),
+                "index_path": Path(str(stack.get("index_path") or "")).name,
+                "status": str(stack.get("status") or "pending"),
+            }
+            for stack in stacks
+        ]
+        return {
+            "vector_retirement_overflow_count": len(stacks),
+            "vector_retirement_overflow_pending": pending,
+            "vector_retirement_overflow_retry_wait": retry_wait,
+            "vector_retirement_overflow_exhausted": exhausted,
+            "vector_retirement_overflow_capacity_rejected": int(
+                self._vector_retirement_overflow_capacity_rejected_total
+            ),
+            "vector_retirement_overflow_capacity_limit": int(
+                self._vector_retirement_overflow_capacity_limit or 0
+            ),
+            "vector_retirement_overflow_capacity_over_limit": sum(
+                bool(stack.get("capacity_over_limit")) for stack in stacks
+            ),
+            "vector_retirement_overflow_oldest_age_ms": round(max(0.0, now - oldest) * 1000.0, 1)
+            if stacks
+            else 0.0,
+            "vector_retirement_overflow_last_error": str(
+                self._vector_retirement_overflow_last_error or ""
+            ),
+            "vector_retirement_overflow_stacks": paths,
+        }
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -1913,6 +2361,10 @@ class MemoryEngine:
         async with self._faiss_lock:
             if generation != self._vector_generation:
                 return
+            if getattr(self, "_vector_retirement_overflow_capacity_blocked", False):
+                self._vector_state = "degraded"
+                self._vector_last_error = "vector retirement overflow capacity is blocked"
+                raise RuntimeError(self._vector_last_error)
             if self._is_ready and self._vector_state == "ready":
                 return
             migration_applied = await self.v2_store.migration_applied("2_index_rebuild")
@@ -2339,6 +2791,12 @@ class MemoryEngine:
             ]
             candidate_path_count = len(self._vector_candidate_paths)
             retired_stacks = [dict(stack) for stack in self._retired_vector_stacks.values()]
+            overflow_stacks = [
+                dict(stack) for stack in self._retired_vector_overflow_stacks.values()
+            ] + [
+                dict(stack)
+                for stack in self._retired_vector_overflow_capacity_stacks.values()
+            ]
         dimension_probe_task = getattr(self, "_vector_dimension_probe_task", None)
         dimension_probe_count = int(_running(dimension_probe_task))
 
@@ -2362,6 +2820,31 @@ class MemoryEngine:
         retirement_statuses = {
             str(stack.get("status") or "pending") for stack in retired_stacks
         }
+        overflow_statuses = {
+            str(stack.get("status") or "pending") for stack in overflow_stacks
+        }
+        overflow_tasks = [
+            stack.get("task")
+            for stack in overflow_stacks
+            if _running(stack.get("task"))
+        ]
+        overflow_futures = [
+            stack.get("sync_future")
+            for stack in overflow_stacks
+            if _running(stack.get("sync_future"))
+        ]
+        owner_names.update(
+            _owner_name(task, "memory.vector.overflow_retirement")
+            for task in overflow_tasks
+        )
+        owner_names.update(
+            "astrmai-vector-overflow-physical" for _future in overflow_futures
+        )
+        owner_names.update(
+            f"memory.vector.overflow_retirement:{stack.get('stack_id', '')}"
+            for stack in overflow_stacks
+            if str(stack.get("status") or "pending") != "retirement_retry_exhausted"
+        )
         return {
             "vector_retirement_count": len(retirement_tasks),
             "vector_candidate_build_count": len(candidate_build_tasks),
@@ -2392,6 +2875,7 @@ class MemoryEngine:
                 int(bool(stack.get("physical_timeout_exceeded")))
                 for stack in retired_stacks
             ),
+            **self._overflow_retirement_diagnostics(),
         }
 
     def describe_vector_status(self) -> dict[str, Any]:
@@ -2474,6 +2958,30 @@ class MemoryEngine:
                     "vector_dimension_probe_count"
                 ],
                 "retired_vector_stack_count": shutdown_owners["retired_vector_stack_count"],
+                "vector_retirement_overflow_count": shutdown_owners[
+                    "vector_retirement_overflow_count"
+                ],
+                "vector_retirement_overflow_pending": shutdown_owners[
+                    "vector_retirement_overflow_pending"
+                ],
+                "vector_retirement_overflow_retry_wait": shutdown_owners[
+                    "vector_retirement_overflow_retry_wait"
+                ],
+                "vector_retirement_overflow_exhausted": shutdown_owners[
+                    "vector_retirement_overflow_exhausted"
+                ],
+                "vector_retirement_overflow_capacity_rejected": shutdown_owners[
+                    "vector_retirement_overflow_capacity_rejected"
+                ],
+                "vector_retirement_overflow_oldest_age_ms": shutdown_owners[
+                    "vector_retirement_overflow_oldest_age_ms"
+                ],
+                "vector_retirement_overflow_last_error": shutdown_owners[
+                    "vector_retirement_overflow_last_error"
+                ],
+                "vector_retirement_overflow_stacks": shutdown_owners[
+                    "vector_retirement_overflow_stacks"
+                ],
                 "vector_close_state": str(getattr(self, "_vector_close_state", "idle")),
                 "last_projector_shutdown": dict(
                     getattr(self, "_last_projector_shutdown", {}) or {}
@@ -3201,7 +3709,8 @@ class MemoryEngine:
                 self.retriever = None
             self._forget_vector_stack_close(retriever, faiss_db)
         retired_closed = await self._close_retired_vector_stacks(timeout_sec=timeout_sec)
-        if not closed or not retired_closed:
+        overflow_closed = await self._close_overflow_vector_stacks(timeout_sec=timeout_sec)
+        if not closed or not retired_closed or not overflow_closed:
             self._vector_state = "degraded"
             self._is_ready = False
             self._vector_close_state = "pending"
