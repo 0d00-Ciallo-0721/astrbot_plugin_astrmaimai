@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -845,7 +846,7 @@ class MemoryGapCoverageTests(unittest.TestCase):
             closed = False
 
             async def close(self):
-                await asyncio.sleep(0)
+                await asyncio.sleep(0.05)
                 self.closed = True
 
         retriever = _Retriever()
@@ -1238,7 +1239,7 @@ class MemoryGapCoverageTests(unittest.TestCase):
                 self.assertEqual(len(sync_futures), 1)
                 candidate_db.close_release.set()
                 self.assertTrue(await asyncio.to_thread(sync_futures[0].result, 1.0))
-                await asyncio.sleep(0)
+                await asyncio.sleep(0.05)
 
         asyncio.run(run())
 
@@ -2055,6 +2056,264 @@ class MemoryGapCoverageTests(unittest.TestCase):
             await asyncio.gather(*(task for task in tasks if task is not None), return_exceptions=True)
 
         asyncio.run(run())
+
+    def test_index_delete_repair_retries_after_unlink_failure(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=["embedding"]),
+            memory=SimpleNamespace(recall_top_k=5),
+            timing=SimpleNamespace(vector_retirement_retry_max_attempts=3),
+        )
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+        index_path = Path(self.temp_dir.name) / "delete-repair.index"
+        index_path.write_bytes(b"index")
+        original_unlink = Path.unlink
+        calls = {"count": 0}
+
+        def flaky_unlink(path, *, missing_ok=False):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise OSError("temporary delete failure")
+            return original_unlink(path, missing_ok=missing_ok)
+
+        async def run():
+            with patch.object(Path, "unlink", new=flaky_unlink):
+                engine._schedule_vector_index_delete_repair(
+                    str(index_path), stack_id="stack-delete", generation=4
+                )
+                await asyncio.sleep(0.05)
+                repair = engine._vector_index_delete_repairs["stack-delete:index-delete"]
+                self.assertEqual(repair["status"], "retry_wait")
+                self.assertTrue(index_path.exists())
+                repair["next_retry_at"] = 0.0
+                self.assertTrue(await engine._close_vector_index_delete_repairs(timeout_sec=0.1))
+                self.assertEqual(repair["status"], "deleted")
+                self.assertFalse(index_path.exists())
+                self.assertTrue(await engine._close_vector_index_delete_repairs(timeout_sec=0.1))
+                self.assertEqual(calls["count"], 2)
+
+        asyncio.run(run())
+
+    def test_index_delete_repair_exhausted_is_terminal_and_diagnosable(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=["embedding"]),
+            memory=SimpleNamespace(recall_top_k=5),
+            timing=SimpleNamespace(vector_retirement_retry_max_attempts=2),
+        )
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+        index_path = Path(self.temp_dir.name) / "delete-exhausted.index"
+        index_path.write_bytes(b"index")
+
+        def always_fail(_path, *, missing_ok=False):
+            raise OSError("permanent delete failure")
+
+        async def run():
+            with patch.object(Path, "unlink", new=always_fail):
+                engine._schedule_vector_index_delete_repair(
+                    str(index_path), stack_id="stack-exhausted", generation=5
+                )
+                await asyncio.sleep(0.05)
+                repair = engine._vector_index_delete_repairs["stack-exhausted:index-delete"]
+                repair["next_retry_at"] = 0.0
+                self.assertFalse(await engine._close_vector_index_delete_repairs(timeout_sec=0.1))
+                repair["next_retry_at"] = 0.0
+                self.assertFalse(await engine._close_vector_index_delete_repairs(timeout_sec=0.1))
+                self.assertEqual(repair["status"], "repair_exhausted")
+                self.assertTrue(index_path.exists())
+                diagnostics = engine.describe_shutdown_owners()
+                self.assertEqual(diagnostics["vector_index_delete_repair_exhausted"], 1)
+                self.assertIn("permanent delete failure", diagnostics["vector_index_delete_repair_last_error"])
+
+        asyncio.run(run())
+
+    def test_index_delete_repair_is_visible_during_shutdown_pending_cleanup(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=["embedding"]),
+            memory=SimpleNamespace(recall_top_k=5),
+            timing=SimpleNamespace(vector_retirement_retry_max_attempts=2),
+        )
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+        index_path = Path(self.temp_dir.name) / "delete-shutdown.index"
+        index_path.write_bytes(b"index")
+
+        def always_fail(_path, *, missing_ok=False):
+            raise OSError("shutdown delete failure")
+
+        async def run():
+            engine.begin_shutdown()
+            with patch.object(Path, "unlink", new=always_fail):
+                engine._schedule_vector_index_delete_repair(
+                    str(index_path), stack_id="stack-shutdown", generation=6
+                )
+                await asyncio.sleep(0.05)
+                repair = engine._vector_index_delete_repairs["stack-shutdown:index-delete"]
+                self.assertEqual(repair["status"], "retry_wait")
+                self.assertEqual(
+                    engine.describe_vector_status()["vector_index_delete_repair_retry_wait"], 1
+                )
+                repair["next_retry_at"] = 0.0
+                self.assertFalse(await engine._close_vector_index_delete_repairs(timeout_sec=0.1))
+                self.assertEqual(repair["attempts"], 2)
+                self.assertEqual(repair["status"], "repair_exhausted")
+
+        asyncio.run(run())
+
+    def test_index_delete_repair_persists_and_is_loaded_by_new_engine(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(provider=SimpleNamespace(embedding_models=["embedding"]), memory=SimpleNamespace(recall_top_k=5))
+        first = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+        first.v2_db_path = str(Path(self.temp_dir.name) / "repairs.db")
+        repair = {
+            "repair_id": "restart:index-delete", "stack_id": "restart", "generation": 7,
+            "index_path": str(Path(self.temp_dir.name) / "retired.index"), "attempts": 2,
+            "max_attempts": 5, "next_retry_at": time.monotonic() + 1000.0, "status": "retry_wait",
+            "last_error": "busy", "revision": 3, "created_at": time.time(), "updated_at": time.time(),
+        }
+        first._persist_index_delete_repair_sync(repair)
+        second = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+        second.v2_db_path = first.v2_db_path
+        asyncio.run(second._load_index_delete_repairs())
+        loaded = second._vector_index_delete_repairs["restart:index-delete"]
+        self.assertEqual(loaded["attempts"], 2)
+        self.assertEqual(loaded["last_error"], "busy")
+        self.assertGreater(loaded["next_retry_at"], time.monotonic())
+
+    def test_index_delete_repair_protects_current_active_index(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(provider=SimpleNamespace(embedding_models=["embedding"]), memory=SimpleNamespace(recall_top_k=5), timing=SimpleNamespace(vector_retirement_retry_max_attempts=2))
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+        path = Path(self.temp_dir.name) / "active.index"
+        path.write_bytes(b"index")
+        engine._vector_index_path = str(path)
+        engine._schedule_vector_index_delete_repair(str(path), stack_id="active", generation=1)
+        repair = engine._vector_index_delete_repairs["active:index-delete"]
+        repair["next_retry_at"] = 0.0
+        self.assertFalse(engine._run_vector_index_delete_repair_attempt("active:index-delete"))
+        self.assertTrue(path.exists())
+        self.assertEqual(repair["last_error"], "active_index_protected")
+
+    def test_index_delete_repair_deleted_ttl_cleanup_keeps_pending(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(provider=SimpleNamespace(embedding_models=["embedding"]), memory=SimpleNamespace(recall_top_k=5))
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+        engine.v2_db_path = str(Path(self.temp_dir.name) / "ttl.db")
+        now = time.time()
+        engine._persist_index_delete_repair_sync({
+            "repair_id": "old:index-delete", "stack_id": "old", "generation": 1, "index_path": "old", "attempts": 1,
+            "max_attempts": 1, "next_retry_at": 0.0, "status": "deleted", "last_error": "", "revision": 1,
+            "created_at": now - 1000, "updated_at": now - 1000,
+        })
+        engine._persist_index_delete_repair_sync({
+            "repair_id": "pending:index-delete", "stack_id": "pending", "generation": 1, "index_path": "pending", "attempts": 1,
+            "max_attempts": 3, "next_retry_at": 0.0, "status": "retry_wait", "last_error": "busy", "revision": 1,
+            "created_at": now - 1000, "updated_at": now - 1000,
+        })
+        engine._vector_index_delete_repair_ttl_sec = 1
+        asyncio.run(engine._cleanup_index_delete_repairs())
+        asyncio.run(engine._load_index_delete_repairs())
+        self.assertNotIn("old:index-delete", engine._vector_index_delete_repairs)
+        self.assertIn("pending:index-delete", engine._vector_index_delete_repairs)
+
+    def test_index_delete_repair_persistence_failure_keeps_pending_snapshot(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(provider=SimpleNamespace(embedding_models=["embedding"]), memory=SimpleNamespace(recall_top_k=5))
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+        with patch.object(engine, "_persist_index_delete_repair_sync", side_effect=OSError("sqlite unavailable")):
+            engine._schedule_vector_index_delete_repair(str(Path(self.temp_dir.name) / "lost.index"), stack_id="persist-fail", generation=1)
+            future = next(iter(engine._vector_index_delete_repair_persistence_futures))
+            with self.assertRaises(OSError):
+                future.result(timeout=2)
+        self.assertIn("persist-fail:index-delete", engine._vector_index_delete_repair_pending_persistence)
+        self.assertEqual(engine._vector_index_delete_repair_persistence_status, "failed")
+
+    def test_index_delete_repair_missing_file_is_idempotently_deleted(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(provider=SimpleNamespace(embedding_models=["embedding"]), memory=SimpleNamespace(recall_top_k=5))
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+        path = Path(self.temp_dir.name) / "already-gone.index"
+        engine._schedule_vector_index_delete_repair(str(path), stack_id="gone", generation=1)
+        repair = engine._vector_index_delete_repairs["gone:index-delete"]
+        self.assertTrue(engine._run_vector_index_delete_repair_attempt("gone:index-delete"))
+        self.assertEqual(repair["status"], "deleted")
+
+    def test_index_delete_repair_dead_letter_is_loaded_as_exhausted(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(provider=SimpleNamespace(embedding_models=["embedding"]), memory=SimpleNamespace(recall_top_k=5))
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+        engine.v2_db_path = str(Path(self.temp_dir.name) / "dead-letter.db")
+        engine._ensure_index_delete_repair_schema_sync()
+        with sqlite3.connect(engine.v2_db_path) as db:
+            db.execute("INSERT INTO vector_index_delete_repairs(repair_id, stack_id, index_path, status, last_error) VALUES (?, ?, ?, ?, ?)", ("legacy:index-delete", "legacy", "legacy.index", "dead_letter", "legacy failure"))
+            db.commit()
+        asyncio.run(engine._load_index_delete_repairs())
+        self.assertEqual(engine._vector_index_delete_repairs["legacy:index-delete"]["status"], "repair_exhausted")
+
+    def test_index_delete_repair_concurrent_cleanup_has_single_unlink(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(provider=SimpleNamespace(embedding_models=["embedding"]), memory=SimpleNamespace(recall_top_k=5))
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+        path = Path(self.temp_dir.name) / "concurrent.index"
+        path.write_bytes(b"index")
+        calls = {"count": 0}
+        original = Path.unlink
+        def unlink_once(target, *, missing_ok=False):
+            calls["count"] += 1
+            time.sleep(0.02)
+            return original(target, missing_ok=missing_ok)
+        with patch.object(Path, "unlink", new=unlink_once):
+            engine._accepting_vector_work = False
+            engine._schedule_vector_index_delete_repair(str(path), stack_id="concurrent", generation=1)
+            repair = engine._vector_index_delete_repairs["concurrent:index-delete"]
+            repair["next_retry_at"] = 0.0
+            async def run():
+                return await asyncio.gather(
+                    engine._close_vector_index_delete_repairs(timeout_sec=1),
+                    engine._close_vector_index_delete_repairs(timeout_sec=1),
+                )
+            result = asyncio.run(run())
+        self.assertTrue(any(result))
+        self.assertEqual(calls["count"], 1)
+
+    def test_index_delete_repair_pending_persistence_retries_three_times(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(provider=SimpleNamespace(embedding_models=["embedding"]), memory=SimpleNamespace(recall_top_k=5))
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+        snapshot = {"repair_id": "retry-persist:index-delete", "stack_id": "retry-persist", "index_path": "x", "status": "retry_wait", "revision": 1}
+        engine._vector_index_delete_repair_pending_persistence[snapshot["repair_id"]] = snapshot
+        calls = {"count": 0}
+        def flaky(_snapshot):
+            calls["count"] += 1
+            if calls["count"] < 3:
+                raise OSError("sqlite busy")
+        async def run():
+            with patch.object(engine, "_persist_index_delete_repair_sync", side_effect=flaky):
+                await engine._flush_index_delete_repair_persistence()
+        asyncio.run(run())
+        self.assertEqual(calls["count"], 3)
+        self.assertNotIn(snapshot["repair_id"], engine._vector_index_delete_repair_pending_persistence)
+
+    def test_index_delete_repair_ttl_cleanup_can_run_from_memory_maintenance(self):
+        maintenance_mod = importlib.import_module("astrmai.memory.services.memory_maintenance_service")
+        class _Store:
+            async def list_canonical(self, **_kwargs): return {"total": 0, "items": []}
+            async def apply_decay(self, **_kwargs): return 0
+            async def list_candidates(self, **_kwargs): return []
+            async def purge_jargon_candidates(self, **_kwargs): return {"deleted_ids": [], "protected_skipped": 0}
+            async def purge_kind_candidates(self, **_kwargs): return {"deleted_ids": [], "protected_skipped": 0}
+        class _Engine:
+            async def _flush_index_delete_repair_persistence(self): self.flushed = True
+            async def _cleanup_index_delete_repairs(self): self.cleaned = True; return 2
+        engine = _Engine()
+        projector = SimpleNamespace(engine=engine, check_consistency=None)
+        service = maintenance_mod.MemoryMaintenanceService(_Store(), projector)
+        async def run():
+            report = await service.run_once(policy={"stale_grace_seconds": 10**9})
+            return report
+        report = asyncio.run(run())
+        self.assertEqual(report["index_delete_repair_cleanup"], 2)
+        self.assertTrue(engine.flushed)
 
     def test_memory_engine_vector_generation_cleanup_keeps_current_and_one_history(self):
         memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")

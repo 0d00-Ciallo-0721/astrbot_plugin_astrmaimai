@@ -371,6 +371,21 @@ _MIGRATIONS: list[tuple[int, str]] = [
         sent_at REAL NOT NULL DEFAULT 0,
         completed_at REAL NOT NULL DEFAULT 0
     )"""),
+    (123, """CREATE TABLE IF NOT EXISTS vector_index_delete_repairs (
+        repair_id TEXT PRIMARY KEY,
+        stack_id TEXT NOT NULL DEFAULT '',
+        generation INTEGER,
+        index_path TEXT NOT NULL DEFAULT '',
+        attempts INTEGER NOT NULL DEFAULT 0,
+        max_attempts INTEGER NOT NULL DEFAULT 1,
+        next_retry_at REAL NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'pending',
+        last_error TEXT NOT NULL DEFAULT '',
+        revision INTEGER NOT NULL DEFAULT 0,
+        created_at REAL NOT NULL DEFAULT 0,
+        updated_at REAL NOT NULL DEFAULT 0
+    )"""),
+    (124, "CREATE INDEX IF NOT EXISTS ix_vector_index_delete_repairs_due ON vector_index_delete_repairs(status, next_retry_at)"),
 ]
 
 

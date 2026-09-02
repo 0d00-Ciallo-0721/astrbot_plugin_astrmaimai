@@ -4,6 +4,7 @@ import hashlib
 import inspect
 import json
 import os
+import sqlite3
 import threading
 import time
 import uuid
@@ -174,6 +175,20 @@ class MemoryEngine:
         self._retired_vector_stacks: dict[str, dict[str, Any]] = {}
         self._retired_vector_overflow_stacks: dict[str, dict[str, Any]] = {}
         self._retired_vector_overflow_capacity_stacks: dict[str, dict[str, Any]] = {}
+        self._vector_index_delete_repairs: dict[str, dict[str, Any]] = {}
+        self._vector_index_delete_repair_tasks: set[asyncio.Task] = set()
+        self._vector_index_delete_repair_persistence_tasks: set[asyncio.Task] = set()
+        self._vector_index_delete_repair_pending_persistence: dict[str, dict[str, Any]] = {}
+        self._vector_index_delete_repair_persistence_status = "unknown"
+        self._vector_index_delete_repair_persistence_failures = 0
+        self._vector_index_delete_repair_last_cleanup_at = 0.0
+        self._vector_index_delete_repair_ttl_sec = 7 * 86400.0
+        self._vector_index_delete_repair_capacity = 4096
+        self._vector_index_delete_repair_executor: ThreadPoolExecutor | None = None
+        self._vector_index_delete_repair_futures: set[Future] = set()
+        self._vector_index_delete_repair_persistence_executor: ThreadPoolExecutor | None = None
+        self._vector_index_delete_repair_persistence_futures: set[Future] = set()
+        self._vector_index_delete_repair_last_error = ""
         self._vector_retirement_overflow_capacity_limit = 0
         self._vector_retirement_overflow_capacity_blocked = False
         self._vector_retirement_overflow_capacity_rejected_total = 0
@@ -815,6 +830,8 @@ class MemoryEngine:
         self._startup_last_yield = time.monotonic()
         self._startup_yield_count = 0
         await self.v2_store.initialize()
+        await self._load_index_delete_repairs()
+        await self._flush_index_delete_repair_persistence()
         await self._startup_checkpoint(force=True)
         self.index_projector = MemoryIndexProjector(self)
         self.v2_store.index_projector = self.index_projector
@@ -1551,10 +1568,527 @@ class MemoryEngine:
                 with self._vector_registry_lock:
                     self._vector_candidate_paths.discard(retired_path)
         if stack.get("delete_index") and retired_path:
+            self._schedule_vector_index_delete_repair(
+                retired_path,
+                stack_id=stack_id,
+                generation=stack.get("generation"),
+            )
+
+    def _index_delete_repair_db_path(self) -> str:
+        """Return the SQLite database used for serializable repair metadata."""
+        return str(getattr(self, "v2_db_path", self.data_path / "memory_v2.db"))
+
+    @staticmethod
+    def _index_delete_repair_columns() -> tuple[str, ...]:
+        return (
+            "repair_id", "stack_id", "generation", "index_path", "attempts",
+            "max_attempts", "next_retry_at", "status", "last_error", "revision",
+            "created_at", "updated_at",
+        )
+
+    def _ensure_index_delete_repair_schema_sync(self) -> None:
+        db_path = self._index_delete_repair_db_path()
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(db_path, timeout=5.0) as db:
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS vector_index_delete_repairs (
+                    repair_id TEXT PRIMARY KEY,
+                    stack_id TEXT NOT NULL DEFAULT '',
+                    generation INTEGER,
+                    index_path TEXT NOT NULL DEFAULT '',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    max_attempts INTEGER NOT NULL DEFAULT 1,
+                    next_retry_at REAL NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    last_error TEXT NOT NULL DEFAULT '',
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL DEFAULT 0,
+                    updated_at REAL NOT NULL DEFAULT 0
+                )"""
+            )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS ix_vector_index_delete_repairs_due "
+                "ON vector_index_delete_repairs(status, next_retry_at)"
+            )
+            db.commit()
+
+    def _persist_index_delete_repair_sync(self, snapshot: dict[str, Any]) -> None:
+        self._ensure_index_delete_repair_schema_sync()
+        persisted = dict(snapshot)
+        retry_at = float(persisted.get("next_retry_at", 0.0) or 0.0)
+        if retry_at and retry_at < 100_000_000:
+            persisted["next_retry_at"] = time.time() + max(0.0, retry_at - time.monotonic())
+        values = tuple(persisted.get(column) for column in self._index_delete_repair_columns())
+        with sqlite3.connect(self._index_delete_repair_db_path(), timeout=5.0) as db:
+            row = db.execute(
+                "SELECT revision, status FROM vector_index_delete_repairs WHERE repair_id = ?",
+                (snapshot.get("repair_id"),),
+            ).fetchone()
+            if row is None:
+                placeholders = ",".join("?" for _ in values)
+                db.execute(
+                    f"INSERT INTO vector_index_delete_repairs ({','.join(self._index_delete_repair_columns())}) VALUES ({placeholders})",
+                    values,
+                )
+            else:
+                current_revision, current_status = int(row[0] or 0), str(row[1] or "")
+                incoming_revision = int(persisted.get("revision", 0) or 0)
+                if current_status in {"deleted", "repair_exhausted"} and str(persisted.get("status") or "") not in {"deleted", "repair_exhausted"}:
+                    return
+                if incoming_revision < current_revision:
+                    return
+                assignments = ",".join(f"{column} = ?" for column in self._index_delete_repair_columns()[1:])
+                db.execute(
+                    f"UPDATE vector_index_delete_repairs SET {assignments} WHERE repair_id = ? AND revision <= ?",
+                    values[1:] + (snapshot.get("repair_id"), incoming_revision),
+                )
+            db.commit()
+
+    def _queue_index_delete_repair_persist(self, repair: dict[str, Any]) -> None:
+        snapshot = {column: repair.get(column) for column in self._index_delete_repair_columns()}
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            with self._vector_registry_lock:
+                executor = self._vector_index_delete_repair_persistence_executor
+                if executor is None:
+                    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="astrmai-index-delete-persist")
+                    self._vector_index_delete_repair_persistence_executor = executor
+                future = executor.submit(self._persist_index_delete_repair_sync, snapshot)
+                self._vector_index_delete_repair_persistence_futures.add(future)
+                self._vector_index_delete_repair_pending_persistence[str(snapshot.get("repair_id"))] = snapshot
+            def _sync_done(done: Future) -> None:
+                self._vector_index_delete_repair_persistence_futures.discard(done)
+                try:
+                    done.result()
+                    self._vector_index_delete_repair_persistence_status = "ok"
+                    self._vector_index_delete_repair_pending_persistence.pop(str(snapshot.get("repair_id")), None)
+                except Exception as exc:
+                    self._vector_index_delete_repair_persistence_failures += 1
+                    self._vector_index_delete_repair_persistence_status = "failed"
+                    self._vector_index_delete_repair_last_error = f"{type(exc).__name__}: {exc}"[:500]
+            future.add_done_callback(_sync_done)
+            return
+
+        async def _persist() -> None:
+            await asyncio.to_thread(self._persist_index_delete_repair_sync, snapshot)
+
+        task = loop.create_task(_persist(), name="astrmai-vector-index-delete-repair-persist")
+        self._vector_index_delete_repair_persistence_tasks.add(task)
+
+        def _done(done: asyncio.Task) -> None:
+            self._vector_index_delete_repair_persistence_tasks.discard(done)
             try:
-                Path(retired_path).unlink(missing_ok=True)
-            except OSError as exc:
-                logger.warning(f"[AstrMai] overflow vector index cleanup degraded: {exc}")
+                done.result()
+                self._vector_index_delete_repair_persistence_status = "ok"
+                self._vector_index_delete_repair_pending_persistence.pop(str(snapshot.get("repair_id")), None)
+            except asyncio.CancelledError:
+                self._vector_index_delete_repair_persistence_status = "pending"
+                self._vector_index_delete_repair_pending_persistence[str(snapshot.get("repair_id"))] = snapshot
+            except Exception as exc:
+                self._vector_index_delete_repair_persistence_failures += 1
+                self._vector_index_delete_repair_persistence_status = "failed"
+                self._vector_index_delete_repair_pending_persistence[str(snapshot.get("repair_id"))] = snapshot
+                self._vector_index_delete_repair_last_error = f"{type(exc).__name__}: {exc}"[:500]
+
+        task.add_done_callback(_done)
+
+    async def _load_index_delete_repairs(self) -> None:
+        try:
+            rows = await asyncio.to_thread(self._load_index_delete_repairs_sync)
+        except Exception as exc:
+            self._vector_index_delete_repair_persistence_status = "failed"
+            self._vector_index_delete_repair_persistence_failures += 1
+            self._vector_index_delete_repair_last_error = f"{type(exc).__name__}: {exc}"[:500]
+            return
+        for row in rows:
+            retry_at = float(row.get("next_retry_at", 0.0) or 0.0)
+            if retry_at > 100_000_000:
+                row["next_retry_at"] = time.monotonic() + max(0.0, retry_at - time.time())
+        with self._vector_registry_lock:
+            for row in rows:
+                repair_id = str(row.get("repair_id") or "")
+                if not repair_id or str(row.get("status") or "") in {"deleted"}:
+                    continue
+                current = self._vector_index_delete_repairs.get(repair_id)
+                if current is None:
+                    row["task"] = None
+                    self._vector_index_delete_repairs[repair_id] = row
+                elif int(row.get("revision", 0) or 0) > int(current.get("revision", 0) or 0):
+                    row["task"] = current.get("task")
+                    self._vector_index_delete_repairs[repair_id] = row
+        for row in rows:
+            if str(row.get("status") or "") in {"pending", "retry_wait", "closing"}:
+                if float(row.get("next_retry_at", 0.0) or 0.0) <= time.monotonic():
+                    self._schedule_vector_index_delete_repair_task(str(row.get("repair_id") or ""))
+        self._vector_index_delete_repair_persistence_status = "ok"
+
+    def _load_index_delete_repairs_sync(self) -> list[dict[str, Any]]:
+        self._ensure_index_delete_repair_schema_sync()
+        with sqlite3.connect(self._index_delete_repair_db_path(), timeout=5.0) as db:
+            db.row_factory = sqlite3.Row
+            rows = db.execute(
+                "SELECT repair_id, stack_id, generation, index_path, attempts, max_attempts, next_retry_at, status, last_error, revision, created_at, updated_at "
+                "FROM vector_index_delete_repairs WHERE status IN ('pending','retry_wait','closing','repair_exhausted','dead_letter')"
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            if item.get("status") == "dead_letter":
+                item["status"] = "repair_exhausted"
+                item["last_error"] = item.get("last_error") or "legacy_dead_letter"
+            result.append(item)
+        return result
+
+    async def _flush_index_delete_repair_persistence(self) -> None:
+        pending = list(self._vector_index_delete_repair_pending_persistence.values())
+        for snapshot in pending:
+            succeeded = False
+            last_exc: Exception | None = None
+            for _attempt in range(3):
+                try:
+                    await asyncio.to_thread(self._persist_index_delete_repair_sync, snapshot)
+                    succeeded = True
+                    break
+                except Exception as exc:
+                    last_exc = exc
+            if succeeded:
+                self._vector_index_delete_repair_pending_persistence.pop(str(snapshot.get("repair_id")), None)
+                self._vector_index_delete_repair_persistence_status = "ok"
+            else:
+                self._vector_index_delete_repair_persistence_status = "failed"
+                if last_exc is not None:
+                    self._vector_index_delete_repair_last_error = f"{type(last_exc).__name__}: {last_exc}"[:500]
+
+    async def _cleanup_index_delete_repairs(self) -> int:
+        """Prune only old deleted rows; active repairs are never evicted."""
+        cutoff = time.time() - float(getattr(self, "_vector_index_delete_repair_ttl_sec", 7 * 86400.0))
+
+        def _cleanup() -> int:
+            self._ensure_index_delete_repair_schema_sync()
+            with sqlite3.connect(self._index_delete_repair_db_path(), timeout=5.0) as db:
+                cursor = db.execute(
+                    "DELETE FROM vector_index_delete_repairs WHERE status = 'deleted' AND updated_at < ?",
+                    (cutoff,),
+                )
+                db.commit()
+                return int(cursor.rowcount or 0)
+
+        try:
+            removed = await asyncio.to_thread(_cleanup)
+            self._vector_index_delete_repair_last_cleanup_at = time.time()
+            with self._vector_registry_lock:
+                for repair_id, repair in list(self._vector_index_delete_repairs.items()):
+                    if str(repair.get("status") or "") == "deleted" and float(repair.get("updated_at", 0.0) or 0.0) < cutoff:
+                        self._vector_index_delete_repairs.pop(repair_id, None)
+            return removed
+        except Exception as exc:
+            self._vector_index_delete_repair_persistence_status = "failed"
+            self._vector_index_delete_repair_persistence_failures += 1
+            self._vector_index_delete_repair_last_error = f"{type(exc).__name__}: {exc}"[:500]
+            return 0
+
+    def _bump_index_delete_repair(self, repair: dict[str, Any]) -> None:
+        repair["revision"] = int(repair.get("revision", 0) or 0) + 1
+        repair["updated_at"] = time.time()
+        self._queue_index_delete_repair_persist(repair)
+
+    def _schedule_vector_index_delete_repair(
+        self,
+        index_path: str,
+        *,
+        stack_id: str,
+        generation: int | None = None,
+    ) -> None:
+        path = str(index_path or "").strip()
+        if not path:
+            return
+        repair_id = f"{stack_id}:index-delete"
+        now = time.time()
+        with self._vector_registry_lock:
+            repair = self._vector_index_delete_repairs.get(repair_id)
+            if repair is None:
+                repair = {
+                    "repair_id": repair_id,
+                    "stack_id": str(stack_id),
+                    "generation": generation,
+                    "index_path": path,
+                    "attempts": 0,
+                    "max_attempts": max(
+                        1,
+                        int(self._timing_value("vector_retirement_retry_max_attempts", 5.0)),
+                    ),
+                    "next_retry_at": 0.0,
+                    "status": "pending",
+                    "last_error": "",
+                    "created_at": now,
+                    "updated_at": now,
+                    "task": None,
+                    "sync_future": None,
+                    "revision": 0,
+                }
+                self._vector_index_delete_repairs[repair_id] = repair
+                self._queue_index_delete_repair_persist(repair)
+            elif repair.get("status") in {"deleted", "repair_exhausted"}:
+                return
+            accepting = bool(getattr(self, "_accepting_vector_work", True))
+        if accepting:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                self._run_vector_index_delete_repair_sync(repair_id)
+                return
+            if not loop.is_closed():
+                self._schedule_vector_index_delete_repair_task(repair_id)
+                return
+        # During shutdown or without a usable loop, leave the durable-in-memory
+        # record pending for close_background_resources/late cleanup.
+        self._schedule_vector_index_delete_repair_sync(repair_id)
+
+    def _schedule_vector_index_delete_repair_sync(self, repair_id: str) -> None:
+        with self._vector_registry_lock:
+            repair = self._vector_index_delete_repairs.get(repair_id)
+            if not repair or repair.get("sync_future") is not None:
+                return
+            executor = self._vector_index_delete_repair_executor
+            if executor is None:
+                executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="astrmai-index-delete")
+                self._vector_index_delete_repair_executor = executor
+            future = executor.submit(self._run_vector_index_delete_repair_attempt, repair_id)
+            repair["sync_future"] = future
+            self._vector_index_delete_repair_futures.add(future)
+
+        def _done(done: Future) -> None:
+            with self._vector_registry_lock:
+                self._vector_index_delete_repair_futures.discard(done)
+                current = self._vector_index_delete_repairs.get(repair_id)
+                if current is not None and current.get("sync_future") is done:
+                    current["sync_future"] = None
+            try:
+                done.result()
+            except Exception as exc:
+                with self._vector_registry_lock:
+                    current = self._vector_index_delete_repairs.get(repair_id)
+                    if current is not None:
+                        current["status"] = "retry_wait"
+                        current["last_error"] = f"{type(exc).__name__}: {exc}"[:500]
+                        current["next_retry_at"] = time.monotonic() + self._retirement_retry_delay(
+                            int(current.get("attempts", 0) or 0)
+                        )
+                        self._bump_index_delete_repair(current)
+
+        future.add_done_callback(_done)
+
+    def _schedule_vector_index_delete_repair_task(self, repair_id: str) -> None:
+        with self._vector_registry_lock:
+            repair = self._vector_index_delete_repairs.get(repair_id)
+            if not repair or repair.get("task") is not None:
+                return
+            if repair.get("status") in {"deleted", "repair_exhausted"}:
+                return
+            delay = max(
+                0.0,
+                float(repair.get("next_retry_at", 0.0) or 0.0) - time.monotonic(),
+            )
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._run_vector_index_delete_repair_sync(repair_id)
+            return
+        if loop.is_closed():
+            self._run_vector_index_delete_repair_sync(repair_id)
+            return
+
+        async def _run() -> bool:
+            if delay:
+                await asyncio.sleep(delay)
+            return await asyncio.to_thread(self._run_vector_index_delete_repair_attempt, repair_id)
+
+        task = loop.create_task(_run(), name="astrmai-vector-index-delete-repair")
+        with self._vector_registry_lock:
+            repair = self._vector_index_delete_repairs.get(repair_id)
+            if not repair or repair.get("task") is not None:
+                task.cancel()
+                return
+            repair["task"] = task
+            repair["updated_at"] = time.time()
+            self._vector_index_delete_repair_tasks.add(task)
+
+        def _consume(done: asyncio.Task) -> None:
+            with self._vector_registry_lock:
+                self._vector_index_delete_repair_tasks.discard(done)
+                repair = self._vector_index_delete_repairs.get(repair_id)
+                if repair is not None and repair.get("task") is done:
+                    repair["task"] = None
+                    repair["updated_at"] = time.time()
+            try:
+                deleted = bool(done.result())
+            except asyncio.CancelledError:
+                retry_after_cancel = False
+                with self._vector_registry_lock:
+                    repair = self._vector_index_delete_repairs.get(repair_id)
+                    if repair is not None:
+                        repair["status"] = "retry_wait"
+                        repair["last_error"] = "cancelled"
+                        repair["next_retry_at"] = time.monotonic() + self._retirement_retry_delay(
+                            int(repair.get("attempts", 0) or 0)
+                        )
+                        self._bump_index_delete_repair(repair)
+                        retry_after_cancel = bool(
+                            getattr(self, "_accepting_vector_work", True)
+                            and not repair.get("suppress_auto_retry", False)
+                        )
+                if retry_after_cancel:
+                    self._schedule_vector_index_delete_repair_task(repair_id)
+                return
+            except Exception as exc:
+                deleted = False
+                with self._vector_registry_lock:
+                    repair = self._vector_index_delete_repairs.get(repair_id)
+                    if repair is not None:
+                        repair["last_error"] = f"{type(exc).__name__}: {exc}"[:500]
+                        self._vector_index_delete_repair_last_error = repair["last_error"]
+                        self._bump_index_delete_repair(repair)
+            if not deleted:
+                with self._vector_registry_lock:
+                    repair = self._vector_index_delete_repairs.get(repair_id)
+                    should_retry = bool(
+                        repair
+                        and repair.get("status") == "retry_wait"
+                        and int(repair.get("attempts", 0) or 0)
+                        < int(repair.get("max_attempts", 1) or 1)
+                        and getattr(self, "_accepting_vector_work", True)
+                    )
+                if should_retry:
+                    self._schedule_vector_index_delete_repair_task(repair_id)
+
+        task.add_done_callback(_consume)
+
+    def _run_vector_index_delete_repair_attempt(self, repair_id: str) -> bool:
+        with self._vector_registry_lock:
+            repair = self._vector_index_delete_repairs.get(repair_id)
+            if not repair or repair.get("status") in {"deleted", "repair_exhausted"}:
+                return repair is not None and repair.get("status") == "deleted"
+            if repair.get("_attempt_inflight"):
+                return False
+            repair["_attempt_inflight"] = True
+            if int(repair.get("attempts", 0) or 0) >= int(repair.get("max_attempts", 1) or 1):
+                repair["status"] = "repair_exhausted"
+                repair["_attempt_inflight"] = False
+                self._bump_index_delete_repair(repair)
+                return False
+            repair["attempts"] = int(repair.get("attempts", 0) or 0) + 1
+            repair["status"] = "closing"
+            self._bump_index_delete_repair(repair)
+            path = str(repair.get("index_path") or "")
+            generation = repair.get("generation")
+            active_path = str(getattr(self, "_vector_index_path", "") or "")
+            current_generation = int(getattr(self, "_vector_generation", 0) or 0)
+            if path and active_path and Path(path).resolve() == Path(active_path).resolve():
+                repair["status"] = "retry_wait"
+                repair["last_error"] = "active_index_protected"
+                repair["next_retry_at"] = time.monotonic() + self._retirement_retry_delay(
+                    int(repair.get("attempts", 0) or 0)
+                )
+                repair["_attempt_inflight"] = False
+                self._bump_index_delete_repair(repair)
+                return False
+        if not Path(path).exists():
+            with self._vector_registry_lock:
+                repair = self._vector_index_delete_repairs.get(repair_id)
+                if repair is not None:
+                    repair["status"] = "deleted"
+                    repair["last_error"] = ""
+                    repair["_attempt_inflight"] = False
+                    self._bump_index_delete_repair(repair)
+            return True
+        try:
+            Path(path).unlink(missing_ok=True)
+        except OSError as exc:
+            with self._vector_registry_lock:
+                repair = self._vector_index_delete_repairs.get(repair_id)
+                if repair is None:
+                    return False
+                repair["status"] = "retry_wait"
+                repair["last_error"] = f"{type(exc).__name__}: {exc}"[:500]
+                self._vector_index_delete_repair_last_error = repair["last_error"]
+                repair["next_retry_at"] = time.monotonic() + self._retirement_retry_delay(
+                    int(repair.get("attempts", 0) or 0)
+                )
+                if int(repair.get("attempts", 0) or 0) >= int(
+                    repair.get("max_attempts", 1) or 1
+                ):
+                    repair["status"] = "repair_exhausted"
+                repair["_attempt_inflight"] = False
+                self._bump_index_delete_repair(repair)
+            return False
+        with self._vector_registry_lock:
+            repair = self._vector_index_delete_repairs.get(repair_id)
+            if repair is not None:
+                repair["status"] = "deleted"
+                repair["last_error"] = ""
+                repair["_attempt_inflight"] = False
+                self._bump_index_delete_repair(repair)
+        return True
+
+    def _run_vector_index_delete_repair_sync(self, repair_id: str) -> None:
+        self._run_vector_index_delete_repair_attempt(repair_id)
+
+    async def _close_vector_index_delete_repairs(self, *, timeout_sec: float | None = None) -> bool:
+        all_deleted = True
+        with self._vector_registry_lock:
+            repairs = list(self._vector_index_delete_repairs.items())
+        for repair_id, repair in repairs:
+            task = repair.get("task")
+            if task is not None and not task.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=timeout_sec)
+                except asyncio.TimeoutError:
+                    # A delayed retry is an owner, but late cleanup is an
+                    # explicit retry boundary. Cancel only the delayed wait,
+                    # then perform the bounded attempt below.
+                    with self._vector_registry_lock:
+                        current = self._vector_index_delete_repairs.get(repair_id)
+                        if current is not None:
+                            current["suppress_auto_retry"] = True
+                    task.cancel()
+                    try:
+                        await asyncio.gather(task, return_exceptions=True)
+                    except Exception:
+                        pass
+                    with self._vector_registry_lock:
+                        current = self._vector_index_delete_repairs.get(repair_id)
+                        if current is not None:
+                            current.pop("suppress_auto_retry", None)
+                            current["next_retry_at"] = 0.0
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
+            sync_future = repair.get("sync_future")
+            if sync_future is not None and not sync_future.done():
+                try:
+                    await asyncio.wait_for(asyncio.wrap_future(sync_future), timeout=timeout_sec)
+                except asyncio.TimeoutError:
+                    all_deleted = False
+                    continue
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
+            with self._vector_registry_lock:
+                current = self._vector_index_delete_repairs.get(repair_id)
+                if current is None or current.get("status") == "deleted":
+                    continue
+                if current.get("status") == "repair_exhausted":
+                    all_deleted = False
+                    continue
+                if float(current.get("next_retry_at", 0.0) or 0.0) > time.monotonic():
+                    all_deleted = False
+                    continue
+            if not await asyncio.to_thread(self._run_vector_index_delete_repair_attempt, repair_id):
+                all_deleted = False
+        return all_deleted
 
     def _schedule_overflow_vector_retirement_attempt(self, stack_id: str) -> None:
         with self._vector_registry_lock:
@@ -1910,63 +2444,62 @@ class MemoryEngine:
             ),
             "vector_retirement_overflow_stacks": paths,
         }
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-        if loop is not None and not loop.is_closed():
-            async def _close() -> bool:
-                closed = await self._await_vector_stack_close(
-                    retriever,
-                    faiss_db,
-                    timeout_sec=self._vector_close_timeout_sec(),
-                )
-                if closed and delete_index and index_path:
-                    try:
-                        Path(index_path).unlink(missing_ok=True)
-                    except OSError:
-                        pass
-                return closed
 
-            task = loop.create_task(_close(), name="astrmai-vector-retirement-overflow")
-            with self._vector_registry_lock:
-                self._vector_retirement_tasks.add(task)
-
-            def _consume(done: asyncio.Task) -> None:
-                with self._vector_registry_lock:
-                    self._vector_retirement_tasks.discard(done)
-                try:
-                    if not done.result():
-                        logger.error("[AstrMai] rejected vector retirement cleanup failed")
-                except Exception as exc:
-                    logger.error(f"[AstrMai] rejected vector retirement cleanup degraded: {exc}")
-
-            task.add_done_callback(_consume)
-            return
+    def _index_delete_repair_diagnostics(self) -> dict[str, Any]:
         with self._vector_registry_lock:
-            executor = self._vector_sync_retirement_executor
-            if executor is None:
-                executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="astrmai-vector-retire")
-                self._vector_sync_retirement_executor = executor
-            future = executor.submit(
-                self._close_vector_stack_physical,
-                retriever,
-                faiss_db,
-                timeout_sec=self._vector_close_timeout_sec(),
-            )
-            self._vector_sync_retirement_futures.add(future)
-
-        def _consume_sync(done: Future) -> None:
-            with self._vector_registry_lock:
-                self._vector_sync_retirement_futures.discard(done)
-            try:
-                if done.result() and delete_index and index_path:
-                    Path(index_path).unlink(missing_ok=True)
-            except Exception as exc:
-                logger.error(f"[AstrMai] rejected vector retirement cleanup degraded: {exc}")
-
-        future.add_done_callback(_consume_sync)
-
+            repairs = list(self._vector_index_delete_repairs.values())
+        now = time.time()
+        statuses = [str(item.get("status") or "pending") for item in repairs]
+        terminal_deleted = sum(status == "deleted" for status in statuses)
+        capacity = int(getattr(self, "_vector_index_delete_repair_capacity", 4096) or 4096)
+        capacity_over = len(repairs) > capacity
+        return {
+            "vector_index_delete_repair_count": len(repairs),
+            "vector_index_delete_repair_pending": sum(
+                status in {"pending", "closing"} for status in statuses
+            ),
+            "vector_index_delete_repair_retry_wait": sum(
+                status == "retry_wait" for status in statuses
+            ),
+            "vector_index_delete_repair_exhausted": sum(
+                status == "repair_exhausted" for status in statuses
+            ),
+            "vector_index_delete_repair_oldest_age_ms": round(
+                max(0.0, now - min(
+                    (float(item.get("created_at") or now) for item in repairs),
+                    default=now,
+                )) * 1000.0,
+                1,
+            ) if repairs else 0.0,
+            "vector_index_delete_repair_last_error": str(
+                self._vector_index_delete_repair_last_error or ""
+            ),
+            "vector_index_delete_repair_deleted": terminal_deleted,
+            "vector_index_delete_repair_persistence_status": str(
+                getattr(self, "_vector_index_delete_repair_persistence_status", "unknown")
+            ),
+            "vector_index_delete_repair_persistence_failures": int(
+                getattr(self, "_vector_index_delete_repair_persistence_failures", 0) or 0
+            ),
+            "vector_index_delete_repair_persistence_pending": len(
+                getattr(self, "_vector_index_delete_repair_pending_persistence", {})
+            ),
+            "vector_index_delete_repair_capacity": capacity,
+            "vector_index_delete_repair_capacity_over_limit": capacity_over,
+            "vector_index_delete_repair_last_cleanup_at": getattr(
+                self, "_vector_index_delete_repair_last_cleanup_at", 0.0
+            ) or None,
+            "vector_index_delete_repairs": [
+                {
+                    "repair_id": str(item.get("repair_id") or ""),
+                    "stack_id": str(item.get("stack_id") or ""),
+                    "index_path": Path(str(item.get("index_path") or "")).name,
+                    "status": str(item.get("status") or "pending"),
+                    "attempts": int(item.get("attempts", 0) or 0),
+                }
+                for item in repairs
+            ],
+        }
     def _retirement_retry_delay(self, attempts: int) -> float:
         base = max(0.25, self._timing_value("vector_retirement_retry_base_sec", 0.25))
         maximum = max(base, self._timing_value("vector_retirement_retry_max_sec", 5.0))
@@ -1996,10 +2529,11 @@ class MemoryEngine:
                 with self._vector_registry_lock:
                     self._vector_candidate_paths.discard(retired_path)
         if stack.get("delete_index") and retired_path:
-            try:
-                Path(retired_path).unlink(missing_ok=True)
-            except OSError as exc:
-                logger.warning(f"[AstrMai] retired vector index cleanup degraded: {exc}")
+            self._schedule_vector_index_delete_repair(
+                retired_path,
+                stack_id=stack_id,
+                generation=stack.get("generation"),
+            )
         self._schedule_deferred_vector_retirements()
 
     def _schedule_deferred_vector_retirements(self) -> None:
@@ -2876,6 +3410,7 @@ class MemoryEngine:
                 for stack in retired_stacks
             ),
             **self._overflow_retirement_diagnostics(),
+            **self._index_delete_repair_diagnostics(),
         }
 
     def describe_vector_status(self) -> dict[str, Any]:
@@ -2991,6 +3526,7 @@ class MemoryEngine:
                 "projection_replay_completed_at": self._projection_replay_completed_at or None,
             }
         )
+        runtime.update(self._index_delete_repair_diagnostics())
         projector = getattr(self, "index_projector", None)
         describe_projector = getattr(projector, "describe_status", None)
         if callable(describe_projector):
@@ -3710,7 +4246,12 @@ class MemoryEngine:
             self._forget_vector_stack_close(retriever, faiss_db)
         retired_closed = await self._close_retired_vector_stacks(timeout_sec=timeout_sec)
         overflow_closed = await self._close_overflow_vector_stacks(timeout_sec=timeout_sec)
-        if not closed or not retired_closed or not overflow_closed:
+        index_delete_closed = await self._close_vector_index_delete_repairs(
+            timeout_sec=timeout_sec,
+        )
+        await self._flush_index_delete_repair_persistence()
+        await self._cleanup_index_delete_repairs()
+        if not closed or not retired_closed or not overflow_closed or not index_delete_closed:
             self._vector_state = "degraded"
             self._is_ready = False
             self._vector_close_state = "pending"
@@ -3740,6 +4281,23 @@ class MemoryEngine:
             with self._vector_registry_lock:
                 if self._vector_candidate_executor is candidate_executor:
                     self._vector_candidate_executor = None
+        with self._vector_registry_lock:
+            repair_executor = self._vector_index_delete_repair_executor
+            repair_idle = not any(not future.done() for future in self._vector_index_delete_repair_futures)
+            persistence_executor = self._vector_index_delete_repair_persistence_executor
+            persistence_idle = not any(
+                not future.done() for future in self._vector_index_delete_repair_persistence_futures
+            )
+        if repair_executor is not None and repair_idle:
+            repair_executor.shutdown(wait=False, cancel_futures=True)
+            with self._vector_registry_lock:
+                if self._vector_index_delete_repair_executor is repair_executor:
+                    self._vector_index_delete_repair_executor = None
+        if persistence_executor is not None and persistence_idle:
+            persistence_executor.shutdown(wait=False, cancel_futures=True)
+            with self._vector_registry_lock:
+                if self._vector_index_delete_repair_persistence_executor is persistence_executor:
+                    self._vector_index_delete_repair_persistence_executor = None
         return True
 
     async def stop_background_tasks(self):

@@ -228,6 +228,21 @@ class MemoryMaintenanceService:
                     }
             except Exception as exc:
                 report["errors"].append(f"index_projection_repair:{type(exc).__name__}")
+        # Keep vector index-delete metadata healthy during normal maintenance,
+        # not only during shutdown.  The engine owns the repair registry and
+        # persistence; this service merely provides the existing maintenance
+        # cadence as its bounded retry/TTL trigger.
+        projector_engine = getattr(self.index_projector, "engine", None) if self.index_projector else None
+        if projector_engine is not None:
+            try:
+                flush_repairs = getattr(projector_engine, "_flush_index_delete_repair_persistence", None)
+                cleanup_repairs = getattr(projector_engine, "_cleanup_index_delete_repairs", None)
+                if callable(flush_repairs):
+                    await flush_repairs()
+                if callable(cleanup_repairs):
+                    report["index_delete_repair_cleanup"] = int(await cleanup_repairs() or 0)
+            except Exception as exc:
+                report["errors"].append(f"index_delete_repair_maintenance:{type(exc).__name__}")
         return report
 
     async def soft_delete(self, memory_id: str, *, reason: str = "") -> int:
