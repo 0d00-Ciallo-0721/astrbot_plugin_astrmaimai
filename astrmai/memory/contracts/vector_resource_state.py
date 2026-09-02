@@ -35,15 +35,22 @@ class VectorResourceState(str, Enum):
 
 
 _ALLOWED_TRANSITIONS: dict[VectorResourceState, frozenset[VectorResourceState]] = {
+    VectorResourceState.UNKNOWN: frozenset({
+        VectorResourceState.ACTIVE,
+        VectorResourceState.CANDIDATE_BUILDING,
+        VectorResourceState.RETIRED_PENDING,
+        VectorResourceState.OVERFLOW_PENDING,
+        VectorResourceState.REPAIR_PENDING,
+    }),
     VectorResourceState.CANDIDATE_BUILDING: frozenset({VectorResourceState.CANDIDATE_READY, VectorResourceState.RETIRED_PENDING}),
-    VectorResourceState.CANDIDATE_READY: frozenset({VectorResourceState.CUTOVER_PENDING}),
+    VectorResourceState.CANDIDATE_READY: frozenset({VectorResourceState.CUTOVER_PENDING, VectorResourceState.RETIRED_PENDING}),
     VectorResourceState.CUTOVER_PENDING: frozenset({VectorResourceState.ACTIVE, VectorResourceState.RETIRED_PENDING}),
     VectorResourceState.ACTIVE: frozenset({VectorResourceState.RETIRED_PENDING}),
     VectorResourceState.RETIRED_PENDING: frozenset({VectorResourceState.RETIRED_CLOSING}),
-    VectorResourceState.RETIRED_CLOSING: frozenset({VectorResourceState.CLOSED, VectorResourceState.RETIRED_RETRY_WAIT}),
+    VectorResourceState.RETIRED_CLOSING: frozenset({VectorResourceState.CLOSED, VectorResourceState.RETIRED_RETRY_WAIT, VectorResourceState.RETIRED_EXHAUSTED, VectorResourceState.OVERFLOW_RETRY_WAIT}),
     VectorResourceState.RETIRED_RETRY_WAIT: frozenset({VectorResourceState.RETIRED_CLOSING, VectorResourceState.RETIRED_EXHAUSTED}),
-    VectorResourceState.OVERFLOW_PENDING: frozenset({VectorResourceState.OVERFLOW_RETRY_WAIT, VectorResourceState.RETIRED_CLOSING}),
-    VectorResourceState.OVERFLOW_RETRY_WAIT: frozenset({VectorResourceState.OVERFLOW_RETRY_WAIT, VectorResourceState.RETIRED_CLOSING, VectorResourceState.RETIRED_EXHAUSTED}),
+    VectorResourceState.OVERFLOW_PENDING: frozenset({VectorResourceState.OVERFLOW_RETRY_WAIT, VectorResourceState.RETIRED_CLOSING, VectorResourceState.CLOSED}),
+    VectorResourceState.OVERFLOW_RETRY_WAIT: frozenset({VectorResourceState.OVERFLOW_RETRY_WAIT, VectorResourceState.RETIRED_CLOSING, VectorResourceState.RETIRED_EXHAUSTED, VectorResourceState.CLOSED}),
     VectorResourceState.REPAIR_PENDING: frozenset({VectorResourceState.REPAIR_RETRY_WAIT, VectorResourceState.REPAIR_BLOCKED, VectorResourceState.REPAIR_EXHAUSTED, VectorResourceState.CLOSED}),
     VectorResourceState.REPAIR_RETRY_WAIT: frozenset({VectorResourceState.REPAIR_PENDING, VectorResourceState.REPAIR_EXHAUSTED, VectorResourceState.REPAIR_BLOCKED}),
 }
@@ -51,7 +58,10 @@ _ALLOWED_TRANSITIONS: dict[VectorResourceState, frozenset[VectorResourceState]] 
 
 def normalize_vector_resource_state(value: Any) -> VectorResourceState:
     try:
-        return value if isinstance(value, VectorResourceState) else VectorResourceState(str(value or "unknown"))
+        if isinstance(value, VectorResourceState):
+            return value
+        enum_value = getattr(value, "value", None)
+        return VectorResourceState(str(enum_value if enum_value is not None else value or "unknown"))
     except (TypeError, ValueError):
         return VectorResourceState.UNKNOWN
 
@@ -104,4 +114,3 @@ class VectorResourceSnapshot:
 
 
 RESOURCE_STATE_SCHEMA_VERSION = 1
-

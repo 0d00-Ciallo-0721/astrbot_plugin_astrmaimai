@@ -42,6 +42,8 @@ from ..contracts.vector_resource_state import (
     RESOURCE_STATE_SCHEMA_VERSION,
     VectorResourceSnapshot,
     VectorResourceState,
+    normalize_vector_resource_state,
+    transition_vector_resource_state,
 )
 from .expression_pattern_service import ExpressionPatternService
 from .cognitive_feedback import (
@@ -167,6 +169,10 @@ class MemoryEngine:
         self._projection_rebuild_active = False
         self._is_ready = False
         self._vector_state = "uninitialized"
+        # Resource lifecycle is represented by VectorResourceState snapshots;
+        # this separate field tracks engine health without overwriting that
+        # lifecycle state (e.g. an active resource may be degraded).
+        self._vector_health_status = "unknown"
         self._vector_bootstrap_task: asyncio.Task | None = None
         self._vector_bootstrap_delay_task: asyncio.Task | None = None
         self._projection_ready_replay_task: asyncio.Task | None = None
@@ -195,6 +201,9 @@ class MemoryEngine:
         self._vector_index_delete_repair_persistence_futures: set[Future] = set()
         self._vector_index_delete_repair_last_error = ""
         self._vector_resource_descriptors: dict[str, dict[str, Any]] = {}
+        self._vector_resource_state_overrides: dict[str, VectorResourceSnapshot] = {}
+        self._vector_state_transition_rejected_total = 0
+        self._vector_state_transition_diagnostics: list[dict[str, Any]] = []
         self._vector_resource_descriptor_pending_persistence: dict[str, dict[str, Any]] = {}
         self._vector_resource_descriptor_persistence_tasks: set[asyncio.Task] = set()
         self._vector_resource_descriptor_persistence_status = "unknown"
@@ -1817,6 +1826,15 @@ class MemoryEngine:
         embedding_provider,
     ):
         candidate_path = str(Path(index_path).resolve())
+        candidate_resource_id = self._vector_resource_id(candidate_path)
+        self._transition_vector_resource(
+            candidate_resource_id,
+            VectorResourceState.CANDIDATE_BUILDING,
+            role="candidate",
+            generation=self._vector_generation,
+            index_path=candidate_path,
+            reason="candidate_build_started",
+        )
         with self._vector_registry_lock:
             self._vector_candidate_paths.add(candidate_path)
         cleanup_state = {"abandoned": False, "scheduled": False}
@@ -1906,6 +1924,14 @@ class MemoryEngine:
         except asyncio.CancelledError:
             with self._vector_registry_lock:
                 cleanup_state["abandoned"] = True
+            self._transition_vector_resource(
+                candidate_resource_id,
+                VectorResourceState.RETIRED_PENDING,
+                role="candidate",
+                generation=self._vector_generation,
+                index_path=candidate_path,
+                reason="candidate_build_cancelled",
+            )
             if physical_future.done():
                 _finish_candidate_build(physical_future)
             raise
@@ -1972,6 +1998,15 @@ class MemoryEngine:
                 delete_index=delete_index,
             )
             return False
+        self._transition_vector_resource(
+            stack_id,
+            VectorResourceState.RETIRED_PENDING,
+            stack_id=stack_id,
+            generation=generation,
+            role="retired",
+            index_path=str(index_path or ""),
+            reason="retirement_scheduled",
+        )
         self._record_vector_resource_descriptor(
             index_path or "",
             role="retired",
@@ -2046,6 +2081,15 @@ class MemoryEngine:
                 self._vector_state = "degraded"
                 if len(self._retired_vector_overflow_capacity_stacks) > capacity_limit:
                     stack["capacity_over_limit"] = True
+        self._transition_vector_resource(
+            stack_id,
+            VectorResourceState.OVERFLOW_PENDING,
+            stack_id=stack_id,
+            generation=stack.get("generation"),
+            role="overflow",
+            index_path=str(index_path or ""),
+            reason="overflow_retirement_scheduled",
+        )
         if index_path:
             self._record_vector_resource_descriptor(
                 index_path,
@@ -2072,6 +2116,16 @@ class MemoryEngine:
             )
             if not self._retired_vector_overflow_capacity_stacks:
                 self._vector_retirement_overflow_capacity_blocked = False
+        if stack:
+            self._transition_vector_resource(
+                stack_id,
+                VectorResourceState.CLOSED,
+                stack_id=stack_id,
+                generation=stack.get("generation"),
+                role="overflow",
+                index_path=stack.get("index_path"),
+                reason="overflow_close_succeeded",
+            )
         self._forget_vector_stack_close(stack.get("retriever"), stack.get("faiss_db"))
         retired_path = str(stack.get("index_path") or "").strip()
         if retired_path:
@@ -2355,6 +2409,15 @@ class MemoryEngine:
                     "revision": 0,
                 }
                 self._vector_index_delete_repairs[repair_id] = repair
+                self._transition_vector_resource(
+                    f"repair:{repair_id}",
+                    VectorResourceState.REPAIR_PENDING,
+                    stack_id=stack_id,
+                    generation=generation,
+                    role="repair",
+                    index_path=path,
+                    reason="index_delete_repair_enqueued",
+                )
                 self._queue_index_delete_repair_persist(repair)
             elif repair.get("status") in {"deleted", "repair_exhausted"}:
                 return
@@ -2507,9 +2570,23 @@ class MemoryEngine:
             repair["attempts"] = int(repair.get("attempts", 0) or 0) + 1
             repair["status"] = "closing"
             self._bump_index_delete_repair(repair)
+            self._transition_vector_resource(
+                f"repair:{repair_id}",
+                VectorResourceState.REPAIR_PENDING,
+                stack_id=repair.get("stack_id"),
+                generation=repair.get("generation"),
+                role="repair",
+                index_path=repair.get("index_path"),
+                reason="index_delete_repair_attempt",
+            )
             path = str(repair.get("index_path") or "")
             generation = repair.get("generation")
             current_generation = int(getattr(self, "_vector_generation", 0) or 0)
+            if not self._vector_state_projection_matches(
+                f"repair:{repair_id}", role="repair", index_path=path
+            ):
+                repair["_attempt_inflight"] = False
+                return False
             protected_paths = self._protected_descriptor_paths()
             if path and str(Path(path).resolve()) in protected_paths:
                 repair["status"] = "retry_wait"
@@ -2529,6 +2606,15 @@ class MemoryEngine:
                         repair["_attempt_inflight"] = False
                         self._bump_index_delete_repair(repair)
                 self._update_vector_resource_repair_status(path, "deleted")
+                self._transition_vector_resource(
+                    f"repair:{repair_id}",
+                    VectorResourceState.CLOSED,
+                    stack_id=repair.get("stack_id"),
+                    generation=repair.get("generation"),
+                    role="repair",
+                    index_path=path,
+                    reason="index_delete_already_absent",
+                )
                 return True
         try:
             Path(path).unlink(missing_ok=True)
@@ -2550,6 +2636,18 @@ class MemoryEngine:
                 repair["_attempt_inflight"] = False
                 self._bump_index_delete_repair(repair)
             self._update_vector_resource_repair_status(path, str(repair.get("status") or "retry_wait"))
+            self._transition_vector_resource(
+                f"repair:{repair_id}",
+                VectorResourceState.REPAIR_EXHAUSTED
+                if str(repair.get("status") or "") == "repair_exhausted"
+                else VectorResourceState.REPAIR_RETRY_WAIT,
+                stack_id=repair.get("stack_id"),
+                generation=repair.get("generation"),
+                role="repair",
+                index_path=path,
+                reason="index_delete_failed",
+                error=repair.get("last_error"),
+            )
             return False
         with self._vector_registry_lock:
             repair = self._vector_index_delete_repairs.get(repair_id)
@@ -2559,6 +2657,15 @@ class MemoryEngine:
                 repair["_attempt_inflight"] = False
                 self._bump_index_delete_repair(repair)
         self._update_vector_resource_repair_status(path, "deleted")
+        self._transition_vector_resource(
+            f"repair:{repair_id}",
+            VectorResourceState.CLOSED,
+            stack_id=repair.get("stack_id"),
+            generation=repair.get("generation"),
+            role="repair",
+            index_path=path,
+            reason="index_delete_succeeded",
+        )
         return True
 
     def _run_vector_index_delete_repair_sync(self, repair_id: str) -> None:
@@ -2634,6 +2741,15 @@ class MemoryEngine:
             if int(stack.get("attempts", 0) or 0) >= int(stack.get("max_attempts", 1) or 1):
                 stack["status"] = "retirement_retry_exhausted"
                 stack["updated_at"] = time.time()
+                self._transition_vector_resource(
+                    stack_id,
+                    VectorResourceState.RETIRED_EXHAUSTED,
+                    stack_id=stack_id,
+                    generation=stack.get("generation"),
+                    role="overflow",
+                    index_path=stack.get("index_path"),
+                    reason="overflow_retry_exhausted",
+                )
                 return
             delay = max(
                 0.0,
@@ -2660,6 +2776,15 @@ class MemoryEngine:
                 stack["attempts"] = int(stack.get("attempts", 0) or 0) + 1
                 stack["status"] = "closing"
                 stack["updated_at"] = time.time()
+            self._transition_vector_resource(
+                stack_id,
+                VectorResourceState.RETIRED_CLOSING,
+                stack_id=stack_id,
+                generation=stack.get("generation"),
+                role="overflow",
+                index_path=stack.get("index_path"),
+                reason="overflow_close_started",
+            )
             return await self._await_vector_stack_close(
                 stack.get("retriever"),
                 stack.get("faiss_db"),
@@ -2724,6 +2849,18 @@ class MemoryEngine:
                     stack["status"] = "retirement_retry_exhausted"
             if not exhausted and getattr(self, "_accepting_vector_work", True):
                 self._schedule_overflow_vector_retirement_attempt(stack_id)
+            self._transition_vector_resource(
+                stack_id,
+                VectorResourceState.OVERFLOW_RETRY_WAIT
+                if not exhausted
+                else VectorResourceState.RETIRED_EXHAUSTED,
+                stack_id=stack_id,
+                generation=stack.get("generation"),
+                role="overflow",
+                index_path=stack.get("index_path"),
+                reason="overflow_close_failed",
+                error=stack.get("last_error"),
+            )
 
         task.add_done_callback(_consume)
 
@@ -2836,6 +2973,11 @@ class MemoryEngine:
                 active_owner = stack.get("task") or stack.get("sync_future")
                 if active_owner is not None:
                     all_closed = False
+            if not self._vector_state_projection_matches(
+                stack_id, role="overflow", stack_id=stack_id, index_path=stack.get("index_path")
+            ):
+                all_closed = False
+                continue
             if active_owner is not None:
                 try:
                     if isinstance(active_owner, asyncio.Task):
@@ -2887,6 +3029,15 @@ class MemoryEngine:
                 stack["attempts"] = attempts + 1
                 stack["status"] = "closing"
                 stack["updated_at"] = time.time()
+            self._transition_vector_resource(
+                stack_id,
+                VectorResourceState.RETIRED_CLOSING,
+                stack_id=stack_id,
+                generation=stack.get("generation"),
+                role="overflow",
+                index_path=stack.get("index_path"),
+                reason="overflow_close_started",
+            )
             try:
                 closed = await self._await_vector_stack_close(
                     stack.get("retriever"),
@@ -2912,6 +3063,15 @@ class MemoryEngine:
                         stack["last_error"] = f"{type(exc).__name__}: {exc}"[:500]
                         self._vector_retirement_overflow_last_error = stack["last_error"]
             if closed:
+                self._transition_vector_resource(
+                    stack_id,
+                    VectorResourceState.CLOSED,
+                    stack_id=stack_id,
+                    generation=stack.get("generation"),
+                    role="overflow",
+                    index_path=stack.get("index_path"),
+                    reason="overflow_close_succeeded",
+                )
                 self._finalize_overflow_vector_stack(stack_id)
             else:
                 with self._vector_registry_lock:
@@ -3049,6 +3209,16 @@ class MemoryEngine:
     def _finalize_retired_vector_stack(self, stack_id: str) -> None:
         with self._vector_registry_lock:
             stack = self._retired_vector_stacks.pop(stack_id, None) or {}
+        if stack:
+            self._transition_vector_resource(
+                stack_id,
+                VectorResourceState.CLOSED,
+                stack_id=stack_id,
+                generation=stack.get("generation"),
+                role="retired",
+                index_path=stack.get("index_path"),
+                reason="retirement_close_succeeded",
+            )
         self._forget_vector_stack_close(stack.get("retriever"), stack.get("faiss_db"))
         retired_path = str(stack.get("index_path") or "").strip()
         if retired_path:
@@ -3107,6 +3277,15 @@ class MemoryEngine:
                 return
             if int(stack.get("attempts", 0) or 0) >= int(stack.get("max_attempts", 1) or 1):
                 stack["status"] = "retry_exhausted"
+                self._transition_vector_resource(
+                    stack_id,
+                    VectorResourceState.RETIRED_EXHAUSTED,
+                    stack_id=stack_id,
+                    generation=stack.get("generation"),
+                    role="retired",
+                    index_path=stack.get("index_path"),
+                    reason="retirement_retry_exhausted",
+                )
                 return
             delay = max(
                 0.0,
@@ -3131,6 +3310,15 @@ class MemoryEngine:
                 stack["attempts"] = int(stack.get("attempts", 0) or 0) + 1
                 stack["close_attempt_total"] = int(stack.get("close_attempt_total", 0) or 0) + 1
                 stack["status"] = "closing"
+            self._transition_vector_resource(
+                stack_id,
+                VectorResourceState.RETIRED_CLOSING,
+                stack_id=stack_id,
+                generation=stack.get("generation"),
+                role="retired",
+                index_path=stack.get("index_path"),
+                reason="retirement_close_started",
+            )
             return await self._await_vector_stack_close(
                 stack.get("retriever"),
                 stack.get("faiss_db"),
@@ -3160,7 +3348,19 @@ class MemoryEngine:
                     return
                 stack["task"] = None
                 if completed.cancelled():
-                    stack["status"] = "cancelled"
+                    stack["status"] = "retry_wait"
+                    stack["next_retry_at"] = time.monotonic() + self._retirement_retry_delay(
+                        int(stack.get("attempts", 0) or 0)
+                    )
+                    self._transition_vector_resource(
+                        stack_id,
+                        VectorResourceState.RETIRED_RETRY_WAIT,
+                        stack_id=stack_id,
+                        generation=stack.get("generation"),
+                        role="retired",
+                        index_path=stack.get("index_path"),
+                        reason="retirement_close_cancelled",
+                    )
                     return
             try:
                 closed = bool(completed.result())
@@ -3169,6 +3369,15 @@ class MemoryEngine:
                 with self._vector_registry_lock:
                     stack["last_error"] = f"{type(exc).__name__}: {exc}"[:500]
             if closed:
+                self._transition_vector_resource(
+                    stack_id,
+                    VectorResourceState.CLOSED,
+                    stack_id=stack_id,
+                    generation=stack.get("generation"),
+                    role="retired",
+                    index_path=stack.get("index_path"),
+                    reason="retirement_close_succeeded",
+                )
                 self._finalize_retired_vector_stack(stack_id)
                 return
             with self._vector_registry_lock:
@@ -3187,6 +3396,18 @@ class MemoryEngine:
                 )
                 if not should_retry:
                     stack["status"] = "retry_exhausted"
+            self._transition_vector_resource(
+                stack_id,
+                VectorResourceState.RETIRED_RETRY_WAIT
+                if should_retry
+                else VectorResourceState.RETIRED_EXHAUSTED,
+                stack_id=stack_id,
+                generation=stack.get("generation"),
+                role="retired",
+                index_path=stack.get("index_path"),
+                reason="retirement_close_failed",
+                error=stack.get("last_error"),
+            )
             if should_retry:
                 self._schedule_vector_retirement_attempt(stack_id)
             else:
@@ -3249,6 +3470,15 @@ class MemoryEngine:
                             stack.get("close_attempt_total", 0) or 0
                         ) + 1
                         stack["status"] = "closing"
+                    self._transition_vector_resource(
+                        stack_id,
+                        VectorResourceState.RETIRED_CLOSING,
+                        stack_id=stack_id,
+                        generation=stack.get("generation"),
+                        role="retired",
+                        index_path=stack.get("index_path"),
+                        reason="retirement_close_started",
+                    )
                     retriever = (
                         stack.get("retriever")
                         if any(resource is stack.get("retriever") for resource in owned_resources)
@@ -3280,6 +3510,16 @@ class MemoryEngine:
                             int(stack.get("attempts", 0) or 0)
                         )
                         stack["next_retry_at"] = time.monotonic() + delay
+                    self._transition_vector_resource(
+                        stack_id,
+                        VectorResourceState.RETIRED_RETRY_WAIT,
+                        stack_id=stack_id,
+                        generation=stack.get("generation"),
+                        role="retired",
+                        index_path=stack.get("index_path"),
+                        reason="retirement_close_failed",
+                        error=stack.get("last_error"),
+                    )
                     time.sleep(delay)
             except BaseException as exc:
                 if not future.done():
@@ -3311,6 +3551,15 @@ class MemoryEngine:
                 else:
                     with self._vector_registry_lock:
                         stack["status"] = "retry_exhausted"
+                    self._transition_vector_resource(
+                        stack_id,
+                        VectorResourceState.RETIRED_EXHAUSTED,
+                        stack_id=stack_id,
+                        generation=stack.get("generation"),
+                        role="retired",
+                        index_path=stack.get("index_path"),
+                        reason="retirement_retry_exhausted",
+                    )
                     logger.warning(f"[AstrMai] synchronous vector retirement exhausted stack_id={stack_id}")
             finally:
                 pass
@@ -3325,12 +3574,35 @@ class MemoryEngine:
             if stack.get("status") == "retry_exhausted":
                 all_closed = False
                 continue
+            if not self._vector_state_projection_matches(
+                stack_id, role="retired", stack_id=stack_id, index_path=stack.get("index_path")
+            ):
+                all_closed = False
+                continue
+            self._transition_vector_resource(
+                stack_id,
+                VectorResourceState.RETIRED_CLOSING,
+                stack_id=stack_id,
+                generation=stack.get("generation"),
+                role="retired",
+                index_path=stack.get("index_path"),
+                reason="retirement_close_started",
+            )
             closed = await self._await_vector_stack_close(
                 stack.get("retriever"),
                 stack.get("faiss_db"),
                 timeout_sec=timeout_sec,
             )
             if closed:
+                self._transition_vector_resource(
+                    stack_id,
+                    VectorResourceState.CLOSED,
+                    stack_id=stack_id,
+                    generation=stack.get("generation"),
+                    role="retired",
+                    index_path=stack.get("index_path"),
+                    reason="retirement_close_succeeded",
+                )
                 self._finalize_retired_vector_stack(stack_id)
             else:
                 all_closed = False
@@ -3484,6 +3756,7 @@ class MemoryEngine:
             async def _make_candidate(index_path):
                 candidate_db = None
                 candidate_retriever = None
+                candidate_resource_id = self._vector_resource_id(index_path)
                 try:
                     candidate_db = await self._construct_vector_candidate(
                         index_path=index_path,
@@ -3520,8 +3793,24 @@ class MemoryEngine:
                     )
                     candidate_projector = MemoryIndexProjector(candidate_engine)
                     candidate_retriever._projection_count_provider = candidate_projector.projection_count
+                    self._transition_vector_resource(
+                        candidate_resource_id,
+                        VectorResourceState.CANDIDATE_READY,
+                        role="candidate",
+                        generation=self._vector_generation,
+                        index_path=str(index_path),
+                        reason="candidate_build_succeeded",
+                    )
                     return candidate_db, candidate_retriever, candidate_hybrid, candidate_projector
                 except (asyncio.CancelledError, Exception):
+                    self._transition_vector_resource(
+                        candidate_resource_id,
+                        VectorResourceState.RETIRED_PENDING,
+                        role="candidate",
+                        generation=self._vector_generation,
+                        index_path=str(index_path),
+                        reason="candidate_build_failed",
+                    )
                     closed = await self._await_vector_stack_close(
                         candidate_retriever,
                         candidate_db,
@@ -3680,6 +3969,35 @@ class MemoryEngine:
             try:
                 # Recheck while the cutover barrier is held. Online projectors see
                 # _projection_rebuild_active and enqueue instead of mutating docs.db.
+                candidate_resource_id = self._vector_resource_id(candidate_index_path)
+                if not self._vector_state_projection_matches(
+                    candidate_resource_id, role="candidate", index_path=str(candidate_index_path)
+                ):
+                    return
+                if str(getattr(self, "_vector_health_status", "unknown") or "unknown") in {"degraded", "blocked"}:
+                    self._vector_state_transition_diagnostics.append({
+                        "resource_id": candidate_resource_id,
+                        "from": "candidate_ready",
+                        "to": "active",
+                        "reason": "health_status_blocked",
+                        "error": "vector engine health is degraded",
+                    })
+                    return
+                transition = self._transition_vector_resource(
+                    candidate_resource_id,
+                    VectorResourceState.CUTOVER_PENDING,
+                    role="candidate",
+                    generation=generation,
+                    index_path=str(candidate_index_path),
+                    shutdown_generation=lifecycle.shutdown_generation,
+                    reason="candidate_cutover_started",
+                )
+                if not transition.get("allowed"):
+                    if transition.get("reason") == "shutdown_generation_mismatch":
+                        return
+                    raise RuntimeError(
+                        f"vector candidate cutover rejected: {transition.get('reason')}"
+                    )
                 report = await candidate_projector.check_consistency()
                 if report.get("error"):
                     raise RuntimeError(f"vector consistency scan failed: {report['error']}")
@@ -3739,6 +4057,22 @@ class MemoryEngine:
                 self._next_retry_time = 0.0
                 self._is_ready = True
                 self._vector_state = "ready"
+                active_transition = self._transition_vector_resource(
+                    candidate_resource_id,
+                    VectorResourceState.ACTIVE,
+                    role="active",
+                    generation=generation,
+                    index_path=str(candidate_index_path),
+                    shutdown_generation=lifecycle.shutdown_generation,
+                    reason="candidate_cutover_published",
+                )
+                if not active_transition.get("allowed"):
+                    if active_transition.get("reason") == "shutdown_generation_mismatch":
+                        return
+                    raise RuntimeError(
+                        f"vector active transition rejected: {active_transition.get('reason')}"
+                    )
+                self._vector_health_status = "healthy"
                 self._vector_dimension_check_status = "matched" if query_dimension is not None else "unknown"
                 if rebuild_required:
                     self._vector_rebuild_succeeded_total += 1
@@ -3746,6 +4080,15 @@ class MemoryEngine:
                 lifecycle.published = True
                 lifecycle.discard_index = False
                 if previous_retriever is not candidate_retriever or previous_faiss_db is not candidate_db:
+                    if previous_index_path:
+                        self._transition_vector_resource(
+                            self._vector_resource_id(previous_index_path),
+                            VectorResourceState.RETIRED_PENDING,
+                            role="retired",
+                            generation=generation - 1,
+                            index_path=str(previous_index_path),
+                            reason="active_retirement_scheduled",
+                        )
                     closed = await self._await_vector_stack_close(
                         previous_retriever,
                         previous_faiss_db,
@@ -3851,6 +4194,11 @@ class MemoryEngine:
             candidate_paths = set(self._vector_candidate_paths)
         seen: set[str] = set()
         for resource_id, descriptor in descriptors.items():
+            override = self._vector_resource_state_overrides.get(resource_id)
+            if override is not None:
+                snapshots.append(override)
+                seen.add(resource_id)
+                continue
             role = str(descriptor.get("role") or "unknown")
             status = str(descriptor.get("resource_status") or "unknown")
             if status in {"repair_exhausted", "retirement_retry_exhausted"}:
@@ -3858,9 +4206,19 @@ class MemoryEngine:
             elif role == "active":
                 state = VectorResourceState.ACTIVE
             elif role == "candidate":
-                state = VectorResourceState.CANDIDATE_READY
+                state = {
+                    "candidate_building": VectorResourceState.CANDIDATE_BUILDING,
+                    "candidate_ready": VectorResourceState.CANDIDATE_READY,
+                    "cutover_pending": VectorResourceState.CUTOVER_PENDING,
+                }.get(status, VectorResourceState.CANDIDATE_READY)
             elif role in {"retired", "overflow"}:
-                state = VectorResourceState.RETIRED_PENDING
+                state = {
+                    "retired_pending": VectorResourceState.RETIRED_PENDING,
+                    "retired_closing": VectorResourceState.RETIRED_CLOSING,
+                    "retired_retry_wait": VectorResourceState.RETIRED_RETRY_WAIT,
+                    "overflow_pending": VectorResourceState.OVERFLOW_PENDING,
+                    "overflow_retry_wait": VectorResourceState.OVERFLOW_RETRY_WAIT,
+                }.get(status, VectorResourceState.RETIRED_PENDING)
             else:
                 state = VectorResourceState.UNKNOWN
             snapshots.append(VectorResourceSnapshot(
@@ -3906,6 +4264,186 @@ class MemoryEngine:
             snapshots.append(VectorResourceSnapshot(resource_id=resource_id, stack_id=str(repair.get("stack_id") or ""), generation=int(repair.get("generation", 0) or 0), role="repair", state=state, index_path=str(repair.get("index_path") or ""), revision=int(repair.get("revision", 0) or 0), attempts=int(repair.get("attempts", 0) or 0), next_retry_at=repair.get("next_retry_at"), last_error=str(repair.get("last_error") or "")))
         return snapshots
 
+    def _transition_vector_resource(
+        self,
+        resource_id: str,
+        target_state: str | VectorResourceState,
+        *,
+        stack_id: str | None = None,
+        generation: int | None = None,
+        role: str | None = None,
+        index_path: str | None = None,
+        revision: int | None = None,
+        owner_id: str | None = None,
+        expected_state: str | VectorResourceState | None = None,
+        expected_revision: int | None = None,
+        shutdown_generation: int | None = None,
+        reason: str | None = None,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        """Atomically validate and record a resource state transition.
+
+        Physical close/unlink is deliberately outside this helper; callers may
+        use the returned identity and revision to fence their completion.
+        """
+        rid = str(resource_id or "").strip()
+        target = normalize_vector_resource_state(target_state)
+        descriptor_update: tuple[str, dict[str, Any]] | None = None
+        with self._vector_registry_lock:
+            current = self._vector_resource_state_overrides.get(rid)
+            if current is None:
+                descriptor = self._vector_resource_descriptors.get(rid, {})
+                current = self._vector_resource_state_snapshots()
+                current = next((item for item in current if item.resource_id == rid), None)
+            is_new_resource = current is None
+            if current is None:
+                current = VectorResourceSnapshot(resource_id=rid, state=VectorResourceState.UNKNOWN)
+            if expected_state is not None and current.state is not normalize_vector_resource_state(expected_state):
+                why = "expected_state_mismatch"
+                allowed = False
+            elif expected_revision is not None and int(current.revision) != int(expected_revision):
+                why = "expected_revision_mismatch"
+                allowed = False
+            elif shutdown_generation is not None and int(shutdown_generation) != int(getattr(self, "_vector_shutdown_generation", 0) or 0):
+                why = "shutdown_generation_mismatch"
+                allowed = False
+            elif (is_new_resource or current.state is VectorResourceState.UNKNOWN) and target in {
+                VectorResourceState.ACTIVE,
+                VectorResourceState.CANDIDATE_BUILDING,
+                VectorResourceState.RETIRED_PENDING,
+                VectorResourceState.OVERFLOW_PENDING,
+                VectorResourceState.REPAIR_PENDING,
+            }:
+                allowed, why = True, "created"
+            else:
+                allowed, why = transition_vector_resource_state(current.state, target)
+            if not allowed:
+                self._vector_state_transition_rejected_total += 1
+                diagnostic = {"resource_id": rid, "from": current.state.value, "to": target.value, "reason": why, "error": str(error or "")[:240]}
+                self._vector_state_transition_diagnostics.append(diagnostic)
+                self._vector_state_transition_diagnostics = self._vector_state_transition_diagnostics[-100:]
+                return {"allowed": False, "reason": why, "resource_id": rid, "state": current.state.value, "revision": current.revision}
+            next_revision = int(current.revision) + 1 if revision is None else int(revision)
+            snapshot = VectorResourceSnapshot(
+                resource_id=rid,
+                stack_id=str(stack_id if stack_id is not None else current.stack_id),
+                generation=int(generation if generation is not None else current.generation),
+                role=str(role if role is not None else current.role),
+                state=target,
+                index_path=str(index_path if index_path is not None else current.index_path),
+                model_id=current.model_id,
+                provider_source_fingerprint=current.provider_source_fingerprint,
+                dimension=current.dimension,
+                revision=next_revision,
+                owner_id=str(owner_id if owner_id is not None else current.owner_id),
+                created_at=current.created_at or time.time(),
+                updated_at=time.time(),
+                next_retry_at=current.next_retry_at,
+                attempts=current.attempts,
+                last_error=str(error or current.last_error or ""),
+                protected=current.protected,
+            )
+            self._vector_resource_state_overrides[rid] = snapshot
+            if index_path and role in {"active", "candidate", "retired", "overflow"}:
+                descriptor_update = (
+                    str(index_path),
+                    {
+                        "role": role,
+                        "generation": generation,
+                        "resource_id": rid,
+                        "resource_status": target.value,
+                        "last_repair_status": target.value if role in {"retired", "overflow"} else "",
+                    },
+                )
+            result = {"allowed": True, "reason": why, "resource_id": rid, "state": target.value, "revision": next_revision, "snapshot": snapshot}
+        if descriptor_update is not None:
+            path, update = descriptor_update
+            try:
+                self._record_vector_resource_descriptor(path, **update)
+            except (OSError, TypeError, ValueError):
+                pass
+        return result
+
+    def _vector_state_projection_matches(
+        self,
+        resource_id: str,
+        *,
+        role: str | None = None,
+        stack_id: str | None = None,
+        index_path: str | None = None,
+    ) -> bool:
+        """Verify compatibility fields still agree with the unified snapshot.
+
+        Legacy registries remain readable for compatibility, but once a
+        resource has a transition override they must not silently drive a
+        physical operation from a conflicting state.
+        """
+        rid = str(resource_id or "")
+        with self._vector_registry_lock:
+            snapshot = self._vector_resource_state_overrides.get(rid)
+            if snapshot is None:
+                return True
+            mismatch = False
+            descriptor = self._vector_resource_descriptors.get(rid)
+            if descriptor is not None:
+                if int(descriptor.get("generation", snapshot.generation) or 0) != int(snapshot.generation):
+                    mismatch = True
+                descriptor_status = str(descriptor.get("resource_status") or "")
+                if descriptor_status and descriptor_status not in {
+                    snapshot.state.value,
+                    "active" if snapshot.state is VectorResourceState.ACTIVE else "",
+                    "published" if snapshot.state is VectorResourceState.ACTIVE else "",
+                }:
+                    mismatch = True
+            if role == "candidate" and snapshot.state in {
+                VectorResourceState.CANDIDATE_BUILDING,
+                VectorResourceState.CANDIDATE_READY,
+                VectorResourceState.CUTOVER_PENDING,
+            }:
+                path = str(index_path or snapshot.index_path or "")
+                if path and str(Path(path).resolve()) not in self._vector_candidate_paths:
+                    mismatch = True
+            if role in {"retired", "overflow"} and not snapshot.state.terminal:
+                sid = str(stack_id or snapshot.stack_id or rid)
+                present = sid in self._retired_vector_stacks
+                if role == "overflow":
+                    present = sid in self._retired_vector_overflow_stacks or sid in self._retired_vector_overflow_capacity_stacks
+                if not present:
+                    mismatch = True
+            if role == "repair" and rid.startswith("repair:"):
+                repair_id = rid.split(":", 1)[1]
+                repair = self._vector_index_delete_repairs.get(repair_id)
+                if repair is None:
+                    mismatch = True
+                else:
+                    expected = {
+                        "retry_wait": VectorResourceState.REPAIR_RETRY_WAIT,
+                        "repair_exhausted": VectorResourceState.REPAIR_EXHAUSTED,
+                        "blocked": VectorResourceState.REPAIR_BLOCKED,
+                        "deleted": VectorResourceState.CLOSED,
+                    }.get(str(repair.get("status") or ""), VectorResourceState.REPAIR_PENDING)
+                    if expected is not snapshot.state:
+                        mismatch = True
+            if mismatch:
+                self._vector_state_transition_rejected_total += 1
+                self._vector_state_transition_diagnostics.append({
+                    "resource_id": rid,
+                    "from": snapshot.state.value,
+                    "to": snapshot.state.value,
+                    "reason": "state_projection_mismatch",
+                    "error": "legacy compatibility fields diverged",
+                })
+                self._vector_state_transition_diagnostics = self._vector_state_transition_diagnostics[-100:]
+                self._vector_state = "degraded"
+                self._vector_health_status = "degraded"
+            return not mismatch
+
+    def _set_vector_health(self, status: str) -> None:
+        """Set engine health while keeping the legacy state field readable."""
+        value = str(status or "unknown")
+        self._vector_health_status = value
+        self._vector_state = value
+
     def describe_vector_resource_states(self) -> dict[str, Any]:
         snapshots = self._vector_resource_state_snapshots()
         counts: dict[str, int] = {}
@@ -3920,8 +4458,13 @@ class MemoryEngine:
             "retired_resource_ids": [item.resource_id for item in snapshots if item.role in {"retired", "overflow"}],
             "blocked_resource_ids": [item.resource_id for item in snapshots if item.state is VectorResourceState.REPAIR_BLOCKED],
             "repair_exhausted_resource_ids": [item.resource_id for item in snapshots if item.state in {VectorResourceState.REPAIR_EXHAUSTED, VectorResourceState.RETIRED_EXHAUSTED}],
-            "invalid_transition_count": 0,
-            "state_diagnostics": {"source": "compatibility_mapping", "unknown_count": counts.get("unknown", 0)},
+            "invalid_transition_count": int(getattr(self, "_vector_state_transition_rejected_total", 0) or 0),
+            "state_diagnostics": {
+                "source": "transition_override" if self._vector_resource_state_overrides else "compatibility_mapping",
+                "unknown_count": counts.get("unknown", 0),
+                "health_status": str(getattr(self, "_vector_health_status", "unknown") or "unknown"),
+                "rejected_transitions": list(getattr(self, "_vector_state_transition_diagnostics", [])[-20:]),
+            },
         }
 
     def describe_shutdown_owners(self) -> dict[str, Any]:
@@ -4061,6 +4604,7 @@ class MemoryEngine:
         runtime.update(
             {
                 "state": self._vector_state,
+                "health_status": str(getattr(self, "_vector_health_status", "unknown") or "unknown"),
                 "available": bool(self._is_ready and self._vector_state == "ready"),
                 "bootstrap_running": bool(
                     self._vector_bootstrap_task is not None
