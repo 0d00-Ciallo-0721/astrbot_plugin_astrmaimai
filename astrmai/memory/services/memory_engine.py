@@ -38,6 +38,11 @@ from ..retrieval.hybrid_retriever import HybridRetriever
 from ..retrieval.vector_store import VectorRetriever
 from ..retrieval.embedding import invoke_embedding
 from ..contracts.memory_query import MemoryQuery, MemoryWriteRequest
+from ..contracts.vector_resource_state import (
+    RESOURCE_STATE_SCHEMA_VERSION,
+    VectorResourceSnapshot,
+    VectorResourceState,
+)
 from .expression_pattern_service import ExpressionPatternService
 from .cognitive_feedback import (
     FEEDBACK_SCHEMA_VERSION,
@@ -3835,6 +3840,90 @@ class MemoryEngine:
         self._schedule_vector_bootstrap()
         return False
 
+    def _vector_resource_state_snapshots(self) -> list[VectorResourceSnapshot]:
+        """Build a diagnostic-only unified view from existing registries."""
+        snapshots: list[VectorResourceSnapshot] = []
+        with self._vector_registry_lock:
+            descriptors = {str(k): dict(v) for k, v in self._vector_resource_descriptors.items()}
+            retired = [dict(v) for v in self._retired_vector_stacks.values()]
+            overflow = [dict(v) for v in self._retired_vector_overflow_stacks.values()]
+            overflow += [dict(v) for v in self._retired_vector_overflow_capacity_stacks.values()]
+            candidate_paths = set(self._vector_candidate_paths)
+        seen: set[str] = set()
+        for resource_id, descriptor in descriptors.items():
+            role = str(descriptor.get("role") or "unknown")
+            status = str(descriptor.get("resource_status") or "unknown")
+            if status in {"repair_exhausted", "retirement_retry_exhausted"}:
+                state = VectorResourceState.RETIRED_EXHAUSTED
+            elif role == "active":
+                state = VectorResourceState.ACTIVE
+            elif role == "candidate":
+                state = VectorResourceState.CANDIDATE_READY
+            elif role in {"retired", "overflow"}:
+                state = VectorResourceState.RETIRED_PENDING
+            else:
+                state = VectorResourceState.UNKNOWN
+            snapshots.append(VectorResourceSnapshot(
+                resource_id=resource_id,
+                stack_id=str(descriptor.get("stack_id") or ""),
+                generation=int(descriptor.get("generation", 0) or 0),
+                role=role,
+                state=state,
+                index_path=str(descriptor.get("index_path") or ""),
+                model_id=str(descriptor.get("embedding_model") or ""),
+                provider_source_fingerprint=str(descriptor.get("api_base_fingerprint") or ""),
+                dimension=descriptor.get("physical_dimension"),
+                revision=int(descriptor.get("revision", 0) or 0),
+                created_at=float(descriptor.get("created_at", 0) or 0),
+                updated_at=float(descriptor.get("updated_at", 0) or 0),
+                last_error=str(descriptor.get("last_error") or ""),
+                protected=role in {"active", "candidate"},
+            ))
+            seen.add(resource_id)
+        for stack, default_role in [*( (item, "retired") for item in retired), *( (item, "overflow") for item in overflow)]:
+            stack_id = str(stack.get("stack_id") or "")
+            resource_id = str(stack.get("resource_id") or f"stack:{stack_id}")
+            if resource_id in seen:
+                continue
+            status = str(stack.get("status") or "pending")
+            if status == "retirement_retry_exhausted":
+                state = VectorResourceState.RETIRED_EXHAUSTED
+            elif status in {"retry_wait", "overflow_retry_wait"}:
+                state = VectorResourceState.OVERFLOW_RETRY_WAIT if resource_id.startswith("stack:") else VectorResourceState.RETIRED_RETRY_WAIT
+            elif status in {"closing", "retired_closing"}:
+                state = VectorResourceState.RETIRED_CLOSING
+            else:
+                state = VectorResourceState.OVERFLOW_PENDING if resource_id.startswith("stack:") else VectorResourceState.RETIRED_PENDING
+            snapshots.append(VectorResourceSnapshot(resource_id=resource_id, stack_id=stack_id, generation=int(stack.get("generation", 0) or 0), role=str(stack.get("role") or default_role), state=state, index_path=str(stack.get("index_path") or ""), revision=int(stack.get("revision", 0) or 0), attempts=int(stack.get("attempts", 0) or 0), next_retry_at=stack.get("next_retry_at"), last_error=str(stack.get("last_error") or ""), protected=False))
+            seen.add(resource_id)
+        for path in candidate_paths:
+            if not any(item.index_path == path for item in snapshots):
+                snapshots.append(VectorResourceSnapshot(resource_id=f"candidate:{path}", role="candidate", state=VectorResourceState.CANDIDATE_BUILDING, index_path=path, generation=int(self._vector_generation), protected=True))
+        for repair_id, repair in self._vector_index_delete_repairs.items():
+            resource_id = f"repair:{repair_id}"
+            status = str(repair.get("status") or "pending")
+            state = {"retry_wait": VectorResourceState.REPAIR_RETRY_WAIT, "repair_exhausted": VectorResourceState.REPAIR_EXHAUSTED, "blocked": VectorResourceState.REPAIR_BLOCKED, "deleted": VectorResourceState.CLOSED}.get(status, VectorResourceState.REPAIR_PENDING)
+            snapshots.append(VectorResourceSnapshot(resource_id=resource_id, stack_id=str(repair.get("stack_id") or ""), generation=int(repair.get("generation", 0) or 0), role="repair", state=state, index_path=str(repair.get("index_path") or ""), revision=int(repair.get("revision", 0) or 0), attempts=int(repair.get("attempts", 0) or 0), next_retry_at=repair.get("next_retry_at"), last_error=str(repair.get("last_error") or "")))
+        return snapshots
+
+    def describe_vector_resource_states(self) -> dict[str, Any]:
+        snapshots = self._vector_resource_state_snapshots()
+        counts: dict[str, int] = {}
+        for item in snapshots:
+            counts[item.state.value] = counts.get(item.state.value, 0) + 1
+        return {
+            "resource_state_schema_version": RESOURCE_STATE_SCHEMA_VERSION,
+            "resources": [item.to_dict() for item in snapshots],
+            "state_counts": counts,
+            "active_resource_id": next((item.resource_id for item in snapshots if item.state is VectorResourceState.ACTIVE), None),
+            "candidate_resource_ids": [item.resource_id for item in snapshots if item.role == "candidate"],
+            "retired_resource_ids": [item.resource_id for item in snapshots if item.role in {"retired", "overflow"}],
+            "blocked_resource_ids": [item.resource_id for item in snapshots if item.state is VectorResourceState.REPAIR_BLOCKED],
+            "repair_exhausted_resource_ids": [item.resource_id for item in snapshots if item.state in {VectorResourceState.REPAIR_EXHAUSTED, VectorResourceState.RETIRED_EXHAUSTED}],
+            "invalid_transition_count": 0,
+            "state_diagnostics": {"source": "compatibility_mapping", "unknown_count": counts.get("unknown", 0)},
+        }
+
     def describe_shutdown_owners(self) -> dict[str, Any]:
         def _running(owner: Any) -> bool:
             return owner is not None and not owner.done()
@@ -3958,6 +4047,7 @@ class MemoryEngine:
             **self._overflow_retirement_diagnostics(),
             **self._index_delete_repair_diagnostics(),
             **dict(self._consistency_repair_diagnostics or {}),
+            **self.describe_vector_resource_states(),
         }
 
     def describe_vector_status(self) -> dict[str, Any]:
@@ -4073,6 +4163,7 @@ class MemoryEngine:
                 "projection_replay_completed_at": self._projection_replay_completed_at or None,
                 **self._vector_resource_diagnostics(),
                 "consistency_repair_diagnostics": dict(self._consistency_repair_diagnostics or {}),
+                **self.describe_vector_resource_states(),
             }
         )
         runtime.update(self._index_delete_repair_diagnostics())
