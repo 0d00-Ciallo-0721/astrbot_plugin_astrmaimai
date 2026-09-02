@@ -388,7 +388,10 @@ class MemoryV2Store:
                     "documents_delete_failed": "documents_delete",
                     "projection_lock_timeout": "projection_lock",
                 }.get(reason_text, "")
-                if previous_status == "dead_letter":
+                # ``repair_exhausted`` is the canonical terminal state.  Keep
+                # accepting the historical ``dead_letter`` value so existing
+                # databases remain non-resurrectable by ordinary retries.
+                if previous_status in {"dead_letter", "repair_exhausted"}:
                     await db.commit()
                     return False
                 created_at = float(row[1] or now) if row else now
@@ -407,9 +410,9 @@ class MemoryV2Store:
                         """
                         INSERT INTO memory_projection_outbox(
                             memory_id, status, attempts, revision, next_retry_at, last_error, last_error_type, last_failed_stage, created_at, updated_at
-                        ) VALUES (?, 'dead_letter', ?, ?, 0, ?, ?, ?, ?, ?)
+                        ) VALUES (?, 'repair_exhausted', ?, ?, 0, ?, ?, ?, ?, ?)
                         ON CONFLICT(memory_id) DO UPDATE SET
-                            status = 'dead_letter',
+                            status = 'repair_exhausted',
                             attempts = excluded.attempts,
                             revision = excluded.revision,
                             next_retry_at = 0,
@@ -602,12 +605,13 @@ class MemoryV2Store:
                 """
                 SELECT status, last_error, attempts, created_at, next_retry_at
                 FROM memory_projection_outbox
-                WHERE status IN ('pending', 'dead_letter')
+                WHERE status IN ('pending', 'dead_letter', 'repair_exhausted')
                 """
             )
             rows = await cursor.fetchall()
         pending = [row for row in rows if str(row[0] or "") == "pending"]
-        dead = [row for row in rows if str(row[0] or "") == "dead_letter"]
+        dead = [row for row in rows if str(row[0] or "") in {"dead_letter", "repair_exhausted"}]
+        exhausted = [row for row in rows if str(row[0] or "") == "repair_exhausted"]
 
         def reason_counts(items) -> dict[str, int]:
             counts: dict[str, int] = {}
@@ -627,6 +631,8 @@ class MemoryV2Store:
             "pending_by_reason": pending_by_reason,
             "dead_letter_count": len(dead),
             "dead_letter_count_by_reason": reason_counts(dead),
+            "repair_exhausted_count": len(exhausted),
+            "repair_exhausted_count_by_reason": reason_counts(exhausted),
             "oldest_pending_age_sec": max(0.0, now - oldest) if oldest else 0.0,
             "max_attempts": max((int(row[2] or 0) for row in rows), default=0),
             "next_retry_at": next_retry or None,

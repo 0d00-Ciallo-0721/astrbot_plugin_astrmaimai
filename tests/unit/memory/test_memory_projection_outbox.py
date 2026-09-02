@@ -150,6 +150,41 @@ class MemoryProjectionOutboxTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_retry_due_isolates_single_item_failure(self):
+        async def run():
+            class _Store:
+                async def list_due_projection_retries(self, *, limit):
+                    return [
+                        {"memory_id": "mem-fails", "attempts": 1, "last_error": "old"},
+                        {"memory_id": "mem-succeeds", "attempts": 1, "last_error": "old"},
+                    ][:limit]
+
+                async def schedule_projection_retry(self, memory_id, reason, **_kwargs):
+                    self.scheduled = (memory_id, reason)
+                    return True
+
+            store = _Store()
+            projector = self.projector_mod.MemoryIndexProjector(
+                type("_Engine", (), {"v2_store": store})()
+            )
+            calls = []
+
+            async def _project(memory_id):
+                calls.append(memory_id)
+                if memory_id == "mem-fails":
+                    raise RuntimeError("one item failed")
+                return True
+
+            projector.project = _project
+            result = await projector.retry_due(limit=2)
+            self.assertEqual(calls, ["mem-fails", "mem-succeeds"])
+            self.assertEqual(result["attempted"], 2)
+            self.assertEqual(result["projected"], 1)
+            self.assertEqual(result["failed"], 1)
+            self.assertEqual(projector._last_retry_items[0]["status"], "failed_retryable")
+
+        asyncio.run(run())
+
     def test_pending_canonical_match_is_marked_as_read_your_write_fallback(self):
         async def run():
             db_path = self._db_path("outbox-read-your-write.db")
@@ -225,6 +260,46 @@ class MemoryProjectionOutboxTests(unittest.TestCase):
                 {"vector_delete_unavailable": 1},
             )
             self.assertEqual(diagnostics["max_attempts"], 3)
+
+        asyncio.run(run())
+
+    def test_projection_retry_exposes_repair_exhausted_terminal_state(self):
+        async def run():
+            db_path = self._db_path("outbox-repair-exhausted.db")
+            store = self.store_mod.MemoryV2Store(db_path, data_path=self.temp_dir.name)
+            self.assertTrue(
+                await store.schedule_projection_retry(
+                    "mem-exhausted",
+                    "vector_delete_unavailable",
+                    base_delay_sec=1,
+                    max_delay_sec=1,
+                    max_attempts=1,
+                )
+            )
+            self.assertFalse(
+                await store.schedule_projection_retry(
+                    "mem-exhausted",
+                    "vector_delete_unavailable",
+                    base_delay_sec=1,
+                    max_delay_sec=1,
+                    max_attempts=1,
+                )
+            )
+            self.assertEqual(
+                await store.projection_retry_status("mem-exhausted"),
+                "repair_exhausted",
+            )
+            diagnostics = await store.projection_retry_diagnostics()
+            self.assertEqual(diagnostics["repair_exhausted_count"], 1)
+            self.assertEqual(diagnostics["dead_letter_count"], 1)
+            # A normal retry admission must not resurrect an exhausted repair.
+            self.assertFalse(
+                await store.schedule_projection_retry(
+                    "mem-exhausted",
+                    "later-retry",
+                    max_attempts=5,
+                )
+            )
 
         asyncio.run(run())
 
@@ -448,6 +523,29 @@ class MemoryProjectionOutboxTests(unittest.TestCase):
             await asyncio.wait_for(stopper, timeout=0.5)
             self.assertTrue(await active)
             self.assertFalse(projector._projection_inflight_tasks)
+
+        asyncio.run(run())
+
+    def test_projection_after_shutdown_does_not_create_new_owner_task(self):
+        async def run():
+            projector = self.projector_mod.MemoryIndexProjector.__new__(self.projector_mod.MemoryIndexProjector)
+            projector._accepting = False
+            projector._projection_inflight_tasks = {}
+            projector._projection_inflight_ids = set()
+            projector._projection_latest_requests = {}
+            projector._projection_request_versions = {}
+            projector._background_tasks = set()
+            persisted = []
+
+            async def _mark_pending_persisted(memory_id, reason):
+                persisted.append((memory_id, reason))
+                return True
+
+            projector._mark_pending_persisted = _mark_pending_persisted
+            self.assertFalse(await projector.project("late-memory"))
+            self.assertEqual(persisted, [("late-memory", "shutdown_rejected")])
+            self.assertEqual(projector._projection_inflight_tasks, {})
+            self.assertEqual(projector._background_tasks, set())
 
         asyncio.run(run())
 

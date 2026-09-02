@@ -40,6 +40,8 @@ class MemoryIndexProjector:
             "pending_count_by_reason": {},
             "dead_letter_count": 0,
             "dead_letter_count_by_reason": {},
+            "repair_exhausted_count": 0,
+            "repair_exhausted_count_by_reason": {},
             "oldest_pending_age_sec": 0.0,
             "max_attempts": 0,
             "next_retry_at": None,
@@ -272,7 +274,7 @@ class MemoryIndexProjector:
                         operation="projection_retry_status",
                         memory_id=memory_id,
                     )
-                    if status == "dead_letter":
+                    if status in {"dead_letter", "repair_exhausted"}:
                         self._clear_pending(memory_id)
                 except Exception as exc:
                     logger.debug(f"[MemoryIndexProjector] retry status unavailable: {exc}")
@@ -775,13 +777,27 @@ class MemoryIndexProjector:
             if not memory_id:
                 continue
             result["attempted"] += 1
-            projected = await self.project(memory_id)
+            failure_reason = ""
+            try:
+                projected = await self.project(memory_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # A single unexpected projection failure must not abort the
+                # whole retry batch. Keep the durable row retryable and let
+                # subsequent items make progress.
+                projected = False
+                failure_reason = f"retry_error:{type(exc).__name__}"
+                try:
+                    await self._mark_pending_persisted(memory_id, failure_reason)
+                except Exception:
+                    self._mark_pending(memory_id, failure_reason)
             item = {
                 "memory_id": memory_id,
                 "attempts": int((row or {}).get("attempts", 0) or 0),
                 "previous_reason": str((row or {}).get("last_error", "") or ""),
                 "status": "projected" if projected else "failed_retryable",
-                "reason": "projected" if projected else self.pending_reason(memory_id) or "projection_failed",
+                "reason": "projected" if projected else failure_reason or self.pending_reason(memory_id) or "projection_failed",
             }
             items.append(item)
             if projected:
@@ -814,7 +830,18 @@ class MemoryIndexProjector:
         items: list[dict[str, object]] = []
         for memory_id in eligible[: max(1, int(limit or 20))]:
             result["attempted"] += 1
-            projected = await self.project(str(memory_id))
+            failure_reason = ""
+            try:
+                projected = await self.project(str(memory_id))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                projected = False
+                failure_reason = f"replay_error:{type(exc).__name__}"
+                try:
+                    await self._mark_pending_persisted(str(memory_id), failure_reason)
+                except Exception:
+                    self._mark_pending(str(memory_id), failure_reason)
             if projected:
                 result["projected"] += 1
                 self._retry_success_count += 1
@@ -824,7 +851,7 @@ class MemoryIndexProjector:
                 result["failed"] += 1
                 self._retry_failure_count += 1
                 status = "failed_retryable"
-                reason = self.pending_reason(str(memory_id)) or "projection_failed"
+                reason = failure_reason or self.pending_reason(str(memory_id)) or "projection_failed"
             items.append({"memory_id": str(memory_id), "status": status, "reason": reason})
         self._last_retry_items = items[-100:]
         return result
@@ -876,6 +903,7 @@ class MemoryIndexProjector:
         diagnostics = dict(getattr(self, "_outbox_diagnostics", {}) or {})
         pending_count = int(diagnostics.get("pending_count", 0) or 0)
         dead_letter_count = int(diagnostics.get("dead_letter_count", 0) or 0)
+        repair_exhausted_count = int(diagnostics.get("repair_exhausted_count", 0) or 0)
         diagnostics.update(
             {
                 "pending_count": max(pending_count, len(self._pending_projection_ids)),
@@ -893,6 +921,10 @@ class MemoryIndexProjector:
                 "retry_success_count": int(getattr(self, "_retry_success_count", 0) or 0),
                 "retry_failure_count": int(getattr(self, "_retry_failure_count", 0) or 0),
                 "retry_rejected_by_shutdown": int(getattr(self, "_retry_rejected_by_shutdown", 0) or 0),
+                "repair_exhausted_count": repair_exhausted_count,
+                "repair_exhausted_count_by_reason": dict(
+                    diagnostics.get("repair_exhausted_count_by_reason", {}) or {}
+                ),
                 "last_retry_items": list(getattr(self, "_last_retry_items", []) or []),
                 "projection_failure_by_reason": dict(getattr(self, "_projection_failure_by_reason", {}) or {}),
                 "projection_deferred_by_reason": dict(getattr(self, "_projection_deferred_by_reason", {}) or {}),
@@ -1257,6 +1289,12 @@ class MemoryIndexProjector:
             "dead_letter_count": int(outbox_diagnostics.get("dead_letter_count", 0) or 0),
             "dead_letter_count_by_reason": dict(
                 outbox_diagnostics.get("dead_letter_count_by_reason", {}) or {}
+            ),
+            "repair_exhausted_count": int(
+                outbox_diagnostics.get("repair_exhausted_count", 0) or 0
+            ),
+            "repair_exhausted_count_by_reason": dict(
+                outbox_diagnostics.get("repair_exhausted_count_by_reason", {}) or {}
             ),
             "oldest_pending_age_sec": float(
                 outbox_diagnostics.get("oldest_pending_age_sec", 0.0) or 0.0

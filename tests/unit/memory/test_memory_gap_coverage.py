@@ -559,6 +559,120 @@ class MemoryGapCoverageTests(unittest.TestCase):
         self.assertEqual(observation["vector"]["status"], "rebuilding")
         self.assertEqual(observation["fallback_source"], "canonical_fts")
 
+    def test_vector_cutover_shutdown_generation_fence_does_not_publish_candidate(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        gateway = SimpleNamespace(
+            config=SimpleNamespace(
+                provider=SimpleNamespace(embedding_models=["embedding"]),
+                memory=SimpleNamespace(recall_top_k=5),
+            )
+        )
+        context = SimpleNamespace(get_provider_by_id=lambda _model_id: object())
+        engine = memory_engine_mod.MemoryEngine(
+            context,
+            gateway,
+            embedding_models=["embedding"],
+            config=gateway.config,
+        )
+        engine.data_path = Path(self.temp_dir.name)
+        engine._force_index_rebuild = True
+        candidate_path = engine.data_path / "cutover-shutdown.index"
+        entered_check = asyncio.Event()
+        release_check = asyncio.Event()
+
+        class _Store:
+            async def migration_applied(self, _version):
+                return False
+
+            async def projection_retry_snapshot_with_revisions(self):
+                return {}
+
+            async def record_migration(self, *_args, **_kwargs):
+                return None
+
+        class _CandidateDB:
+            def __init__(self):
+                self.close_calls = 0
+                self.embedding_storage = SimpleNamespace(
+                    index=SimpleNamespace(d=1, ntotal=0)
+                )
+
+            async def initialize(self):
+                return None
+
+            async def close(self, **_kwargs):
+                self.close_calls += 1
+                return True
+
+        class _CandidateRetriever:
+            def __init__(self):
+                self.close_calls = 0
+
+            async def refresh_storage_metrics(self, **_kwargs):
+                return None
+
+            async def close(self, **_kwargs):
+                self.close_calls += 1
+                return True
+
+        class _CandidateProjector:
+            async def projection_count(self):
+                return 0
+
+            async def rebuild_all(self):
+                return 0
+
+            async def check_consistency(self):
+                if not entered_check.is_set():
+                    entered_check.set()
+                    await release_check.wait()
+                return {
+                    "faiss_index_count_observed": False,
+                    "missing_projection_ids": [],
+                    "orphan_projection_ids": [],
+                    "inactive_projection_ids": [],
+                    "duplicate_projection_ids": [],
+                    "faiss_ids_missing_from_documents": [],
+                    "document_ids_missing_from_faiss": [],
+                }
+
+        candidate_db = _CandidateDB()
+        candidate_retriever = _CandidateRetriever()
+        engine.v2_store = _Store()
+        engine._probe_embedding_dimension = lambda *_args, **_kwargs: asyncio.sleep(
+            0,
+            result={
+                "query_dimension": 1,
+                "dimension_probe_status": "ok",
+                "provider_source_id": "test-provider",
+            },
+        )
+        engine._construct_vector_candidate = lambda **_kwargs: asyncio.sleep(
+            0, result=candidate_db
+        )
+        engine._new_vector_index_path = lambda _generation: candidate_path
+
+        async def run():
+            with patch.object(memory_engine_mod, "HAS_FAISS", True), patch.object(
+                memory_engine_mod, "VectorRetriever", return_value=candidate_retriever
+            ), patch.object(
+                memory_engine_mod, "HybridRetriever", return_value=object()
+            ), patch.object(
+                memory_engine_mod, "MemoryIndexProjector", return_value=_CandidateProjector()
+            ):
+                task = asyncio.create_task(engine._bootstrap_vector_index())
+                await asyncio.wait_for(entered_check.wait(), timeout=1.0)
+                engine.begin_shutdown()
+                release_check.set()
+                await asyncio.wait_for(task, timeout=1.0)
+
+        asyncio.run(run())
+
+        self.assertFalse(engine._is_ready)
+        self.assertIsNone(engine.faiss_db)
+        self.assertEqual(candidate_retriever.close_calls, 1)
+        self.assertEqual(candidate_db.close_calls, 1)
+
     def test_retrieve_trace_records_canonical_fts_fallback_during_rebuild(self):
         contracts = self.contracts
 
