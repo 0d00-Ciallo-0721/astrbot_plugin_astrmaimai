@@ -12,6 +12,7 @@ from ..shared.helpers.plugin_helpers import cleanup_stale_focus_pools, collect_b
 from ..infrastructure.runtime.outbound_send_guard import OUTBOUND_SEND_GATE
 from .runtime_instance_coordinator import RUNTIME_INSTANCE_COORDINATOR
 from .runtime_context import PluginRuntimeContext
+from ..infrastructure.runtime.runtime_status_schema import build_runtime_status_schema
 
 
 class PluginLifecycleManager:
@@ -1670,7 +1671,7 @@ class PluginLifecycleManager:
             for component, reason in sorted(diagnostics_errors.items())
         )[:1000]
         budget_state_unknown = "background_budget" in unknown_components
-        return {
+        report = {
             "remaining": remaining,
             "remaining_by_kind": remaining_by_kind,
             "active": budget_active,
@@ -1713,6 +1714,15 @@ class PluginLifecycleManager:
             "deferred_by_kind": deferred_by_kind,
             "event_bus_status": event_bus_status,
         }
+        report["runtime_status_schema"] = build_runtime_status_schema(
+            runtime_status=self.runtime.status.as_dict(),
+            config=getattr(self.runtime, "config", None),
+            infrastructure_settings=getattr(self.runtime, "infrastructure_settings", None),
+            background=budget_status,
+            memory=vector_status,
+            shutdown=report,
+        )
+        return report
 
     async def _run_bounded_shutdown_stage(
         self,

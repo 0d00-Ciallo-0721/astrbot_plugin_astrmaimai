@@ -70,9 +70,13 @@ class AttentionDecisionRouter:
         key = str(name or "unknown")
         self._diagnostic_counts[key] = self._diagnostic_counts.get(key, 0) + int(amount or 0)
 
-    def describe_status(self) -> dict[str, Any]:
-        self._prune_ignore_caches()
-        self._prune_participation_states()
+    def describe_status(self, *, read_only: bool = False) -> dict[str, Any]:
+        # Runtime diagnostics must not advance cache/state lifecycle.  The
+        # default keeps the historical pruning behavior for active callers;
+        # read_only=True provides a side-effect-free snapshot for observers.
+        if not read_only:
+            self._prune_ignore_caches()
+            self._prune_participation_states()
         samples = sorted(self._judge_latency_samples_ms)
 
         def percentile(ratio: float) -> float:

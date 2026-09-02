@@ -470,6 +470,54 @@ class ContextRuntimeWiringTests(unittest.TestCase):
         )
         self.assertEqual(terminal_total, 5)
 
+    def test_runtime_diagnostics_schema_consumes_turn_provider_and_stage_producers(self):
+        runtime_context_mod = importlib.import_module("astrmai.app.runtime_context")
+        runtime = runtime_context_mod.PluginRuntimeContext(
+            host_context=SimpleNamespace(),
+            raw_config={},
+            config=SimpleNamespace(),
+            runtime_coordinator=SimpleNamespace(),
+            host_bridge=SimpleNamespace(),
+        )
+        runtime.cognition.system2_planner = SimpleNamespace(
+            turn_trace_history=[
+                {
+                    "turn_id": "turn-1",
+                    "trace_id": "trace-1",
+                    "started_at": 100.0,
+                    "trace_finalized_at": 100.1,
+                    "turn_total_elapsed_ms": 100.0,
+                    "status": "completed",
+                    "reply_sent": True,
+                    "llm_call_ledger": [
+                        {
+                            "call_id": "call-1",
+                            "status": "success",
+                            "elapsed_ms": 45.0,
+                            "model_attempts": [
+                                {"retry_index": 0, "fallback": False},
+                                {"retry_index": 1, "fallback": True},
+                            ],
+                        }
+                    ],
+                    "stage_ledger": [
+                        {"stage": "gateway.semaphore_wait", "elapsed_ms": 6.0},
+                        {"stage": "system2.chat_lock_wait", "elapsed_ms": 8.0},
+                    ],
+                }
+            ]
+        )
+        diagnostics = runtime.build_diagnostics()
+        schema = diagnostics["runtime_status_schema"]
+        self.assertEqual(schema["turns"]["turn_id"], "turn-1")
+        self.assertEqual(schema["turns"]["total_elapsed_ms"], 100.0)
+        self.assertEqual(schema["provider"]["provider_request_count"], 1)
+        self.assertEqual(schema["provider"]["retry_count"], 1)
+        self.assertEqual(schema["provider"]["fallback_count"], 1)
+        self.assertEqual(schema["provider"]["measurement_scope"], "runtime_turn_traces")
+        self.assertEqual(schema["queues"]["gateway_semaphore_wait_ms"], 6.0)
+        self.assertEqual(schema["queues"]["sys2_lock_wait_ms"], 8.0)
+
     def test_runtime_diagnostics_tolerates_malformed_and_cyclic_traces(self):
         runtime_context_mod = importlib.import_module("astrmai.app.runtime_context")
         runtime = runtime_context_mod.PluginRuntimeContext(

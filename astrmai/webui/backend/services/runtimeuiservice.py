@@ -24,6 +24,7 @@ class RuntimeUiService:
             "data": {
                 "snapshot_at": diagnostics.get("snapshot_at", 0.0),
                 "diagnostics_status": diagnostics.get("diagnostics_status", "unknown"),
+                "runtime_status_schema": diagnostics.get("runtime_status_schema"),
                 "history": list(diagnostics.get("history", []) or []),
             },
             "runtime_bound": self.plugin_api.has_bound_facade(),

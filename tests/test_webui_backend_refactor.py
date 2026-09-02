@@ -237,12 +237,13 @@ class WebuiBackendRefactorTests(unittest.TestCase):
                 return {
                     "snapshot_at": 12.0,
                     "diagnostics_status": "degraded",
-                    "history": [{"background_active": 1}],
+                    "runtime_status_schema": {"runtime_status_schema_version": 1},
+                    "history": [{"background_active": 1, "runtime_status_schema": {"runtime_status_schema_version": 1}}],
                 }
 
         service = service_mod.RuntimeUiService(adapter_mod.PluginApiAdapter(facade=_Facade()))
         result = asyncio.run(service.runtime_status_history())
-        self.assertEqual(result["data"]["history"], [{"background_active": 1}])
+        self.assertEqual(result["data"]["history"][0]["runtime_status_schema"]["runtime_status_schema_version"], 1)
         self.assertEqual(result["data"]["diagnostics_status"], "degraded")
 
     def test_server_mounts_aggregated_api_router(self):

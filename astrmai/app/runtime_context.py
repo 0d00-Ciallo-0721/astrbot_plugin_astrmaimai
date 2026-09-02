@@ -9,6 +9,7 @@ from typing import Any, Awaitable, Callable
 from ..shared.constants.defaults import InfrastructureSettings, build_infrastructure_settings
 from ..infrastructure.runtime.background_task_budget import BackgroundTaskBudget
 from ..infrastructure.runtime.background_task_owner_registry import BackgroundTaskOwnerRegistry
+from ..infrastructure.runtime.runtime_status_schema import build_runtime_status_schema
 
 System2Callback = Callable[[Any, list[Any] | None], Awaitable[Any]]
 
@@ -497,11 +498,23 @@ class PluginRuntimeContext:
             {"available": False},
         )
         attention_router = getattr(self.attention_gate, "decision_router", None)
+
+        def describe_attention_read_only() -> dict[str, Any]:
+            if attention_router is None:
+                return {"available": False}
+            describe = getattr(attention_router, "describe_status", None)
+            if not callable(describe):
+                return {"available": False}
+            try:
+                return describe(read_only=True)
+            except TypeError:
+                # Compatibility with older test/host adapters that do not
+                # expose the keyword yet; their status call remains safe.
+                return describe()
+
         attention_status = safe_component(
             "attention",
-            attention_router.describe_status
-            if attention_router is not None and hasattr(attention_router, "describe_status")
-            else lambda: {"available": False},
+            describe_attention_read_only,
             {"available": False},
         )
         attention_gate_status = safe_component(
@@ -708,6 +721,46 @@ class PluginRuntimeContext:
             "external_result": external_result_status,
             "long_turn": long_turn_status,
         }
+        # Versioned schema is an additive, read-only projection.  Keep all
+        # legacy fields above intact for existing host/UI consumers.
+        gateway_status: dict[str, Any] = {}
+        if self.gateway is not None:
+            try:
+                provider_health = self.gateway.describe_provider_health()
+                if isinstance(provider_health, dict):
+                    gateway_status = {
+                        "provider_health": provider_health,
+                        "measurement_scope": "gateway_provider_health",
+                    }
+            except Exception:
+                gateway_status = {"measurement_scope": "gateway_provider_health"}
+        snapshot["runtime_status_schema"] = build_runtime_status_schema(
+            runtime_status=self.status.as_dict(),
+            config=self.config,
+            infrastructure_settings=self.infrastructure_settings,
+            attention=attention_status,
+            gateway=gateway_status,
+            background=budget_status,
+            memory=vector_status,
+            shutdown={
+                "status": self.status.shutdown_final_status,
+                "shutdown_generation": self.status.shutdown_generation,
+                "pending": self.status.shutdown_pending_drain,
+            },
+            turns=long_turn_status,
+            traces=traces,
+            stages={
+                name: {
+                    "stage_name": name,
+                    "elapsed_ms": elapsed_ms,
+                    "status": "measured",
+                    "started_at": None,
+                    "finished_at": None,
+                    "error_type": None,
+                }
+                for name, elapsed_ms in self.status.startup_stage_timings.items()
+            },
+        )
         history_sample = {
             "snapshot_at": snapshot["snapshot_at"],
             "diagnostics_status": snapshot["diagnostics_status"],
@@ -728,6 +781,12 @@ class PluginRuntimeContext:
             "long_turn_p95_ms": safe_float(long_turn_status.get("elapsed_ms_p95", 0.0)),
             "long_turn_timeout": safe_int(long_turn_status.get("timeout", 0)),
             "long_turn_budget_exhausted": safe_int(long_turn_status.get("budget_exhausted", 0)),
+            "runtime_status_schema_version": snapshot["runtime_status_schema"]["runtime_status_schema_version"],
+            "effective_config_fingerprint": snapshot["runtime_status_schema"]["effective_config_fingerprint"],
+            "lifecycle_status": snapshot["runtime_status_schema"]["lifecycle_status"],
+            # Preserve the complete versioned projection in history.  Legacy
+            # summary fields above remain for existing consumers.
+            "runtime_status_schema": snapshot["runtime_status_schema"],
         }
         sample_interval = max(0.0, safe_float(self.diagnostics_sample_interval_sec, 60.0))
         if (
