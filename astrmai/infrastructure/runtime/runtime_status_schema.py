@@ -404,6 +404,7 @@ def build_runtime_status_schema(
     telemetry_turns = aggregate_turn_telemetry(traces)
     telemetry_provider = aggregate_provider_telemetry(traces)
     telemetry_waits = aggregate_stage_waits(traces)
+    has_trace_source = traces is not None
 
     lifecycle = "unknown"
     if runtime.get("shutdown_final_status") == "degraded":
@@ -472,18 +473,18 @@ def build_runtime_status_schema(
         "trace_id": _status_value(turns_input, "trace_id") or (telemetry_turns.get("latest") or {}).get("trace_id"),
         "started_at": _status_value(turns_input, "started_at") or (telemetry_turns.get("latest") or {}).get("started_at"),
         "finished_at": _status_value(turns_input, "finished_at") or (telemetry_turns.get("latest") or {}).get("finished_at"),
-        "total_elapsed_ms": _status_value(turns_input, "total_elapsed_ms") if _status_value(turns_input, "total_elapsed_ms") is not None else telemetry_turns.get("total_elapsed_ms"),
-        "total_elapsed_p50_ms": _status_value(turns_input, "elapsed_ms_p50") if _status_value(turns_input, "elapsed_ms_p50") is not None else telemetry_turns.get("elapsed_ms_p50"),
-        "total_elapsed_p95_ms": _status_value(turns_input, "elapsed_ms_p95") if _status_value(turns_input, "elapsed_ms_p95") is not None else telemetry_turns.get("elapsed_ms_p95"),
-        "total_elapsed_p99_ms": _status_value(turns_input, "elapsed_ms_p99") if _status_value(turns_input, "elapsed_ms_p99") is not None else telemetry_turns.get("elapsed_ms_p99"),
+        "total_elapsed_ms": telemetry_turns.get("total_elapsed_ms") if has_trace_source else _status_value(turns_input, "total_elapsed_ms"),
+        "total_elapsed_p50_ms": telemetry_turns.get("elapsed_ms_p50") if has_trace_source else _status_value(turns_input, "elapsed_ms_p50"),
+        "total_elapsed_p95_ms": telemetry_turns.get("elapsed_ms_p95") if has_trace_source else _status_value(turns_input, "elapsed_ms_p95"),
+        "total_elapsed_p99_ms": telemetry_turns.get("elapsed_ms_p99") if has_trace_source else _status_value(turns_input, "elapsed_ms_p99"),
         "terminal_reason": _status_value(turns_input, "terminal_reason") or (telemetry_turns.get("latest") or {}).get("terminal_reason"),
         "reply_sent": _status_value(turns_input, "reply_sent") if _status_value(turns_input, "reply_sent") is not None else (telemetry_turns.get("latest") or {}).get("reply_sent"),
         "fallback_sent": _status_value(turns_input, "fallback_sent") if _status_value(turns_input, "fallback_sent") is not None else (telemetry_turns.get("latest") or {}).get("fallback_sent"),
         "tool_action_count": _status_value(turns_input, "tool_action_count") if _status_value(turns_input, "tool_action_count") is not None else (telemetry_turns.get("latest") or {}).get("tool_action_count"),
         "deferred_replayed": _status_value(turns_input, "deferred_replayed") if _status_value(turns_input, "deferred_replayed") is not None else (telemetry_turns.get("latest") or {}).get("deferred_replayed"),
         "terminal_status": _status_value(turns_input, "terminal_status") or (telemetry_turns.get("latest") or {}).get("terminal_status"),
-        "sample_size": _status_value(turns_input, "sample_size") if _status_value(turns_input, "sample_size") is not None else telemetry_turns.get("sample_size"),
-        "measurement_scope": "runtime_turn_traces" if telemetry_turns.get("sample_size") else None,
+        "sample_size": telemetry_turns.get("sample_size") if has_trace_source else _status_value(turns_input, "sample_size"),
+        "measurement_scope": "runtime_turn_traces" if has_trace_source and telemetry_turns.get("sample_size") else None,
         "records": telemetry_turns.get("records") or None,
     }
     resource_state = _status_value(memory, "resource_state", "vector_resource_state")
