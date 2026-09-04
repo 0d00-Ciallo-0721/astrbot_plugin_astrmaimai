@@ -684,7 +684,7 @@ class ContextRuntimeWiringTests(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_trace_stores_write_json_atomically(self):
+    def test_trace_stores_write_raw_trace_as_jsonl(self):
         raw_store_mod = importlib.import_module("astrmai.infrastructure.runtime.raw_trace_store")
         turn_store_mod = importlib.import_module("astrmai.infrastructure.runtime.turn_trace_store")
 
@@ -692,11 +692,15 @@ class ContextRuntimeWiringTests(unittest.TestCase):
             raw_store = raw_store_mod.RawTraceEventStore(self.temp_dir.name, max_per_chat=50)
             turn_store = turn_store_mod.TurnTraceSampleStore(self.temp_dir.name, max_per_chat=50)
             await raw_store.append({"created_at": 1.0, "chat_id": "chat-1", "stage": "raw"})
+            await raw_store.flush()
             await turn_store.append({"created_at": 2.0, "chat_id": "chat-1", "stage": "turn"})
-            raw_payload = json.loads(raw_store.path.read_text(encoding="utf-8"))
-            self.assertEqual(raw_payload["by_chat"]["chat-1"][0]["stage"], "raw")
-            # G8/WU-06: turn trace 落盘改 append-only JSONL（raw trace 仍是整文件 JSON）；
-            # 断言从"整文件结构"改为"JSONL 行内容"，写入原子性由 tmp+replace 压实路径保证
+            raw_lines = [
+                json.loads(line)
+                for line in raw_store.jsonl_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(raw_lines[0]["stage"], "raw")
+            # Both trace stores use compact append-only JSONL on the hot path.
             turn_lines = [
                 json.loads(line)
                 for line in turn_store.jsonl_path.read_text(encoding="utf-8").splitlines()

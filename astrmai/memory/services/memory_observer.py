@@ -86,8 +86,14 @@ class MemoryObserver:
             elif event.component == "session_summarizer":
                 stage_state["last_summarize_stage"] = event.stage
             self._last_stage_by_chat[event.chat_id] = stage_state
-        await self._record_global_observability(data)
-        await self._append_trace_event(data)
+        # The observability hub owns RawTrace persistence when available.  A
+        # direct append is only a compatibility fallback for lightweight
+        # adapters that do not provide the hub; otherwise one observation must
+        # never be written twice to the same store.
+        if self.observability_hub is not None and hasattr(self.observability_hub, "record"):
+            await self._record_global_observability(data)
+        else:
+            await self._append_trace_event(data)
         return data
 
     def _update_counters(self, event: MemoryObservationEvent) -> None:

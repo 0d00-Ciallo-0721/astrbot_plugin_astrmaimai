@@ -1081,6 +1081,7 @@ class PluginLifecycleManager:
     def _apply_shutdown_fences(self) -> dict[str, str]:
         errors = dict(getattr(self, "_shutdown_fence_errors", {}) or {})
         memory_engine = getattr(self.runtime, "memory_engine", None)
+        raw_trace_store = getattr(getattr(self.runtime, "db_service", None), "raw_trace_store", None)
         fences = (
             (
                 "background_budget.begin_drain",
@@ -1094,6 +1095,10 @@ class PluginLifecycleManager:
             (
                 "memory.projector.begin_shutdown",
                 getattr(getattr(memory_engine, "index_projector", None), "begin_shutdown", None),
+            ),
+            (
+                "observability.raw_trace.begin_shutdown",
+                getattr(raw_trace_store, "begin_shutdown", None),
             ),
         )
         for name, fence in fences:
@@ -2419,6 +2424,18 @@ class PluginLifecycleManager:
             await self._wait_executor_release_tasks(
                 timeout_sec=min(2.0, float(self.SHUTDOWN_TASK_TIMEOUT or 2.0))
             )
+            raw_trace_store = getattr(getattr(self.runtime, "db_service", None), "raw_trace_store", None)
+            close_raw_trace = getattr(raw_trace_store, "close", None)
+            if callable(close_raw_trace):
+                close_result = self._invoke_with_optional_keyword(
+                    close_raw_trace,
+                    "timeout_sec",
+                    min(1.0, float(self.SHUTDOWN_TASK_TIMEOUT or 1.0)),
+                )
+                if inspect.isawaitable(close_result):
+                    close_result = await close_result
+                if close_result is False:
+                    logger.warning("[AstrMai] RawTrace writer did not drain within shutdown grace")
             tasks_to_wait = collect_background_tasks(*self.runtime.iter_task_owners())
             current_task = asyncio.current_task()
             durable_tasks: set[Any] = set()
@@ -2448,7 +2465,7 @@ class PluginLifecycleManager:
             # (CPython detail). Use explicit id() dedup if this breaks on another runtime.
             unique_tasks = [task for task in dict.fromkeys(tasks_to_wait) if task is not None]
             for task in unique_tasks:
-                if not task.done():
+                if not task.done() and not getattr(task, "_astrmai_raw_trace_writer", False):
                     task.cancel()
             try:
                 _, pending = await asyncio.wait(unique_tasks, timeout=self.SHUTDOWN_TASK_TIMEOUT)

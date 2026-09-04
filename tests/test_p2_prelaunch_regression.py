@@ -45,7 +45,7 @@ class P2PrelaunchRegressionTests(unittest.TestCase):
         self.assertEqual(caps.provider_family, "anthropic")
         self.assertTrue(caps.supports_cache_control)
 
-    def test_raw_trace_store_falls_back_when_replace_is_locked(self):
+    def test_raw_trace_store_uses_append_only_jsonl_when_legacy_replace_is_locked(self):
         from astrmai.infrastructure.runtime.raw_trace_store import RawTraceEventStore
 
         store = RawTraceEventStore(Path(self.temp_dir.name), filename="raw.json")
@@ -53,7 +53,8 @@ class P2PrelaunchRegressionTests(unittest.TestCase):
         with patch("astrmai.infrastructure.runtime.raw_trace_store.os.replace", side_effect=PermissionError("locked")):
             asyncio.run(store.append({"chat_id": "chat-1", "created_at": 1.0, "kind": "test"}))
 
-        self.assertTrue(store.path.exists())
+        asyncio.run(store.flush())
+        self.assertTrue(store.jsonl_path.exists())
         self.assertEqual(asyncio.run(store.recent(chat_id="chat-1"))[0]["kind"], "test")
 
     def test_message_scope_handles_nonstandard_event_accessors(self):

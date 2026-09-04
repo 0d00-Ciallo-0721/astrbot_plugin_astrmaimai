@@ -531,6 +531,7 @@ class PluginRuntimeContext:
             self.persona_summarizer,
             self.event_bus,
             self.owner_registry,
+            getattr(self.db_service, "raw_trace_store", None),
         )
 
     def build_diagnostics(self) -> dict[str, Any]:
@@ -639,6 +640,14 @@ class PluginRuntimeContext:
             if self.chat_loop_kernel is not None and hasattr(self.chat_loop_kernel, "describe_status_sync")
             else lambda: {"enabled": False, "tracked_chats": 0},
             {"enabled": False, "tracked_chats": 0},
+        )
+        raw_trace_store = getattr(self.db_service, "raw_trace_store", None)
+        raw_trace_status = safe_component(
+            "raw_trace_store",
+            raw_trace_store.describe_status
+            if raw_trace_store is not None and hasattr(raw_trace_store, "describe_status")
+            else lambda: {"available": False},
+            {"available": False},
         )
         planner = self.system2_planner
         try:
@@ -790,6 +799,9 @@ class PluginRuntimeContext:
                 "external_result_dispatcher": self.external_result_dispatcher is not None,
             },
             "chat_loop": chat_loop_status,
+            "observability": {
+                "raw_trace": raw_trace_status,
+            },
             "memory": {
                 "vector_retrieval": vector_status,
             },

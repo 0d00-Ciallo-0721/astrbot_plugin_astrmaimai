@@ -53,6 +53,8 @@ from ...proactive.dispatcher import append_proactive_stage
 class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
     """System 2 planner facade for prompt construction and execution orchestration."""
 
+    MAX_RAW_TRACE_EVENTS_PER_TURN = 128
+
     FOLLOW_UP_SYSTEM_PROMPT = (
         "You are a follow-up decision judge. "
         "Only decide whether the bot should send one short follow-up message. "
@@ -1752,15 +1754,32 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             return []
         trace_id = str(event.get_extra("astrmai_trace_id", "") or "")
         trace_log = list(event.get_extra("astrmai_trace_log", []) or [])
+        max_events = max(1, int(self.MAX_RAW_TRACE_EVENTS_PER_TURN))
+        if len(trace_log) > max_events:
+            head_count = max_events // 2
+            tail_count = max_events - head_count - 1
+            dropped_count = len(trace_log) - head_count - tail_count
+            trace_log = [
+                *trace_log[:head_count],
+                {
+                    "stage": "trace.events_truncated",
+                    "level": "warning",
+                    "summary": f"{dropped_count} raw trace events omitted",
+                    "payload": {"dropped_event_count": dropped_count},
+                },
+                *(trace_log[-tail_count:] if tail_count else []),
+            ]
         created_at = time.time()
         events: list[dict] = []
-        for item in trace_log:
+        for sequence, item in enumerate(trace_log):
             payload = dict(item or {})
             stage = str(payload.get("stage", "") or "")
             if not stage:
                 continue
             payload["chat_id"] = str(chat_id or "")
             payload["trace_id"] = trace_id or str(payload.get("trace_id", "") or "")
+            if not str(payload.get("event_id", "") or "") and payload["trace_id"]:
+                payload["event_id"] = f"{payload['trace_id']}:{sequence}:{stage}"
             payload["created_at"] = float(payload.get("created_at", created_at) or created_at)
             events.append(payload)
         return events

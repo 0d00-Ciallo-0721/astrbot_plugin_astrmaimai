@@ -78,9 +78,9 @@ class MemoryObserverGapCoverageTests(unittest.TestCase):
             )
 
             self.assertEqual(first["chat_id"], "chat-1")
-            self.assertEqual(len(trace_store.items), 3)
-            self.assertEqual(trace_store.items[0]["stage"], "memory.instant_gate.gate_hit")
-            self.assertEqual(trace_store.items[0]["memory_event"]["payload"], {"score": 0.9})
+            # The hub owns RawTrace persistence when it is bound.  The
+            # observer must not also write the same memory event directly.
+            self.assertEqual(trace_store.items, [])
             self.assertEqual(len(hub.records), 3)
             self.assertEqual(hub.records[0]["domain"], "memory")
             self.assertEqual(hub.records[0]["kind"], "action")

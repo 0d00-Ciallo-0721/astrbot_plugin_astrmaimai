@@ -257,7 +257,11 @@ class PluginBootstrap:
         # if turn_trace_store / raw_trace_store produce file-not-found at runtime.
         trace_cache_dir = Path(getattr(persistence, "cache_dir", Path("data") / "plugin_data" / "astrmai" / "cache"))
         db_service.turn_trace_store = TurnTraceSampleStore(trace_cache_dir)
-        db_service.raw_trace_store = RawTraceEventStore(trace_cache_dir)
+        db_service.raw_trace_store = RawTraceEventStore(
+            trace_cache_dir,
+            owner_registry=getattr(db_service, "owner_registry", None),
+            generation=int(getattr(getattr(db_service, "owner_registry", None), "generation", 0) or 0),
+        )
         db_service.context_economy_benchmark_store = ContextEconomyBenchmarkSampleStore(trace_cache_dir)
         gateway.benchmark_sample_store = db_service.context_economy_benchmark_store
         if getattr(memory_engine, "tool_service", None) is not None:

@@ -107,6 +107,20 @@ class PluginLifecycleShutdownRegressionTests(unittest.TestCase):
         self.assertIn("memory_pipeline.begin_shutdown", calls)
         self.assertFalse(runtime.status.accepting_events)
 
+    def test_begin_shutdown_fences_raw_trace_admission_immediately(self):
+        calls = []
+        runtime = self._build_runtime(calls)
+        runtime.core.db_service = SimpleNamespace(
+            raw_trace_store=SimpleNamespace(
+                begin_shutdown=lambda: calls.append("raw_trace.begin_shutdown")
+            )
+        )
+        from astrmai.app.lifecycle import PluginLifecycleManager
+
+        manager = PluginLifecycleManager(runtime)
+        manager.begin_shutdown()
+        self.assertIn("raw_trace.begin_shutdown", calls)
+
     def test_startup_waits_for_persistence_schema_before_memory_consumers(self):
         async def _run():
             from astrmai.app.lifecycle import PluginLifecycleManager
