@@ -14,6 +14,12 @@ from tests.helpers.attention_stubs import install_attention_stubs
 from astrmai.infrastructure.persistence.attention_deferred_outbox import (
     AttentionDeferredOutboxStore,
 )
+from astrmai.infrastructure.runtime.turn_call_ledger import (
+    configure_turn_budget,
+    detach_turn_telemetry,
+    deferred_replay_budget_scope,
+    remaining_turn_budget,
+)
 
 
 class _Event:
@@ -120,6 +126,211 @@ class AttentionDeferredQueueTests(unittest.TestCase):
         calls, status = asyncio.run(run())
         self.assertEqual(calls, ["run"])
         self.assertEqual(status, "replayed")
+
+    def test_replay_uses_independent_budget_when_original_turn_expired(self):
+        async def run():
+            event = _Event()
+            telemetry = configure_turn_budget(
+                event,
+                total_budget_sec=1.0,
+                main_reply_reserve_sec=0.0,
+            )
+            telemetry.deadline_monotonic = time.monotonic() - 1.0
+            expired_deadline = telemetry.deadline_monotonic
+            calls = []
+            observed = {}
+
+            async def work():
+                calls.append("started")
+                observed["event"] = remaining_turn_budget(event)
+                observed["none"] = remaining_turn_budget(None)
+                await asyncio.sleep(0)
+
+            self.gate._deferred_attention_work["expired-turn"] = {
+                "work_id": "expired-turn",
+                "chat_id": event.unified_msg_origin,
+                "task_name": "attention.system2",
+                "retry_factory": work,
+                "event": event,
+                "enqueued_at": time.time(),
+                "next_retry_at": 0.0,
+                "expires_at": time.time() + 5.0,
+                "attempts": 0,
+                "max_attempts": 3,
+                "shutdown_generation": self.gate._shutdown_generation,
+                "_terminal_status": None,
+            }
+            self.gate._ensure_deferred_attention_dispatcher()
+            await asyncio.wait_for(event.terminal_event.wait(), timeout=2.0)
+            status = event.get_extra("deferred_terminal_status")
+            await self.gate.shutdown_workers()
+            return telemetry.deadline_monotonic, expired_deadline, calls, observed, status
+
+        deadline, expired_deadline, calls, observed, status = asyncio.run(run())
+        self.assertEqual(calls, ["started"])
+        self.assertGreater(observed["event"], 0.0)
+        self.assertGreater(observed["none"], 0.0)
+        self.assertEqual(deadline, expired_deadline)
+        self.assertEqual(status, "replayed")
+
+    def test_replay_budget_scopes_are_isolated_and_reset(self):
+        async def observe(deadline):
+            with deferred_replay_budget_scope(deadline, work_id=str(deadline)):
+                first = remaining_turn_budget(None)
+                await asyncio.sleep(0)
+                second = remaining_turn_budget(None)
+            return first, second, remaining_turn_budget(None)
+
+        async def run():
+            now = time.monotonic()
+            return await asyncio.gather(
+                observe(now + 1.0),
+                observe(now + 2.0),
+            )
+
+        values = asyncio.run(run())
+        self.assertEqual(len(values), 2)
+        self.assertGreater(values[0][0], 0.0)
+        self.assertGreater(values[1][0], values[0][0])
+        self.assertGreater(values[0][1], 0.0)
+        self.assertGreater(values[1][1], 0.0)
+        self.assertIsNone(values[0][2])
+        self.assertIsNone(values[1][2])
+
+    def test_replay_provider_failure_is_not_marked_replayed_or_fallback(self):
+        async def run():
+            event = _Event()
+
+            async def work():
+                raise RuntimeError("provider probe")
+
+            self.gate._deferred_attention_work["provider-failure"] = {
+                "work_id": "provider-failure",
+                "chat_id": event.unified_msg_origin,
+                "task_name": "attention.compaction",
+                "retry_factory": work,
+                "event": event,
+                "enqueued_at": time.time(),
+                "next_retry_at": 0.0,
+                "expires_at": time.time() + 5.0,
+                "attempts": 0,
+                "max_attempts": 1,
+                "shutdown_generation": self.gate._shutdown_generation,
+                "_terminal_status": None,
+            }
+            self.gate._ensure_deferred_attention_dispatcher()
+            await asyncio.wait_for(event.terminal_event.wait(), timeout=2.0)
+            status = self.gate.describe_status()
+            await self.gate.shutdown_workers()
+            return event.get_extra("deferred_terminal_status"), status
+
+        terminal, status = asyncio.run(run())
+        self.assertEqual(terminal, "failed")
+        self.assertEqual(status["attention_deferred_replayed_total"], 0)
+        self.assertGreaterEqual(status["attention_deferred_task_started_total"], 1)
+        self.assertEqual(status["attention_deferred_last_failure_kind"], "task_internal_error")
+
+    def test_compaction_replay_completes_after_original_deadline_expired(self):
+        async def run():
+            event = _Event()
+            telemetry = configure_turn_budget(
+                event,
+                total_budget_sec=1.0,
+                main_reply_reserve_sec=0.0,
+            )
+            telemetry.deadline_monotonic = time.monotonic() - 1.0
+            observed = []
+
+            async def work():
+                observed.append(remaining_turn_budget(event))
+
+            self.gate._deferred_attention_work["compaction-replay"] = {
+                "work_id": "compaction-replay",
+                "chat_id": event.unified_msg_origin,
+                "task_name": "attention.compaction",
+                "retry_factory": work,
+                "event": event,
+                "enqueued_at": time.time(),
+                "next_retry_at": 0.0,
+                "expires_at": time.time() + 5.0,
+                "attempts": 0,
+                "max_attempts": 1,
+                "shutdown_generation": self.gate._shutdown_generation,
+                "_terminal_status": None,
+            }
+            self.gate._ensure_deferred_attention_dispatcher()
+            await asyncio.wait_for(event.terminal_event.wait(), timeout=2.0)
+            terminal = event.get_extra("deferred_terminal_status")
+            await self.gate.shutdown_workers()
+            return terminal, observed
+
+        terminal, observed = asyncio.run(run())
+        self.assertEqual(terminal, "replayed")
+        self.assertEqual(len(observed), 1)
+        self.assertGreater(observed[0], 0.0)
+
+    def test_replay_budget_reply_reserve_is_task_specific(self):
+        async def observe(reserve):
+            with deferred_replay_budget_scope(
+                time.monotonic() + 2.0,
+                reply_reserve_sec=reserve,
+                work_id="reserve",
+            ):
+                return remaining_turn_budget(None), remaining_turn_budget(
+                    None, reserve_for_reply=True
+                )
+
+        execution, reserved = asyncio.run(observe(0.5))
+        self.assertGreater(execution, reserved)
+        self.assertGreater(reserved, 0.0)
+
+    def test_replay_child_task_cannot_use_budget_after_scope_exit(self):
+        async def run():
+            result = {}
+
+            async def child():
+                await asyncio.sleep(0.01)
+                result["remaining"] = remaining_turn_budget(None)
+
+            with deferred_replay_budget_scope(
+                time.monotonic() + 2.0,
+                work_id="child-scope",
+            ):
+                task = asyncio.create_task(child())
+            await task
+            return result["remaining"]
+
+        self.assertIsNone(asyncio.run(run()))
+
+    def test_detached_child_does_not_invalidate_parent_replay_budget(self):
+        async def run():
+            result = {}
+            scope_exited = asyncio.Event()
+
+            async def detached_child():
+                detach_turn_telemetry()
+                result["detached_child"] = remaining_turn_budget(None)
+
+            async def inherited_child():
+                await scope_exited.wait()
+                result["inherited_child_after_scope"] = remaining_turn_budget(None)
+
+            with deferred_replay_budget_scope(
+                time.monotonic() + 2.0,
+                work_id="detached-child",
+            ):
+                detached_task = asyncio.create_task(detached_child())
+                inherited_task = asyncio.create_task(inherited_child())
+                await detached_task
+                result["parent"] = remaining_turn_budget(None)
+            scope_exited.set()
+            await inherited_task
+            return result
+
+        result = asyncio.run(run())
+        self.assertIsNone(result["detached_child"])
+        self.assertGreater(result["parent"], 0.0)
+        self.assertIsNone(result["inherited_child_after_scope"])
 
     def test_local_attention_slot_timeout_replays_without_fallback(self):
         async def run():
@@ -372,6 +583,145 @@ class AttentionDeferredQueueTests(unittest.TestCase):
             await self.gate.shutdown_workers()
 
         asyncio.run(run())
+
+    def test_deferred_restore_rebuilds_compaction_without_process_event(self):
+        async def run():
+            db_path = Path(self.temp_dir.name) / "compaction-restore.db"
+            store = AttentionDeferredOutboxStore(db_path)
+            calls = []
+
+            class Compaction:
+                async def schedule_compaction_evaluation(self, chat_id, focus_context=None, message_source=None):
+                    calls.append((chat_id, focus_context, message_source))
+
+            self.gate.context_compaction = Compaction()
+            self.gate.process_event = mock.AsyncMock(side_effect=AssertionError("must not process event"))
+            now = time.time()
+            await store.enqueue(
+                {
+                    "work_id": "compaction-restore-1",
+                    "chat_id": "default:GroupMessage:compact",
+                    "task_name": "attention.compaction",
+                    "reason": "queue_timeout",
+                    "attempts": 0,
+                    "max_attempts": 1,
+                    "next_retry_at_wall": now,
+                    "expires_at": now + 10.0,
+                    "diagnostics": {
+                        "replay_metadata": {
+                            "chat_id": "default:GroupMessage:compact",
+                            "focus_context_version": "v1",
+                        }
+                    },
+                },
+                event_data={"unified_msg_origin": "default:GroupMessage:compact"},
+            )
+            self.gate._deferred_attention_outbox = store
+            await self.gate._restore_deferred_attention()
+            item = self.gate._deferred_attention_work["compaction-restore-1"]
+            await item["retry_factory"]()
+            await self.gate.shutdown_workers()
+            return calls
+
+        calls = asyncio.run(run())
+        self.assertEqual(calls, [("default:GroupMessage:compact", None, "user")])
+
+    def test_deferred_restore_unknown_task_is_blocked_without_generic_fallback(self):
+        async def run():
+            db_path = Path(self.temp_dir.name) / "unknown-restore.db"
+            store = AttentionDeferredOutboxStore(db_path)
+            self.gate.process_event = mock.AsyncMock(
+                side_effect=AssertionError("unknown task must not process event")
+            )
+            now = time.time()
+            await store.enqueue(
+                {
+                    "work_id": "unknown-restore-1",
+                    "chat_id": "default:GroupMessage:unknown",
+                    "task_name": "attention.unknown",
+                    "reason": "queue_timeout",
+                    "next_retry_at_wall": now,
+                    "expires_at": now + 30.0,
+                },
+                event_data={
+                    "message_str": "unknown",
+                    "unified_msg_origin": "default:GroupMessage:unknown",
+                },
+            )
+            self.gate._deferred_attention_outbox = store
+            await self.gate._restore_deferred_attention()
+            await asyncio.sleep(0)
+            description = await store.describe()
+            await self.gate.shutdown_workers()
+            return description
+
+        self.assertEqual(asyncio.run(run())["total"], 0)
+
+    def test_active_replay_is_visible_to_runtime_diagnostics(self):
+        async def run():
+            event = _Event()
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def work():
+                started.set()
+                await release.wait()
+
+            self.gate._deferred_attention_work["active-replay"] = {
+                "work_id": "active-replay",
+                "chat_id": event.unified_msg_origin,
+                "task_name": "attention.compaction",
+                "retry_factory": work,
+                "event": event,
+                "enqueued_at": time.time(),
+                "next_retry_at": 0.0,
+                "expires_at": time.time() + 10.0,
+                "attempts": 0,
+                "max_attempts": 1,
+                "shutdown_generation": self.gate._shutdown_generation,
+                "_terminal_status": None,
+            }
+            self.gate._ensure_deferred_attention_dispatcher()
+            await asyncio.wait_for(started.wait(), timeout=1.0)
+            active = self.gate.describe_status()
+            release.set()
+            await asyncio.wait_for(event.terminal_event.wait(), timeout=1.0)
+            await self.gate.shutdown_workers()
+            return active
+
+        status = asyncio.run(run())
+        self.assertTrue(status["attention_deferred_replay_budget_active"])
+        self.assertIn("active-replay", status["attention_deferred_replay_active_work_ids"])
+
+    def test_system2_replay_admission_deadline_excludes_reply_reserve(self):
+        async def run():
+            observed = {}
+
+            async def fake_slot(awaitable_factory, event=None, *, admission_deadline=None):
+                observed["deadline"] = admission_deadline
+                return await awaitable_factory()
+
+            original = self.gate._run_background_slot
+            self.gate._run_background_slot = fake_slot
+            try:
+                hard_deadline = time.monotonic() + 2.0
+                with deferred_replay_budget_scope(
+                    hard_deadline,
+                    work_id="reserve-boundary",
+                    reply_reserve_sec=0.5,
+                ):
+                    await self.gate._run_background_task(
+                        asyncio.sleep(0),
+                        _Event(),
+                        task_name="attention.system2",
+                        _deferred_replay=True,
+                    )
+            finally:
+                self.gate._run_background_slot = original
+            return hard_deadline, observed["deadline"]
+
+        hard_deadline, admission_deadline = asyncio.run(run())
+        self.assertLess(admission_deadline, hard_deadline - 0.35)
 
     def test_deferred_terminal_transition_removes_persisted_record(self):
         async def run():

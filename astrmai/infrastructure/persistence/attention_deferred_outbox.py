@@ -44,7 +44,9 @@ class AttentionDeferredOutboxStore:
                     lease_until REAL NOT NULL DEFAULT 0,
                     created_at REAL NOT NULL DEFAULT 0,
                     updated_at REAL NOT NULL DEFAULT 0,
-                    last_error TEXT NOT NULL DEFAULT ''
+                    last_error TEXT NOT NULL DEFAULT '',
+                    diagnostics_json TEXT NOT NULL DEFAULT '{}',
+                    revision INTEGER NOT NULL DEFAULT 0
                 )
                 """
             )
@@ -52,6 +54,32 @@ class AttentionDeferredOutboxStore:
                 "CREATE INDEX IF NOT EXISTS ix_attention_deferred_due "
                 "ON attention_deferred_outbox(status, next_retry_at, created_at)"
             )
+            # Older outboxes predate replay diagnostics; add the nullable-safe
+            # column in place so restored rows remain compatible.
+            cursor = await db.execute("PRAGMA table_info(attention_deferred_outbox)")
+            columns = {str(row[1]) for row in await cursor.fetchall()}
+            await cursor.close()
+            if "diagnostics_json" not in columns:
+                try:
+                    await db.execute(
+                        "ALTER TABLE attention_deferred_outbox "
+                        "ADD COLUMN diagnostics_json TEXT NOT NULL DEFAULT '{}'"
+                    )
+                except Exception as exc:
+                    # Another startup task may have added the column between
+                    # PRAGMA and ALTER.  Only that duplicate-column race is
+                    # safe to absorb; preserve all other schema failures.
+                    if "duplicate column" not in str(exc).lower():
+                        raise
+            if "revision" not in columns:
+                try:
+                    await db.execute(
+                        "ALTER TABLE attention_deferred_outbox "
+                        "ADD COLUMN revision INTEGER NOT NULL DEFAULT 0"
+                    )
+                except Exception as exc:
+                    if "duplicate column" not in str(exc).lower():
+                        raise
             await db.commit()
 
     async def enqueue(self, item: dict[str, Any], *, event_data: dict[str, Any]) -> bool:
@@ -63,6 +91,12 @@ class AttentionDeferredOutboxStore:
         if not work_id:
             return False
         payload = json.dumps(event_data or {}, ensure_ascii=False, default=str)
+        try:
+            revision = int(item.get("revision", 0) or 0)
+        except (TypeError, ValueError):
+            revision = 0
+        if revision <= 0:
+            revision = max(1, int(item.get("attempts", 0) or 0) + 1)
         async with connect_aiosqlite(self.db_path) as db:
             await db.execute(
                 """
@@ -70,8 +104,8 @@ class AttentionDeferredOutboxStore:
                     work_id, chat_id, task_name, reason, event_json,
                     turn_thread_id, turn_generation, worker_generation,
                     attempts, max_attempts, next_retry_at, expires_at,
-                    status, lease_token, lease_until, created_at, updated_at, last_error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', '', 0, ?, ?, '')
+                    status, lease_token, lease_until, created_at, updated_at, last_error, diagnostics_json, revision
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', '', 0, ?, ?, '', ?, ?)
                 ON CONFLICT(work_id) DO UPDATE SET
                     chat_id=excluded.chat_id, task_name=excluded.task_name,
                     reason=excluded.reason, event_json=excluded.event_json,
@@ -83,7 +117,9 @@ class AttentionDeferredOutboxStore:
                     status=attention_deferred_outbox.status,
                     lease_token=attention_deferred_outbox.lease_token,
                     lease_until=attention_deferred_outbox.lease_until,
-                    updated_at=excluded.updated_at, last_error=''
+                    updated_at=excluded.updated_at, last_error='', diagnostics_json=excluded.diagnostics_json,
+                    revision=excluded.revision
+                WHERE excluded.revision > attention_deferred_outbox.revision
                 """,
                 (
                     work_id,
@@ -100,6 +136,8 @@ class AttentionDeferredOutboxStore:
                     float(item.get("expires_at", now) or now),
                     now,
                     now,
+                    json.dumps(item.get("diagnostics") or {}, ensure_ascii=False, default=str)[:4000],
+                    revision,
                 ),
             )
             await db.commit()
@@ -126,7 +164,7 @@ class AttentionDeferredOutboxStore:
             )
             query = (
                 "SELECT work_id, chat_id, task_name, reason, event_json, turn_thread_id, "
-                "turn_generation, worker_generation, attempts, max_attempts, next_retry_at, expires_at "
+                "turn_generation, worker_generation, attempts, max_attempts, next_retry_at, expires_at, diagnostics_json, revision "
                 "FROM attention_deferred_outbox WHERE status='queued'"
             )
             params: list[Any] = []
@@ -150,6 +188,8 @@ class AttentionDeferredOutboxStore:
             "work_id", "chat_id", "task_name", "reason", "event_json", "turn_thread_id",
             "turn_generation", "worker_generation", "attempts", "max_attempts",
             "next_retry_at_wall", "expires_at",
+            "diagnostics_json",
+            "revision",
         )
         result = []
         for row in rows:
@@ -158,6 +198,10 @@ class AttentionDeferredOutboxStore:
                 item["event_data"] = json.loads(str(item.pop("event_json") or "{}"))
             except (TypeError, ValueError, json.JSONDecodeError):
                 item["event_data"] = {}
+            try:
+                item["diagnostics"] = json.loads(str(item.pop("diagnostics_json") or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                item["diagnostics"] = {}
             item["lease_token"] = token
             result.append(item)
         return result

@@ -26,6 +26,25 @@ _CURRENT_TELEMETRY: ContextVar["TurnTelemetryContext | None"] = ContextVar(
     "astrmai_turn_telemetry",
     default=None,
 )
+_DEFERRED_REPLAY_BUDGET: ContextVar["DeferredReplayBudget | None"] = ContextVar(
+    "astrmai_deferred_replay_budget",
+    default=None,
+)
+
+
+@dataclass(slots=True)
+class DeferredReplayBudget:
+    """Independent deadline propagated through a deferred replay task."""
+
+    deadline_monotonic: float
+    work_id: str = ""
+    generation: int = 0
+    reply_reserve_sec: float = 0.0
+    active: bool = True
+
+    @property
+    def execution_deadline_monotonic(self) -> float:
+        return self.deadline_monotonic - max(0.0, self.reply_reserve_sec)
 
 
 @dataclass(slots=True)
@@ -163,6 +182,12 @@ def remaining_turn_budget(
     *,
     reserve_for_reply: bool = False,
 ) -> float | None:
+    replay_budget = _DEFERRED_REPLAY_BUDGET.get()
+    if replay_budget is not None and replay_budget.active:
+        remaining = max(0.0, replay_budget.deadline_monotonic - time.monotonic())
+        if reserve_for_reply:
+            remaining = max(0.0, remaining - max(0.0, replay_budget.reply_reserve_sec))
+        return remaining
     context = current_turn_telemetry(event)
     if context is None or context.deadline_monotonic <= 0.0:
         return None
@@ -242,15 +267,45 @@ def turn_telemetry_scope(event: Any):
         _CURRENT_TELEMETRY.reset(token)
 
 
+@contextmanager
+def deferred_replay_budget_scope(
+    deadline_monotonic: float,
+    *,
+    work_id: str = "",
+    generation: int = 0,
+    reply_reserve_sec: float = 0.0,
+):
+    """Bind a replay-only budget without mutating the original event telemetry."""
+    budget = DeferredReplayBudget(
+        deadline_monotonic=float(deadline_monotonic),
+        work_id=str(work_id or ""),
+        generation=int(generation or 0),
+        reply_reserve_sec=max(0.0, float(reply_reserve_sec or 0.0)),
+    )
+    token = _DEFERRED_REPLAY_BUDGET.set(budget)
+    try:
+        yield budget
+    finally:
+        budget.active = False
+        _DEFERRED_REPLAY_BUDGET.reset(token)
+
+
+def current_deferred_replay_budget() -> DeferredReplayBudget | None:
+    budget = _DEFERRED_REPLAY_BUDGET.get()
+    return budget if budget is not None and budget.active else None
+
+
 def detach_turn_telemetry() -> None:
     """常驻后台任务入口调用：斩断随 asyncio.create_task 复制继承的 turn telemetry。
 
     懒启动的常驻 worker 若在某个 turn 的处理上下文（main.py turn_telemetry_scope）中
     创建，将永久携带该轮 deadline，导致 worker 内所有 event=None 的网关调用在原轮
     预算耗尽后集体秒败（turn_deadline_exhausted）并把账记进陈旧 turn。
-    contextvar 是 task 私有的，置空不影响创建方。
+    replay budget 也一并清理；预算对象在 scope 结束时失效，因此即使子 task
+    已复制旧 context，也不会继续使用过期预算。contextvar 是 task 私有的，置空不影响创建方。
     """
     _CURRENT_TELEMETRY.set(None)
+    _DEFERRED_REPLAY_BUDGET.set(None)
 
 
 def rebind_turn_telemetry(event: Any) -> TurnTelemetryContext:
@@ -1218,6 +1273,7 @@ __all__ = [
     "TELEMETRY_CONTEXT_KEY",
     "TRACE_SCHEMA_VERSION",
     "TurnTelemetryContext",
+    "DeferredReplayBudget",
     "begin_stage",
     "begin_llm_call",
     "bind_turn_telemetry_identity",
@@ -1238,6 +1294,8 @@ __all__ = [
     "record_reply_stats",
     "attach_background_task_trace",
     "remaining_turn_budget",
+    "deferred_replay_budget_scope",
+    "current_deferred_replay_budget",
     "turn_telemetry_scope",
     "turn_telemetry_snapshot",
 ]
