@@ -78,6 +78,14 @@ class CognitiveSnapshot:
     social_intent: str = ""
     action_tier: str = ""
     allowed_action_families: list[str] = field(default_factory=list)
+    planned_tool_families: list[str] = field(default_factory=list)
+    planned_tool_names: list[str] = field(default_factory=list)
+    planned_tool_goal: str = ""
+    planned_tool_target_hint: str = ""
+    planned_tool_mode: str = ""
+    negated_tool_families: list[str] = field(default_factory=list)
+    suppressed_tool_families: list[str] = field(default_factory=list)
+    suppression_reasons: list[str] = field(default_factory=list)
     stance: str = ""
     state_bias: str = ""
     risk_flags: list[str] = field(default_factory=list)
@@ -265,6 +273,14 @@ class ToolDecisionTrace:
     preselected_tools: list[str] = field(default_factory=list)
     hidden_requestable_tools: list[str] = field(default_factory=list)
     disclosure_request_source: str = ""
+    disclosure_sources: list[str] = field(default_factory=list)
+    tools_before_expansion: list[str] = field(default_factory=list)
+    tools_after_expansion: list[str] = field(default_factory=list)
+    second_pass_requested: bool = False
+    second_pass_applied: bool = False
+    selected_tool_cards: list[str] = field(default_factory=list)
+    tool_resolution_chain: list[str] = field(default_factory=list)
+    tool_unavailable_reasons: list[str] = field(default_factory=list)
     disclosure_requested_tools: list[str] = field(default_factory=list)
     disclosure_rejected_requests: list[dict[str, Any]] = field(default_factory=list)
     explicit_tool_intent: bool = False
@@ -297,6 +313,18 @@ class ToolDecisionTrace:
     removed_by_caution: list[str] = field(default_factory=list)
     removed_by_social_intent: list[str] = field(default_factory=list)
     removed_by_stance: list[str] = field(default_factory=list)
+    capability_catalog_version: str = ""
+    capability_catalog_tool_count: int = 0
+    capability_catalog_token_estimate: int = 0
+    planned_tool_families: list[str] = field(default_factory=list)
+    planned_tool_names: list[str] = field(default_factory=list)
+    planned_tool_goal: str = ""
+    planned_tool_target_hint: str = ""
+    planned_tool_mode: str = ""
+    suppressed_tool_families: list[str] = field(default_factory=list)
+    suppression_reasons: list[str] = field(default_factory=list)
+    second_pass_available: bool = False
+    unavailable_tools: list[str] = field(default_factory=list)
 
     def record_step(
         self,
@@ -479,6 +507,14 @@ def build_turn_trace_summary(
             "social_intent": cognitive.social_intent,
             "action_tier": cognitive.action_tier,
             "allowed_action_families": list(cognitive.allowed_action_families or []),
+            "planned_tool_families": list(cognitive.planned_tool_families or []),
+            "planned_tool_names": list(cognitive.planned_tool_names or []),
+            "planned_tool_goal": _preview_text(cognitive.planned_tool_goal, 240),
+            "planned_tool_target_hint": _preview_text(cognitive.planned_tool_target_hint, 120),
+            "planned_tool_mode": cognitive.planned_tool_mode,
+            "negated_tool_families": list(cognitive.negated_tool_families or []),
+            "suppressed_tool_families": list(cognitive.suppressed_tool_families or []),
+            "suppression_reasons": list(cognitive.suppression_reasons or []),
             "stance": cognitive.stance,
             "state_bias": _preview_text(cognitive.state_bias, 120),
             "risk_flags": list(cognitive.risk_flags or []),
@@ -683,6 +719,14 @@ def build_turn_trace_summary(
             "preselected_tools": list(tools.preselected_tools or []),
             "hidden_requestable_tools": list(tools.hidden_requestable_tools or []),
             "disclosure_request_source": tools.disclosure_request_source,
+            "disclosure_sources": list(tools.disclosure_sources or []),
+            "tools_before_expansion": list(tools.tools_before_expansion or []),
+            "tools_after_expansion": list(tools.tools_after_expansion or []),
+            "second_pass_requested": bool(tools.second_pass_requested),
+            "second_pass_applied": bool(tools.second_pass_applied),
+            "selected_tool_cards": list(tools.selected_tool_cards or []),
+            "tool_resolution_chain": list(tools.tool_resolution_chain or []),
+            "tool_unavailable_reasons": list(tools.tool_unavailable_reasons or []),
             "disclosure_requested_tools": list(tools.disclosure_requested_tools or []),
             "disclosure_rejected_requests": list(tools.disclosure_rejected_requests or []),
             "explicit_tool_intent": bool(tools.explicit_tool_intent),
@@ -715,6 +759,18 @@ def build_turn_trace_summary(
             "removed_by_caution": list(tools.removed_by_caution or []),
             "removed_by_social_intent": list(tools.removed_by_social_intent or []),
             "removed_by_stance": list(tools.removed_by_stance or []),
+            "capability_catalog_version": tools.capability_catalog_version,
+            "capability_catalog_tool_count": int(tools.capability_catalog_tool_count or 0),
+            "capability_catalog_token_estimate": int(tools.capability_catalog_token_estimate or 0),
+            "planned_tool_families": list(tools.planned_tool_families or []),
+            "planned_tool_names": list(tools.planned_tool_names or []),
+            "planned_tool_goal": _preview_text(tools.planned_tool_goal, 240),
+            "planned_tool_target_hint": _preview_text(tools.planned_tool_target_hint, 120),
+            "planned_tool_mode": tools.planned_tool_mode,
+            "suppressed_tool_families": list(tools.suppressed_tool_families or []),
+            "suppression_reasons": list(tools.suppression_reasons or []),
+            "second_pass_available": bool(tools.second_pass_available),
+            "unavailable_tools": list(tools.unavailable_tools or []),
         },
     }
 

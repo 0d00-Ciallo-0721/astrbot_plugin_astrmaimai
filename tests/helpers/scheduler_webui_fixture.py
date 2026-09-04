@@ -28,6 +28,7 @@ FIXTURE_ACCEPTANCE_BASELINE_DIR = (
     / "pages_acceptance"
     / "20260519T221500Z-astrbot-plugin-host-check"
 )
+FIXTURE_ACCEPTANCE_BASELINE_PATH = FIXTURE_ACCEPTANCE_BASELINE_DIR / "acceptance_baseline.md"
 
 DEFAULT_FIXTURE_PROFILE = "admin_full"
 DEFAULT_SCHEDULER_PROFILE = "balanced"
@@ -995,6 +996,19 @@ def _seed_sqlite(conn: sqlite3.Connection, profile: str) -> dict[str, int]:
 def ensure_fixture_files(profile: str = DEFAULT_FIXTURE_PROFILE) -> dict[str, Any]:
     selected_profile = _validate_profile_name(profile)
     FIXTURE_ROOT.mkdir(parents=True, exist_ok=True)
+    # Keep the ignored acceptance fixture self-contained after repository
+    # artifact cleanup; this is a small test baseline, not production data.
+    FIXTURE_ACCEPTANCE_BASELINE_DIR.mkdir(parents=True, exist_ok=True)
+    if (
+        not FIXTURE_ACCEPTANCE_BASELINE_PATH.exists()
+        or "iframe" not in FIXTURE_ACCEPTANCE_BASELINE_PATH.read_text(encoding="utf-8")
+    ):
+        FIXTURE_ACCEPTANCE_BASELINE_PATH.write_text(
+            "# AstrMai acceptance baseline\n\n"
+            "The AstrBot plugin page is rendered inside the host iframe.\n"
+            "Bridge connection and plugin-page rendering are part of this fixture baseline.\n",
+            encoding="utf-8",
+        )
     _write_fixture_config(selected_profile)
     harness_path = _write_direct_open_harness(selected_profile)
     conn = sqlite3.connect(FIXTURE_DB_PATH)

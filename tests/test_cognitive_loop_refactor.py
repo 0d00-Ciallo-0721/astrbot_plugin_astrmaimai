@@ -457,6 +457,24 @@ class CognitiveLoopRefactorTests(unittest.TestCase):
         self.assertIn("current_goal=continue the puzzle gently", gateway.calls[0]["prompt"])
         self.assertIn("goal_status=continuing", gateway.calls[0]["prompt"])
 
+    def test_cognitive_loop_parses_autonomous_planner_fields_without_execution(self):
+        gateway = _FakeGateway([])
+        loop = self.mod.CognitiveLoop(gateway)
+        event = _FakeEvent("我想联系她")
+        decision = loop._build_decision({
+            "action": "reply",
+            "reply_need": "reply",
+            "planned_tool_families": ["private", "not_a_family"],
+            "planned_tool_names": ["space_transition_action", "not_a_tool"],
+            "planned_tool_goal": "联系好友",
+            "planned_tool_mode": "autonomous",
+            "negated_tool_families": [],
+        })
+        self.assertEqual(decision.planned_tool_families, ["private"])
+        self.assertEqual(decision.planned_tool_names, ["space_transition_action"])
+        self.assertEqual(decision.planned_tool_mode, "autonomous")
+        self.assertIn("space_transition_action", loop._build_initial_prompt(event, None))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -7,6 +7,7 @@ from typing import Any, Callable, Iterable
 from .tool_contracts import (
     FAMILY_TO_TOOL,
     TOOL_CAPABILITIES,
+    canonical_tool_name,
     requires_explicit_disclosure,
 )
 
@@ -142,6 +143,7 @@ SECOND_PASS_ALLOWED_PACKAGES: tuple[str, ...] = (
     "identity",
     "relationship",
     "artifact",
+    "cross_session",
     "memory_governance",
 )
 
@@ -376,6 +378,11 @@ class ToolDisclosurePlanner:
         has_forward: bool = False,
         has_reply: bool = False,
         requested_packages: Iterable[str] = (),
+        planned_tool_families: Iterable[str] = (),
+        planned_tool_names: Iterable[str] = (),
+        negated_tool_families: Iterable[str] = (),
+        suppressed_tool_families: Iterable[str] = (),
+        is_group: bool | None = None,
         max_chat_tools: int = 8,
         max_task_tools: int = 16,
     ) -> ToolDisclosurePlan:
@@ -388,14 +395,43 @@ class ToolDisclosurePlanner:
         if has_image:
             self._append_package(packages, reasons, "default_vision", "image_context")
 
+        if isinstance(explicit_tool_families, str):
+            explicit_tool_families = [explicit_tool_families]
         explicit_families = tuple(str(family or "").strip() for family in (explicit_tool_families or []) if str(family or "").strip())
+        if isinstance(negated_tool_families, str):
+            negated_tool_families = [negated_tool_families]
+        if isinstance(planned_tool_families, str):
+            planned_tool_families = [planned_tool_families]
+        if isinstance(planned_tool_names, str):
+            planned_tool_names = [planned_tool_names]
+        negated_families = {str(family or "").strip() for family in (negated_tool_families or []) if str(family or "").strip()}
+        suppressed_families = {
+            str(family or "").strip()
+            for family in (suppressed_tool_families or [])
+            if str(family or "").strip()
+        }
+        if negated_families & {"reaction", "qq_reaction"}:
+            negated_families.add("emoji_reaction")
+        blocked_planned_families = negated_families | suppressed_families
+        planned_families = tuple(
+            str(family or "").strip()
+            for family in (planned_tool_families or [])
+            if str(family or "").strip() and str(family or "").strip() not in blocked_planned_families
+        )
+        planned_names = tuple(
+            canonical_tool_name(str(name or "").strip())
+            for name in (planned_tool_names or [])
+            if str(name or "").strip()
+        )
         exact_tool_names = [
             tool_name
             for family in explicit_families
             for tool_name in (FAMILY_TO_TOOL.get(family),)
-            if tool_name
+            if tool_name and family not in negated_families
         ]
         for family in explicit_families:
+            if family in negated_families:
+                continue
             tool_name = FAMILY_TO_TOOL.get(family, "")
             if not tool_name:
                 continue
@@ -412,13 +448,64 @@ class ToolDisclosurePlanner:
         package_families = [
             family
             for family in explicit_families
-            if family not in PRECISION_ONLY_FAMILIES
+            if family not in PRECISION_ONLY_FAMILIES and family not in negated_families
         ]
         for package in package_names_for_families(package_families):
             self._append_package(packages, reasons, package, "explicit_family")
 
         for package in normalize_requested_packages(requested_packages):
             self._append_package(packages, reasons, package, "requested_second_pass")
+
+        # Autonomous planner output is a structured intent signal, not an
+        # execution grant.  It only expands disclosure for capabilities that
+        # are explicitly marked autonomous_allowed and remain valid for this
+        # chat context; the executor still performs all target/platform checks.
+        autonomous_families: list[str] = []
+        for family in planned_families:
+            tool_name = FAMILY_TO_TOOL.get(family, "")
+            spec = TOOL_CAPABILITIES.get(tool_name) if tool_name else None
+            if spec is None or not spec.autonomous_allowed:
+                continue
+            if is_group is not None and ((is_group and "group" not in spec.contexts) or (not is_group and "private" not in spec.contexts)):
+                continue
+            autonomous_families.append(family)
+            decisions.append(
+                ToolDisclosureDecision(
+                    family=family,
+                    tool_name=tool_name,
+                    source="autonomous_planner",
+                    confidence=0.7,
+                    invocation_mode="optional",
+                    reason=f"planned_{family}",
+                )
+            )
+        for family in autonomous_families:
+            tool_name = FAMILY_TO_TOOL.get(family, "")
+            if tool_name and tool_name not in exact_tool_names:
+                exact_tool_names.append(tool_name)
+            for package in FAMILY_TO_PACKAGES.get(family, ()):
+                self._append_package(packages, reasons, package, "autonomous_planner")
+        for name in planned_names:
+            spec = TOOL_CAPABILITIES.get(name)
+            if spec is None or not spec.autonomous_allowed or spec.family in blocked_planned_families:
+                continue
+            if is_group is not None and ((is_group and "group" not in spec.contexts) or (not is_group and "private" not in spec.contexts)):
+                continue
+            if name not in exact_tool_names:
+                exact_tool_names.append(name)
+            if name not in {item.tool_name for item in decisions}:
+                decisions.append(
+                    ToolDisclosureDecision(
+                        family=spec.family,
+                        tool_name=name,
+                        source="autonomous_planner",
+                        confidence=0.7,
+                        invocation_mode="optional",
+                        reason=f"planned_tool_{name}",
+                    )
+                )
+            for package in FAMILY_TO_PACKAGES.get(spec.family, ()):
+                self._append_package(packages, reasons, package, "autonomous_planner")
 
         if has_image or self._contains_any(text, self.ARTIFACT_KEYWORDS):
             self._append_package(packages, reasons, "artifact", "message_artifact")
@@ -475,22 +562,30 @@ class ToolDisclosurePlanner:
             if not requires_explicit_disclosure(name) or name in exact_tool_names
         ]
         selected_tool_names = _ordered_unique([*package_tool_names, *exact_tool_names])
-        if max_tools and max_tools > 0:
-            selected_package_tools = [
+        if negated_families:
+            selected_tool_names = [
                 name
-                for name in tool_names_for_packages(
-                    packages
-                )
-                if not requires_explicit_disclosure(name) or name in exact_tool_names
+                for name in selected_tool_names
+                if str(getattr(TOOL_CAPABILITIES.get(name), "family", "")) not in negated_families
             ]
-            protected = _ordered_unique([
-                *DEFAULT_VISIBLE_TOOL_NAMES,
-                *selected_package_tools,
-                *exact_tool_names,
+        if max_tools and max_tools > 0:
+            # Defaults are a stable contract and remain visible.  The limit
+            # applies to dynamic package additions; exact planner selections
+            # are retained ahead of optional package members.
+            defaults = [name for name in selected_tool_names if name in DEFAULT_VISIBLE_TOOL_NAMES]
+            dynamic = [name for name in selected_tool_names if name not in DEFAULT_VISIBLE_TOOL_NAMES]
+            exact = [name for name in exact_tool_names if name in dynamic]
+            optional = [name for name in dynamic if name not in exact]
+            selected_tool_names = _ordered_unique([
+                *defaults,
+                *([*exact, *optional][:max_tools]),
             ])
-            selected_tool_names = _ordered_unique(
-                [*selected_tool_names[:max_tools], *protected]
-            )
+            if negated_families:
+                selected_tool_names = [
+                    name
+                    for name in selected_tool_names
+                    if str(getattr(TOOL_CAPABILITIES.get(name), "family", "")) not in negated_families
+                ]
         second_pass_packages = tuple(
             package
             for package in SECOND_PASS_ALLOWED_PACKAGES

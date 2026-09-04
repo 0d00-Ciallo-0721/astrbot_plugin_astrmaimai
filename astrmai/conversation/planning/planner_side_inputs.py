@@ -22,7 +22,7 @@ from .tool_contracts import (
     get_tool_capability,
     build_explicit_invocation_plans,
     filter_tools_for_context,
-    is_model_disclosure_requestable,
+    is_planner_disclosure_requestable,
     normalize_tool_schemas,
     publish_invocation_plans,
     tool_display_name,
@@ -1218,6 +1218,17 @@ class PlannerSideInputMixin:
         turn_tools.disclosure_request_source = ""
         turn_tools.disclosure_requested_tools = []
         turn_tools.disclosure_rejected_requests = []
+        turn_tools.capability_catalog_version = str(event.get_extra("astrmai_capability_catalog_version", "") or "")
+        turn_tools.capability_catalog_tool_count = int(event.get_extra("astrmai_capability_catalog_tool_count", 0) or 0)
+        turn_tools.capability_catalog_token_estimate = int(event.get_extra("astrmai_capability_catalog_token_estimate", 0) or 0)
+        turn_tools.planned_tool_families = self._event_string_list(event, "astrmai_planned_tool_families")
+        turn_tools.planned_tool_names = self._event_string_list(event, "astrmai_planned_tool_names")
+        turn_tools.planned_tool_goal = str(event.get_extra("astrmai_planned_tool_goal", "") or "")[:240]
+        turn_tools.planned_tool_target_hint = str(event.get_extra("astrmai_planned_tool_target_hint", "") or "")[:120]
+        turn_tools.planned_tool_mode = str(event.get_extra("astrmai_planned_tool_mode", "") or "")[:32]
+        turn_tools.suppressed_tool_families = self._event_string_list(event, "astrmai_suppressed_tool_families")
+        turn_tools.suppression_reasons = self._event_string_list(event, "astrmai_suppression_reasons")
+        turn_tools.second_pass_available = False
         turn_tools.second_pass_added_tools = []
         turn_tools.second_pass_tool_executed = False
         turn_tools.intent_contracts = []
@@ -1337,7 +1348,12 @@ class PlannerSideInputMixin:
                 is_group=bool(event.get_group_id()),
                 name_resolver=self._canonical_tool_name,
             )
-            if not explicit_tool_intent and not self._conversation_flag("autonomous_chat_tools_enabled", True):
+            planner_has_autonomous_plan = bool(
+                self._event_string_list(event, "astrmai_planned_tool_families")
+                or self._event_string_list(event, "astrmai_planned_tool_names")
+                or self._event_string_list(event, "astrmai_allowed_action_families")
+            )
+            if not explicit_tool_intent and not planner_has_autonomous_plan and not self._conversation_flag("autonomous_chat_tools_enabled", True):
                 candidate_tools = [
                     tool
                     for tool in candidate_tools
@@ -1355,6 +1371,25 @@ class PlannerSideInputMixin:
             has_forward = self._event_has_component_hint(event, ("forward", "node"))
             has_reply = self._event_has_component_hint(event, ("reply",))
             requested_packages = self._event_string_list(event, "astrmai_requested_tool_packages")
+            planned_tool_families = self._event_string_list(event, "astrmai_planned_tool_families")
+            planned_tool_names = self._event_string_list(event, "astrmai_planned_tool_names")
+            negated_tool_families = self._event_string_list(event, "astrmai_negated_tool_families")
+            suppressed_tool_families = self._event_string_list(event, "astrmai_suppressed_tool_families")
+            if not planned_tool_families and not planned_tool_names:
+                # Compatibility with older CognitiveLoop producers.  This is
+                # only a disclosure hint; execution authorization remains in
+                # the normal tool admission path.
+                planned_tool_families = self._event_string_list(event, "astrmai_allowed_action_families")
+            policy = event.get_extra("astrmai_tool_call_policy", {})
+            if isinstance(policy, dict):
+                negated_tool_families = sorted(
+                    set(negated_tool_families)
+                    | {
+                        str(family or "").strip()
+                        for family in policy.get("negated_families", []) or []
+                        if str(family or "").strip()
+                    }
+                )
             disclosure_plan = ToolDisclosurePlanner().plan(
                 message=tool_intent_text,
                 requested_tier=requested_tier,
@@ -1365,10 +1400,16 @@ class PlannerSideInputMixin:
                 has_forward=has_forward,
                 has_reply=has_reply,
                 requested_packages=requested_packages,
+                planned_tool_families=planned_tool_families,
+                planned_tool_names=planned_tool_names,
+                negated_tool_families=negated_tool_families,
+                suppressed_tool_families=suppressed_tool_families,
+                is_group=bool(event.get_group_id()),
                 max_chat_tools=max(1, self._conversation_int("tool_disclosure_max_tools_chat", 8)),
                 max_task_tools=max(1, self._conversation_int("tool_disclosure_max_tools_task", 16)),
             )
             selected_tool_names = set(disclosure_plan.tool_names)
+            turn_tools.tools_before_expansion = [self._canonical_tool_name(tool) for tool in candidate_tools]
             tools = select_tools_by_names(
                 candidate_tools,
                 selected_tool_names,
@@ -1383,7 +1424,7 @@ class PlannerSideInputMixin:
             hidden_requestable_tools = [
                 self._canonical_tool_name(tool)
                 for tool in hidden_tools
-                if is_model_disclosure_requestable(self._canonical_tool_name(tool))
+                if is_planner_disclosure_requestable(self._canonical_tool_name(tool))
             ]
             event.set_extra("astrmai_hidden_requestable_tools", hidden_requestable_tools)
             second_pass_packages = (
@@ -1392,14 +1433,42 @@ class PlannerSideInputMixin:
                 else []
             )
             event.set_extra("astrmai_disclosure_second_pass_packages", second_pass_packages)
+            turn_tools.second_pass_available = bool(second_pass_packages)
             turn_tools.disclosure_enabled = True
             turn_tools.disclosure_tier = disclosure_plan.tier
             turn_tools.disclosure_packages = list(disclosure_plan.packages)
             turn_tools.disclosure_reasons = list(disclosure_plan.package_reasons)
             turn_tools.disclosure_second_pass_packages = list(second_pass_packages)
+            # These are packages that may be requested later, not evidence of
+            # an actual model request.  The request flag is set only by the
+            # capability lookup / Executor expansion path.
+            turn_tools.second_pass_requested = bool(
+                event.get_extra("astrmai_requested_tool_packages", [])
+                or event.get_extra("astrmai_requested_tool_names", [])
+            )
+            turn_tools.selected_tool_cards = list(disclosure_plan.tool_names)
+            turn_tools.tool_resolution_chain = list(disclosure_plan.package_reasons)
+            turn_tools.unavailable_tools = []
+            turn_tools.tool_unavailable_reasons = []
             turn_tools.disclosure_decisions = [asdict(item) for item in disclosure_plan.decisions]
             turn_tools.preselected_tools = list(disclosure_plan.preselected_tool_names)
             turn_tools.hidden_requestable_tools = list(hidden_requestable_tools)
+            turn_tools.tools_after_expansion = [self._canonical_tool_name(tool) for tool in tools]
+            turn_tools.disclosure_sources = sorted({
+                "default",
+                "context" if (has_image or has_forward or has_reply) else "",
+                "explicit_user_intent" if explicit_tool_intent else "",
+                "autonomous_planner" if (planned_tool_families or planned_tool_names) else "",
+            } - {""})
+            actual_second_pass_requested = bool(
+                event.get_extra("astrmai_requested_tool_packages", [])
+                or event.get_extra("astrmai_requested_tool_names", [])
+            )
+            turn_tools.disclosure_request_source = (
+                str(event.get_extra("astrmai_tool_disclosure_request_source", "") or "")
+                if actual_second_pass_requested
+                else ""
+            )
             disclosure_families: set[str] = set()
             for tool_name in disclosure_plan.tool_names:
                 disclosure_families.update(self.TOOL_FAMILIES.get(tool_name, set()))
@@ -1421,6 +1490,16 @@ class PlannerSideInputMixin:
                 if protected_families:
                     allowed_families.update(protected_families)
                     turn_tools.allowed_families = sorted(allowed_families)
+            planned_allowed = set(planned_tool_families) | {
+                str(get_tool_capability(name).family)
+                for name in planned_tool_names
+                if get_tool_capability(name) is not None
+            }
+            if planned_allowed:
+                planned_allowed -= set(negated_tool_families)
+                planned_allowed -= set(suppressed_tool_families)
+                allowed_families.update(planned_allowed)
+                turn_tools.allowed_families = sorted(allowed_families)
             turn_tools.record_step(
                 "planner.tool_disclosure",
                 [self._canonical_tool_name(tool) for tool in candidate_tools],

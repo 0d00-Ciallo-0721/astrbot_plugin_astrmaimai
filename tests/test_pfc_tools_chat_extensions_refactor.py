@@ -266,7 +266,71 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
 
         self.assertIsNone(event.get_extra("astrmai_requested_tool_names"))
         self.assertIn("request_status=invalid", result)
-        self.assertIn("not_hidden_or_not_readonly", result)
+        self.assertIn("tool_not_hidden_or_requestable", result)
+
+    def test_capability_lookup_failure_is_recorded_as_failed_not_success(self):
+        event = _FakeEvent(group_id="12345")
+        event._astrmai_disclosure_hidden_tools = [SimpleNamespace(name="space_transition_action")]
+        result = asyncio.run(
+            self.mod.BotCapabilityLookupTool().call(
+                _wrap_event(event),
+                need="完全无法匹配的能力请求",
+            )
+        )
+        self.assertIn("request_status=invalid", result)
+        trace = event.get_extra("astrmai_tool_execution_trace")
+        self.assertEqual(trace[-1]["status"], "failed")
+        self.assertEqual(trace[-1]["reason"], "capability_resolution_failed")
+        self.assertNotIn("当前可申请的隐藏只读能力", result)
+        self.assertIn("当前可申请的隐藏能力", result)
+
+    def test_capability_lookup_can_request_autonomous_private_tool_with_live_context(self):
+        event = _FakeEvent(group_id="12345")
+        event._astrmai_disclosure_hidden_tools = [
+            SimpleNamespace(name="space_transition_action"),
+        ]
+        event.set_extra(
+            "astrmai_turn_context",
+            SimpleNamespace(
+                tools=SimpleNamespace(
+                    available_tools=["bot_capability_lookup"],
+                    filtered_tools=["bot_capability_lookup"],
+                    required_tools=[],
+                )
+            ),
+        )
+
+        result = asyncio.run(
+            self.mod.BotCapabilityLookupTool().call(
+                _wrap_event(event),
+                needed_family="private",
+            )
+        )
+
+        self.assertIn("request_status=accepted", result)
+        self.assertEqual(
+            event.get_extra("astrmai_requested_tool_names"),
+            ["space_transition_action"],
+        )
+
+    def test_contact_route_without_turn_context_is_fail_closed(self):
+        event = _FakeEvent(group_id="12345")
+        event.bot.api = _MapApi(
+            {"get_friend_list": {"data": [{"user_id": "1481314186", "remark": "萤"}]}}
+        )
+
+        result = json.loads(
+            asyncio.run(
+                self.mod.ContactRouteSuggestTool().call(
+                    _wrap_event(event), target="萤", intent="传话"
+                )
+            )
+        )
+
+        self.assertEqual(result["route"], "friend_private")
+        self.assertFalse(result["tool_loaded"])
+        self.assertFalse(result["executable"])
+        self.assertEqual(result["blocked_reason"], "tool_state_unknown")
 
     def test_wait_tool_records_actual_execution(self):
         event = _FakeEvent(group_id="12345")
@@ -1156,6 +1220,16 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
 
         self.assertIn("机器人好友", result)
         self.assertIn("space_transition_action", result)
+
+    def test_contact_route_suggest_returns_structured_capability_state(self):
+        event = _FakeEvent(group_id="777")
+        event.bot.api = _MapApi({"get_friend_list": {"data": [{"user_id": "1481314186", "remark": "萤"}]}})
+        event.set_extra("astrmai_turn_context", SimpleNamespace(tools=SimpleNamespace(available_tools=["contact_route_suggest_tool"])))
+        result = json.loads(asyncio.run(self.mod.ContactRouteSuggestTool().call(_wrap_event(event), target="萤", intent="传话")))
+        self.assertEqual(result["route"], "friend_private")
+        self.assertFalse(result["tool_loaded"])
+        self.assertFalse(result["executable"])
+        self.assertEqual(result["blocked_reason"], "tool_unavailable_in_context")
 
     def test_dispatcher_commits_quote_reply_action(self):
         event = _FakeEvent(group_id="777")

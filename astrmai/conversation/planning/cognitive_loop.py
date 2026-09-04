@@ -16,6 +16,7 @@ from ...infrastructure.runtime.turn_call_ledger import clamp_timeout_to_turn_bud
 from ..contracts.prompt_envelope import PromptEnvelope
 from ..contracts.turn_context import ensure_turn_context, get_turn_context
 from .member_action_intent import detect_member_action_candidate, normalize_member_action_purpose
+from .tool_semantics import build_planner_capability_catalog
 
 
 @dataclass(slots=True)
@@ -38,6 +39,14 @@ class CognitiveDecision:
     member_action_purpose: str = ""
     member_action_target: str = ""
     member_action_confidence: float = 0.0
+    planned_tool_families: list[str] = field(default_factory=list)
+    planned_tool_names: list[str] = field(default_factory=list)
+    planned_tool_goal: str = ""
+    planned_tool_target_hint: str = ""
+    planned_tool_mode: str = ""
+    negated_tool_families: list[str] = field(default_factory=list)
+    suppressed_tool_families: list[str] = field(default_factory=list)
+    suppression_reasons: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -90,10 +99,13 @@ class CognitiveLoop:
         "Your output is never shown to the user. "
         "Decide only from the current clue, do not script-continue old dialogue. "
         "You may request at most one readonly tool observation before the final decision. "
-        "Never request side-effect tools. "
+        "You cannot execute side-effect tools during this cognitive stage, but you may plan a later Planner action using any suitable autonomous capability. "
+        "Do not require an explicit command for an autonomous chat behavior. "
+        "If the user clearly negates an action, record its family in negated_tool_families and do not plan it. "
+        "planned_tool_goal and planned_tool_target_hint must be short semantic summaries; never invent QQ IDs, message IDs, or private message text. "
         'Return strict JSON with keys: action, intent, memory_policy, retrieve_keys, '
         "style_policy, forbid_history_continuation, inner_monologue, reply_need, "
-        "social_intent, action_tier, allowed_action_families, stance, state_bias, "
+        "social_intent, action_tier, allowed_action_families, planned_tool_families, planned_tool_names, planned_tool_goal, planned_tool_target_hint, planned_tool_mode, negated_tool_families, stance, state_bias, "
         "risk_flags, attack_confidence, member_action_purpose, member_action_target, "
         "member_action_confidence, "
         "need_tool, tool_name, tool_query. "
@@ -119,7 +131,7 @@ class CognitiveLoop:
         "Do not ask for more tools. "
         'Required keys: action, intent, memory_policy, retrieve_keys, '
         "style_policy, forbid_history_continuation, inner_monologue, reply_need, "
-        "social_intent, action_tier, allowed_action_families, stance, state_bias, "
+        "social_intent, action_tier, allowed_action_families, planned_tool_families, planned_tool_names, planned_tool_goal, planned_tool_target_hint, planned_tool_mode, negated_tool_families, stance, state_bias, "
         "risk_flags, attack_confidence, member_action_purpose, member_action_target, member_action_confidence."
     )
 
@@ -423,6 +435,17 @@ class CognitiveLoop:
         safe_related_context = PromptEnvelope.sanitize_inline_text(related_context)
         safe_background = PromptEnvelope.sanitize_inline_text(background)
         safe_recent_transcript = PromptEnvelope.sanitize_inline_text(recent_transcript)
+        is_group = bool(event.get_group_id()) if hasattr(event, "get_group_id") else False
+        has_image = bool(
+            (event.get_extra("direct_image_refs", []) if hasattr(event, "get_extra") else [])
+            or (event.get_extra("extracted_image_refs", []) if hasattr(event, "get_extra") else [])
+            or (event.get_extra("astrmai_recent_media_candidates", []) if hasattr(event, "get_extra") else [])
+        ) or bool(member_candidate_data.get("has_image", False))
+        capability_catalog = build_planner_capability_catalog(is_group=is_group, has_image=has_image)
+        if hasattr(event, "set_extra"):
+            event.set_extra("astrmai_capability_catalog_version", "planner-semantics-v1")
+            event.set_extra("astrmai_capability_catalog_tool_count", len(capability_catalog.splitlines()) if capability_catalog else 0)
+            event.set_extra("astrmai_capability_catalog_token_estimate", max(0, len(capability_catalog) // 4))
         return (
             "Current message:\n"
             f"{self._truncate(safe_current_text, 600)}\n\n"
@@ -456,6 +479,8 @@ class CognitiveLoop:
             f"Chat id: {PromptEnvelope.sanitize_inline_text(str(event.unified_msg_origin or ''))}\n"
             f"Sender id: {PromptEnvelope.sanitize_inline_text(str(event.get_sender_id() or ''))}\n"
             f"Sender name: {PromptEnvelope.sanitize_inline_text(str(event.get_sender_name() or ''))}\n"
+            "Planner capability catalog (meaning only; execution remains gated):\n"
+            f"{self._truncate(capability_catalog, 4200)}\n\n"
             "If a readonly observation would materially help, request one allowed tool."
         )
 
@@ -478,7 +503,7 @@ class CognitiveLoop:
         allowed_keys = (
             "action", "intent", "memory_policy", "retrieve_keys", "style_policy",
             "forbid_history_continuation", "inner_monologue", "reply_need",
-            "social_intent", "action_tier", "allowed_action_families", "stance",
+            "social_intent", "action_tier", "allowed_action_families", "planned_tool_families", "planned_tool_names", "planned_tool_goal", "planned_tool_target_hint", "planned_tool_mode", "negated_tool_families", "suppressed_tool_families", "suppression_reasons", "stance",
             "state_bias", "risk_flags", "attack_confidence", "member_action_purpose",
             "member_action_target", "member_action_confidence", "need_tool",
             "tool_name", "tool_query",
@@ -491,6 +516,10 @@ class CognitiveLoop:
                 "action": str,
                 "retrieve_keys": list,
                 "allowed_action_families": list,
+                "planned_tool_families": list,
+                "planned_tool_names": list,
+                "negated_tool_families": list,
+                "suppressed_tool_families": list,
                 "risk_flags": list,
                 "need_tool": bool,
             },
@@ -576,6 +605,14 @@ class CognitiveLoop:
             social_intent=social_intent,
             action_tier=action_tier,
             allowed_action_families=self._normalize_string_list(data.get("allowed_action_families")),
+            planned_tool_families=self._normalize_planned_families(data.get("planned_tool_families")),
+            planned_tool_names=self._normalize_planned_names(data.get("planned_tool_names")),
+            planned_tool_goal=self._truncate(str(data.get("planned_tool_goal", "") or ""), 240),
+            planned_tool_target_hint=self._truncate(str(data.get("planned_tool_target_hint", "") or ""), 120),
+            planned_tool_mode=self._normalize_tool_mode(data.get("planned_tool_mode")),
+            negated_tool_families=self._normalize_planned_families(data.get("negated_tool_families")),
+            suppressed_tool_families=self._normalize_planned_families(data.get("suppressed_tool_families")),
+            suppression_reasons=self._normalize_string_list(data.get("suppression_reasons")),
             stance=self._normalize_stance(data.get("stance"), social_intent),
             state_bias=str(data.get("state_bias", "") or "").strip(),
             risk_flags=risk_flags,
@@ -584,6 +621,32 @@ class CognitiveLoop:
             member_action_target=member_action_target,
             member_action_confidence=member_action_confidence,
         )
+
+    @staticmethod
+    def _normalize_planned_families(value: Any) -> list[str]:
+        from .tool_contracts import TOOL_CAPABILITIES
+        allowed = {str(spec.family) for spec in TOOL_CAPABILITIES.values()}
+        allowed.update({"wait", "query", "reaction", "qq_reaction"})
+        if isinstance(value, str):
+            value = [value]
+        if not isinstance(value, list):
+            return []
+        return list(dict.fromkeys(str(item or "").strip() for item in value if str(item or "").strip() in allowed))
+
+    @staticmethod
+    def _normalize_planned_names(value: Any) -> list[str]:
+        from .tool_contracts import TOOL_CAPABILITIES, canonical_tool_name
+        if isinstance(value, str):
+            value = [value]
+        if not isinstance(value, list):
+            return []
+        normalized = [canonical_tool_name(str(item or "").strip()) for item in value]
+        return list(dict.fromkeys(item for item in normalized if item in TOOL_CAPABILITIES))
+
+    @staticmethod
+    def _normalize_tool_mode(value: Any) -> str:
+        normalized = str(value or "").strip().lower()
+        return normalized if normalized in {"autonomous", "relay", "observation"} else ""
 
     @staticmethod
     def _normalize_action(value: Any) -> str:

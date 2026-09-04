@@ -1309,9 +1309,57 @@ class PlannerCognitiveLoopRefactorTests(unittest.TestCase):
         guidance_text = "\n".join(envelope.guidance_lines)
         self.assertIn("本轮可用动作：查询记忆/画像、查询自我设定、戳一戳。只有确实合适时才使用，普通闲聊直接回复。", guidance_text)
         self.assertIn("等待只在对方明显没说完", guidance_text)
-        self.assertIn("撤回只在用户明确要求", guidance_text)
+        self.assertIn("撤回只在上一条机器人消息确实需要撤回", guidance_text)
         self.assertEqual(guidance_text.count("查询记忆/画像"), 1)
         self.assertIn("本轮可用动作", "\n".join(planner.prompt_refiner.calls[0]["prompt_envelope"].guidance_lines))
+
+    def test_production_relay_phrase_flows_from_cognitive_plan_to_execution_tools(self):
+        """Exercise the real cognitive extras -> disclosure -> executor chain."""
+        decision = self.planner_mod.CognitiveDecision(
+            action="reply",
+            intent="relay a request to a confirmed friend",
+            memory_policy="light",
+            action_tier="chat",
+            planned_tool_families=["private"],
+            planned_tool_names=["space_transition_action"],
+            planned_tool_goal="转达想看妃爱cos",
+            planned_tool_target_hint="空酱",
+            planned_tool_mode="relay",
+        )
+        planner = self._make_planner(decision)
+
+        def _candidate_tools(*args, **kwargs):
+            return [
+                _NamedTool("qq_friend_lookup"),
+                _NamedTool("contact_route_suggest_tool"),
+                _NamedTool("space_transition_action"),
+                _NamedTool("bot_capability_lookup"),
+            ]
+
+        planner._build_full_pfc_tools = _candidate_tools
+        event = _FakeEvent(
+            text="对的对的 你和她发一个消息，说我想看妃爱的cos，你看看能不能发出去"
+        )
+        _install_focus_extras(event)
+
+        result = asyncio.run(planner.plan_and_execute(event, [event]))
+
+        self.assertEqual(result, "ok")
+        executed_names = {
+            getattr(tool, "name", "")
+            for tool in (planner.executor.calls[0]["tools"] or [])
+        }
+        self.assertTrue({
+            "qq_friend_lookup",
+            "contact_route_suggest_tool",
+            "space_transition_action",
+        } <= executed_names)
+        self.assertEqual(event.get_extra("astrmai_planned_tool_families"), ["private"])
+        self.assertEqual(event.get_extra("astrmai_planned_tool_target_hint"), "空酱")
+        self.assertEqual(event.get_extra("astrmai_planned_tool_mode"), "relay")
+        turn_tools = event.get_extra("astrmai_turn_context").tools
+        self.assertIn("space_transition_action", turn_tools.selected_tool_cards)
+        self.assertIn("target_hint=空酱", "\n".join(event.get_extra("astrmai_prompt_envelope").guidance_lines))
 
     def test_planner_distinguishes_prepared_and_model_required_tools(self):
         decision = self.planner_mod.CognitiveDecision(
@@ -1522,7 +1570,7 @@ class PlannerCognitiveLoopRefactorTests(unittest.TestCase):
 
         envelope = event.get_extra("astrmai_prompt_envelope")
         guidance_text = "\n".join(envelope.guidance_lines)
-        self.assertIn("用户明确要求", guidance_text)
+        self.assertIn("自主选择", guidance_text)
         self.assertIn("proactive_poke", guidance_text)
         self.assertNotIn("如果气氛合适，可以顺手发表情包", guidance_text)
         self.assertNotIn("等待只在对方明显没说完", guidance_text)

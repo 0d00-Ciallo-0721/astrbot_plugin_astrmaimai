@@ -976,7 +976,7 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         )
         self.assertEqual(plain_event.get_extra("astrmai_required_tools"), [])
         self.assertIn("qq_friend_lookup", plain_turn.tools.hidden_requestable_tools)
-        self.assertNotIn("space_transition_action", plain_turn.tools.hidden_requestable_tools)
+        self.assertIn("space_transition_action", plain_turn.tools.hidden_requestable_tools)
         self.assertTrue(ctx.shared_dict["disable_rag_injection"])
 
         legacy_mixin = self._prepare_tool_mixin()
@@ -1348,6 +1348,31 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         )
         self.assertEqual(event.get_extra("astrmai_required_tools"), ["space_transition_action"])
         self.assertEqual(event.get_extra("astrmai_tool_tier"), "full")
+
+    def test_autonomous_private_plan_exposes_cross_session_tool_without_explicit_request(self):
+        mixin = self._prepare_tool_mixin()
+        event = _FakeEvent(message="我想联系她确认一下", group_id=None)
+        event.set_extra("astrmai_planned_tool_families", ["private"])
+        event.set_extra("astrmai_planned_tool_mode", "autonomous")
+
+        tools = asyncio.run(
+            mixin._build_execution_tools(
+                "default:FriendMessage:user-1",
+                event,
+                "user-1",
+                "Alice",
+                SimpleNamespace(shared_dict={}),
+                is_all_mode=True,
+                is_fast_mode=False,
+                is_tool_call_mode=False,
+            )
+        )
+
+        names = _normalized_tool_names(tools)
+        self.assertIn("space_transition_action", names)
+        self.assertIn("cross_session", event.get_extra("astrmai_turn_context").tools.disclosure_packages)
+        self.assertEqual(event.get_extra("astrmai_turn_context").tools.disclosure_request_source, "")
+        self.assertIn("autonomous_planner", event.get_extra("astrmai_turn_context").tools.disclosure_sources)
 
     def test_cross_session_request_missing_message_clarifies_instead_of_required_tool(self):
         mixin = self._prepare_tool_mixin()

@@ -32,7 +32,7 @@ from ..tool_contracts import (
     TOOL_CAPABILITIES,
     canonical_tool_name,
     get_tool_capability,
-    is_model_disclosure_requestable,
+    is_planner_disclosure_requestable,
     record_tool_lifecycle,
     requires_explicit_authorization,
     tool_display_name,
@@ -49,7 +49,7 @@ from ..tool_intent_resolution import resolve_capability_need
 MODEL_REQUESTABLE_TOOL_NAMES: tuple[str, ...] = tuple(
     name
     for name in TOOL_CAPABILITIES
-    if name not in DEFAULT_VISIBLE_TOOL_NAMES and is_model_disclosure_requestable(name)
+    if name not in DEFAULT_VISIBLE_TOOL_NAMES and is_planner_disclosure_requestable(name)
 )
 MODEL_REQUESTABLE_FAMILIES: tuple[str, ...] = tuple(
     family
@@ -1198,7 +1198,7 @@ class ProactivePokeTool(FunctionTool[AstrAgentContext]):
         default_factory=lambda: {
             "type": "object",
             "properties": {
-                "target_name": {"type": "string", "description": "要戳的用户名或 ID；仅在 peer_poke 或私聊明确授权时可留空。", "maxLength": 80}
+                "target_name": {"type": "string", "description": "要戳的用户名或 ID；仅在 peer_poke 或私聊且当前目标已由上下文确认时可留空。", "maxLength": 80}
             },
         }
     )
@@ -2893,9 +2893,10 @@ class BotCapabilityLookupTool(FunctionTool[AstrAgentContext]):
     name: str = "bot_capability_lookup"
     description: str = (
         "只读查询本轮已披露和仍可申请的工具能力。当前工具不足时，"
-        "优先把用户的原始需求放入 need，系统会映射并申请一个精确的只读工具；"
+        "优先把用户的原始需求放入 need，系统会映射并申请一个精确的能力；"
         "也可使用枚举中的 needed_family、needed_tool 或 needed_package。"
-        "撤回、戳一戳、@、引用回复、消息表情回应、看图和发表情包属于首轮常用工具，无需申请。"
+        "二次申请只会披露当前上下文允许、且标记为 autonomous_allowed 的能力；"
+        "披露不等于授权，实际动作仍由执行层校验。"
     )
     parameters: dict = Field(
         default_factory=lambda: {
@@ -2903,25 +2904,25 @@ class BotCapabilityLookupTool(FunctionTool[AstrAgentContext]):
             "properties": {
                 "need": {
                     "type": "string",
-                    "description": "用自然语言描述缺少的查证能力，推荐直接复述用户需求。",
+                    "description": "用自然语言描述缺少的能力，推荐直接复述用户需求。",
                     "minLength": 2,
                     "maxLength": 240,
                 },
                 "needed_package": {
                     "type": "string",
                     "description": (
-                        "需要一组只读能力时使用；能确定单个能力时优先使用 need、needed_family 或 needed_tool。"
+                        "需要一组能力时使用；能确定单个能力时优先使用 need、needed_family 或 needed_tool。"
                     ),
                     "enum": list(MODEL_REQUESTABLE_PACKAGES),
                 },
                 "needed_family": {
                     "type": "string",
-                    "description": "精确申请一个只读工具族。",
+                    "description": "精确申请一个当前上下文可用的工具族。",
                     "enum": list(MODEL_REQUESTABLE_FAMILIES),
                 },
                 "needed_tool": {
                     "type": "string",
-                    "description": "精确申请一个只读工具；只追加这个工具。",
+                    "description": "精确申请一个当前上下文可用的工具；只追加这个工具。",
                     "enum": list(MODEL_REQUESTABLE_TOOL_NAMES),
                 },
             },
@@ -2937,18 +2938,69 @@ class BotCapabilityLookupTool(FunctionTool[AstrAgentContext]):
         required = list(getattr(tools_state, "required_tools", []) or [])
         hidden_tools = list(getattr(event, "_astrmai_disclosure_hidden_tools", []) or [])
         hidden_names = [
-            str(getattr(tool, "name", "") or "").strip()
+            canonical_tool_name(str(getattr(tool, "name", "") or "").strip())
             for tool in hidden_tools
             if str(getattr(tool, "name", "") or "").strip()
         ]
+        is_group = False
+        try:
+            is_group = bool(event.get_group_id())
+        except Exception:
+            is_group = False
+        blocked_families: set[str] = set()
+        if hasattr(event, "get_extra"):
+            blocked_families.update(
+                str(item or "").strip()
+                for item in (
+                    event.get_extra("astrmai_negated_tool_families", []) or []
+                )
+                if str(item or "").strip()
+            )
+            blocked_families.update(
+                str(item or "").strip()
+                for item in (
+                    event.get_extra("astrmai_suppressed_tool_families", []) or []
+                )
+                if str(item or "").strip()
+            )
+            policy = event.get_extra("astrmai_tool_call_policy", {})
+            if isinstance(policy, dict):
+                blocked_families.update(
+                    str(item or "").strip()
+                    for item in (policy.get("negated_families", []) or [])
+                    if str(item or "").strip()
+                )
+        if blocked_families.intersection({"reaction", "qq_reaction"}):
+            blocked_families.add("emoji_reaction")
+
+        def planner_requestable_in_context(name: str) -> bool:
+            canonical = canonical_tool_name(name)
+            spec = get_tool_capability(canonical)
+            if spec is None or not is_planner_disclosure_requestable(canonical):
+                return False
+            # Lightweight tool adapters used by unit tests may not carry a
+            # TurnContext.  Preserve their historical read-only lookup
+            # fallback, but never claim a side-effect capability is loaded
+            # without runtime state.
+            if turn_context is None:
+                return spec.effect_type == "query"
+            if spec.family in blocked_families:
+                return False
+            context_name = "group" if is_group else "private"
+            return context_name in spec.contexts
+
         hidden_requestable = [
-            name for name in hidden_names if is_model_disclosure_requestable(name)
+            name for name in hidden_names if planner_requestable_in_context(name)
+        ]
+        autonomous_on_demand = [
+            name for name in hidden_names
+            if planner_requestable_in_context(name)
         ]
         if not hidden_requestable and hasattr(event, "get_extra"):
             hidden_requestable = [
-                str(name or "").strip()
+                canonical_tool_name(str(name or "").strip())
                 for name in event.get_extra("astrmai_hidden_requestable_tools", []) or []
-                if is_model_disclosure_requestable(str(name or "").strip())
+                if planner_requestable_in_context(str(name or "").strip())
             ]
 
         need = str(kwargs.get("need", "") or "").strip()
@@ -2964,18 +3016,19 @@ class BotCapabilityLookupTool(FunctionTool[AstrAgentContext]):
         exact_tools: list[str] = []
         request_source = ""
         if needed_tool:
+            needed_tool = canonical_tool_name(needed_tool)
             if needed_tool in hidden_requestable:
                 exact_tools.append(needed_tool)
                 request_source = "needed_tool"
             else:
-                rejected.append({"field": "needed_tool", "value": needed_tool, "reason": "not_hidden_or_not_readonly"})
+                rejected.append({"field": "needed_tool", "value": needed_tool, "reason": "tool_not_hidden_or_requestable"})
         elif needed_family:
             family_tool = FAMILY_TO_TOOL.get(needed_family, "")
             if family_tool in hidden_requestable:
                 exact_tools.append(family_tool)
                 request_source = "needed_family"
             else:
-                rejected.append({"field": "needed_family", "value": needed_family, "reason": "not_hidden_or_not_readonly"})
+                rejected.append({"field": "needed_family", "value": needed_family, "reason": "tool_not_hidden_or_requestable"})
         elif need:
             resolution = resolve_capability_need(
                 need,
@@ -3042,6 +3095,9 @@ class BotCapabilityLookupTool(FunctionTool[AstrAgentContext]):
         unavailable = sorted(
             set(MODEL_REQUESTABLE_TOOL_NAMES) - set(hidden_requestable) - filtered_set
         )
+        capability_state = "known"
+        if tools_state is None:
+            capability_state = "unknown"
         hidden_catalog = [
             f"{name}（{tool_display_name(name)}）"
             for name in hidden_requestable
@@ -3051,9 +3107,10 @@ class BotCapabilityLookupTool(FunctionTool[AstrAgentContext]):
             f"本轮可用工具数量：{len(available)}。",
             "只读查询能力：" + (", ".join(readonly[:40]) or "无"),
             "可执行动作能力：" + (", ".join(actions[:40]) or "无"),
-            "当前可申请的隐藏只读能力：" + (", ".join(hidden_catalog[:40]) or "无"),
+            "当前可申请的隐藏能力：" + (", ".join(hidden_catalog[:40]) or "无"),
             "当前环境不可用或已过滤能力：" + (", ".join(unavailable[:40]) or "无"),
-            "可请求二次开放的只读工具包：" + ", ".join(MODEL_REQUESTABLE_PACKAGES),
+            f"capability_state={capability_state};available_now={len(filtered_set)};available_on_demand={len(autonomous_on_demand)};requestable_in_context={len(hidden_requestable)};unavailable_in_context={len(unavailable)}",
+            "可请求二次开放的工具包/能力包：" + ", ".join(MODEL_REQUESTABLE_PACKAGES),
         ]
         if package:
             lines.append("已记录工具包二次开放请求：" + ", ".join(package))
@@ -3070,8 +3127,10 @@ class BotCapabilityLookupTool(FunctionTool[AstrAgentContext]):
         _record_tool_execution(
             event,
             self.name,
+            status=("failed" if rejected or (need and not exact_tools and not package) else "success"),
             source_domain="system_capability",
             operation="disclose",
+            reason=("capability_resolution_failed" if rejected or (need and not exact_tools and not package) else ""),
         )
         return "\n".join(lines)
 
@@ -3475,26 +3534,65 @@ class ContactRouteSuggestTool(FunctionTool[AstrAgentContext]):
         event = _get_current_event(context)
         target = str(kwargs.get("target", "") or "").strip()
         intent = str(kwargs.get("intent", "") or "").strip()
-        lines = [f"路由建议：intent={intent or '未说明'}。"]
+        result: dict[str, Any] = {
+            "route": "current_chat",
+            "target_id": "",
+            "target_name": target,
+            "recommended_action": "",
+            "tool_loaded": False,
+            "executable": False,
+            "blocked_reason": None,
+            "intent": intent,
+            "summary": "",
+        }
+        turn_context = event.get_extra("astrmai_turn_context", None) if hasattr(event, "get_extra") else None
+        available_tools = set(getattr(getattr(turn_context, "tools", None), "available_tools", []) or [])
+        # Missing runtime diagnostics are not evidence that the sender tool is
+        # loaded.  Keep this read-only suggestion fail-closed so a route result
+        # can never promise an action that the Executor cannot actually call.
+        transition_loaded = bool(
+            turn_context
+            and "space_transition_action" in available_tools
+        )
         if not target:
-            lines.append("没有目标人：建议直接在当前会话回复，不要跨会话发送。")
+            result["blocked_reason"] = "target_missing"
+            result["summary"] = "没有目标人：建议直接在当前会话回复，不要跨会话发送。"
             _record_tool_execution(event, self.name)
-            return "\n".join(lines)
+            return json.dumps(result, ensure_ascii=False)
         resolved, reason = await _resolve_friend_target(event, context.context.context, self.db_service, target)
         if resolved:
             target_id, display = resolved
-            lines.append(f"目标是机器人好友：{display}({target_id})。")
-            lines.append("建议：如果用户明确让你传话或联系对方，可调用 space_transition_action；否则先在当前会话确认。")
+            result.update(
+                route="friend_private",
+                target_id=str(target_id),
+                target_name=display,
+                recommended_action="space_transition_action",
+                tool_loaded=transition_loaded,
+                executable=transition_loaded,
+                blocked_reason=(
+                    None
+                    if transition_loaded
+                    else "tool_state_unknown" if turn_context is None else "tool_unavailable_in_context"
+                ),
+                summary=(
+                    f"目标是机器人好友：{display}({target_id})。"
+                    + (
+                        "建议调用 space_transition_action。"
+                        if transition_loaded
+                        else "space_transition_action 当前状态未知，不能声称可发送。"
+                        if turn_context is None
+                        else "space_transition_action 当前未加载，不能声称可发送。"
+                    )
+                ),
+            )
         else:
             group_id = str(event.get_group_id() or "").strip()
             if group_id:
-                lines.append(f"未确认为机器人好友：{reason}")
-                lines.append("建议：如果目标是当前群友，可用 construct_at_event 或当前群回复；不要声称能私聊对方。")
+                result.update(route="group_or_current_chat", blocked_reason=reason or "friend_not_verified", summary=f"未确认为机器人好友：{reason}")
             else:
-                lines.append(f"未确认为机器人好友：{reason}")
-                lines.append("建议：无法跨会话发送；请让用户提供准确 QQ 或确认对方是机器人好友。")
+                result.update(route="current_chat", blocked_reason=reason or "friend_not_verified", summary=f"未确认为机器人好友：{reason}")
         _record_tool_execution(event, self.name)
-        return "\n".join(lines)
+        return json.dumps(result, ensure_ascii=False)
 
 
 @dataclass

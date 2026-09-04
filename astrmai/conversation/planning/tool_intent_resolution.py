@@ -35,6 +35,7 @@ QQ_NUMBER_RE = re.compile(r"(?<!\d)\d{5,12}(?!\d)")
 _SEND_VERBS = (
     "发消息",
     "发个消息",
+    "发一个消息",
     "发一条消息",
     "私聊",
     "私信",
@@ -64,6 +65,10 @@ _AMBIGUOUS_TARGETS = {
 
 
 _CAPABILITY_NEED_HINTS: dict[str, tuple[str, ...]] = {
+    # Cross-session sending is a distinct capability from friend lookup.  A
+    # phrase may mention both a friend and a send request; the send intent
+    # must win so capability lookup can disclose the action path.
+    "private": _SEND_VERBS + ("跨会话", "转达", "发出去"),
     "group_member": ("群成员", "群名片", "管理员", "群主", "在群里吗", "是不是群员"),
     "group_fact": ("共同群", "哪些群", "哪个群", "群里见过", "同一个群", "群关系"),
     "forward_message": ("合并转发", "转发消息", "转发记录", "转发里", "聊天记录里"),

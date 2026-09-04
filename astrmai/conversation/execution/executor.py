@@ -62,7 +62,7 @@ from ..planning.tool_contracts import (
     TOOL_CAPABILITIES,
     canonical_tool_name,
     get_tool_capability,
-    is_model_disclosure_requestable,
+    is_planner_disclosure_requestable,
     record_tool_lifecycle,
     tool_display_name,
 )
@@ -377,6 +377,17 @@ class ConcurrentExecutor:
             "astrmai_prepared_required_tools",
             "astrmai_requested_tool_packages",
             "astrmai_requested_tool_names",
+            "astrmai_planned_tool_families",
+            "astrmai_planned_tool_names",
+            "astrmai_planned_tool_goal",
+            "astrmai_planned_tool_target_hint",
+            "astrmai_planned_tool_mode",
+            "astrmai_negated_tool_families",
+            "astrmai_suppressed_tool_families",
+            "astrmai_suppression_reasons",
+            "astrmai_capability_catalog_version",
+            "astrmai_capability_catalog_tool_count",
+            "astrmai_capability_catalog_token_estimate",
             "astrmai_tool_disclosure_requests",
             "astrmai_tool_disclosure_request_source",
             "astrmai_tool_disclosure_rejected_requests",
@@ -1303,6 +1314,44 @@ class ConcurrentExecutor:
     def _tool_name(tool: Any) -> str:
         return str(getattr(tool, "name", "") or "").strip()
 
+    @staticmethod
+    def _planner_disclosure_allowed(event: AstrMessageEvent, tool_name: str) -> bool:
+        """Validate a second-pass planner disclosure against live turn state."""
+        canonical = canonical_tool_name(tool_name)
+        spec = get_tool_capability(canonical)
+        if spec is None or not is_planner_disclosure_requestable(canonical):
+            return False
+        turn_context = event.get_extra("astrmai_turn_context", None) if hasattr(event, "get_extra") else None
+        if turn_context is None:
+            # Compatibility adapters may omit TurnContext for read-only
+            # second-pass tests, but execution-affecting disclosures must be
+            # fail-closed when the live context is unavailable.
+            return spec.effect_type == "query"
+        blocked: set[str] = set()
+        if hasattr(event, "get_extra"):
+            for key in ("astrmai_negated_tool_families", "astrmai_suppressed_tool_families"):
+                blocked.update(
+                    str(item or "").strip()
+                    for item in (event.get_extra(key, []) or [])
+                    if str(item or "").strip()
+                )
+            policy = event.get_extra("astrmai_tool_call_policy", {})
+            if isinstance(policy, dict):
+                blocked.update(
+                    str(item or "").strip()
+                    for item in (policy.get("negated_families", []) or [])
+                    if str(item or "").strip()
+                )
+        if blocked.intersection({"reaction", "qq_reaction"}):
+            blocked.add("emoji_reaction")
+        if spec.family in blocked:
+            return False
+        try:
+            is_group = bool(event.get_group_id())
+        except Exception:
+            is_group = False
+        return ("group" if is_group else "private") in spec.contexts
+
     def _expand_tools_for_disclosure_request(
         self,
         event: AstrMessageEvent,
@@ -1312,6 +1361,17 @@ class ConcurrentExecutor:
         if not hasattr(event, "get_extra") or not hasattr(event, "set_extra"):
             return expansion
         if event.get_extra("astrmai_tool_disclosure_expanded_once", False):
+            turn_context = event.get_extra("astrmai_turn_context", None)
+            tools_state = getattr(turn_context, "tools", None)
+            if tools_state is not None:
+                # The one-shot expansion has already been consumed; retain
+                # the request/applied diagnostics without advertising another
+                # expansion opportunity in this turn.
+                tools_state.second_pass_available = False
+                tools_state.second_pass_requested = bool(
+                    event.get_extra("astrmai_requested_tool_packages", [])
+                    or event.get_extra("astrmai_requested_tool_names", [])
+                )
             return expansion
         conversation = getattr(self.config, "conversation", None)
         if not bool(getattr(conversation, "tool_disclosure_allow_second_pass", True)):
@@ -1331,14 +1391,19 @@ class ConcurrentExecutor:
         ]
         requested_names: list[str] = []
         for name in raw_requested_names:
-            if is_model_disclosure_requestable(name):
-                requested_names.append(name)
+            canonical = canonical_tool_name(name)
+            if self._planner_disclosure_allowed(event, canonical):
+                requested_names.append(canonical)
             else:
                 rejected.append(
                     {
                         "field": "needed_tool",
-                        "value": name,
-                        "reason": "model_disclosure_requires_readonly_tool",
+                        "value": canonical,
+                        "reason": (
+                            "planner_disclosure_not_allowed"
+                            if event.get_extra("astrmai_turn_context", None) is None
+                            else "planner_disclosure_not_allowed_in_context"
+                        ),
                     }
                 )
         expansion.requested_tools = list(requested_names)
@@ -1370,9 +1435,13 @@ class ConcurrentExecutor:
         turn_context = event.get_extra("astrmai_turn_context", None)
         tools_state = getattr(turn_context, "tools", None)
         if tools_state is not None:
+            tools_state.second_pass_available = bool(
+                event.get_extra("astrmai_disclosure_second_pass_packages", [])
+            )
             tools_state.disclosure_request_source = expansion.source
             tools_state.disclosure_requested_tools = list(requested_names)
             tools_state.disclosure_rejected_requests = list(rejected)
+            tools_state.second_pass_requested = bool(requested or requested_names)
         if not packages and not requested_names:
             return expansion
         hidden_tools = list(getattr(event, "_astrmai_disclosure_hidden_tools", []) or [])
@@ -1394,7 +1463,7 @@ class ConcurrentExecutor:
         seen_addition_names: set[str] = set()
         for tool in [*additions, *exact_additions]:
             name = self._tool_name(tool)
-            if not name or name in seen_addition_names or not is_model_disclosure_requestable(name):
+            if not name or name in seen_addition_names or not self._planner_disclosure_allowed(event, name):
                 continue
             seen_addition_names.add(name)
             merged_additions.append(tool)
@@ -1422,17 +1491,21 @@ class ConcurrentExecutor:
         event.set_extra("astrmai_tool_disclosure_rejected_requests", rejected)
         if tools_state is not None:
             tools_state.disclosure_expanded_packages = list(packages)
+            tools_state.second_pass_available = False
             tools_state.disclosure_request_source = expansion.source
             tools_state.disclosure_requested_tools = list(requested_names)
             tools_state.disclosure_rejected_requests = list(rejected)
             tools_state.second_pass_added_tools = list(added_names)
+            tools_state.second_pass_applied = True
             tools_state.filtered_tools = [self._tool_name(tool) for tool in merged if self._tool_name(tool)]
-            tools_state.record_step(
-                "executor.tool_disclosure_second_pass",
-                [self._tool_name(tool) for tool in current_tools or []],
-                tools_state.filtered_tools,
-                "requested_packages(" + ",".join(packages) + ");requested_tools(" + ",".join(requested_names) + ")",
-            )
+            record_step = getattr(tools_state, "record_step", None)
+            if callable(record_step):
+                record_step(
+                    "executor.tool_disclosure_second_pass",
+                    [self._tool_name(tool) for tool in current_tools or []],
+                    tools_state.filtered_tools,
+                    "requested_packages(" + ",".join(packages) + ");requested_tools(" + ",".join(requested_names) + ")",
+                )
         for tool_name in added_names:
             record_tool_lifecycle(
                 event,
@@ -1467,7 +1540,7 @@ class ConcurrentExecutor:
                         "source": "model_disclosure_request",
                         "required": True,
                         "deterministic_fallback": False,
-                        "reason": "model_requested_exact_readonly_tool",
+                        "reason": "model_requested_exact_tool",
                         "entity_domain": "",
                         "operation": "",
                         "target": "",
@@ -2457,7 +2530,7 @@ class ConcurrentExecutor:
                         event,
                         chat_id,
                         runtime["bot_id"],
-                        ["requested_readonly_capability"],
+                        ["requested_capability"],
                         model=provider_id,
                     )
                 if missing_required:

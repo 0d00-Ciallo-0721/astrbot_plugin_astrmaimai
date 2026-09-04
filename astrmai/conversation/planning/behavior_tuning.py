@@ -111,10 +111,20 @@ class BehaviorTuningPolicy:
         return "sharp_reply" not in cooldown_tags
 
     @classmethod
+    def _suppress_planned_actions(cls, decision: CognitiveDecision, reason: str) -> None:
+        planned = list(getattr(decision, "planned_tool_families", []) or [])
+        if planned:
+            existing = list(getattr(decision, "suppressed_tool_families", []) or [])
+            decision.suppressed_tool_families = list(dict.fromkeys([*existing, *planned]))
+            reasons = list(getattr(decision, "suppression_reasons", []) or [])
+            decision.suppression_reasons = list(dict.fromkeys([*reasons, reason]))
+
+    @classmethod
     def _downgrade_pushback(cls, decision: CognitiveDecision, reason: str) -> CognitiveDecision:
         decision.social_intent = "boundary"
         decision.stance = "guarded"
         decision.action_tier = "none"
+        cls._suppress_planned_actions(decision, reason)
         decision.allowed_action_families = []
         cls._append_flag(decision, "pushback_downgraded")
         cls._append_flag(decision, reason)
@@ -143,24 +153,28 @@ class BehaviorTuningPolicy:
             decision.reply_need = "wait"
             decision.social_intent = "observe"
             decision.action_tier = "none"
+            cls._suppress_planned_actions(decision, "uncertain_observe")
             decision.allowed_action_families = []
             decision.stance = "cool"
             cls._append_flag(decision, "uncertain_observe")
             return decision
 
         directly_addressed = cls._is_directly_addressed(event, prompt_envelope)
+        has_planned_actions = bool(getattr(decision, "planned_tool_families", []) or getattr(decision, "planned_tool_names", []))
         if not directly_addressed and decision.action != "tool_call":
-            if cls._looks_like_short_ambient(event) and decision.social_intent in {"answer", "join", "tease"}:
+            if not has_planned_actions and cls._looks_like_short_ambient(event) and decision.social_intent in {"answer", "join", "tease"}:
                 decision.action = "wait"
                 decision.reply_need = "wait"
                 decision.social_intent = "observe"
                 decision.action_tier = "none"
+                cls._suppress_planned_actions(decision, "group_ambient_short_wait")
                 decision.allowed_action_families = []
                 decision.stance = "cool"
                 cls._append_flag(decision, "group_ambient_short_wait")
                 return decision
-            if decision.social_intent in {"join", "tease"}:
+            if not has_planned_actions and decision.social_intent in {"join", "tease"}:
                 decision.action_tier = "none"
+                cls._suppress_planned_actions(decision, "group_non_direct_softened")
                 decision.allowed_action_families = []
                 cls._append_flag(decision, "group_non_direct_softened")
 

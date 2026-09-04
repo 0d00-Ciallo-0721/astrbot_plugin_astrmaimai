@@ -481,8 +481,8 @@ class ConversationConfig(BaseModel):
         description="单轮最多向模型披露多少个近期图片候选",
     )
     tool_progressive_disclosure_enabled: bool = Field(default=True, repr=False)
-    tool_disclosure_max_tools_chat: int = Field(default=8, ge=1, repr=False)
-    tool_disclosure_max_tools_task: int = Field(default=16, ge=1, repr=False)
+    tool_disclosure_max_tools_chat: int = Field(default=8, ge=1, repr=False, description="普通聊天最多开放的额外动态工具数（默认工具始终保留）")
+    tool_disclosure_max_tools_task: int = Field(default=16, ge=1, repr=False, description="明确任务最多开放的额外动态工具数（默认工具始终保留）")
     tool_disclosure_allow_second_pass: bool = Field(default=True, repr=False)
     history_lookup_enabled: bool = Field(default=True, description="允许模型在用户明确请求时只读查询会话历史")
     history_lookup_private_enabled: bool = Field(default=True, description="允许显式查询机器人与好友的近期私聊历史")

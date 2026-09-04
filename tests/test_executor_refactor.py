@@ -1151,9 +1151,72 @@ class RefactoredExecutorTests(unittest.TestCase):
         self.assertIsNone(event.get_extra("astrmai_disclosure_expanded_tools"))
         self.assertEqual(
             event.get_extra("astrmai_tool_disclosure_rejected_requests")[0]["reason"],
-            "model_disclosure_requires_readonly_tool",
+            "planner_disclosure_not_allowed",
         )
         self.assertEqual(event.get_extra("astrmai_tool_second_pass_resolution"), "degraded")
+
+    def test_tool_mode_expands_autonomous_private_tool_with_live_context(self):
+        call_count = {"value": 0}
+
+        def _tool_response(kwargs):
+            call_count["value"] += 1
+            if call_count["value"] == 1:
+                kwargs["event"].set_extra(
+                    "astrmai_requested_tool_names", ["space_transition_action"]
+                )
+                return "[TERMINAL_YIELD]: need private relay"
+            tool_names = [getattr(tool, "name", "") for tool in kwargs["tools"].tools]
+            self.assertIn("space_transition_action", tool_names)
+            kwargs["event"].set_extra(
+                "astrmai_tool_execution_trace",
+                [{"tool_name": "space_transition_action", "status": "success"}],
+            )
+            return "[TERMINAL_YIELD]: relay complete"
+
+        gateway = _FakeGateway(tool_responses={"model-a": _tool_response})
+        gateway.config.conversation = SimpleNamespace(
+            tool_disclosure_allow_second_pass=True,
+            tool_disclosure_max_tools_task=16,
+        )
+        executor = self.executor_mod.ConcurrentExecutor(
+            context=SimpleNamespace(),
+            gateway=gateway,
+            reply_engine=_FakeReplyService(),
+            evolution_manager=_FakeEvolution(),
+            config=gateway.config,
+        )
+        event = _FakeEvent()
+        event.set_extra(
+            "astrmai_turn_context",
+            SimpleNamespace(
+                tools=SimpleNamespace(
+                    available_tools=["bot_capability_lookup"],
+                    filtered_tools=["bot_capability_lookup"],
+                    required_tools=[],
+                )
+            ),
+        )
+        event.set_extra("astrmai_disclosure_second_pass_packages", ["cross_session"])
+        event._astrmai_disclosure_hidden_tools = [
+            SimpleNamespace(name="space_transition_action")
+        ]
+
+        result = asyncio.run(
+            executor.execute(
+                event,
+                "prompt",
+                "system",
+                tools=[SimpleNamespace(name="bot_capability_lookup")],
+            )
+        )
+
+        self.assertEqual(result, "relay complete")
+        self.assertEqual(call_count["value"], 2)
+        self.assertEqual(
+            event.get_extra("astrmai_disclosure_expanded_tools"),
+            ["space_transition_action"],
+        )
+        self.assertFalse(event.get_extra("astrmai_turn_context").tools.second_pass_available)
 
     def test_chat_tool_tier_uses_configured_multi_tool_max_steps(self):
         gateway = _FakeGateway()

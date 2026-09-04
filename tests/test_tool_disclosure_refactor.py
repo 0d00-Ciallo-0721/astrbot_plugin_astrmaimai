@@ -3,6 +3,7 @@ from astrmai.conversation.planning.tool_contracts import (
     TOOL_DISPLAY_NAMES,
     ToolCapabilitySpec,
     is_model_disclosure_requestable,
+    is_planner_disclosure_requestable,
     is_autonomous_interaction,
     requires_explicit_authorization,
 )
@@ -11,6 +12,13 @@ from astrmai.conversation.planning.tool_disclosure import (
     ToolDisclosurePlanner,
 )
 from astrmai.conversation.planning.tool_contracts import requires_explicit_authorization
+from astrmai.conversation.planning.tool_contracts import TOOL_NAME_ALIASES
+from astrmai.conversation.planning.tool_semantics import (
+    TOOL_PLANNER_SEMANTICS,
+    build_planner_capability_catalog,
+    validate_planner_semantics,
+)
+from astrmai.conversation.planning.tool_intent_resolution import resolve_capability_need
 
 
 CORE_TOOLS = {
@@ -20,6 +28,41 @@ CORE_TOOLS = {
     "bot_capability_lookup",
     "learned_language_lookup",
 }
+
+
+def test_planner_semantics_cover_canonical_registry_without_aliases():
+    missing, extra = validate_planner_semantics()
+    assert not missing
+    assert not extra
+    assert not set(TOOL_NAME_ALIASES) & set(TOOL_PLANNER_SEMANTICS)
+    assert set(TOOL_PLANNER_SEMANTICS) == set(TOOL_CAPABILITIES)
+
+
+def test_capability_catalog_is_context_pruned_and_schema_free():
+    private_catalog = build_planner_capability_catalog(is_group=False, has_image=False)
+    group_catalog = build_planner_capability_catalog(is_group=True, has_image=True)
+    assert "construct_at_event" not in private_catalog
+    assert "vision_message_analyze_tool" not in private_catalog
+    assert "construct_at_event" in group_catalog
+    assert "vision_message_analyze_tool" in group_catalog
+    assert '"properties"' not in group_catalog
+    assert "target=" in group_catalog
+    assert "context=" in group_catalog
+
+
+def test_unverified_report_can_be_planned_but_is_not_default_disclosed():
+    default_plan = ToolDisclosurePlanner().plan(
+        message="听说他换工作了", requested_tier="", explicit_tool_intent=False, explicit_tool_families=set()
+    )
+    planned = ToolDisclosurePlanner().plan(
+        message="听说他换工作了",
+        requested_tier="",
+        explicit_tool_intent=False,
+        explicit_tool_families=set(),
+        planned_tool_families=["unverified_report"],
+    )
+    assert "unverified_report_record_tool" not in default_plan.tool_names
+    assert "unverified_report_record_tool" in planned.tool_names
 
 DEFAULT_ACTION_TOOLS = {
     "regret_and_withdraw_action",
@@ -257,4 +300,91 @@ def test_explicit_meme_request_keeps_default_actions_without_opening_fun_package
     assert "fun" not in plan.packages
     assert "message_reaction_action" not in plan.tool_names
     assert "proactive_like_action" in plan.tool_names
+
+
+def test_autonomous_planner_private_plan_opens_cross_session_without_explicit_words():
+    plan = ToolDisclosurePlanner().plan(
+        message="闲聊",
+        requested_tier="chat",
+        explicit_tool_intent=False,
+        explicit_tool_families=set(),
+        planned_tool_families=["private"],
+    )
+    assert "cross_session" in plan.packages
+    assert "space_transition_action" in plan.tool_names
+    assert any(item.source == "autonomous_planner" for item in plan.decisions)
+
+
+def test_negated_autonomous_planner_private_plan_is_suppressed():
+    plan = ToolDisclosurePlanner().plan(
+        message="闲聊",
+        requested_tier="chat",
+        explicit_tool_intent=False,
+        explicit_tool_families=set(),
+        planned_tool_families=["private"],
+        negated_tool_families=["private"],
+    )
+    assert "space_transition_action" not in plan.tool_names
+
+
+def test_suppressed_autonomous_plan_is_not_disclosed():
+    plan = ToolDisclosurePlanner().plan(
+        message="闲聊",
+        requested_tier="chat",
+        explicit_tool_intent=False,
+        explicit_tool_families=set(),
+        planned_tool_families=["private"],
+        suppressed_tool_families=["private"],
+    )
+    assert "space_transition_action" not in plan.tool_names
+    assert "cross_session" not in plan.packages
+
+
+def test_planner_disclosure_requestable_includes_autonomous_hidden_tools():
+    assert is_planner_disclosure_requestable("space_transition_action")
+
+
+def test_negated_family_vetoes_default_action_disclosure():
+    plan = ToolDisclosurePlanner().plan(
+        message="不要发任何表情包",
+        requested_tier="",
+        explicit_tool_intent=False,
+        explicit_tool_families=set(),
+        negated_tool_families=["meme"],
+    )
+    assert "proactive_meme" not in plan.tool_names
     assert "proactive_poke" in plan.tool_names
+
+
+def test_production_relay_phrase_resolves_private_capability_before_friend_lookup():
+    phrase = "对的对的 你和她发一个消息，说我想看妃爱的cos，你看看能不能发出去"
+    resolution = resolve_capability_need(
+        phrase,
+        available_tool_names=["qq_friend_lookup", "contact_route_suggest_tool", "space_transition_action"],
+    )
+    assert resolution is not None
+    assert resolution.family == "private"
+    assert resolution.tool_name == "space_transition_action"
+    friend_word_phrase = "给好友发私聊消息，说我想看妃爱的cos"
+    friend_word_resolution = resolve_capability_need(
+        friend_word_phrase,
+        available_tool_names=["qq_friend_lookup", "space_transition_action"],
+    )
+    assert friend_word_resolution is not None
+    assert friend_word_resolution.family == "private"
+    assert friend_word_resolution.tool_name == "space_transition_action"
+
+
+def test_disclosure_caps_dynamic_tools_without_removing_default_tools():
+    plan = ToolDisclosurePlanner().plan(
+        message="闲聊",
+        requested_tier="chat",
+        explicit_tool_intent=False,
+        explicit_tool_families=set(),
+        planned_tool_families=["private", "friend_fact", "group_fact", "artifact"],
+        max_chat_tools=2,
+        max_task_tools=2,
+    )
+    extras = set(plan.tool_names) - set(DEFAULT_VISIBLE_TOOL_NAMES)
+    assert len(extras) <= 2
+    assert set(DEFAULT_VISIBLE_TOOL_NAMES) <= set(plan.tool_names)

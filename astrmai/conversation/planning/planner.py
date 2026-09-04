@@ -46,6 +46,7 @@ from .planner_prompt_context import PlannerPromptContextMixin
 from .planner_side_inputs import PlannerSideInputMixin
 from .think_level_policy import ThinkLevelPolicy
 from .tool_contracts import tool_display_name
+from .tool_semantics import planner_semantics_for
 from ...proactive.dispatcher import append_proactive_stage
 
 
@@ -630,12 +631,53 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             tool_tier = str(event.get_extra("astrmai_tool_tier", "full") or "full")
         tool_names = [str(getattr(tool, "name", "") or "").strip() for tool in tools]
         guidance_lines = list(getattr(prompt_envelope, "guidance_lines", []) or [])
+        if event is not None and hasattr(event, "get_extra"):
+            planned_families = [
+                str(item or "").strip()[:48]
+                for item in event.get_extra("astrmai_planned_tool_families", []) or []
+                if str(item or "").strip()
+            ]
+            planned_names = [
+                str(item or "").strip()[:80]
+                for item in event.get_extra("astrmai_planned_tool_names", []) or []
+                if str(item or "").strip()
+            ]
+            planned_goal = re.sub(
+                r"\s+", " ", str(event.get_extra("astrmai_planned_tool_goal", "") or "")
+            ).strip()[:240]
+            planned_target = re.sub(
+                r"\s+", " ", str(event.get_extra("astrmai_planned_tool_target_hint", "") or "")
+            ).strip()[:120]
+            planned_mode = re.sub(
+                r"[^a-zA-Z_ -]", "", str(event.get_extra("astrmai_planned_tool_mode", "") or "")
+            ).strip()[:32]
+            # Cognitive output is a routing hint, never a tool argument.  Do
+            # not pass through long numeric identifiers or private payloads.
+            planned_goal = re.sub(r"(?<!\d)\d{5,}(?!\d)", "[id omitted]", planned_goal)
+            planned_target = re.sub(r"(?<!\d)\d{5,}(?!\d)", "[id omitted]", planned_target)
+            if planned_families or planned_names or planned_goal or planned_target or planned_mode:
+                plan_summary = []
+                if planned_families:
+                    plan_summary.append("families=" + ",".join(planned_families[:8]))
+                if planned_names:
+                    plan_summary.append("tools=" + ",".join(planned_names[:8]))
+                if planned_mode:
+                    plan_summary.append("mode=" + planned_mode)
+                if planned_target:
+                    plan_summary.append("target_hint=" + planned_target)
+                if planned_goal:
+                    plan_summary.append("goal=" + planned_goal)
+                guidance_lines.append(
+                    "认知阶段提供了以下执行路由摘要（仅供选择工具和补全语境，不能直接当作参数）："
+                    + "；".join(plan_summary)
+                    + "。仍须从当前事件或只读查询结果确认目标，并以工具真实结果决定回复。"
+                )
         # OPT-12/TL-01: 二段披露 585 轮/16h 零触发——唯一入口是模型主动调
         # bot_capability_lookup，但 guidance 从未提示该自检路径
         if "bot_capability_lookup" in tool_names:
             guidance_lines.append(
                 "如果回答依赖当前不可见的 QQ、关系、历史消息或人格事实，禁止猜测；"
-                "调用 bot_capability_lookup，把用户的原始需求放入 need。系统会精确追加一个只读工具并重跑本轮；"
+                "调用 bot_capability_lookup，把用户的原始需求放入 need。系统会精确追加一个当前上下文允许的工具/能力并重跑本轮；"
                 "只有已经知道合法内部标识时才使用 needed_family/needed_tool，需要一组能力时才使用 needed_package。"
             )
         if event is not None and "vision_message_analyze_tool" in tool_names:
@@ -768,14 +810,23 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             if isinstance(policy, dict) and policy.get("mode") in {"image_only", "image_plus_text", "image_question"} and not policy.get("action_authorized", False):
                 guidance = "当前消息包含图片但没有明确动作授权。默认只回答用户文字或图片事实；不要调用表情包、戳一戳、点赞、@成员、复读或话题切换等副作用动作。"
             else:
-                guidance = "只有在用户明确要求或本轮动作策略已授权时才使用表情包、轻互动或点赞；普通闲聊直接自然回复即可。"
+                guidance = "这些互动工具可由机器人根据当前关系、语境和自身意图自主选择，不需要用户明确下令；用户明确否定对应动作时不得调用。普通闲聊直接自然回复即可。"
             if any(name in {"proactive_poke", "construct_at_event"} for name in tool_names):
-                guidance += "戳人或@别人必须有明确目标和本轮授权。"
-            cards = [
-                f"{name}: {self.TOOL_CAPABILITY_CARDS[name]}"
-                for name in tool_names
-                if name in self.TOOL_CAPABILITY_CARDS
-            ]
+                guidance += "戳人或@别人必须能从当前上下文或查询结果解析出明确目标。"
+            cards = []
+            for name in tool_names:
+                card = self.TOOL_CAPABILITY_CARDS.get(name)
+                semantics = planner_semantics_for(name)
+                if not card and semantics:
+                    card = f"用途：{semantics.purpose}；适用：{semantics.use_when}；结果：{semantics.result_mode}。"
+                if card and semantics:
+                    card += (
+                        f"目标：{semantics.target_hint or '由当前上下文确认'}；"
+                        f"上下文：{semantics.context_hint or '当前会话'}；"
+                        f"继续：{semantics.continuation_mode}。"
+                    )
+                if card:
+                    cards.append(f"{name}: {card}")
             if cards:
                 guidance += "工具能力卡：" + "；".join(cards)
             guidance_lines.append(guidance)
@@ -789,6 +840,15 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             if label and label not in labels:
                 labels.append(label)
             card = self.TOOL_CAPABILITY_CARDS.get(tool_name)
+            semantics = planner_semantics_for(tool_name)
+            if not card and semantics:
+                card = f"用途：{semantics.purpose}；适用：{semantics.use_when}；结果：{semantics.result_mode}。"
+            if card and semantics:
+                card += (
+                    f"目标：{semantics.target_hint or '由当前上下文确认'}；"
+                    f"上下文：{semantics.context_hint or '当前会话'}；"
+                    f"继续：{semantics.continuation_mode}。"
+                )
             if card:
                 cards.append(f"{tool_name}: {card}")
         if not labels:
@@ -796,7 +856,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             return
         guidance = (
             f"本轮可用动作：{'、'.join(labels)}。只有确实合适时才使用，普通闲聊直接回复。"
-            "等待只在对方明显没说完、或当前确实不该回复时使用；撤回只在用户明确要求或上一条回复确实需要撤回时使用。"
+            "等待只在对方明显没说完、或当前确实不该回复时使用；撤回只在上一条机器人消息确实需要撤回或当前语境需要修正时使用。"
         )
         if cards:
             guidance += "工具能力卡：" + "；".join(cards)
@@ -935,6 +995,9 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             "action_tier": getattr(decision, "action_tier", ""),
             "memory_policy": getattr(decision, "memory_policy", ""),
             "retrieve_keys": list(getattr(decision, "retrieve_keys", []) or []),
+            "planned_tool_families": list(getattr(decision, "planned_tool_families", []) or []),
+            "planned_tool_names": list(getattr(decision, "planned_tool_names", []) or []),
+            "planned_tool_mode": getattr(decision, "planned_tool_mode", ""),
             "stance": getattr(decision, "stance", ""),
             "risk_flags": list(getattr(decision, "risk_flags", []) or []),
             "attack_confidence": float(getattr(decision, "attack_confidence", 0.0) or 0.0),
@@ -2585,6 +2648,14 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                 event.set_extra("astrmai_social_intent", cognitive_decision.social_intent)
                 event.set_extra("astrmai_action_tier", cognitive_decision.action_tier)
                 event.set_extra("astrmai_allowed_action_families", list(cognitive_decision.allowed_action_families))
+                event.set_extra("astrmai_planned_tool_families", list(cognitive_decision.planned_tool_families))
+                event.set_extra("astrmai_planned_tool_names", list(cognitive_decision.planned_tool_names))
+                event.set_extra("astrmai_planned_tool_goal", cognitive_decision.planned_tool_goal)
+                event.set_extra("astrmai_planned_tool_target_hint", cognitive_decision.planned_tool_target_hint)
+                event.set_extra("astrmai_planned_tool_mode", cognitive_decision.planned_tool_mode)
+                event.set_extra("astrmai_negated_tool_families", list(cognitive_decision.negated_tool_families))
+                event.set_extra("astrmai_suppressed_tool_families", list(cognitive_decision.suppressed_tool_families))
+                event.set_extra("astrmai_suppression_reasons", list(cognitive_decision.suppression_reasons))
                 event.set_extra("astrmai_stance", cognitive_decision.stance)
                 event.set_extra("astrmai_state_bias", cognitive_decision.state_bias)
                 event.set_extra("astrmai_risk_flags", list(cognitive_decision.risk_flags))
@@ -2599,6 +2670,14 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                 turn_context.cognitive.social_intent = cognitive_decision.social_intent
                 turn_context.cognitive.action_tier = cognitive_decision.action_tier
                 turn_context.cognitive.allowed_action_families = list(cognitive_decision.allowed_action_families)
+                turn_context.cognitive.planned_tool_families = list(cognitive_decision.planned_tool_families)
+                turn_context.cognitive.planned_tool_names = list(cognitive_decision.planned_tool_names)
+                turn_context.cognitive.planned_tool_goal = cognitive_decision.planned_tool_goal
+                turn_context.cognitive.planned_tool_target_hint = cognitive_decision.planned_tool_target_hint
+                turn_context.cognitive.planned_tool_mode = cognitive_decision.planned_tool_mode
+                turn_context.cognitive.negated_tool_families = list(cognitive_decision.negated_tool_families)
+                turn_context.cognitive.suppressed_tool_families = list(cognitive_decision.suppressed_tool_families)
+                turn_context.cognitive.suppression_reasons = list(cognitive_decision.suppression_reasons)
                 turn_context.cognitive.stance = cognitive_decision.stance
                 turn_context.cognitive.state_bias = cognitive_decision.state_bias
                 turn_context.cognitive.risk_flags = list(cognitive_decision.risk_flags)

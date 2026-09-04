@@ -54,7 +54,7 @@ TOOL_CAPABILITIES: dict[str, ToolCapabilitySpec] = {
     "topic_thread_lookup": ToolCapabilitySpec("topic_thread_lookup", "topic_thread", "query", explicit_policy="required", autonomous_allowed=True),
     "bot_capability_lookup": ToolCapabilitySpec("bot_capability_lookup", "capability", "query", explicit_policy="required", autonomous_allowed=True),
     "memory_write_correction_tool": ToolCapabilitySpec("memory_write_correction_tool", "memory_correction", "memory_write", explicit_policy="optional", autonomous_allowed=True),
-    "unverified_report_record_tool": ToolCapabilitySpec("unverified_report_record_tool", "unverified_report", "memory_write", explicit_policy="required"),
+    "unverified_report_record_tool": ToolCapabilitySpec("unverified_report_record_tool", "unverified_report", "memory_write", explicit_policy="required", autonomous_allowed=True),
     "persona_fact_check_tool": ToolCapabilitySpec("persona_fact_check_tool", "persona_fact", "query", explicit_policy="required", autonomous_allowed=True),
     "group_activity_snapshot_tool": ToolCapabilitySpec("group_activity_snapshot_tool", "group_activity", "query", contexts=("group",), explicit_policy="required", autonomous_allowed=True),
     "contact_route_suggest_tool": ToolCapabilitySpec("contact_route_suggest_tool", "route_suggest", "query", explicit_policy="required", autonomous_allowed=True),
@@ -125,8 +125,23 @@ def get_tool_capability(tool_name: str) -> ToolCapabilitySpec | None:
 
 def is_model_disclosure_requestable(tool_name: str) -> bool:
     """Only read-only tools may be opened from a model-originated request."""
+    return is_readonly_observation_requestable(tool_name)
+
+
+def is_readonly_observation_requestable(tool_name: str) -> bool:
+    """Whether the cognitive observation stage may request this tool."""
     spec = get_tool_capability(tool_name)
     return bool(spec and spec.effect_type == "query")
+
+
+def is_planner_disclosure_requestable(tool_name: str) -> bool:
+    """Whether structured planner intent may disclose this capability.
+
+    Disclosure only makes a tool available to the execution layer; it never
+    bypasses authorization, target, platform, or lifecycle checks.
+    """
+    spec = get_tool_capability(tool_name)
+    return bool(spec and spec.autonomous_allowed)
 
 
 def requires_explicit_disclosure(tool_name: str) -> bool:
@@ -341,6 +356,8 @@ __all__ = [
     "get_tool_capability",
     "filter_tools_for_context",
     "is_model_disclosure_requestable",
+    "is_readonly_observation_requestable",
+    "is_planner_disclosure_requestable",
     "is_autonomous_interaction",
     "normalize_tool_schema",
     "normalize_tool_schemas",
