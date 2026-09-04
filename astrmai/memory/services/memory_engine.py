@@ -1721,7 +1721,7 @@ class MemoryEngine:
             with self._vector_registry_lock:
                 self._vector_close_retry_after[id(resource)] = (
                     resource,
-                    time.monotonic() + 0.25,
+                    time.monotonic() + self._retirement_retry_delay(1),
                 )
 
     async def _await_vector_resource_close(self, resource, *, timeout_sec: float | None) -> bool:
@@ -2129,12 +2129,10 @@ class MemoryEngine:
     def _finalize_overflow_vector_stack(self, stack_id: str) -> None:
         with self._vector_registry_lock:
             stack = (
-                self._retired_vector_overflow_stacks.pop(stack_id, None)
-                or self._retired_vector_overflow_capacity_stacks.pop(stack_id, None)
+                self._retired_vector_overflow_stacks.get(stack_id)
+                or self._retired_vector_overflow_capacity_stacks.get(stack_id)
                 or {}
             )
-            if not self._retired_vector_overflow_capacity_stacks:
-                self._vector_retirement_overflow_capacity_blocked = False
         if stack:
             self._transition_vector_resource(
                 stack_id,
@@ -2170,6 +2168,21 @@ class MemoryEngine:
                 stack_id=stack_id,
                 generation=stack.get("generation"),
             )
+        # Keep the overflow stack registered until the durable index-delete
+        # repair record has been created.  This closes the observable window
+        # where neither the stack nor its repair owner exists.  Removal is
+        # identity-checked so a concurrent finalizer cannot delete a newer
+        # stack with the same id.
+        with self._vector_registry_lock:
+            current = self._retired_vector_overflow_stacks.get(stack_id)
+            if current is stack:
+                self._retired_vector_overflow_stacks.pop(stack_id, None)
+            else:
+                current = self._retired_vector_overflow_capacity_stacks.get(stack_id)
+                if current is stack:
+                    self._retired_vector_overflow_capacity_stacks.pop(stack_id, None)
+            if not self._retired_vector_overflow_capacity_stacks:
+                self._vector_retirement_overflow_capacity_blocked = False
 
     def _index_delete_repair_db_path(self) -> str:
         """Return the SQLite database used for serializable repair metadata."""
@@ -2746,6 +2759,46 @@ class MemoryEngine:
                 all_deleted = False
         return all_deleted
 
+    async def _settle_vector_index_delete_repair_tasks(
+        self, *, timeout_sec: float | None = None
+    ) -> bool:
+        """Ensure every asyncio repair owner is settled before loop shutdown.
+
+        The repair registry is the source of truth for durable deletion work,
+        while this task set is the source of truth for event-loop ownership.
+        Keep the two observable independently so an overflow finalizer cannot
+        leave an untracked ``astrmai-vector-index-delete-repair`` task behind.
+        """
+        with self._vector_registry_lock:
+            tasks = [task for task in self._vector_index_delete_repair_tasks if not task.done()]
+        if not tasks:
+            return True
+        timeout = timeout_sec if timeout_sec is not None else self._vector_close_timeout_sec()
+        all_settled = True
+        for task in tasks:
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+            except asyncio.TimeoutError:
+                all_settled = False
+                task.cancel()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(task, return_exceptions=True), timeout=timeout
+                    )
+                except asyncio.TimeoutError:
+                    # A cancellation-resistant owner remains a durable repair
+                    # concern; keep it visible rather than claiming closure.
+                    continue
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # The done callback consumes the exception; settlement still
+                # succeeded from the event-loop ownership perspective.
+                pass
+        with self._vector_registry_lock:
+            remaining = [task for task in self._vector_index_delete_repair_tasks if not task.done()]
+        return all_settled and not remaining
+
     def _schedule_overflow_vector_retirement_attempt(self, stack_id: str) -> None:
         with self._vector_registry_lock:
             stack = self._overflow_stack(stack_id)
@@ -3010,7 +3063,23 @@ class MemoryEngine:
                             timeout=timeout_sec,
                         )
                 except asyncio.TimeoutError:
-                    continue
+                    # During shutdown/late cleanup a retry-wait task is only
+                    # sleeping until its next attempt.  Cancel that delay and
+                    # perform the bounded close below, otherwise a shared
+                    # close owner can finish while this stack remains hidden
+                    # behind its scheduled retry.
+                    if (
+                        isinstance(active_owner, asyncio.Task)
+                        and str(stack.get("status") or "") == "retry_wait"
+                    ):
+                        active_owner.cancel()
+                        await asyncio.gather(active_owner, return_exceptions=True)
+                        await asyncio.sleep(0)
+                        with self._vector_registry_lock:
+                            if self._overflow_stack(stack_id) is stack:
+                                stack["next_retry_at"] = 0.0
+                    else:
+                        continue
                 except asyncio.CancelledError:
                     owner_cancelled = bool(
                         getattr(active_owner, "cancelled", lambda: False)()
@@ -3157,6 +3226,11 @@ class MemoryEngine:
     def _index_delete_repair_diagnostics(self) -> dict[str, Any]:
         with self._vector_registry_lock:
             repairs = list(self._vector_index_delete_repairs.values())
+            repair_tasks = [
+                task
+                for task in self._vector_index_delete_repair_tasks
+                if not task.done()
+            ]
         now = time.time()
         statuses = [str(item.get("status") or "pending") for item in repairs]
         terminal_deleted = sum(status == "deleted" for status in statuses)
@@ -3184,6 +3258,10 @@ class MemoryEngine:
                 self._vector_index_delete_repair_last_error or ""
             ),
             "vector_index_delete_repair_deleted": terminal_deleted,
+            "vector_index_delete_repair_task_count": len(repair_tasks),
+            "vector_index_delete_repair_task_names": sorted(
+                str(task.get_name()) for task in repair_tasks
+            ),
             "vector_index_delete_repair_persistence_status": str(
                 getattr(self, "_vector_index_delete_repair_persistence_status", "unknown")
             ),
@@ -4520,6 +4598,11 @@ class MemoryEngine:
                 for _resource, owner in self._vector_close_tasks.values()
                 if _running(owner)
             ]
+            index_delete_repair_tasks = [
+                task
+                for task in self._vector_index_delete_repair_tasks
+                if _running(task)
+            ]
             candidate_path_count = len(self._vector_candidate_paths)
             retired_stacks = [dict(stack) for stack in self._retired_vector_stacks.values()]
             overflow_stacks = [
@@ -4545,6 +4628,10 @@ class MemoryEngine:
             *(
                 _owner_name(owner, "memory.vector_close_owner")
                 for owner in close_owners
+            ),
+            *(
+                _owner_name(task, "memory.vector_index_delete_repair")
+                for task in index_delete_repair_tasks
             ),
             *("memory.vector_dimension_probe" for _ in range(dimension_probe_count)),
         }
@@ -4583,6 +4670,7 @@ class MemoryEngine:
             "vector_candidate_path_count": candidate_path_count,
             "vector_sync_retirement_count": len(sync_retirement_futures),
             "vector_close_owner_count": len(close_owners),
+            "vector_index_delete_repair_task_count": len(index_delete_repair_tasks),
             "vector_dimension_probe_count": dimension_probe_count,
             "retired_vector_stack_count": len(retired_stacks),
             "owner_task_names": sorted(owner_names),
@@ -5454,9 +5542,18 @@ class MemoryEngine:
         index_delete_closed = await self._close_vector_index_delete_repairs(
             timeout_sec=timeout_sec,
         )
+        repair_tasks_settled = await self._settle_vector_index_delete_repair_tasks(
+            timeout_sec=timeout_sec,
+        )
         await self._flush_index_delete_repair_persistence()
         await self._cleanup_index_delete_repairs()
-        if not closed or not retired_closed or not overflow_closed or not index_delete_closed:
+        if (
+            not closed
+            or not retired_closed
+            or not overflow_closed
+            or not index_delete_closed
+            or not repair_tasks_settled
+        ):
             self._vector_state = "degraded"
             self._is_ready = False
             self._vector_close_state = "pending"

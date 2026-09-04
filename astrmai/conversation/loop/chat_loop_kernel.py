@@ -36,6 +36,7 @@ class ChatLoopKernel:
     HEARTBEAT_DUE_HORIZON_SECONDS = 2.0
     HEARTBEAT_MAX_BATCH = 32
     FAST_RECHECK_SECONDS = 5.0
+    BUSY_BACKOFF_SECONDS = (5.0, 15.0, 30.0, 60.0)
     WAIT_RECHECK_SECONDS = 20.0
     POST_DIALOGUE_RECHECK_SECONDS = 15.0
     MAINTENANCE_RECHECK_SECONDS = 120.0
@@ -1954,7 +1955,19 @@ class ChatLoopKernel:
             return
 
         if action == "SKIP_BUSY":
-            decision.next_tick_delay = self.FAST_RECHECK_SECONDS
+            if state.busy_since <= 0.0:
+                state.busy_since = now
+            if state.last_decision == "SKIP_BUSY":
+                state.busy_backoff_level = min(
+                    len(self.BUSY_BACKOFF_SECONDS) - 1,
+                    int(state.busy_backoff_level or 0) + 1,
+                )
+            else:
+                state.busy_backoff_level = 0
+            decision.next_tick_delay = self.BUSY_BACKOFF_SECONDS[state.busy_backoff_level]
+            decision.metadata["busy_backoff_level"] = int(state.busy_backoff_level)
+            decision.metadata["busy_skip_count"] = int(state.busy_skip_count or 0) + 1
+            decision.metadata["busy_duration_sec"] = max(0.0, now - state.busy_since)
             decision.metadata["scheduler_bucket"] = "fast_recheck"
             decision.metadata["schedule_reason"] = "executor_busy"
             return
@@ -2068,6 +2081,14 @@ class ChatLoopKernel:
             pass  # ponytail: don't reset fairness counter on non-heartbeat message ingress
         state.next_tick_at = now + float(decision.next_tick_delay or 0.0) if decision.next_tick_delay > 0 else 0.0
         state.retry_backoff_until = 0.0
+        if decision.action == "SKIP_BUSY":
+            state.busy_skip_count = int(state.busy_skip_count or 0) + 1
+        else:
+            state.busy_since = 0.0
+            state.busy_backoff_level = 0
+            state.busy_skip_count = 0
+            state.busy_last_log_at = 0.0
+            state.busy_log_suppressed = 0
         self._write_base_pending_signals(state, decision)
         state.phase = self._derive_phase(decision)
 
@@ -2231,26 +2252,47 @@ class ChatLoopKernel:
         dispatch_result: Any,
         pre_state_summary: dict[str, Any],
     ) -> None:
-        logger.debug(
-            "[ChatLoopKernel] tick chat=%s trigger=%s action=%s reason=%s bridge=%s pre=%s post=%s quiet=%s cooldown_blocks=%s wait_scope=%s maintenance_winner=%s skipped_lower=%s next_tick=%.1fs due=%s bucket=%s schedule_reason=%s signals=%s",
-            state.chat_id,
-            snapshot.trigger_type,
-            decision.action,
-            decision.reason,
-            decision.metadata.get("dispatch_bridge", ""),
-            pre_state_summary,
-            self._summarize_state(state),
-            decision.metadata.get("quiet_active", False),
-            decision.metadata.get("cooldown_blocks", []),
-            decision.metadata.get("wait_scope", ""),
-            decision.metadata.get("maintenance_priority_winner", ""),
-            decision.metadata.get("skipped_lower_priority_actions", []),
-            float(decision.next_tick_delay or 0.0),
-            decision.metadata.get("due_for_heartbeat", False),
-            decision.metadata.get("scheduler_bucket", ""),
-            decision.metadata.get("schedule_reason", ""),
-            decision.metadata.get("signals_summary", {}),
-        )
+        if decision.action == "SKIP_BUSY":
+            now = time.time()
+            should_log = (
+                state.busy_skip_count <= 1
+                or now - float(state.busy_last_log_at or 0.0) >= 60.0
+            )
+            if should_log:
+                logger.debug(
+                    "[ChatLoopKernel] busy chat=%s pending=%s skips=%s duration=%.1fs backoff=%.1fs suppressed=%s",
+                    state.chat_id,
+                    snapshot.executor_pending,
+                    state.busy_skip_count,
+                    max(0.0, now - float(state.busy_since or now)),
+                    float(decision.next_tick_delay or 0.0),
+                    state.busy_log_suppressed,
+                )
+                state.busy_last_log_at = now
+                state.busy_log_suppressed = 0
+            else:
+                state.busy_log_suppressed = int(state.busy_log_suppressed or 0) + 1
+        else:
+            logger.debug(
+                "[ChatLoopKernel] tick chat=%s trigger=%s action=%s reason=%s bridge=%s pre=%s post=%s quiet=%s cooldown_blocks=%s wait_scope=%s maintenance_winner=%s skipped_lower=%s next_tick=%.1fs due=%s bucket=%s schedule_reason=%s signals=%s",
+                state.chat_id,
+                snapshot.trigger_type,
+                decision.action,
+                decision.reason,
+                decision.metadata.get("dispatch_bridge", ""),
+                pre_state_summary,
+                self._summarize_state(state),
+                decision.metadata.get("quiet_active", False),
+                decision.metadata.get("cooldown_blocks", []),
+                decision.metadata.get("wait_scope", ""),
+                decision.metadata.get("maintenance_priority_winner", ""),
+                decision.metadata.get("skipped_lower_priority_actions", []),
+                float(decision.next_tick_delay or 0.0),
+                decision.metadata.get("due_for_heartbeat", False),
+                decision.metadata.get("scheduler_bucket", ""),
+                decision.metadata.get("schedule_reason", ""),
+                decision.metadata.get("signals_summary", {}),
+            )
         self._emit_tick_observability(state, snapshot, decision, dispatch_result, pre_state_summary)
 
     def _emit_due_selection_observability(self, report: dict[str, Any]) -> None:
@@ -2478,6 +2520,10 @@ class ChatLoopKernel:
             "consecutive_selected_count": int(state.consecutive_selected_count or 0),
             "last_maintenance_selected_at": float(state.last_maintenance_selected_at or 0.0),
             "retry_backoff_until": float(state.retry_backoff_until or 0.0),
+            "busy_since": float(state.busy_since or 0.0),
+            "busy_backoff_level": int(state.busy_backoff_level or 0),
+            "busy_skip_count": int(state.busy_skip_count or 0),
+            "busy_log_suppressed": int(state.busy_log_suppressed or 0),
             "missed_due_passes": int(state.missed_due_passes or 0),
             "forced_promotion_count": int(state.forced_promotion_count or 0),
             "last_forced_promotion_at": float(state.last_forced_promotion_at or 0.0),

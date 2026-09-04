@@ -1650,6 +1650,12 @@ class MemoryIndexProjector:
                 db_path=self._documents_db_path(),
             )
         except Exception as exc:
+            # A fresh docs.db is a valid pre-vector state.  Faiss owns the
+            # documents table and creates it when a configured candidate is
+            # initialized, so only this explicit SQLite condition is an empty
+            # projection; every other query failure remains degraded.
+            if "no such table: documents" in str(exc).lower():
+                return []
             logger.warning(f"[MemoryIndexProjector] consistency scan degraded: {exc}")
             raise
         result: list[tuple[int, str]] = []

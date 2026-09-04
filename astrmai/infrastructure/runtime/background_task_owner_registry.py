@@ -114,17 +114,52 @@ class BackgroundTaskOwnerRegistry:
         name: str = "",
     ) -> asyncio.Task[Any]:
         """Create and register a task in one operation."""
+        normalized_family = self._normalize(task_family, "unknown")
+        normalized_scope = self._normalize(scope_id, "GLOBAL")
+        normalized_run = str(run_id or "").strip()
+        if normalized_run:
+            for record in self._records.values():
+                if (
+                    record.task_family == normalized_family
+                    and record.scope_id == normalized_scope
+                    and record.run_id == normalized_run
+                    and record.task is not None
+                    and not record.task.done()
+                ):
+                    # A commit/run id is the idempotency key for post-send and
+                    # other durable background consumers.  Reuse the original
+                    # task instead of creating a duplicate side effect.
+                    close = getattr(awaitable, "close", None)
+                    if callable(close):
+                        close()
+                    return record.task
         task = asyncio.create_task(awaitable, name=name or None)
-        self.register(
-            task,
-            task_family=task_family,
-            scope_id=scope_id,
-            run_id=run_id,
-            owner=owner,
-            generation=generation,
-            cancel_status=cancel_status,
-        )
+        try:
+            self.register(
+                task,
+                task_family=normalized_family,
+                scope_id=normalized_scope,
+                run_id=normalized_run,
+                owner=owner,
+                generation=generation,
+                cancel_status=cancel_status,
+            )
+        except BaseException:
+            # Registration failure must not leave a task that can execute the
+            # side effect outside lifecycle accounting.
+            task.cancel()
+            task.add_done_callback(self._consume_untracked_task)
+            raise
         return task
+
+    @staticmethod
+    def _consume_untracked_task(task: asyncio.Task[Any]) -> None:
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except BaseException:
+            return
 
     def register(
         self,

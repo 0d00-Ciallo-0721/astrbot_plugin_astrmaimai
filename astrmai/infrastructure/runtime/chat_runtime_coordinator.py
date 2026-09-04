@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -36,12 +37,41 @@ class ActivityRecord:
 
 
 @dataclass
+class ExecutorLease:
+    """Traceable ownership of one executor slot.
+
+    The lease, rather than the legacy integer counter, is the settlement
+    authority.  ``executor_pending`` remains a compatibility projection.
+    """
+
+    token: str
+    chat_id: str
+    thread_id: str = ""
+    turn_id: str = ""
+    generation: int = 0
+    owner_task: asyncio.Task | None = None
+    queued_at: float = field(default_factory=time.monotonic)
+    acquired_at: float = 0.0
+    state: str = "queued"
+    lock: asyncio.Lock | None = None
+
+    @property
+    def acquired(self) -> bool:
+        return self.state == "acquired"
+
+    def locked(self) -> bool:
+        """Compatibility probe for legacy lock consumers."""
+        return bool(self.lock is not None and self.lock.locked())
+
+
+@dataclass
 class ChatRuntimeState:
     sys2_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     sys2_thread_locks: Dict[str, asyncio.Lock] = field(default_factory=dict)
     executor_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     executor_thread_locks: Dict[str, asyncio.Lock] = field(default_factory=dict)
     executor_pending: int = 0
+    executor_leases: Dict[str, ExecutorLease] = field(default_factory=dict)
     wait_targets: List[str] = field(default_factory=list)
     wait_target_name: str = ""
     latest_activity_ts: float = 0.0
@@ -119,15 +149,18 @@ class ChatRuntimeCoordinator:
         chat_id: str,
         max_pending: int = 2,
         thread_id: str = "",
-    ) -> Optional[asyncio.Lock]:
+        turn_id: str = "",
+        generation: int = 0,
+    ) -> Optional[ExecutorLease]:
+        normalized_chat_id = str(chat_id or "").strip()
+        normalized_thread_id = str(thread_id or "").strip()
+        lease: ExecutorLease
         async with self._lock:
             if self._shutdown:
                 return None
-            state = self._states.setdefault(chat_id, ChatRuntimeState())
-            if state.executor_pending >= max_pending:
+            state = self._states.setdefault(normalized_chat_id, ChatRuntimeState())
+            if len(state.executor_leases) >= max_pending:
                 return None
-            state.executor_pending += 1
-            normalized_thread_id = str(thread_id or "").strip()
             if normalized_thread_id:
                 if (
                     normalized_thread_id not in state.executor_thread_locks
@@ -149,31 +182,131 @@ class ChatRuntimeCoordinator:
                 )
             else:
                 executor_lock = state.executor_lock
+            lease = ExecutorLease(
+                token=uuid.uuid4().hex,
+                chat_id=normalized_chat_id,
+                thread_id=normalized_thread_id,
+                turn_id=str(turn_id or "").strip(),
+                generation=int(generation or 0),
+                owner_task=asyncio.current_task(),
+                lock=executor_lock,
+            )
+            state.executor_leases[lease.token] = lease
+            state.executor_pending = len(state.executor_leases)
         try:
             await executor_lock.acquire()
-        except asyncio.CancelledError:
-            # ponytail: decrement on cancel to prevent permanent blockage
+            # Mark the local handle before the next await.  If cancellation
+            # lands while reacquiring the coordinator mutex, release can still
+            # distinguish an owned lock from a queued lease.
+            lease.state = "acquired"
+            lease.acquired_at = time.monotonic()
             async with self._lock:
-                if chat_id in self._states:
-                    self._states[chat_id].executor_pending = max(0, self._states[chat_id].executor_pending - 1)
-            raise
-        return executor_lock
-
-    async def release_executor(self, chat_id: str, thread_id: str = "") -> None:
-        executor_lock: Optional[asyncio.Lock] = None
-        async with self._lock:
-            state = self._states.get(chat_id)
-            if not state:
-                return
-            state.executor_pending = max(0, state.executor_pending - 1)
-            normalized_thread_id = str(thread_id or "").strip()
-            executor_lock = (
-                state.executor_thread_locks.get(normalized_thread_id)
-                if normalized_thread_id
-                else state.executor_lock
+                current = self._states.get(normalized_chat_id)
+                current_lease = current.executor_leases.get(lease.token) if current else None
+                if current_lease is None or current_lease.state == "released":
+                    # A concurrent reconciliation settled this owner while it
+                    # was waiting; do not hand out a stale lock.
+                    if executor_lock.locked():
+                        executor_lock.release()
+                    return None
+                current_lease.state = "acquired"
+                current_lease.acquired_at = float(lease.acquired_at or time.monotonic())
+                current_lease.owner_task = asyncio.current_task()
+                current.executor_pending = len(current.executor_leases)
+        except asyncio.CancelledError:
+            # Settlement runs independently of the cancelled acquire task so
+            # the queued lease cannot remain in executor_pending.
+            settlement = asyncio.create_task(
+                self.release_executor(normalized_chat_id, lease=lease)
             )
-        if executor_lock is not None and executor_lock.locked():
-            executor_lock.release()
+            def _consume_settlement(task: asyncio.Task) -> None:
+                if task.cancelled():
+                    return
+                try:
+                    task.exception()
+                except Exception:
+                    return
+            settlement.add_done_callback(_consume_settlement)
+            try:
+                await asyncio.shield(settlement)
+            except asyncio.CancelledError:
+                # A second cancellation must not cancel the settlement task.
+                pass
+            raise
+        return lease
+
+    async def release_executor(
+        self,
+        chat_id: str,
+        thread_id: str = "",
+        *,
+        lease: ExecutorLease | str | None = None,
+        generation: int | None = None,
+        turn_id: str = "",
+    ) -> bool:
+        executor_lease: ExecutorLease | None = None
+        normalized_chat_id = str(chat_id or "").strip()
+        async with self._lock:
+            state = self._states.get(normalized_chat_id)
+            if not state:
+                return False
+            token = lease.token if isinstance(lease, ExecutorLease) else str(lease or "").strip()
+            if token:
+                executor_lease = state.executor_leases.get(token)
+            else:
+                normalized_thread_id = str(thread_id or "").strip()
+                candidates = [
+                    item for item in state.executor_leases.values()
+                    if (not normalized_thread_id or item.thread_id == normalized_thread_id)
+                ]
+                if candidates:
+                    executor_lease = min(candidates, key=lambda item: item.queued_at)
+            if executor_lease is None:
+                return False
+            if generation is not None and int(generation or 0) != int(executor_lease.generation or 0):
+                return False
+            if turn_id and str(turn_id) != str(executor_lease.turn_id):
+                return False
+            was_acquired = executor_lease.acquired
+            state.executor_leases.pop(executor_lease.token, None)
+            executor_lease.state = "released"
+            executor_lease.owner_task = None
+            state.executor_pending = len(state.executor_leases)
+            normalized_thread_id = str(thread_id or "").strip()
+            executor_lock = executor_lease.lock or (
+                state.executor_thread_locks.get(normalized_thread_id)
+                if normalized_thread_id else state.executor_lock
+            )
+            if was_acquired and executor_lock is not None and executor_lock.locked():
+                executor_lock.release()
+            return True
+
+    async def reconcile_executor_leases(self, chat_id: str | None = None) -> int:
+        """Settle leases whose owner task has ended without running finally."""
+        settled = 0
+        async with self._lock:
+            states = (
+                {str(chat_id or "").strip(): self._states.get(str(chat_id or "").strip())}
+                if chat_id is not None else dict(self._states)
+            )
+            for state in states.values():
+                if state is None:
+                    continue
+                for item in list(state.executor_leases.values()):
+                    owner = item.owner_task
+                    if owner is not None and not owner.done():
+                        continue
+                    was_acquired = item.acquired
+                    state.executor_leases.pop(item.token, None)
+                    item.state = "reconciled"
+                    item.owner_task = None
+                    if was_acquired and item.lock is not None and item.lock.locked():
+                        item.lock.release()
+                    settled += 1
+                state.executor_pending = len(state.executor_leases)
+        if settled:
+            await self.record_concurrency_event("executor_lease_reconciled", settled)
+        return settled
 
     async def update_wait_targets(self, chat_id: str, targets: List[str], target_name: str = "") -> None:
         async with self._lock:
@@ -492,6 +625,9 @@ class ChatRuntimeCoordinator:
             state = self._states.get(chat_id)
             if not state:
                 return {}
+            now_monotonic = time.monotonic()
+            lease_items = list(state.executor_leases.values())
+            oldest_lease = min(lease_items, key=lambda item: item.queued_at, default=None)
             activity_times = [float(item or 0.0) for item in state.activity_times if float(item or 0.0) > 0.0]
             recent_60s = [item for item in activity_times if now - item <= 60.0]
             recent_5m = [item for item in activity_times if now - item <= 300.0]
@@ -507,7 +643,35 @@ class ChatRuntimeCoordinator:
                 "activity_record_count": len(state.activity_records),
                 "recent_activity_count_60s": len(recent_60s),
                 "recent_activity_count": len(recent_5m),
-                "executor_pending": int(state.executor_pending or 0),
+                "executor_pending": len(state.executor_leases),
+                "executor_lease_count": len(lease_items),
+                "oldest_executor_lease_age_ms": (
+                    round(max(0.0, now_monotonic - oldest_lease.queued_at) * 1000.0, 1)
+                    if oldest_lease is not None else 0.0
+                ),
+                "executor_lease_owners": sorted({
+                    str(item.owner_task.get_name())
+                    for item in lease_items
+                    if item.owner_task is not None and hasattr(item.owner_task, "get_name")
+                }),
+                "executor_leases": [
+                    {
+                        "token": item.token,
+                        "thread_id": item.thread_id,
+                        "turn_id": item.turn_id,
+                        "generation": item.generation,
+                        "state": item.state,
+                        "queued_at": float(item.queued_at),
+                        "acquired_at": float(item.acquired_at or 0.0),
+                        "owner_task": (
+                            item.owner_task.get_name()
+                            if item.owner_task is not None and hasattr(item.owner_task, "get_name")
+                            else ""
+                        ),
+                        "owner_done": bool(item.owner_task.done()) if item.owner_task is not None else True,
+                    }
+                    for item in state.executor_leases.values()
+                ],
                 "wait_targets": state.wait_targets[:],
                 "turn_generations": dict(state.turn_generations),
                 "active_turn_task_count": len(state.active_turn_tasks),
@@ -529,7 +693,7 @@ class ChatRuntimeCoordinator:
         async with self._lock:
             current_state = self._states.get(chat_id)
             if current_state is state and state is not None:
-                if not state.active_turn_tasks and not self._state_has_locked_locks(state):
+                if not state.active_turn_tasks and not state.executor_leases and not self._state_has_locked_locks(state):
                     self._states.pop(chat_id, None)
         return state is not None
 
@@ -545,8 +709,6 @@ class ChatRuntimeCoordinator:
                 for task in state.active_turn_tasks.values()
                 if task is not current_task and not task.done()
             ]
-            self._states.clear()
-            self._active_turn_tasks.clear()
         for task in tasks:
             task.cancel()
         if tasks:
@@ -558,6 +720,28 @@ class ChatRuntimeCoordinator:
                     pass
             for task in pending:
                 task.add_done_callback(self._consume_shutdown_task)
+        # Keep states visible while late owners settle; this avoids hiding a
+        # stale pending lease behind shutdown.  Explicit reopen starts a fresh
+        # coordinator generation and clears them.
+        async with self._lock:
+            for state in self._states.values():
+                for thread_id, task in list(state.active_turn_tasks.items()):
+                    if task.done():
+                        state.active_turn_tasks.pop(thread_id, None)
+                        self._active_turn_tasks.discard(task)
+        await self.reconcile_executor_leases()
+        async with self._lock:
+            removable = [
+                chat_id
+                for chat_id, state in self._states.items()
+                if not state.active_turn_tasks
+                and not state.executor_leases
+                and not self._state_has_locked_locks(state)
+            ]
+            for chat_id in removable:
+                self._states.pop(chat_id, None)
+            if not self._states:
+                self._active_turn_tasks.clear()
         return len(tasks)
 
     @staticmethod
@@ -581,7 +765,7 @@ class ChatRuntimeCoordinator:
                 if (
                     now - state.latest_activity_ts > max_idle_sec
                     and not state.active_turn_tasks
-                    and not state.executor_pending
+                    and not state.executor_leases
                     and not self._state_has_locked_locks(state)
                 )
             ]

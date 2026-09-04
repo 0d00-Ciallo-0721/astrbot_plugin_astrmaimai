@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from tests.helpers import install_astrbot_stubs
 
@@ -59,6 +60,66 @@ class PersistenceRegressionsMigratedTests(unittest.TestCase):
             cols = [row[1] for row in conn.execute("PRAGMA table_info(memoryevent)").fetchall()]
 
         self.assertIn("session_id", cols)
+
+    def test_schema_readiness_waits_for_delayed_async_initialization(self):
+        async def _run():
+            release = asyncio.Event()
+            original_init = self.persistence_mod.PersistenceManager._init_db
+
+            async def _delayed_init(manager):
+                await release.wait()
+                await original_init(manager)
+
+            with patch.object(self.persistence_mod.PersistenceManager, "_init_db", _delayed_init):
+                manager = self.persistence_mod.PersistenceManager()
+                self.managers.append(manager)
+                waiter = asyncio.create_task(manager.wait_until_ready())
+                await asyncio.sleep(0)
+                self.assertFalse(waiter.done())
+
+                release.set()
+                await waiter
+
+            with sqlite3.connect(manager.db_path) as conn:
+                tables = {
+                    row[0]
+                    for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                }
+            self.assertIn("memory_turn_checkpoint", tables)
+            self.assertIn("background_task_ledger", tables)
+
+        asyncio.run(_run())
+
+    def test_schema_readiness_propagates_async_initialization_failure(self):
+        async def _run():
+            async def _failing_init(_manager):
+                raise sqlite3.OperationalError("forced schema failure")
+
+            with patch.object(self.persistence_mod.PersistenceManager, "_init_db", _failing_init):
+                manager = self.persistence_mod.PersistenceManager()
+                self.managers.append(manager)
+                with self.assertRaisesRegex(RuntimeError, "persistence schema initialization failed") as ctx:
+                    await manager.wait_until_ready()
+
+            self.assertIsInstance(ctx.exception.__cause__, sqlite3.OperationalError)
+            self.assertIn("forced schema failure", str(ctx.exception.__cause__))
+
+        asyncio.run(_run())
+
+    def test_schema_readiness_propagates_sync_initialization_failure(self):
+        schema_mod = importlib.import_module(
+            "astrmai.infrastructure.persistence.persistence_schema"
+        )
+        with patch.object(
+            schema_mod,
+            "_run_migrations",
+            side_effect=sqlite3.OperationalError("forced sync schema failure"),
+        ):
+            with self.assertRaisesRegex(
+                sqlite3.OperationalError,
+                "forced sync schema failure",
+            ):
+                self.persistence_mod.PersistenceManager()
 
     def test_reload_datamodels_does_not_duplicate_indexes_on_create_all(self):
         datamodels_mod = importlib.import_module("astrmai.infrastructure.persistence.orm_models")

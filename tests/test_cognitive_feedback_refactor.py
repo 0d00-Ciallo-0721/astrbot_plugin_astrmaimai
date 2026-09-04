@@ -948,6 +948,275 @@ class CognitiveFeedbackRefactorTests(unittest.TestCase):
         self.assertEqual(memory.recent_calls, ["chat-a", "chat-b", "chat-a"])
         self.assertEqual([call["session_id"] for call in memory.memory_calls], ["chat-b", "chat-a"])
 
+    def test_diary_batches_active_chats_and_persists_checkpoint(self):
+        class _Persistence:
+            def __init__(self):
+                self.checkpoints = {}
+
+            def load_persona_cache(self):
+                return {}
+
+            async def load_diary_checkpoint_async(self, date):
+                return self.checkpoints.get(date, {})
+
+            async def save_diary_checkpoint_async(self, date, checkpoint):
+                self.checkpoints[date] = dict(checkpoint)
+
+        class _Memory:
+            def __init__(self):
+                self.memory_calls = []
+
+            async def get_recent_memories(self, _chat_id, hours=24):
+                return []
+
+            async def add_memory(self, **kwargs):
+                self.memory_calls.append(kwargs["session_id"])
+
+        async def _call_lane(*_args, **_kwargs):
+            return "summary"
+
+        persistence = _Persistence()
+        memory = _Memory()
+        service = self.diary_mod.DiaryService(
+            persistence=persistence,
+            memory_engine=memory,
+            config=SimpleNamespace(persona=SimpleNamespace(persona_id="global")),
+            call_background_lane=_call_lane,
+            semaphore=asyncio.Semaphore(1),
+            prompt_registry=SimpleNamespace(
+                render_template=lambda *_args, **_kwargs: SimpleNamespace(prompt="diary", system_prompt="system")
+            ),
+        )
+        states = [SimpleNamespace(chat_id="chat-a"), SimpleNamespace(chat_id="chat-b")]
+
+        first = asyncio.run(service.run_once(states, diary_date="2026-07-15", max_chats=1))
+        second = asyncio.run(service.run_once(states, diary_date="2026-07-15", max_chats=1))
+
+        self.assertEqual(first["succeeded"], 1)
+        self.assertEqual(first["deferred_chat_ids"], ["chat-b"])
+        self.assertEqual(second["succeeded"], 1)
+        self.assertEqual(memory.memory_calls, ["chat-a", "chat-b"])
+        self.assertEqual(persistence.checkpoints["2026-07-15"]["completed_chat_ids"], ["chat-a", "chat-b"])
+
+    def test_diary_checkpoint_uses_production_sqlite_persistence(self):
+        persistence_mod = importlib.import_module(
+            "astrmai.infrastructure.persistence.persistence_schema"
+        )
+
+        class _Persistence(persistence_mod.PersistenceSchemaMixin):
+            def __init__(self, db_path):
+                self.db_path = db_path
+
+        db_path = self.temp_dir.name + "/diary-checkpoint.db"
+        persistence = _Persistence(db_path)
+        checkpoint = {
+            "date": "2026-07-16",
+            "completed_chat_ids": ["chat-a"],
+            "cursor": 1,
+        }
+
+        self.assertTrue(asyncio.run(persistence.save_diary_checkpoint_async("2026-07-16", checkpoint)))
+        restored = asyncio.run(persistence.load_diary_checkpoint_async("2026-07-16"))
+        self.assertEqual(restored, checkpoint)
+
+        restarted = _Persistence(db_path)
+        self.assertEqual(restarted.load_diary_checkpoint("2026-07-16"), checkpoint)
+
+    def test_diary_per_chat_timeout_is_deferred_and_can_resume(self):
+        class _Memory:
+            async def get_recent_memories(self, _chat_id, hours=24):
+                return []
+
+            async def add_memory(self, **_kwargs):
+                return None
+
+        calls = []
+
+        async def _call_lane(_kind, chat_id, *_args, **_kwargs):
+            calls.append(chat_id)
+            await asyncio.sleep(0.2)
+            return "summary"
+
+        service = self.diary_mod.DiaryService(
+            persistence=SimpleNamespace(load_persona_cache=lambda: {}),
+            memory_engine=_Memory(),
+            config=SimpleNamespace(persona=SimpleNamespace(persona_id="global")),
+            call_background_lane=_call_lane,
+            semaphore=asyncio.Semaphore(1),
+            prompt_registry=SimpleNamespace(
+                render_template=lambda *_args, **_kwargs: SimpleNamespace(prompt="diary", system_prompt="system")
+            ),
+        )
+        states = [SimpleNamespace(chat_id="chat-timeout")]
+
+        deferred = asyncio.run(
+            service.run_once(states, diary_date="2026-07-17", per_chat_timeout_sec=0.1)
+        )
+        self.assertEqual(deferred["succeeded"], 0)
+        self.assertEqual(deferred["deferred_chat_ids"], ["chat-timeout"])
+
+        async def _fast_lane(_kind, _chat_id, *_args, **_kwargs):
+            return "summary"
+
+        service._call_background_lane = _fast_lane
+        resumed = asyncio.run(service.run_once(states, diary_date="2026-07-17"))
+        self.assertEqual(resumed["succeeded"], 1)
+        self.assertEqual(calls, ["chat-timeout"])
+
+    def test_diary_checkpoint_false_keeps_chat_deferred(self):
+        class _Persistence:
+            def load_persona_cache(self):
+                return {}
+
+            async def save_diary_checkpoint_async(self, _date, _checkpoint):
+                return False
+
+        class _Memory:
+            async def get_recent_memories(self, _chat_id, hours=24):
+                return []
+
+            async def add_memory(self, **_kwargs):
+                return None
+
+        async def _call_lane(*_args, **_kwargs):
+            return "summary"
+
+        service = self.diary_mod.DiaryService(
+            persistence=_Persistence(),
+            memory_engine=_Memory(),
+            config=SimpleNamespace(persona=SimpleNamespace(persona_id="global")),
+            call_background_lane=_call_lane,
+            semaphore=asyncio.Semaphore(1),
+            prompt_registry=SimpleNamespace(
+                render_template=lambda *_args, **_kwargs: SimpleNamespace(prompt="diary", system_prompt="system")
+            ),
+        )
+        result = asyncio.run(service.run_once([SimpleNamespace(chat_id="chat-fail")], diary_date="2026-07-18"))
+        self.assertEqual(result["succeeded"], 0)
+        self.assertEqual(result["succeeded_in_memory"], 1)
+        self.assertEqual(result["checkpoint_persist_failed"], 1)
+        self.assertEqual(result["deferred_chat_ids"], ["chat-fail"])
+
+    def test_diary_checkpoint_exception_keeps_chat_deferred(self):
+        class _Persistence:
+            def load_persona_cache(self):
+                return {}
+
+            async def save_diary_checkpoint_async(self, _date, _checkpoint):
+                raise OSError("database unavailable")
+
+        class _Memory:
+            async def get_recent_memories(self, _chat_id, hours=24):
+                return []
+
+            async def add_memory(self, **_kwargs):
+                return None
+
+        async def _call_lane(*_args, **_kwargs):
+            return "summary"
+
+        service = self.diary_mod.DiaryService(
+            persistence=_Persistence(),
+            memory_engine=_Memory(),
+            config=SimpleNamespace(persona=SimpleNamespace(persona_id="global")),
+            call_background_lane=_call_lane,
+            semaphore=asyncio.Semaphore(1),
+            prompt_registry=SimpleNamespace(
+                render_template=lambda *_args, **_kwargs: SimpleNamespace(prompt="diary", system_prompt="system")
+            ),
+        )
+        result = asyncio.run(service.run_once([SimpleNamespace(chat_id="chat-error")], diary_date="2026-07-19"))
+        self.assertEqual(result["succeeded"], 0)
+        self.assertEqual(result["checkpoint_persist_failed"], 1)
+        self.assertEqual(result["deferred_chat_ids"], ["chat-error"])
+
+    def test_diary_checkpoint_load_failure_pauses_batch(self):
+        class _Persistence:
+            def load_persona_cache(self):
+                return {}
+
+            async def load_diary_checkpoint_async(self, _date):
+                raise OSError("database unavailable")
+
+        calls = []
+
+        async def _call_lane(*_args, **_kwargs):
+            calls.append(True)
+            return "summary"
+
+        service = self.diary_mod.DiaryService(
+            persistence=_Persistence(),
+            memory_engine=SimpleNamespace(),
+            config=SimpleNamespace(persona=SimpleNamespace(persona_id="global")),
+            call_background_lane=_call_lane,
+            semaphore=asyncio.Semaphore(1),
+            prompt_registry=SimpleNamespace(
+                render_template=lambda *_args, **_kwargs: SimpleNamespace(prompt="diary", system_prompt="system")
+            ),
+        )
+        result = asyncio.run(
+            service.run_once(
+                [SimpleNamespace(chat_id="chat-1"), SimpleNamespace(chat_id="chat-2")],
+                diary_date="2026-07-21",
+            )
+        )
+        self.assertTrue(result["checkpoint_load_failed"])
+        self.assertEqual(result["diagnostics_status"], "degraded")
+        self.assertEqual(result["deferred_chat_ids"], ["chat-1", "chat-2"])
+        self.assertEqual(calls, [])
+
+    def test_diary_checkpoint_cursor_controls_resume_order(self):
+        class _Persistence:
+            def __init__(self):
+                self.checkpoint = {
+                    "completed_chat_ids": [],
+                    "cursor": 2,
+                }
+                self.saved = []
+
+            def load_persona_cache(self):
+                return {}
+
+            async def load_diary_checkpoint_async(self, _date):
+                return dict(self.checkpoint)
+
+            async def save_diary_checkpoint_async(self, _date, checkpoint):
+                self.checkpoint = dict(checkpoint)
+                self.saved.append(dict(checkpoint))
+                return True
+
+        class _Memory:
+            def __init__(self):
+                self.calls = []
+
+            async def get_recent_memories(self, chat_id, hours=24):
+                self.calls.append(chat_id)
+                return []
+
+            async def add_memory(self, **_kwargs):
+                return None
+
+        async def _call_lane(*_args, **_kwargs):
+            return "summary"
+
+        persistence = _Persistence()
+        memory = _Memory()
+        service = self.diary_mod.DiaryService(
+            persistence=persistence,
+            memory_engine=memory,
+            config=SimpleNamespace(persona=SimpleNamespace(persona_id="global")),
+            call_background_lane=_call_lane,
+            semaphore=asyncio.Semaphore(1),
+            prompt_registry=SimpleNamespace(
+                render_template=lambda *_args, **_kwargs: SimpleNamespace(prompt="diary", system_prompt="system")
+            ),
+        )
+        states = [SimpleNamespace(chat_id=f"chat-{index}") for index in range(4)]
+        result = asyncio.run(service.run_once(states, diary_date="2026-07-20", max_chats=2))
+        self.assertEqual(result["succeeded"], 2)
+        self.assertEqual(memory.calls, ["chat-2", "chat-3"])
+        self.assertEqual(persistence.checkpoint["cursor"], 0)
+
     def test_dream_retry_resumes_failed_stage_without_regeneration(self):
         class _Memory:
             def __init__(self):

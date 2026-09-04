@@ -140,6 +140,70 @@ class RefactoredReplyServiceTests(unittest.TestCase):
         )
         self.assertTrue(all(stage["status"] == "success" for stage in stages))
 
+    def test_committed_reply_releases_post_send_to_tracked_owner(self):
+        class _OwnerRegistry:
+            generation = 4
+
+            def __init__(self):
+                self.tasks = []
+
+            def track(self, awaitable, **_kwargs):
+                task = asyncio.create_task(awaitable)
+                self.tasks.append(task)
+                return task
+
+        async def _slow_post_send(*_args, **_kwargs):
+            await asyncio.sleep(0.05)
+
+        async def _run():
+            registry = _OwnerRegistry()
+            service = self.reply_mod.ReplyService(
+                state_engine=FakeStateEngine(),
+                mood_manager=SimpleNamespace(),
+                owner_registry=registry,
+            )
+            service._settle_post_send = _slow_post_send
+            event = FakeEvent("user-1", "Alice", "hello")
+            artifact = await service.handle_reply(event, "visible", event.unified_msg_origin)
+            self.assertTrue(artifact.sent)
+            self.assertEqual(len(registry.tasks), 1)
+            self.assertFalse(registry.tasks[0].done())
+            await registry.tasks[0]
+
+        asyncio.run(_run())
+
+    def test_post_send_registration_failure_runs_single_fallback_with_diagnostic(self):
+        class _OwnerRegistry:
+            generation = 1
+
+            def track(self, _awaitable, **_kwargs):
+                raise RuntimeError("owner registry unavailable")
+
+        async def _run():
+            registry = _OwnerRegistry()
+            service = self.reply_mod.ReplyService(
+                state_engine=FakeStateEngine(),
+                mood_manager=SimpleNamespace(),
+                owner_registry=registry,
+            )
+            calls = []
+
+            async def _post_send(*_args, **_kwargs):
+                calls.append(True)
+
+            service._settle_post_send = _post_send
+            event = FakeEvent("user-1", "Alice", "hello")
+            artifact = await service.handle_reply(event, "visible", event.unified_msg_origin)
+            self.assertTrue(artifact.sent)
+            self.assertEqual(calls, [True])
+            self.assertTrue(event.get_extra("astrmai_post_send_track_failed"))
+            self.assertEqual(
+                event.get_extra("astrmai_post_send_track_error_type"),
+                "RuntimeError",
+            )
+
+        asyncio.run(_run())
+
     def test_completed_reply_blocks_later_fallback_send(self):
         service = self._service()
         service._settle_post_send = _noop_post_send

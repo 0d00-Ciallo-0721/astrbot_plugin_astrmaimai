@@ -5,8 +5,17 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from astrmai.infrastructure.persistence.architecture_migration_audit import (
+    LATEST_ARCHITECTURE_SCHEMA_VERSION,
+)
 
 
 REQUIRED_FILES = (
@@ -48,7 +57,9 @@ def build_release_report(root: Path) -> dict[str, Any]:
         "required_files_tracked": not missing,
         "missing_required_files": missing,
         "forbidden_tracked_data": forbidden,
-        "rollback_pair": "old_code+old_data or new_code+v128_data",
+        "rollback_pair": (
+            f"old_code+old_data or new_code+v{LATEST_ARCHITECTURE_SCHEMA_VERSION}_data"
+        ),
         "release_ready": not status and not missing and not forbidden,
     }
 

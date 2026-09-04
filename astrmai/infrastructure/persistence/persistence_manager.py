@@ -21,6 +21,8 @@ class PersistenceManager(
     RelationshipLedgerPersistenceMixin,
 ):
     """Persistence manager for refactored local storage."""
+    _schema_init_failures_are_fatal = True
+
     def __init__(self):
         try:
             from astrbot.core.utils.astrbot_path import get_astrbot_data_path

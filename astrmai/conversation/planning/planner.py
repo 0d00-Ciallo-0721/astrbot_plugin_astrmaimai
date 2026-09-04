@@ -183,6 +183,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             runtime_coordinator=runtime_coordinator,
             visual_cortex=visual_cortex,
             image_resolver=image_resolver,
+            owner_registry=owner_registry,
         )
 
     def refresh_config(self, config) -> None:

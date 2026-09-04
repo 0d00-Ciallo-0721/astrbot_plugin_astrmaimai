@@ -195,6 +195,7 @@ class ProactiveTask:
             call_background_lane=self._call_background_lane,
             semaphore=self._bg_semaphore,
             prompt_registry=self.prompt_registry,
+            background_task_budget=self.background_task_budget,
         )
         self.dream_scheduler = DreamScheduler(
             context=context,
@@ -1570,7 +1571,10 @@ class ProactiveTask:
                 diary_date=diary_date,
             )
             report = dict(report or {})
-            if int(report.get("failed", 0) or 0) == 0:
+            if (
+                int(report.get("failed", 0) or 0) == 0
+                and not list(report.get("deferred_chat_ids", []) or [])
+            ):
                 self._last_diary_date = diary_date
         finally:
             if self._diary_pending_date == diary_date:

@@ -24,6 +24,24 @@ DEFAULT_ITEMS = (
 CLONE_MARKER = ".astrmai_clone"
 
 
+class ArchiveApplyError(RuntimeError):
+    """Archive apply failed and its compensating rollback also failed."""
+
+    def __init__(
+        self,
+        original_error: Exception,
+        rollback_error: Exception,
+        partial_result: dict[str, Any],
+    ) -> None:
+        super().__init__(
+            f"archive apply failed ({type(original_error).__name__}: {original_error}) "
+            f"and rollback failed ({type(rollback_error).__name__}: {rollback_error})"
+        )
+        self.original_error = original_error
+        self.rollback_error = rollback_error
+        self.partial_result = partial_result
+
+
 def _assert_clone(root: Path) -> Path:
     resolved = root.resolve()
     normalized = str(resolved).lower().replace("/", "\\")
@@ -109,6 +127,21 @@ def apply_archive_plan(plan: dict[str, Any]) -> dict[str, Any]:
             if destination.exists():
                 if _sha256(destination) != str(item["sha256"]):
                     raise ValueError(f"archive destination hash mismatch: {destination}")
+                # The destination is already verified byte-for-byte. Remove
+                # the duplicate from the live scan tree so preflight cannot
+                # rediscover it as an unknown index. This is reversible via
+                # rollback_archive_plan using the archived copy.
+                if source.is_dir():
+                    shutil.rmtree(str(source))
+                else:
+                    source.unlink()
+                moved.append(
+                    {
+                        **item,
+                        "deduplicated_source": True,
+                        "applied_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
                 continue
             shutil.move(str(source), str(destination))
             moved.append({**item, "applied_at": datetime.now(timezone.utc).isoformat()})
@@ -118,8 +151,12 @@ def apply_archive_plan(plan: dict[str, Any]) -> dict[str, Any]:
             "items": moved,
         }
         manifest.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    except Exception:
-        rollback_archive_plan({"root": str(root), "moved": moved})
+    except Exception as apply_exc:
+        partial_result = {**plan, "root": str(root), "moved": list(moved)}
+        try:
+            rollback_archive_plan(partial_result)
+        except Exception as rollback_exc:
+            raise ArchiveApplyError(apply_exc, rollback_exc, partial_result) from rollback_exc
         raise
     return {**plan, "moved": moved, "manifest": str(manifest)}
 
@@ -140,7 +177,13 @@ def rollback_archive_plan(result: dict[str, Any]) -> list[str]:
         if _sha256(destination) != str(item["sha256"]):
             raise ValueError(f"cannot rollback archive; hash changed: {destination}")
         source.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(destination), str(source))
+        if item.get("deduplicated_source"):
+            if destination.is_dir():
+                shutil.copytree(str(destination), str(source))
+            else:
+                shutil.copy2(str(destination), str(source))
+        else:
+            shutil.move(str(destination), str(source))
         restored.append(str(item["source"]))
     return restored
 

@@ -22,6 +22,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from astrmai.memory.services.vector_migration_decision import decide_vector_migration
+from astrmai.infrastructure.persistence.architecture_migration_audit import (
+    LATEST_ARCHITECTURE_SCHEMA_VERSION,
+)
 
 
 def _sha256(path: Path) -> str:
@@ -252,8 +255,10 @@ def build_report(
         if item.get("integrity_check") not in (None, "ok"):
             report["blocking_reasons"].append(f"sqlite_integrity:{item['path']}")
         if item.get("path", "").endswith("astrmai.db") and "backups" not in item.get("path", ""):
-            if int(item.get("user_version", 0) or 0) < 128:
-                report["blocking_reasons"].append("main_schema_requires_migration:95_to_128")
+            if int(item.get("user_version", 0) or 0) < LATEST_ARCHITECTURE_SCHEMA_VERSION:
+                report["blocking_reasons"].append(
+                    f"main_schema_requires_migration:to_v{LATEST_ARCHITECTURE_SCHEMA_VERSION}"
+                )
     if report.get("manifest"):
         manifest = report["manifest"]
         if not manifest.get("api_base_fingerprint"):
@@ -298,7 +303,7 @@ def build_report(
         "sensitive_or_probe_files": [item["path"] for item in report["cache"] if str(item["path"]).endswith(("gemini_probe.py", ".key", ".pem"))],
     }
     report["migration_plan"] = {
-        "main_database": "v95_to_v128" if any("main_schema_requires_migration" in item for item in report["blocking_reasons"]) else "no_op",
+        "main_database": f"upgrade_to_v{LATEST_ARCHITECTURE_SCHEMA_VERSION}" if any("main_schema_requires_migration" in item for item in report["blocking_reasons"]) else "no_op",
         "memory_v2": "initialize_or_verify_schema_v2",
         "vector_identity": "rebuild_new_generation_or_lexical_fallback" if report["vector_summary"]["identity_status"] == "unknown" else "verify_and_decide",
     }
@@ -306,7 +311,9 @@ def build_report(
         "preserve_source_snapshot": True,
         "preserve_legacy_indexes": True,
         "preserve_pre_migration_databases": True,
-        "rollback_pair": "old_code+v95_data or new_code+v128_data",
+        "rollback_pair": (
+            f"old_code+legacy_data or new_code+v{LATEST_ARCHITECTURE_SCHEMA_VERSION}_data"
+        ),
     }
     return report
 

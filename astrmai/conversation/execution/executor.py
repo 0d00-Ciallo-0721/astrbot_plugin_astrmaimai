@@ -255,6 +255,7 @@ class ConcurrentExecutor:
         runtime_coordinator=None,
         visual_cortex=None,
         image_resolver=None,
+        owner_registry=None,
     ):
         self.context = context
         self.gateway = gateway
@@ -262,6 +263,7 @@ class ConcurrentExecutor:
         self.evolution_manager = evolution_manager
         self.config = config if config else gateway.config
         self.runtime_coordinator = runtime_coordinator
+        self.owner_registry = owner_registry
         self.visual_cortex = visual_cortex
         self.image_resolver = image_resolver
         self.reread_action_dispatcher = None
@@ -269,6 +271,7 @@ class ConcurrentExecutor:
         self._chat_thread_locks = {}
         self._chat_pending_count = {}
         self._global_lock = asyncio.Lock()
+        self._executor_release_tasks: set[asyncio.Task] = set()
         self._native_vision_breakers: dict[str, float] = {}
 
     @staticmethod
@@ -1008,22 +1011,104 @@ class ConcurrentExecutor:
             or ""
         ).strip()
 
+    @staticmethod
+    def _coordinator_accepts(method, parameter: str) -> bool:
+        """Inspect compatibility signatures without masking call failures."""
+        try:
+            signature = inspect.signature(method)
+        except (TypeError, ValueError):
+            return False
+        return parameter in signature.parameters or any(
+            item.kind is inspect.Parameter.VAR_KEYWORD
+            for item in signature.parameters.values()
+        )
+
+    async def _settle_executor_release(self, release_coro, *, metadata: dict[str, Any] | None = None) -> None:
+        """Keep lease settlement alive if the enclosing turn is cancelled."""
+        task = asyncio.create_task(release_coro)
+        release_tasks = getattr(self, "_executor_release_tasks", None)
+        if not isinstance(release_tasks, set):
+            release_tasks = set()
+            self._executor_release_tasks = release_tasks
+        release_tasks.add(task)
+        def _finish(completed: asyncio.Task) -> None:
+            release_tasks.discard(completed)
+            if completed.cancelled():
+                return
+            try:
+                error = completed.exception()
+            except BaseException as exc:
+                error = exc
+            if error is not None:
+                details = dict(metadata or {})
+                logger.error(
+                    "[Executor] executor release settlement failed: %s metadata=%s",
+                    error,
+                    details,
+                )
+                event = details.pop("event", None)
+                if event is not None and hasattr(event, "set_extra"):
+                    try:
+                        event.set_extra("astrmai_executor_release_failed", True)
+                        event.set_extra("astrmai_executor_release_error_type", type(error).__name__)
+                    except Exception:
+                        pass
+        task.add_done_callback(_finish)
+        registry = getattr(self, "owner_registry", None)
+        register = getattr(registry, "register", None)
+        if callable(register):
+            details = dict(metadata or {})
+            event = details.pop("event", None)
+            try:
+                register(
+                    task,
+                    task_family="executor.release",
+                    scope_id=str(details.get("chat_id", "") or "GLOBAL"),
+                    run_id=str(details.get("lease_token", "") or f"release-{id(task)}"),
+                    owner="ConcurrentExecutor",
+                    generation=int(details.get("generation", 0) or 0),
+                    cancel_status="cancelled",
+                )
+            except Exception as exc:
+                logger.warning("[Executor] release owner registration degraded: %s", exc)
+        await asyncio.shield(task)
+
     async def _acquire_chat_execution_lock(self, chat_id: str, event: AstrMessageEvent | None = None):
         timeout_sec = self._executor_lock_wait_timeout(event) if event is not None else 15.0
         thread_id = self._turn_thread_id(event) if event is not None else ""
+        turn = event.get_extra("astrmai_turn_identity", None) if event is not None else None
+        telemetry = event.get_extra("astrmai_turn_telemetry", None) if event is not None else None
+        turn_id = str(
+            getattr(turn, "turn_id", "")
+            or getattr(telemetry, "turn_id", "")
+            or (event.get_extra("astrmai_turn_id", "") if event is not None else "")
+            or (event.get_extra("astrmai_trace_id", "") if event is not None else "")
+            or ""
+        ).strip()
+        try:
+            generation = int(
+                getattr(turn, "generation", 0)
+                or getattr(telemetry, "generation", 0)
+                or (event.get_extra("astrmai_turn_generation", 0) if event is not None else 0)
+                or 0
+            )
+        except (TypeError, ValueError):
+            generation = 0
         using_runtime_coordinator = self.runtime_coordinator is not None
         if using_runtime_coordinator:
             if timeout_sec <= 0.0:
                 return None, True, "queue_timeout"
+            acquire_method = self.runtime_coordinator.try_acquire_executor
+            acquire_kwargs = {"max_pending": 2}
+            for key, value in (
+                ("thread_id", thread_id),
+                ("turn_id", turn_id),
+                ("generation", generation),
+            ):
+                if self._coordinator_accepts(acquire_method, key):
+                    acquire_kwargs[key] = value
             try:
-                try:
-                    acquire = self.runtime_coordinator.try_acquire_executor(
-                        chat_id,
-                        max_pending=2,
-                        thread_id=thread_id,
-                    )
-                except TypeError:
-                    acquire = self.runtime_coordinator.try_acquire_executor(chat_id, max_pending=2)
+                acquire = acquire_method(chat_id, **acquire_kwargs)
                 chat_lock = await asyncio.wait_for(acquire, timeout=max(0.1, timeout_sec))
             except asyncio.TimeoutError:
                 return None, True, "queue_timeout"
@@ -1053,6 +1138,16 @@ class ConcurrentExecutor:
                 acquired = True
             except asyncio.TimeoutError:
                 acquired = False
+            except asyncio.CancelledError:
+                async with self._global_lock:
+                    pending = max(0, self._chat_pending_count.get(chat_id, 1) - 1)
+                    if pending:
+                        self._chat_pending_count[chat_id] = pending
+                    else:
+                        self._chat_pending_count.pop(chat_id, None)
+                        self._chat_locks.pop(chat_id, None)
+                        getattr(self, "_chat_thread_locks", {}).pop(chat_id, None)
+                raise
         if not acquired:
             async with self._global_lock:
                 self._chat_pending_count[chat_id] = max(0, self._chat_pending_count.get(chat_id, 1) - 1)
@@ -1069,21 +1164,93 @@ class ConcurrentExecutor:
         chat_lock: Optional[asyncio.Lock],
         event: AstrMessageEvent | None = None,
     ) -> None:
-        if chat_lock is not None and chat_lock.locked():
-            chat_lock.release()
-        if using_runtime_coordinator:
-            thread_id = self._turn_thread_id(event) if event is not None else ""
-            try:
-                await self.runtime_coordinator.release_executor(chat_id, thread_id=thread_id)
-            except TypeError:
-                await self.runtime_coordinator.release_executor(chat_id)
-            return
-        async with self._global_lock:
-            self._chat_pending_count[chat_id] -= 1
-            if self._chat_pending_count[chat_id] == 0:
-                self._chat_locks.pop(chat_id, None)
-                getattr(self, "_chat_thread_locks", {}).pop(chat_id, None)
-                self._chat_pending_count.pop(chat_id, None)
+        async def _release() -> None:
+            if using_runtime_coordinator:
+                thread_id = self._turn_thread_id(event) if event is not None else ""
+                release_method = self.runtime_coordinator.release_executor
+                release_kwargs = {}
+                if self._coordinator_accepts(release_method, "thread_id"):
+                    release_kwargs["thread_id"] = thread_id
+                if hasattr(chat_lock, "token") and self._coordinator_accepts(release_method, "lease"):
+                    release_kwargs["lease"] = chat_lock
+                elif self._coordinator_accepts(release_method, "turn_id") and event is not None:
+                    turn = event.get_extra("astrmai_turn_identity", None)
+                    release_kwargs["turn_id"] = str(getattr(turn, "turn_id", "") or "")
+                last_error = None
+                for attempt in range(3):
+                    try:
+                        result = release_method(chat_id, **release_kwargs)
+                        if inspect.isawaitable(result):
+                            result = await result
+                        if result is not False:
+                            return
+                        # Reconciliation may have settled this exact lease
+                        # between attempts.  Preserve rejection diagnostics
+                        # when the token is still present, but treat an
+                        # observed missing token as an idempotent settlement.
+                        lease_token = str(getattr(chat_lock, "token", "") or "")
+                        snapshot_fn = getattr(self.runtime_coordinator, "get_activity_snapshot", None)
+                        if lease_token and callable(snapshot_fn):
+                            snapshot = snapshot_fn(chat_id)
+                            if inspect.isawaitable(snapshot):
+                                snapshot = await snapshot
+                            if isinstance(snapshot, dict) and "executor_leases" in snapshot:
+                                leases = snapshot["executor_leases"]
+                                valid_lease_rows = isinstance(leases, list) and all(
+                                    isinstance(item, dict)
+                                    and isinstance(item.get("token"), str)
+                                    and bool(item.get("token"))
+                                    for item in leases
+                                )
+                                if valid_lease_rows and not any(
+                                    item["token"] == lease_token for item in leases
+                                ):
+                                    return
+                        last_error = RuntimeError("coordinator rejected executor release")
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        last_error = exc
+                    if attempt < 2:
+                        await asyncio.sleep(0.05 * (2**attempt))
+                reconcile = getattr(self.runtime_coordinator, "reconcile_executor_leases", None)
+                if callable(reconcile):
+                    try:
+                        reconcile_kwargs = {}
+                        if self._coordinator_accepts(reconcile, "chat_id"):
+                            reconcile_kwargs["chat_id"] = chat_id
+                        result = reconcile(**reconcile_kwargs)
+                        if inspect.isawaitable(result):
+                            await result
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        logger.warning(
+                            "[Executor] release exhaustion reconciliation degraded for %s: %s",
+                            chat_id,
+                            exc,
+                        )
+                raise RuntimeError("executor release exhausted") from last_error
+            async with self._global_lock:
+                pending = max(0, self._chat_pending_count.get(chat_id, 1) - 1)
+                if pending:
+                    self._chat_pending_count[chat_id] = pending
+                else:
+                    self._chat_locks.pop(chat_id, None)
+                    getattr(self, "_chat_thread_locks", {}).pop(chat_id, None)
+                    self._chat_pending_count.pop(chat_id, None)
+
+        metadata = {
+            "chat_id": str(chat_id or ""),
+            "lease_token": str(getattr(chat_lock, "token", "") or ""),
+            "generation": str(
+                getattr(getattr(event, "get_extra", lambda *_: None)("astrmai_turn_identity", None), "generation", 0)
+                if event is not None
+                else 0
+            ),
+            "event": event,
+        }
+        await self._settle_executor_release(_release(), metadata=metadata)
 
     @staticmethod
     def _is_group_chat_event(event: AstrMessageEvent, chat_id: str) -> bool:

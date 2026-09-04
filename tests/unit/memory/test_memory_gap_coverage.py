@@ -306,6 +306,38 @@ class MemoryGapCoverageTests(unittest.TestCase):
         self.assertEqual(repaired["rebuilt_missing"], 1)
         self.assertEqual(len(retriever.added), 1)
 
+    def test_index_projector_treats_fresh_docs_db_as_empty_projection(self):
+        db_path = str(Path(self.temp_dir.name) / "fresh-docs.db")
+
+        class _Store:
+            async def projection_retry_snapshot_with_revisions(self):
+                return {}
+
+            async def list_projectable(self):
+                return []
+
+        async def _query(query, params=(), *, db_path=None):
+            import aiosqlite
+
+            async with aiosqlite.connect(db_path) as db:
+                cursor = await db.execute(query, params)
+                return await cursor.fetchall()
+
+        engine = SimpleNamespace(
+            db_path=db_path,
+            v2_store=_Store(),
+            _run_documents_query=_query,
+            faiss_db=None,
+            vec_retriever=None,
+        )
+        projector = self.projector_mod.MemoryIndexProjector(engine)
+
+        with self.assertNoLogs("astrmai", level="WARNING"):
+            report = asyncio.run(projector.check_consistency())
+
+        self.assertNotIn("error", report)
+        self.assertEqual(report["projection_count"], 0)
+
     def test_hybrid_retriever_ignores_bad_metadata_json_without_dropping_result(self):
         result = self.utils_mod.SearchResult(
             doc_id=1,
@@ -1748,19 +1780,143 @@ class MemoryGapCoverageTests(unittest.TestCase):
             )
             self.assertEqual(len(engine._retired_vector_overflow_stacks), 1)
             stack_id = next(iter(engine._retired_vector_overflow_stacks))
-            await asyncio.sleep(0.03)
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline and retriever.calls < 1:
+                await asyncio.sleep(0.005)
             stack = engine._overflow_stack(stack_id)
             self.assertIsNotNone(stack)
             self.assertIn(stack["status"], {"retry_wait", "closing"})
             self.assertTrue(index_path.exists())
             deadline = time.monotonic() + 1.0
-            while time.monotonic() < deadline and engine._overflow_stack(stack_id) is not None:
-                await asyncio.sleep(0.02)
+            while time.monotonic() < deadline:
+                repair = engine._vector_index_delete_repairs.get(f"{stack_id}:index-delete")
+                active_repairs = [
+                    task for task in engine._vector_index_delete_repair_tasks if not task.done()
+                ]
+                if (
+                    engine._overflow_stack(stack_id) is None
+                    and repair is not None
+                    and repair.get("status") == "deleted"
+                    and not active_repairs
+                    and not index_path.exists()
+                ):
+                    break
+                await asyncio.sleep(0.01)
             self.assertIsNone(engine._overflow_stack(stack_id))
+            repair = engine._vector_index_delete_repairs.get(f"{stack_id}:index-delete")
+            self.assertIsNotNone(repair)
+            self.assertEqual(repair["status"], "deleted")
+            self.assertFalse(
+                [task for task in engine._vector_index_delete_repair_tasks if not task.done()]
+            )
             self.assertFalse(index_path.exists())
             self.assertGreaterEqual(retriever.calls, 2)
 
         asyncio.run(run())
+
+    def test_overflow_retirement_close_waits_for_index_delete_repair_owner(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=["embedding"]),
+            memory=SimpleNamespace(recall_top_k=5),
+            timing=SimpleNamespace(
+                vector_retirement_registry_limit=1,
+                vector_retirement_overflow_registry_limit=1,
+                vector_retirement_retry_max_attempts=3,
+                vector_close_timeout_sec=0.2,
+            ),
+        )
+        engine = memory_engine_mod.MemoryEngine(
+            SimpleNamespace(), SimpleNamespace(config=config), config=config
+        )
+        engine._retired_vector_stacks["full"] = {"status": "closing"}
+        index_path = Path(self.temp_dir.name) / "overflow-close.index"
+        index_path.write_bytes(b"candidate")
+
+        class _Retriever:
+            async def close(self, **_kwargs):
+                return True
+
+        async def run():
+            stack_id = "overflow-close"
+            engine._retired_vector_overflow_stacks[stack_id] = {
+                "stack_id": stack_id,
+                "retriever": _Retriever(),
+                "faiss_db": None,
+                "index_path": str(index_path),
+                "generation": 3,
+                "delete_index": True,
+                "attempts": 0,
+                "max_attempts": 3,
+                "next_retry_at": 0.0,
+                "status": "retry_wait",
+                "created_at": time.time(),
+                "updated_at": time.time(),
+                "task": None,
+                "sync_future": None,
+            }
+            engine._record_vector_resource_descriptor(
+                index_path,
+                role="overflow",
+                generation=3,
+                resource_id=stack_id,
+                resource_status="retry_wait",
+            )
+            engine._retired_vector_stacks.clear()
+            engine.begin_shutdown()
+
+            self.assertTrue(await engine.close_background_resources())
+            self.assertIsNone(engine._overflow_stack(stack_id))
+            self.assertFalse(index_path.exists())
+            repair = engine._vector_index_delete_repairs[f"{stack_id}:index-delete"]
+            self.assertEqual(repair["status"], "deleted")
+            self.assertFalse(
+                [
+                    task
+                    for task in engine._vector_index_delete_repair_tasks
+                    if not task.done()
+                ]
+            )
+            diagnostics = engine.describe_shutdown_owners()
+            self.assertEqual(diagnostics["vector_index_delete_repair_task_count"], 0)
+
+        asyncio.run(run())
+
+    def test_overflow_finalize_registers_repair_before_removing_stack(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=["embedding"]),
+            memory=SimpleNamespace(recall_top_k=5),
+            timing=SimpleNamespace(vector_retirement_retry_max_attempts=2),
+        )
+        engine = memory_engine_mod.MemoryEngine(
+            SimpleNamespace(), SimpleNamespace(config=config), config=config
+        )
+        index_path = Path(self.temp_dir.name) / "overflow-order.index"
+        index_path.write_bytes(b"candidate")
+        stack_id = "overflow-order"
+        stack = {
+            "stack_id": stack_id,
+            "retriever": None,
+            "faiss_db": None,
+            "index_path": str(index_path),
+            "generation": 4,
+            "delete_index": True,
+            "status": "closing",
+        }
+        engine._retired_vector_overflow_stacks[stack_id] = stack
+        observed = {}
+        original = engine._schedule_vector_index_delete_repair
+
+        def _schedule(path, *, stack_id, generation=None):
+            observed["stack_present_during_registration"] = engine._overflow_stack(stack_id) is stack
+            return original(path, stack_id=stack_id, generation=generation)
+
+        engine._schedule_vector_index_delete_repair = _schedule
+        engine._finalize_overflow_vector_stack(stack_id)
+        self.assertTrue(observed["stack_present_during_registration"])
+        self.assertIsNone(engine._overflow_stack(stack_id))
+        self.assertIn(f"{stack_id}:index-delete", engine._vector_index_delete_repairs)
 
     def test_overflow_retirement_exception_keeps_reference_and_exhausts(self):
         memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")

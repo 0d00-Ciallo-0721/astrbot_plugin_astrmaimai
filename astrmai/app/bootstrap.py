@@ -409,6 +409,7 @@ class PluginBootstrap:
                 owner_registry=getattr(runtime, "owner_registry", None),
             ),
             qq_action_store=QQActionLedgerStore(runtime.db_service.db_path),
+            owner_registry=getattr(runtime, "owner_registry", None),
         )
         persona_summarizer = PersonaSummarizer(
             runtime.persistence,

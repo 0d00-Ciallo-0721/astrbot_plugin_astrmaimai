@@ -70,6 +70,7 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
         reply_commit_service=None,
         post_reply_feedback_coordinator=None,
         qq_action_store=None,
+        owner_registry=None,
     ):
         self.state_engine = state_engine
         self.mood_manager = mood_manager
@@ -84,6 +85,8 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
             else ReplyCommitService()
         )
         self.post_reply_feedback_coordinator = post_reply_feedback_coordinator
+        self.owner_registry = owner_registry
+        self._post_send_tasks: set[asyncio.Task] = set()
         self.group_reread_observer = None
         self.qq_action_dispatcher = QQActionDispatcher(
             config=self.config,
@@ -389,7 +392,7 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
             commit_result.repair_scheduled
         )
 
-        await self._settle_post_send(
+        post_send_coro = self._settle_post_send(
             event,
             chat_id,
             bypassed_tag=(
@@ -400,6 +403,47 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
             anchor_event=anchor_event,
             reply_text=artifact.visible_text,
         )
+        registry = getattr(self, "owner_registry", None)
+        track = getattr(registry, "track", None)
+        if callable(track):
+            try:
+                post_send_task = track(
+                    post_send_coro,
+                    task_family="reply.post_send",
+                    scope_id=chat_id,
+                    run_id=str(committed_turn.commit_id),
+                    owner="ReplyService",
+                    generation=getattr(registry, "generation", 0),
+                    cancel_status="cancelled",
+                    name="astrmai:reply:post-send",
+                )
+                self._post_send_tasks.add(post_send_task)
+                post_send_task.add_done_callback(self._post_send_tasks.discard)
+            except Exception as exc:
+                try:
+                    event.set_extra("astrmai_post_send_track_failed", True)
+                    event.set_extra("astrmai_post_send_track_error_type", type(exc).__name__)
+                except Exception:
+                    pass
+                logger.warning(
+                    "[ReplyService] post-send owner registration degraded for %s: %s",
+                    chat_id,
+                    exc,
+                )
+                post_send_coro.close()
+                await self._settle_post_send(
+                    event,
+                    chat_id,
+                    bypassed_tag=(
+                        bypassed_tag
+                        or event.get_extra("astrmai_bypass_mood_analysis", None)
+                    ),
+                    window_events=window_events,
+                    anchor_event=anchor_event,
+                    reply_text=artifact.visible_text,
+                )
+        else:
+            await post_send_coro
         artifact.metadata.setdefault("send_status", "sent")
         return artifact
 

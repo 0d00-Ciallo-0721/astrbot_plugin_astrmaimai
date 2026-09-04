@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
+import time
 
 import aiosqlite
 from astrbot.api import logger
@@ -427,6 +429,11 @@ _MIGRATIONS: list[tuple[int, str]] = [
         revision INTEGER NOT NULL DEFAULT 0
     )"""),
     (128, "CREATE INDEX IF NOT EXISTS ix_memory_consistency_repairs_due ON memory_consistency_repairs(status, next_retry_at, lease_until)"),
+    (129, """CREATE TABLE IF NOT EXISTS diary_checkpoints (
+        diary_date TEXT PRIMARY KEY,
+        checkpoint_json TEXT NOT NULL DEFAULT '{}',
+        updated_at REAL NOT NULL DEFAULT 0
+    )"""),
 ]
 
 
@@ -666,6 +673,7 @@ def _dedupe_sqlmodel_metadata_indexes() -> None:
 class PersistenceSchemaMixin:
     # ponytail: lazy init ready event, avoids MRO issues with mixins
     _init_ready_event: asyncio.Event | None = None
+    _schema_init_failures_are_fatal = False
 
     @property
     def _init_ready(self) -> asyncio.Event:
@@ -702,6 +710,7 @@ class PersistenceSchemaMixin:
             await self._apply_schema_patch_async(db, statement, scope=scope)
 
     def _schedule_init_db(self):
+        self._init_error = None
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -720,14 +729,23 @@ class PersistenceSchemaMixin:
         if task.cancelled():
             self._init_error = asyncio.CancelledError()
             logger.warning("[AstrMai-DB] async init task cancelled")
+            self._init_ready.set()
             return
         exc = task.exception()
         if exc is not None:
             self._init_error = exc
             logger.error(f"[AstrMai-DB] async init failed: {exc}", exc_info=(type(exc), exc, exc.__traceback__))
+            self._init_ready.set()
             return
         self._init_error = None
         self._init_ready.set()
+
+    async def wait_until_ready(self) -> None:
+        """Wait for the complete schema initialization and propagate failures."""
+        await self._init_ready.wait()
+        error = getattr(self, "_init_error", None)
+        if error is not None:
+            raise RuntimeError("persistence schema initialization failed") from error
 
     def _init_db_sync(self):
         try:
@@ -823,6 +841,13 @@ class PersistenceSchemaMixin:
                 """)
                 _run_migrations(db)
                 db.execute("""
+                    CREATE TABLE IF NOT EXISTS diary_checkpoints (
+                        diary_date TEXT PRIMARY KEY,
+                        checkpoint_json TEXT NOT NULL DEFAULT '{}',
+                        updated_at REAL NOT NULL DEFAULT 0
+                    )
+                """)
+                db.execute("""
                     CREATE TABLE IF NOT EXISTS cronsnapshot (
                         job_id      TEXT PRIMARY KEY,
                         name        TEXT DEFAULT '',
@@ -860,6 +885,134 @@ class PersistenceSchemaMixin:
                 db.commit()
         except Exception as e:
             logger.error(f"[AstrMai-Infra] init db failed: {e}")
+            if self._schema_init_failures_are_fatal:
+                raise
+
+    # ==========================================
+    # Diary checkpoint I/O
+    # ==========================================
+
+    @staticmethod
+    def _decode_diary_checkpoint(raw: object) -> dict:
+        if isinstance(raw, dict):
+            return dict(raw)
+        try:
+            value = json.loads(str(raw or "{}"))
+        except (TypeError, ValueError):
+            return {}
+        return dict(value) if isinstance(value, dict) else {}
+
+    def _ensure_diary_checkpoint_table_sync(self, db) -> None:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS diary_checkpoints (
+                diary_date TEXT PRIMARY KEY,
+                checkpoint_json TEXT NOT NULL DEFAULT '{}',
+                updated_at REAL NOT NULL DEFAULT 0
+            )
+        """)
+
+    async def _ensure_diary_checkpoint_table_async(self, db) -> None:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS diary_checkpoints (
+                diary_date TEXT PRIMARY KEY,
+                checkpoint_json TEXT NOT NULL DEFAULT '{}',
+                updated_at REAL NOT NULL DEFAULT 0
+            )
+        """)
+
+    def load_diary_checkpoint(self, diary_date: str) -> dict:
+        date_key = str(diary_date or "").strip()
+        if not date_key:
+            return {}
+        self._diary_checkpoint_load_failed = False
+        try:
+            with connect_sqlite(self.db_path) as db:
+                self._ensure_diary_checkpoint_table_sync(db)
+                row = db.execute(
+                    "SELECT checkpoint_json FROM diary_checkpoints WHERE diary_date = ?",
+                    (date_key,),
+                ).fetchone()
+                db.commit()
+        except Exception as exc:
+            self._diary_checkpoint_load_failed = True
+            logger.warning("[AstrMai-DB] diary checkpoint load degraded: %s", exc)
+            return {}
+        return self._decode_diary_checkpoint(row[0] if row else "{}")
+
+    async def load_diary_checkpoint_async(self, diary_date: str) -> dict:
+        date_key = str(diary_date or "").strip()
+        if not date_key:
+            return {}
+        self._diary_checkpoint_load_failed = False
+        try:
+            async with connect_aiosqlite(self.db_path) as db:
+                await self._ensure_diary_checkpoint_table_async(db)
+                cursor = await db.execute(
+                    "SELECT checkpoint_json FROM diary_checkpoints WHERE diary_date = ?",
+                    (date_key,),
+                )
+                row = await cursor.fetchone()
+                await cursor.close()
+                await db.commit()
+        except Exception as exc:
+            self._diary_checkpoint_load_failed = True
+            logger.warning("[AstrMai-DB] diary checkpoint async load degraded: %s", exc)
+            return {}
+        return self._decode_diary_checkpoint(row[0] if row else "{}")
+
+    def save_diary_checkpoint(self, diary_date: str, checkpoint: dict) -> bool:
+        date_key = str(diary_date or "").strip()
+        if not date_key:
+            return False
+        try:
+            payload = json.dumps(dict(checkpoint or {}), ensure_ascii=False, sort_keys=True)
+            with connect_sqlite(self.db_path) as db:
+                self._ensure_diary_checkpoint_table_sync(db)
+                db.execute(
+                    """
+                    INSERT INTO diary_checkpoints(diary_date, checkpoint_json, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(diary_date) DO UPDATE SET
+                        checkpoint_json = excluded.checkpoint_json,
+                        updated_at = excluded.updated_at
+                    """,
+                    (date_key, payload, time.time()),
+                )
+                db.commit()
+            return True
+        except (TypeError, ValueError) as exc:
+            logger.warning("[AstrMai-DB] diary checkpoint is not JSON-safe: %s", exc)
+            return False
+        except Exception as exc:
+            logger.warning("[AstrMai-DB] diary checkpoint save degraded: %s", exc)
+            return False
+
+    async def save_diary_checkpoint_async(self, diary_date: str, checkpoint: dict) -> bool:
+        date_key = str(diary_date or "").strip()
+        if not date_key:
+            return False
+        try:
+            payload = json.dumps(dict(checkpoint or {}), ensure_ascii=False, sort_keys=True)
+            async with connect_aiosqlite(self.db_path) as db:
+                await self._ensure_diary_checkpoint_table_async(db)
+                await db.execute(
+                    """
+                    INSERT INTO diary_checkpoints(diary_date, checkpoint_json, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(diary_date) DO UPDATE SET
+                        checkpoint_json = excluded.checkpoint_json,
+                        updated_at = excluded.updated_at
+                    """,
+                    (date_key, payload, time.time()),
+                )
+                await db.commit()
+            return True
+        except (TypeError, ValueError) as exc:
+            logger.warning("[AstrMai-DB] diary checkpoint is not JSON-safe: %s", exc)
+            return False
+        except Exception as exc:
+            logger.warning("[AstrMai-DB] diary checkpoint async save degraded: %s", exc)
+            return False
 
     # ==========================================
     # Cache I/O (Persona Summarizer)
@@ -959,6 +1112,13 @@ class PersistenceSchemaMixin:
                     )
                 """)
                 await _run_migrations_async(db)
+                await db.execute("""
+                    CREATE TABLE IF NOT EXISTS diary_checkpoints (
+                        diary_date TEXT PRIMARY KEY,
+                        checkpoint_json TEXT NOT NULL DEFAULT '{}',
+                        updated_at REAL NOT NULL DEFAULT 0
+                    )
+                """)
                 await db.execute("""
                     CREATE TABLE IF NOT EXISTS cronsnapshot (
                         job_id      TEXT PRIMARY KEY,

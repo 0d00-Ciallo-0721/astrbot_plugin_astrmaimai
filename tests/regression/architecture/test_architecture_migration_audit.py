@@ -205,6 +205,43 @@ def test_async_v122_creates_qq_action_ledger(tmp_path):
     assert "transport_idempotency_key" in columns
 
 
+def test_v129_creates_diary_checkpoints_from_v128(tmp_path):
+    path = tmp_path / "astrmai-v128.db"
+    with sqlite3.connect(path) as db:
+        db.execute("PRAGMA user_version = 128")
+        _run_migrations(db)
+        table = db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='diary_checkpoints'"
+        ).fetchone()
+        version = int(db.execute("PRAGMA user_version").fetchone()[0])
+
+    assert table == (1,)
+    assert version == 129
+
+
+def test_async_v129_creates_diary_checkpoints_from_v128(tmp_path):
+    path = tmp_path / "astrmai-v128-async.db"
+
+    async def run():
+        async with aiosqlite.connect(path) as db:
+            await db.execute("PRAGMA user_version = 128")
+            await _run_migrations_async(db)
+            await db.commit()
+            cursor = await db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='diary_checkpoints'"
+            )
+            table = await cursor.fetchone()
+            await cursor.close()
+            cursor = await db.execute("PRAGMA user_version")
+            row = await cursor.fetchone()
+            await cursor.close()
+            return table, int(row[0] if row else 0)
+
+    table, version = asyncio.run(run())
+    assert table == (1,)
+    assert version == 129
+
+
 def test_migration_audit_is_repeatable_and_never_repairs_unknown_actor(tmp_path):
     path = tmp_path / "astrmai.db"
     with sqlite3.connect(path) as db:

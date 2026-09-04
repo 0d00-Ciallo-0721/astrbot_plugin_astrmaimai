@@ -107,6 +107,76 @@ class PluginLifecycleShutdownRegressionTests(unittest.TestCase):
         self.assertIn("memory_pipeline.begin_shutdown", calls)
         self.assertFalse(runtime.status.accepting_events)
 
+    def test_startup_waits_for_persistence_schema_before_memory_consumers(self):
+        async def _run():
+            from astrmai.app.lifecycle import PluginLifecycleManager
+
+            calls = []
+            release = asyncio.Event()
+            runtime = self._build_runtime(calls)
+            runtime.status.lifecycle_state = "initializing"
+
+            async def wait_until_ready():
+                calls.append("schema.wait")
+                await release.wait()
+                calls.append("schema.ready")
+
+            runtime.core.persistence = SimpleNamespace(wait_until_ready=wait_until_ready)
+            manager = PluginLifecycleManager(runtime)
+            manager._await_runtime_reload_fence = lambda: asyncio.sleep(0, result=True)
+            manager._restore_dialogue_snapshot = lambda: asyncio.sleep(0, result=calls.append("dialogue.restore"))
+
+            async def initialize_memory():
+                calls.append("memory.initialize")
+                manager._shutdown_requested = True
+
+            manager.initialize_memory = initialize_memory
+            startup = asyncio.create_task(manager._complete_startup())
+            for _ in range(3):
+                await asyncio.sleep(0)
+                if calls:
+                    break
+
+            self.assertEqual(calls, ["schema.wait"])
+            release.set()
+            await startup
+            self.assertEqual(
+                calls,
+                ["schema.wait", "schema.ready", "dialogue.restore", "memory.initialize"],
+            )
+
+        asyncio.run(_run())
+
+    def test_schema_initialization_failure_blocks_startup(self):
+        async def _run():
+            from astrmai.app.lifecycle import PluginLifecycleManager
+
+            calls = []
+            runtime = self._build_runtime(calls)
+            runtime.status.lifecycle_state = "initializing"
+            runtime.status.accepting_events = True
+
+            async def wait_until_ready():
+                raise RuntimeError("forced readiness failure")
+
+            runtime.core.persistence = SimpleNamespace(wait_until_ready=wait_until_ready)
+            manager = PluginLifecycleManager(runtime)
+            manager._await_runtime_reload_fence = lambda: asyncio.sleep(0, result=True)
+            manager._restore_dialogue_snapshot = lambda: asyncio.sleep(0, result=calls.append("dialogue.restore"))
+            manager.initialize_memory = lambda: asyncio.sleep(0, result=calls.append("memory.initialize"))
+
+            await manager._complete_startup()
+
+            self.assertEqual(calls, [])
+            self.assertEqual(runtime.status.startup_blocked_reason, "schema_initialization_failed")
+            self.assertFalse(runtime.status.accepting_events)
+            self.assertFalse(runtime.status.is_running)
+            self.assertFalse(runtime.status.lifecycle_started)
+            self.assertEqual(runtime.status.lifecycle_state, "failed")
+            self.assertIn("persistence.schema", runtime.status.degraded_components)
+
+        asyncio.run(_run())
+
     def test_shutdown_stage_task_is_registered_with_terminal_status(self):
         async def _run():
             from astrmai.app.lifecycle import PluginLifecycleManager
@@ -168,6 +238,137 @@ class PluginLifecycleShutdownRegressionTests(unittest.TestCase):
         self.assertEqual(report["remaining_by_kind"]["memory.vector_close_owner"], 1)
         self.assertEqual(report["remaining_by_category_total"], report["remaining_total"])
         self.assertIn("vector-close-owner", report["owner_task_names"])
+
+    def test_shutdown_waits_for_executor_release_before_generic_owner_cancel(self):
+        from astrmai.app.lifecycle import PluginLifecycleManager
+        from astrmai.infrastructure.runtime.background_task_owner_registry import (
+            BackgroundTaskOwnerRegistry,
+        )
+
+        async def _run():
+            registry = BackgroundTaskOwnerRegistry()
+            released = asyncio.Event()
+
+            async def _release():
+                await asyncio.sleep(0)
+                released.set()
+
+            registry.track(
+                _release(),
+                task_family="executor.release",
+                scope_id="chat-shutdown",
+                run_id="lease-shutdown",
+            )
+            reconciled = []
+
+            class _Coordinator:
+                async def reconcile_executor_leases(self):
+                    reconciled.append(True)
+
+            manager = PluginLifecycleManager.__new__(PluginLifecycleManager)
+            manager.runtime = SimpleNamespace(
+                owner_registry=registry,
+                runtime_coordinator=_Coordinator(),
+                system2_planner=None,
+            )
+            pending = await manager._wait_executor_release_tasks(timeout_sec=1.0)
+            self.assertEqual(pending, 0)
+            self.assertTrue(released.is_set())
+            self.assertEqual(reconciled, [True])
+
+        asyncio.run(_run())
+
+    def test_shutdown_pending_report_includes_active_owner_registry_task(self):
+        async def _run():
+            from astrmai.app.lifecycle import PluginLifecycleManager
+
+            runtime = self._build_runtime([])
+            task = runtime.owner_registry.track(
+                asyncio.Event().wait(),
+                task_family="executor.release",
+                scope_id="chat-1",
+                run_id="lease-1",
+                name="executor-release-chat-1",
+            )
+            manager = PluginLifecycleManager(runtime)
+            report = manager._shutdown_pending_report(None)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            return report
+
+        report = asyncio.run(_run())
+        self.assertEqual(report["owner_registry_active_count"], 1)
+        self.assertEqual(report["remaining_by_kind"]["executor.release"], 1)
+        self.assertIn("executor-release-chat-1", report["owner_task_names"])
+
+    def test_late_cleanup_watcher_is_not_counted_as_owner_registry_pending(self):
+        async def _run():
+            from astrmai.app.lifecycle import PluginLifecycleManager
+
+            runtime = self._build_runtime([])
+            manager = PluginLifecycleManager(runtime)
+            manager._late_shutdown_cleanup_task = asyncio.current_task()
+            runtime.owner_registry.register(
+                asyncio.current_task(),
+                task_family="shutdown.late_cleanup",
+                scope_id="GLOBAL",
+            )
+            return manager._shutdown_pending_report(None)
+
+        report = asyncio.run(_run())
+        self.assertEqual(report["owner_registry_active_count"], 0)
+
+    def test_owner_registry_task_disappears_from_pending_report_after_completion(self):
+        async def _run():
+            from astrmai.app.lifecycle import PluginLifecycleManager
+
+            runtime = self._build_runtime([])
+            release = asyncio.Event()
+            task = runtime.owner_registry.track(
+                release.wait(),
+                task_family="executor.release",
+                scope_id="chat-2",
+                name="executor-release-chat-2",
+            )
+            manager = PluginLifecycleManager(runtime)
+            before = manager._shutdown_pending_report(None)
+            release.set()
+            await task
+            await asyncio.sleep(0)
+            after = manager._shutdown_pending_report(None)
+            return before, after
+
+        before, after = asyncio.run(_run())
+        self.assertEqual(before["remaining_by_kind"]["executor.release"], 1)
+        self.assertNotIn("executor.release", after["remaining_by_kind"])
+        self.assertNotIn("executor-release-chat-2", after["owner_task_names"])
+
+    def test_executor_release_timeout_keeps_shutdown_completion_blocked(self):
+        async def _run():
+            from astrmai.app.lifecycle import PluginLifecycleManager
+
+            runtime = self._build_runtime([])
+            task = runtime.owner_registry.track(
+                asyncio.Event().wait(),
+                task_family="executor.release",
+                scope_id="chat-timeout",
+                name="executor-release-timeout",
+            )
+            manager = PluginLifecycleManager(runtime)
+            pending_count = await manager._wait_executor_release_tasks(timeout_sec=0.0)
+            report = manager._shutdown_pending_report(None)
+            completed = manager._transition_shutdown_complete(
+                pending_report=report,
+                reason="test",
+            )
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            return pending_count, report, completed
+
+        pending_count, report, completed = asyncio.run(_run())
+        self.assertEqual(pending_count, 1)
+        self.assertEqual(report["remaining_by_kind"]["executor.release"], 1)
+        self.assertFalse(completed)
 
     def test_legacy_vector_owner_snapshot_without_registry_lock_fails_closed(self):
         from astrmai.app.lifecycle import PluginLifecycleManager
@@ -771,6 +972,160 @@ class PluginLifecycleShutdownRegressionTests(unittest.TestCase):
             self.assertEqual(status.persona_completed_shards, 1)
 
         asyncio.run(_run())
+
+    def test_persona_startup_without_configured_models_skips_llm_and_degrades(self):
+        async def _run():
+            from astrmai.app.lifecycle import PluginLifecycleManager
+            from astrmai.app.runtime_context import RuntimeStatus
+
+            status = RuntimeStatus()
+
+            class _Summarizer:
+                REQUIRED_SHARDS = ()
+                pending_tasks = {}
+
+                @staticmethod
+                def _cache_key(persona_id, _session_id):
+                    return persona_id or "global"
+
+                async def ensure_core_ready(self, *_args, **_kwargs):
+                    raise AssertionError("startup must not invoke persona LLM without configured models")
+
+            runtime = SimpleNamespace(
+                background_tasks=set(),
+                lifecycle=SimpleNamespace(manager=None),
+                status=status,
+                config=SimpleNamespace(
+                    provider=SimpleNamespace(task_models=[], fallback_models=[]),
+                    persona=SimpleNamespace(),
+                ),
+                context_engine=SimpleNamespace(resolve_active_persona=lambda: ("persona", "raw prompt")),
+                persona_summarizer=_Summarizer(),
+                set_boot_phase=status.set_phase,
+                mark_degraded=status.mark_degraded,
+            )
+            manager = PluginLifecycleManager(runtime)
+
+            ready = await manager._initialize_persona_core_until_ready()
+            return ready, status
+
+        ready, status = asyncio.run(_run())
+        self.assertTrue(ready)
+        self.assertEqual(status.persona_state, "provider_unconfigured")
+        self.assertFalse(status.persona_persisted)
+        self.assertEqual(status.startup_blocked_reason, "")
+        self.assertIn("persona.core", status.degraded_components)
+
+    def test_persona_startup_with_unregistered_models_skips_llm(self):
+        async def _run():
+            from astrmai.app.lifecycle import PluginLifecycleManager
+            from astrmai.app.runtime_context import RuntimeStatus
+
+            status = RuntimeStatus()
+
+            class _Summarizer:
+                REQUIRED_SHARDS = ()
+                pending_tasks = {}
+
+                @staticmethod
+                def _cache_key(persona_id, _session_id):
+                    return persona_id or "global"
+
+                async def ensure_core_ready(self, *_args, **_kwargs):
+                    raise AssertionError("unregistered providers must not receive startup LLM calls")
+
+            class _ProviderManager:
+                @staticmethod
+                def get_provider_by_id(_model_id):
+                    return None
+
+            runtime = SimpleNamespace(
+                background_tasks=set(),
+                lifecycle=SimpleNamespace(manager=None),
+                status=status,
+                config=SimpleNamespace(
+                    provider=SimpleNamespace(task_models=["missing/model"], fallback_models=[]),
+                    persona=SimpleNamespace(),
+                ),
+                context=SimpleNamespace(provider_manager=_ProviderManager()),
+                context_engine=SimpleNamespace(resolve_active_persona=lambda: ("persona", "raw prompt")),
+                persona_summarizer=_Summarizer(),
+                set_boot_phase=status.set_phase,
+                mark_degraded=status.mark_degraded,
+            )
+            manager = PluginLifecycleManager(runtime)
+
+            ready = await manager._initialize_persona_core_until_ready()
+            return ready, status
+
+        ready, status = asyncio.run(_run())
+        self.assertTrue(ready)
+        self.assertEqual(status.persona_state, "provider_unavailable")
+        self.assertIn("provider_unavailable", status.persona_last_error)
+
+    def test_persona_startup_fails_closed_when_provider_registry_is_unverifiable(self):
+        from astrmai.app.lifecycle import PluginLifecycleManager
+        from astrmai.app.runtime_context import RuntimeStatus
+
+        class _Summarizer:
+            REQUIRED_SHARDS = ()
+            pending_tasks = {}
+
+            @staticmethod
+            def _cache_key(persona_id, _session_id):
+                return persona_id or "global"
+
+            async def ensure_core_ready(self, *_args, **_kwargs):
+                raise AssertionError(
+                    "unverifiable provider registries must not receive persona LLM calls"
+                )
+
+        class _MissingGetter:
+            pass
+
+        class _FailingProviderManager:
+            @staticmethod
+            def get_provider_by_id(_model_id):
+                raise RuntimeError("registry unavailable")
+
+        contexts = {
+            "provider_manager_missing": SimpleNamespace(),
+            "provider_getter_missing": SimpleNamespace(provider_manager=_MissingGetter()),
+            "registry_query_failed": SimpleNamespace(
+                provider_manager=_FailingProviderManager()
+            ),
+        }
+
+        for label, context in contexts.items():
+            with self.subTest(label=label):
+                status = RuntimeStatus()
+                runtime = SimpleNamespace(
+                    background_tasks=set(),
+                    lifecycle=SimpleNamespace(manager=None),
+                    status=status,
+                    config=SimpleNamespace(
+                        provider=SimpleNamespace(
+                            task_models=["configured/model"], fallback_models=[]
+                        ),
+                        persona=SimpleNamespace(),
+                    ),
+                    context=context,
+                    context_engine=SimpleNamespace(
+                        resolve_active_persona=lambda: ("persona", "raw prompt")
+                    ),
+                    persona_summarizer=_Summarizer(),
+                    set_boot_phase=status.set_phase,
+                    mark_degraded=status.mark_degraded,
+                )
+
+                ready = asyncio.run(
+                    PluginLifecycleManager(runtime)._initialize_persona_core_until_ready()
+                )
+
+                self.assertTrue(ready)
+                self.assertEqual(status.persona_state, "provider_unavailable")
+                self.assertFalse(status.persona_persisted)
+                self.assertIn("persona.core", status.degraded_components)
 
     def test_persona_startup_timeout_marks_not_ready_without_opening_ingress(self):
         async def _run():

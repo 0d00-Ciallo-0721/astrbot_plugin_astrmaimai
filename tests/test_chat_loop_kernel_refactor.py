@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from tests.helpers.astrbot_stubs import install_astrbot_stubs
 
@@ -138,6 +139,39 @@ class ChatLoopKernelRefactorTests(unittest.TestCase):
         self.assertEqual(result.decision.next_tick_delay, 5.0)
         self.assertEqual(result.decision.metadata["scheduler_bucket"], "fast_recheck")
         self.assertEqual(calls, [])
+
+    def test_busy_heartbeat_uses_bounded_exponential_backoff(self):
+        class _Coordinator:
+            async def get_activity_snapshot(self, chat_id):
+                return {"chat_id": chat_id, "executor_pending": 1, "wait_targets": []}
+
+        kernel = self.kernel_mod.ChatLoopKernel(runtime_coordinator=_Coordinator())
+
+        async def _run():
+            return [
+                (await kernel.tick(chat_id="busy-chat", trigger="heartbeat")).decision.next_tick_delay
+                for _ in range(6)
+            ]
+
+        delays = asyncio.run(_run())
+        self.assertEqual(delays, [5.0, 15.0, 30.0, 60.0, 60.0, 60.0])
+
+    def test_busy_heartbeat_logs_are_aggregated(self):
+        class _Coordinator:
+            async def get_activity_snapshot(self, chat_id):
+                return {"chat_id": chat_id, "executor_pending": 1, "wait_targets": []}
+
+        kernel = self.kernel_mod.ChatLoopKernel(runtime_coordinator=_Coordinator())
+
+        async def _run():
+            with patch.object(self.kernel_mod.logger, "debug") as debug:
+                for _ in range(3):
+                    await kernel.tick(chat_id="busy-chat", trigger="heartbeat")
+                return debug.call_count, (await kernel.get_loop_state("busy-chat")).busy_log_suppressed
+
+        debug_calls, suppressed = asyncio.run(_run())
+        self.assertEqual(debug_calls, 1)
+        self.assertEqual(suppressed, 2)
 
     def test_background_dispatch_failure_records_retry_state(self):
         class _Coordinator:

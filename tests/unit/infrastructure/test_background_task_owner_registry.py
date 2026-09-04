@@ -108,6 +108,57 @@ class BackgroundTaskOwnerRegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("failed", statuses)
         self.assertIn("cancelled", statuses)
 
+    async def test_track_deduplicates_same_run_without_starting_new_awaitable(self):
+        registry = BackgroundTaskOwnerRegistry()
+        started = []
+
+        async def work():
+            started.append(True)
+            await asyncio.sleep(10)
+
+        first = registry.track(
+            work(),
+            task_family="reply.post_send",
+            scope_id="chat-1",
+            run_id="commit-1",
+        )
+        second = registry.track(
+            work(),
+            task_family="reply.post_send",
+            scope_id="chat-1",
+            run_id="commit-1",
+        )
+        self.assertIs(first, second)
+        await asyncio.sleep(0)
+        self.assertEqual(started, [True])
+        await registry.cancel_all(timeout_sec=0.5)
+        with self.assertRaises(asyncio.CancelledError):
+            await first
+
+    async def test_track_registration_failure_cancels_created_task(self):
+        registry = BackgroundTaskOwnerRegistry()
+        original_register = registry.register
+        started = []
+
+        async def work():
+            started.append(True)
+            await asyncio.sleep(10)
+
+        def fail_register(*_args, **_kwargs):
+            raise RuntimeError("registry unavailable")
+
+        registry.register = fail_register
+        with self.assertRaises(RuntimeError):
+            registry.track(
+                work(),
+                task_family="reply.post_send",
+                scope_id="chat-1",
+                run_id="commit-fail",
+            )
+        registry.register = original_register
+        await asyncio.sleep(0)
+        self.assertEqual(started, [])
+
     async def test_memory_pipeline_sweep_is_registered_and_stopped(self):
         registry = BackgroundTaskOwnerRegistry(generation=3)
         pipeline = MemoryTurnPipeline(

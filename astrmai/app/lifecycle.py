@@ -90,6 +90,53 @@ class PluginLifecycleManager:
             return False
         return self._transition_lifecycle_state("shutdown_complete", reason=reason)
 
+    async def _wait_executor_release_tasks(self, *, timeout_sec: float = 2.0) -> int:
+        """Give detached executor releases a bounded chance to settle before shutdown.
+
+        Release tasks are deliberately separate from the cancelled Turn task,
+        so they must be awaited before the generic owner cancellation pass.
+        Remaining tasks stay visible as pending and are reconciled afterward;
+        they are never treated as released merely because shutdown timed out.
+        """
+        registry = getattr(self.runtime, "owner_registry", None)
+        tasks: set[asyncio.Task[Any]] = set()
+        records = getattr(registry, "records", None)
+        if callable(records):
+            try:
+                tasks.update(
+                    record.task
+                    for record in records(include_terminal=False)
+                    if getattr(record, "task_family", "") == "executor.release"
+                    and getattr(record, "task", None) is not None
+                    and not record.task.done()
+                )
+            except Exception as exc:
+                logger.warning("[AstrMai] executor release owner inspection degraded: %s", exc)
+        planner = getattr(self.runtime, "system2_planner", None)
+        executor = getattr(planner, "executor", None)
+        tasks.update(
+            task
+            for task in (getattr(executor, "_executor_release_tasks", set()) or set())
+            if task is not None and not task.done()
+        )
+        if tasks:
+            for task in tasks:
+                task._astrmai_executor_release = True
+            _, pending = await asyncio.wait(tasks, timeout=max(0.0, float(timeout_sec)))
+            if pending:
+                logger.warning(
+                    "[AstrMai] executor release settlement still pending: %s",
+                    len(pending),
+                )
+        coordinator = getattr(self.runtime, "runtime_coordinator", None)
+        reconcile = getattr(coordinator, "reconcile_executor_leases", None)
+        if callable(reconcile):
+            try:
+                await reconcile()
+            except Exception as exc:
+                logger.warning("[AstrMai] executor lease reconciliation degraded: %s", exc)
+        return sum(1 for task in tasks if not task.done())
+
     def _bootstrap_legacy_shutdown_state(self) -> None:
         """Lift legacy flag-only fixtures into the validated shutdown path."""
         status = getattr(self.runtime, "status", None)
@@ -169,6 +216,34 @@ class PluginLifecycleManager:
             self.runtime.mark_degraded("memory.engine", str(exc))
             self._transition_lifecycle_state("degraded", reason="memory_initialize_failed")
             logger.warning(f"[AstrMai] Memory engine start degraded: {exc}")
+
+    async def _await_persistence_schema_ready(self) -> bool:
+        persistence = getattr(self.runtime, "persistence", None)
+        wait_until_ready = getattr(persistence, "wait_until_ready", None)
+        if not callable(wait_until_ready):
+            return True
+        self.runtime.set_boot_phase("lifecycle.persistence_schema")
+        started = time.monotonic()
+        try:
+            await wait_until_ready()
+        except Exception as exc:
+            self.runtime.status.startup_stage_timings["persistence_schema_ready_ms"] = round(
+                (time.monotonic() - started) * 1000.0,
+                1,
+            )
+            self.runtime.status.startup_blocked_reason = "schema_initialization_failed"
+            self.runtime.status.accepting_events = False
+            self.runtime.status.is_running = False
+            self.runtime.status.lifecycle_started = False
+            self.runtime.mark_degraded("persistence.schema", str(exc))
+            self._transition_lifecycle_state("failed", reason="schema_initialization_failed")
+            logger.error("[AstrMai] startup blocked: persistence schema initialization failed: %s", exc)
+            return False
+        self.runtime.status.startup_stage_timings["persistence_schema_ready_ms"] = round(
+            (time.monotonic() - started) * 1000.0,
+            1,
+        )
+        return True
 
     # G4/PL-10: 只有"显式重新初始化插件实例"才允许复位终止闩锁。
     # 两个场景有真实张力，必须按来源区分：
@@ -507,6 +582,49 @@ class PluginLifecycleManager:
         except (TypeError, ValueError):
             return 900.0
 
+    def _persona_models_configured(self) -> bool | None:
+        """Return False only when the persona model pools are explicitly empty."""
+        provider_config = getattr(self.runtime.config, "provider", None)
+        if provider_config is None:
+            return None
+        task_models = getattr(provider_config, "task_models", ()) or ()
+        fallback_models = getattr(provider_config, "fallback_models", ()) or ()
+        return bool(
+            [model for model in (*task_models, *fallback_models) if str(model or "").strip()]
+        )
+
+    async def _persona_provider_available(self) -> bool | None:
+        """Probe only the host registry; never make a provider/network request."""
+        provider_config = getattr(self.runtime.config, "provider", None)
+        if provider_config is None:
+            # Lightweight unit adapters historically omit provider config.  A
+            # real runtime always exposes a context; fail closed there instead
+            # of allowing persona startup to reach ensure_core_ready().
+            return None if not hasattr(self.runtime, "context") else False
+        models = [
+            str(model).strip()
+            for model in (
+                *(getattr(provider_config, "task_models", ()) or ()),
+                *(getattr(provider_config, "fallback_models", ()) or ()),
+            )
+            if str(model or "").strip()
+        ]
+        context = getattr(self.runtime, "context", None)
+        manager = getattr(context, "provider_manager", None)
+        getter = getattr(manager, "get_provider_by_id", None)
+        if not callable(getter):
+            return False
+        for model_id in models:
+            try:
+                provider = getter(model_id)
+                if inspect.isawaitable(provider):
+                    provider = await provider
+            except Exception:
+                continue
+            if provider is not None:
+                return True
+        return False
+
     async def _restore_dialogue_snapshot(self) -> None:
         # G4/PL-09: 重载后恢复群对话热/温区（TTL 与 schema 版本双重约束在 store 内部）
         store = getattr(self.runtime, "dialogue_store", None)
@@ -628,6 +746,8 @@ class PluginLifecycleManager:
         logger.info("[AstrMai] Initializing Memory Engine...")
         if not await self._await_runtime_reload_fence():
             return
+        if not await self._await_persistence_schema_ready():
+            return
         await self._restore_dialogue_snapshot()
         await self.initialize_memory()
         if self._shutdown_requested:
@@ -637,7 +757,12 @@ class PluginLifecycleManager:
         persona_ready = await self._initialize_persona_core_until_ready()
         if self._shutdown_requested or not persona_ready:
             return
-        logger.info("[AstrMai] boot phase: persona core ready and persisted")
+        if self.runtime.status.persona_persisted:
+            logger.info("[AstrMai] boot phase: persona core ready and persisted")
+        else:
+            logger.info(
+                "[AstrMai] boot phase: persona core degraded; persona_persisted=false"
+            )
 
         init_meme_storage()
         await self.load_command_metadata()
@@ -682,6 +807,43 @@ class PluginLifecycleManager:
         persona_id, raw_prompt = context_engine.resolve_active_persona()
         cache_key = summarizer._cache_key(persona_id, "global")
         self.runtime.status.persona_cache_key = cache_key
+        if self._persona_models_configured() is False:
+            self.runtime.status.persona_state = "provider_unconfigured"
+            self.runtime.status.persona_persisted = False
+            self.runtime.status.persona_last_error = "provider_unconfigured"
+            self.runtime.status.startup_blocked_reason = ""
+            self.runtime.status.startup_retry_at = 0.0
+            self.runtime.set_boot_phase("lifecycle.persona_degraded")
+            self.runtime.mark_degraded(
+                "persona.core",
+                "provider_unconfigured; startup persona generation skipped",
+            )
+            logger.warning(
+                "[AstrMai] persona startup generation skipped: no task or fallback model configured"
+            )
+            return True
+        provider_available = await self._persona_provider_available()
+        if provider_available is not True:
+            # ``None`` is retained only for the explicitly supported
+            # lightweight adapter path (no provider config and no runtime
+            # context).  Production/runtime paths fail closed.
+            if provider_available is None and not hasattr(self.runtime, "context"):
+                pass
+            else:
+                self.runtime.status.persona_state = "provider_unavailable"
+                self.runtime.status.persona_persisted = False
+                self.runtime.status.persona_last_error = "provider_unavailable"
+                self.runtime.status.startup_blocked_reason = ""
+                self.runtime.status.startup_retry_at = 0.0
+                self.runtime.set_boot_phase("lifecycle.persona_degraded")
+                self.runtime.mark_degraded(
+                    "persona.core",
+                    "provider_unavailable; startup persona generation skipped",
+                )
+                logger.warning(
+                    "[AstrMai] persona startup generation skipped: configured models are not registered"
+                )
+                return True
         initial_delay, max_delay = self._persona_retry_bounds()
         startup_timeout = self._persona_startup_timeout()
         startup_started = time.monotonic()
@@ -1645,6 +1807,11 @@ class PluginLifecycleManager:
             "memory.vector_owners",
             "vector_close_owner_count",
         )
+        index_delete_repair_task_count = _safe_int(
+            vector_owner_status.get("vector_index_delete_repair_task_count"),
+            "memory.vector_owners",
+            "vector_index_delete_repair_task_count",
+        )
         retired_stack_count = _safe_int(
             vector_owner_status.get("retired_vector_stack_count"),
             "memory.vector_owners",
@@ -1654,6 +1821,41 @@ class PluginLifecycleManager:
             current_task = asyncio.current_task()
         except RuntimeError:
             current_task = None
+        # Owner Registry is the source of truth for detached work (including
+        # executor.release).  Keep its active records in the shutdown report;
+        # otherwise a bounded release wait can hide a still-running task.
+        # The late-cleanup watcher is reported separately below and must not
+        # count itself while it is computing this report.
+        owner_registry_active_count = 0
+        owner_registry_task_families: dict[str, int] = {}
+        owner_registry_task_names: set[str] = set()
+        owner_registry = getattr(self.runtime, "owner_registry", None)
+        owner_registry_records = getattr(owner_registry, "records", None)
+        if owner_registry is None or not callable(owner_registry_records):
+            _mark_unknown("owner_registry", "active task registry unavailable")
+        else:
+            try:
+                registry_records = owner_registry_records(include_terminal=False)
+                if not isinstance(registry_records, (list, tuple, set, frozenset)):
+                    raise TypeError(f"invalid records: {type(registry_records).__name__}")
+                watcher = getattr(self, "_late_shutdown_cleanup_task", None)
+                for record in registry_records:
+                    task = getattr(record, "task", None)
+                    if task is None or task.done() or task is current_task or task is watcher:
+                        continue
+                    family = str(getattr(record, "task_family", "") or "unknown")
+                    owner_registry_active_count += 1
+                    owner_registry_task_families[family] = owner_registry_task_families.get(family, 0) + 1
+                    get_name = getattr(task, "get_name", None)
+                    owner_registry_task_names.add(
+                        str(get_name() if callable(get_name) else getattr(record, "owner", family))
+                    )
+                    remaining_by_kind[family] = max(
+                        remaining_by_kind.get(family, 0), owner_registry_task_families[family]
+                    )
+            except Exception as exc:
+                _mark_unknown("owner_registry", f"{type(exc).__name__}: {exc}")
+                remaining_by_kind["owner_registry.state_unknown"] = 1
         isolated_shutdown_tasks = [
             task
             for task in (getattr(self, "_isolated_shutdown_tasks", set()) or set())
@@ -1672,6 +1874,10 @@ class PluginLifecycleManager:
             remaining_by_kind["memory.vector_sync_retirement"] = sync_retirement_count
         if close_owner_count:
             remaining_by_kind["memory.vector_close_owner"] = close_owner_count
+        if index_delete_repair_task_count:
+            remaining_by_kind[
+                "memory.vector_index_delete_repair"
+            ] = index_delete_repair_task_count
         if retired_stack_count:
             remaining_by_kind["memory.retired_vector_stack"] = retired_stack_count
         if isolated_shutdown_count:
@@ -1715,6 +1921,7 @@ class PluginLifecycleManager:
             close_owner_count,
             retired_stack_count,
             isolated_shutdown_count,
+            owner_registry_active_count,
             int(bool(unknown_components)),
             *(1 for task in lifecycle_tasks.values() if task is not None and not task.done()),
         )
@@ -1732,6 +1939,7 @@ class PluginLifecycleManager:
             remaining_by_kind["background_budget.state_unknown"] = 1
             remaining = max(remaining, 1)
         owner_task_names = set(str(name) for name in owner_names)
+        owner_task_names.update(owner_registry_task_names)
         for task in (getattr(projector, "_background_tasks", set()) or set()):
             if task is not None and not task.done():
                 owner_task_names.add(str(task.get_name() if hasattr(task, "get_name") else "memory.projection"))
@@ -1799,6 +2007,8 @@ class PluginLifecycleManager:
             "physical": budget_physical,
             "worker_count": worker_count,
             "vector_stack_present": vector_stack_present,
+            "owner_registry_active_count": owner_registry_active_count,
+            "owner_registry_task_families": dict(sorted(owner_registry_task_families.items())),
             "has_pending": bool(remaining),
             "remaining_total": category_sum,
             "remaining_by_category_total": category_sum,
@@ -2206,6 +2416,9 @@ class PluginLifecycleManager:
 
         projector = None
         try:
+            await self._wait_executor_release_tasks(
+                timeout_sec=min(2.0, float(self.SHUTDOWN_TASK_TIMEOUT or 2.0))
+            )
             tasks_to_wait = collect_background_tasks(*self.runtime.iter_task_owners())
             current_task = asyncio.current_task()
             durable_tasks: set[Any] = set()
@@ -2216,6 +2429,7 @@ class PluginLifecycleManager:
                 for task in tasks_to_wait
                 if task is not current_task
                 and task not in durable_tasks
+                and not getattr(task, "_astrmai_executor_release", False)
                 and not getattr(task, "_astrmai_shutdown_internal", False)
             ]
         except Exception as exc:

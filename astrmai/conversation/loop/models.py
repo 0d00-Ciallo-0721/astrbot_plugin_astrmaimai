@@ -50,6 +50,11 @@ class ChatLoopState:
     consecutive_selected_count: int = 0
     last_maintenance_selected_at: float = 0.0
     retry_backoff_until: float = 0.0
+    busy_since: float = 0.0
+    busy_backoff_level: int = 0
+    busy_skip_count: int = 0
+    busy_last_log_at: float = 0.0
+    busy_log_suppressed: int = 0
     missed_due_passes: int = 0
     forced_promotion_count: int = 0
     last_forced_promotion_at: float = 0.0
