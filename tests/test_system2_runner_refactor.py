@@ -544,6 +544,7 @@ class RefactoredSystem2RunnerTests(unittest.TestCase):
 
         self.assertFalse(asyncio.run(runner_mod.System2Runner(runtime).run(event)))
         self.assertEqual(event.get_extra("astrmai_execution_status"), "queue_timeout")
+        self.assertFalse(event.get_extra("astrmai_system2_failure_handled", False))
         self.assertEqual(event.get_extra("astrmai_queue_timeout_stage"), "system2.energy_prepare")
         stages = event.get_extra("astrmai_stage_ledger", [])
         self.assertEqual(stages[-1]["stage"], "system2.energy_prepare")

@@ -150,6 +150,7 @@ class AttentionDeferredOutboxTests(unittest.TestCase):
                         attempts=1,
                         next_retry_at=now + 120.0,
                         error="still busy",
+                        diagnostics={"last_failure_kind": "background_queue_wait"},
                     )
                 )
                 description = await store.describe()
@@ -160,6 +161,10 @@ class AttentionDeferredOutboxTests(unittest.TestCase):
                 self.assertNotEqual(retry_rows[0]["lease_token"], token)
                 self.assertEqual(retry_rows[0]["attempts"], 1)
                 self.assertEqual(retry_rows[0]["event_data"]["message_str"], "updated")
+                self.assertEqual(
+                    retry_rows[0]["diagnostics"]["last_failure_kind"],
+                    "background_queue_wait",
+                )
 
                 self.assertTrue(
                     await store.finish(

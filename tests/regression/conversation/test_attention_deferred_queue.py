@@ -450,6 +450,155 @@ class AttentionDeferredQueueTests(unittest.TestCase):
         self.assertEqual(status, "skipped_already_terminal")
         self.assertEqual(sent, [])
 
+    def test_replay_preflight_rejection_preserves_reason(self):
+        async def run():
+            event = _Event()
+            event.set_extra("astrmai_system2_failure_handled", True)
+            self.gate._deferred_attention_work["preflight-reason"] = {
+                "work_id": "preflight-reason",
+                "chat_id": event.unified_msg_origin,
+                "task_name": "attention.system2",
+                "retry_factory": lambda: asyncio.sleep(0),
+                "event": event,
+                "enqueued_at": time.time(),
+                "next_retry_at": 0.0,
+                "expires_at": time.time() + 5.0,
+                "attempts": 0,
+                "max_attempts": 3,
+                "_terminal_status": None,
+            }
+            self.gate._ensure_deferred_attention_dispatcher()
+            await asyncio.wait_for(event.terminal_event.wait(), timeout=1.5)
+            return (
+                event.get_extra("deferred_terminal_status"),
+                event.get_extra("deferred_terminal_reason"),
+                self.gate.describe_status(),
+            )
+
+        status, reason, diagnostics = asyncio.run(run())
+        self.assertEqual(status, "skipped_already_terminal")
+        self.assertEqual(reason, "turn_already_handled")
+        self.assertEqual(diagnostics["attention_deferred_last_failure_stage"], "")
+
+    def test_malformed_replay_preflight_is_failed_with_reason_and_stage(self):
+        async def run():
+            event = _Event()
+            event.set_extra("astrmai_turn_outcome", "corrupt")
+            self.gate._deferred_attention_work["preflight-malformed"] = {
+                "work_id": "preflight-malformed",
+                "chat_id": event.unified_msg_origin,
+                "task_name": "attention.system2",
+                "retry_factory": lambda: asyncio.sleep(0),
+                "event": event,
+                "enqueued_at": time.time(),
+                "next_retry_at": 0.0,
+                "expires_at": time.time() + 5.0,
+                "attempts": 0,
+                "max_attempts": 3,
+                "_terminal_status": None,
+            }
+            self.gate._ensure_deferred_attention_dispatcher()
+            await asyncio.wait_for(event.terminal_event.wait(), timeout=1.5)
+            return (
+                event.get_extra("deferred_terminal_status"),
+                event.get_extra("deferred_terminal_reason"),
+                self.gate.describe_status(),
+            )
+
+        status, reason, diagnostics = asyncio.run(run())
+        self.assertEqual(status, "failed")
+        self.assertEqual(reason, "malformed_turn_outcome")
+        self.assertEqual(diagnostics["attention_deferred_last_failure_stage"], "replay_preflight")
+        self.assertEqual(diagnostics["attention_deferred_last_failure_kind"], "malformed_turn_outcome")
+
+    def test_output_claim_preflight_waits_for_retry_instead_of_failing(self):
+        async def run():
+            event = _Event()
+            event.set_extra(
+                "astrmai_turn_outcome",
+                {"terminal_status": "active", "output_claim": "reply"},
+            )
+            item = {
+                "work_id": "preflight-claim",
+                "chat_id": event.unified_msg_origin,
+                "task_name": "attention.system2",
+                "retry_factory": lambda: asyncio.sleep(0),
+                "event": event,
+                "enqueued_at": time.time(),
+                "next_retry_at": 0.0,
+                "expires_at": time.time() + 5.0,
+                "attempts": 0,
+                "max_attempts": 3,
+                "_terminal_status": None,
+            }
+            self.gate._deferred_attention_work[item["work_id"]] = item
+            status = self.gate._deferred_replay_status(item)
+            return status
+
+        status = asyncio.run(run())
+        self.assertEqual(status, ("retry", "output_claim_exists"))
+
+    def test_dispatcher_does_not_terminal_fail_before_retry_preflight(self):
+        async def run():
+            event = _Event()
+            event.set_extra(
+                "astrmai_turn_outcome",
+                {"terminal_status": "active", "output_claim": "reply"},
+            )
+            calls = []
+
+            async def work():
+                calls.append("run")
+
+            self.gate._deferred_attention_work["preflight-delay"] = {
+                "work_id": "preflight-delay",
+                "chat_id": event.unified_msg_origin,
+                "task_name": "attention.system2",
+                "retry_factory": work,
+                "event": event,
+                "enqueued_at": time.time(),
+                "next_retry_at": 0.0,
+                "expires_at": time.time() + 5.0,
+                "attempts": 0,
+                "max_attempts": 3,
+                "_terminal_status": None,
+            }
+            self.gate._ensure_deferred_attention_dispatcher()
+            await asyncio.sleep(0.05)
+            self.assertIsNone(event.get_extra("deferred_terminal_status"))
+            event.set_extra("astrmai_turn_outcome", {"terminal_status": "active"})
+            await asyncio.wait_for(event.terminal_event.wait(), timeout=2.0)
+            await self.gate.shutdown_workers()
+            return calls, event.get_extra("deferred_terminal_status")
+
+        calls, status = asyncio.run(run())
+        self.assertEqual(calls, ["run"])
+        self.assertEqual(status, "replayed")
+
+    def test_queue_timeout_marker_remains_replayable(self):
+        async def run():
+            event = _Event()
+            event.set_extra("astrmai_execution_status", "queue_timeout")
+            event.set_extra("astrmai_queue_timeout_stage", "system2.energy_prepare")
+            item = {
+                "work_id": "queue-timeout-replayable",
+                "chat_id": event.unified_msg_origin,
+                "task_name": "attention.system2",
+                "retry_factory": lambda: asyncio.sleep(0),
+                "event": event,
+                "turn_generation": 0,
+                "enqueued_at": time.time(),
+                "next_retry_at": 0.0,
+                "expires_at": time.time() + 5.0,
+                "attempts": 0,
+                "max_attempts": 3,
+                "_terminal_status": None,
+            }
+            return self.gate._deferred_replay_status(item)
+
+        status = asyncio.run(run())
+        self.assertEqual(status, (None, ""))
+
     def test_started_execution_timeout_is_not_replayed(self):
         async def run():
             calls = []

@@ -215,6 +215,7 @@ class AttentionDeferredOutboxStore:
         attempts: int = 0,
         next_retry_at: float = 0.0,
         error: str = "",
+        diagnostics: dict[str, Any] | None = None,
     ) -> bool:
         if not self.db_path:
             return False
@@ -224,7 +225,8 @@ class AttentionDeferredOutboxStore:
         async with connect_aiosqlite(self.db_path) as db:
             cursor = await db.execute(
                 "UPDATE attention_deferred_outbox SET status=?, attempts=?, next_retry_at=?, "
-                "lease_token='', lease_until=0, updated_at=?, last_error=? "
+                "lease_token='', lease_until=0, updated_at=?, last_error=?, "
+                "diagnostics_json=COALESCE(?, diagnostics_json) "
                 "WHERE work_id=? AND lease_token=?",
                 (
                     normalized if not (normalized == "retry_wait") else "queued",
@@ -232,6 +234,11 @@ class AttentionDeferredOutboxStore:
                     float(next_retry_at or 0.0),
                     time.time(),
                     str(error or "")[:500],
+                    (
+                        json.dumps(diagnostics, ensure_ascii=False, default=str)[:4000]
+                        if diagnostics is not None
+                        else None
+                    ),
                     str(work_id or ""),
                     str(lease_token or ""),
                 ),

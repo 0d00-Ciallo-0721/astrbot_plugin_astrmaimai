@@ -403,6 +403,7 @@ class AttentionGate:
                     attempts=int(item.get("attempts", 0) or 0),
                     next_retry_at=time.time() if status == "shutdown" else 0.0,
                     error=reason,
+                    diagnostics=item.get("diagnostics") if isinstance(item.get("diagnostics"), dict) else None,
                 )
                 if not changed:
                     raise RuntimeError("deferred outbox settlement lease was not current")
@@ -1099,7 +1100,7 @@ class AttentionGate:
             for work_id in deferred_ids:
                 item = self._deferred_attention_work.pop(work_id, None)
                 if item is not None:
-                    self._set_deferred_terminal(item, "stale")
+                    self._set_deferred_terminal(item, "stale", reason="chat_session_removed")
             removed = bool(deferred_ids) or removed
         removed = bool(
             await self._cancel_session_workers(chat_id, session=removed_session)
@@ -1703,10 +1704,25 @@ class AttentionGate:
         self._deferred_attention_counts[status] += 1
         self._deferred_attention_last_terminal_at = time.time()
         event = item.get("event") if isinstance(item, dict) else None
+        diagnostics = item.get("diagnostics", {}) if isinstance(item, dict) else {}
+        failure_stage = str(
+            item.get("last_failure_stage", "")
+            or (diagnostics.get("last_failure_stage", "") if isinstance(diagnostics, dict) else "")
+            or ""
+        ) if isinstance(item, dict) else ""
+        failure_kind = str(
+            item.get("last_failure_kind", "")
+            or (diagnostics.get("last_failure_kind", "") if isinstance(diagnostics, dict) else "")
+            or ""
+        ) if isinstance(item, dict) else ""
         if event is not None and hasattr(event, "set_extra"):
             event.set_extra("deferred_terminal_status", status)
             if reason:
                 event.set_extra("deferred_terminal_reason", str(reason))
+            if failure_stage:
+                event.set_extra("deferred_failure_stage", failure_stage)
+            if failure_kind:
+                event.set_extra("deferred_failure_kind", failure_kind)
         self._deferred_attention_dispatcher_last_progress_at = time.time()
         task_name = str(item.get("task_name", "attention.misc") or "attention.misc") if isinstance(item, dict) else "attention.misc"
         work_id = str(item.get("work_id", "") or "") if isinstance(item, dict) else ""
@@ -1716,7 +1732,9 @@ class AttentionGate:
         level(
             "[Attention] deferred work terminal "
             f"work_id={work_id} task={task_name} status={status} "
-            f"reason={reason or ''} queue_depth={len(self._deferred_attention_work)}"
+            f"reason={reason or ''} "
+            f"failure_stage={failure_stage or ''} failure_kind={failure_kind or ''} "
+            f"queue_depth={len(self._deferred_attention_work)}"
         )
         return True
 
@@ -1747,14 +1765,15 @@ class AttentionGate:
         except (TypeError, ValueError):
             return 0.0
 
-    def _deferred_replay_status(self, item: dict[str, Any]) -> str | None:
+    def _deferred_replay_status(self, item: dict[str, Any]) -> tuple[str | None, str]:
         if self._workers_shutdown:
-            return "shutdown"
+            return "shutdown", "workers_shutdown"
         if int(item.get("shutdown_generation", self._shutdown_generation) or 0) != int(self._shutdown_generation):
-            return "shutdown"
+            return "shutdown", "shutdown_generation_mismatch"
         event = item.get("event")
         if event is not None and hasattr(event, "get_extra"):
-            if not can_deferred_replay(event).allowed:
+            replay_decision = can_deferred_replay(event)
+            if not replay_decision.allowed:
                 outcome = event.get_extra("astrmai_turn_outcome", {})
                 status = str(
                     outcome.get("terminal_status", "")
@@ -1762,49 +1781,58 @@ class AttentionGate:
                     else ""
                 )
                 if status in {"completed", "fallback"}:
-                    return "skipped_already_terminal"
+                    return "skipped_already_terminal", "turn_already_terminal"
                 if status in {"shutdown", "cancelled", "budget_exhausted", "superseded"}:
-                    return status
-                return "failed"
+                    return status, f"turn_{status}"
+                reason = str(replay_decision.reason or "deferred_replay_not_allowed")
+                if reason in {"output_claim_exists", "deferred_replay_claimed"}:
+                    return "retry", reason
+                if reason in {
+                    "turn_already_handled",
+                    "system2_already_handled",
+                    "completion_callback_completed",
+                }:
+                    return "skipped_already_terminal", reason
+                return "failed", reason
             status = str(event.get_extra("astrmai_execution_status", "") or "")
             if status in {"sent", "completed", "stale_drop", "shutdown_rejected", "cancelled"}:
                 if status in {"sent", "completed"}:
-                    return "skipped_already_terminal"
+                    return "skipped_already_terminal", "execution_already_terminal"
                 if status == "stale_drop":
-                    return "stale"
+                    return "stale", "execution_stale_drop"
                 if status == "shutdown_rejected":
-                    return "shutdown"
-                return "cancelled"
+                    return "shutdown", "execution_shutdown_rejected"
+                return "cancelled", "execution_cancelled"
             if bool(event.get_extra("astrmai_reply_sent", False)):
-                return "skipped_already_terminal"
+                return "skipped_already_terminal", "reply_already_sent"
             if bool(event.get_extra("astrmai_system2_failure_handled", False)):
-                return "skipped_already_terminal"
+                return "skipped_already_terminal", "system2_already_handled"
             if bool(event.get_extra("astrmai_proactive_completed", False)):
-                return "skipped_already_terminal"
+                return "skipped_already_terminal", "proactive_already_completed"
             if bool(event.get_extra("astrmai_event_cancelled", False)):
-                return "cancelled"
+                return "cancelled", "event_cancelled"
             turn = event.get_extra("astrmai_turn_identity", None)
             expected_thread = str(item.get("turn_thread_id", "") or "")
             expected_generation = int(item.get("turn_generation", 0) or 0)
             if expected_generation > 0 and turn is None:
-                return "stale"
+                return "stale", "turn_identity_missing"
             if turn is not None and expected_thread:
                 if str(getattr(turn, "thread_id", "") or "") != expected_thread or int(getattr(turn, "generation", 0) or 0) != expected_generation:
-                    return "superseded"
+                    return "superseded", "turn_identity_mismatch"
             elif turn is not None and expected_generation > 0:
                 if int(getattr(turn, "generation", 0) or 0) != expected_generation:
-                    return "superseded"
+                    return "superseded", "turn_generation_mismatch"
         session_identity = item.get("session_identity")
         if session_identity is not None:
             session = self.focus_pools.get(str(item.get("chat_id", "") or ""))
             if session is None or id(session) != int(session_identity):
-                return "stale"
+                return "stale", "session_identity_mismatch"
             if bool(getattr(session, "closed", False)):
-                return "stale"
+                return "stale", "session_closed"
             expected_generation = item.get("worker_generation")
             if expected_generation is not None and int(getattr(session, "worker_generation", 0) or 0) != int(expected_generation):
-                return "superseded"
-        return None
+                return "superseded", "worker_generation_mismatch"
+        return None, ""
 
     async def _dispatch_deferred_attention_work(self) -> None:
         while not self._workers_shutdown:
@@ -1826,16 +1854,13 @@ class AttentionGate:
                 # record must not terminate the dispatcher and strand all
                 # following deferred work.
                 self._deferred_attention_work.pop(item_key, None)
-                self._set_deferred_terminal(item, "failed")
-                continue
-            try:
-                replay_status = self._deferred_replay_status(item)
-            except Exception as exc:
-                logger.warning("[Attention] malformed deferred metadata; dropping item: %r", exc)
-                replay_status = "failed"
-            if replay_status is not None:
-                self._deferred_attention_work.pop(item_key, None)
-                self._set_deferred_terminal(item, replay_status)
+                self._record_deferred_replay_failure(
+                    item,
+                    item.get("event"),
+                    stage="replay_preflight",
+                    kind="retry_factory_missing",
+                )
+                self._set_deferred_terminal(item, "failed", reason="retry_factory_missing")
                 continue
             try:
                 expires_at = float(item.get("expires_at", now) or now)
@@ -1865,6 +1890,36 @@ class AttentionGate:
                     await asyncio.sleep(min(delay, 1.0))
                 except asyncio.CancelledError:
                     raise
+                continue
+            try:
+                replay_status, replay_reason = self._deferred_replay_status(item)
+            except Exception as exc:
+                logger.warning("[Attention] malformed deferred metadata; dropping item: %r", exc)
+                replay_status, replay_reason = "failed", f"{type(exc).__name__}: {exc}"[:500]
+            if replay_status is not None:
+                if replay_status == "retry":
+                    item["next_retry_at"] = time.monotonic() + 1.0
+                    self._record_deferred_replay_failure(
+                        item,
+                        item.get("event"),
+                        stage="replay_preflight",
+                        kind=replay_reason or "replay_not_ready",
+                    )
+                    self._schedule_deferred_persist(item)
+                    continue
+                self._deferred_attention_work.pop(item_key, None)
+                if replay_status == "failed":
+                    self._record_deferred_replay_failure(
+                        item,
+                        item.get("event"),
+                        stage="replay_preflight",
+                        kind=replay_reason or "replay_preflight_failed",
+                    )
+                self._set_deferred_terminal(
+                    item,
+                    replay_status,
+                    reason=replay_reason or None,
+                )
                 continue
             try:
                 item["attempts"] = int(item.get("attempts", 0) or 0) + 1

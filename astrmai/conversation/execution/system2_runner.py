@@ -97,7 +97,10 @@ class System2Runner:
         except asyncio.TimeoutError:
             finish_stage(main_event, energy_stage, status="timeout", reason="queue_timeout")
             main_event.set_extra("astrmai_execution_status", "queue_timeout")
-            mark_system2_handled(main_event, "system2_queue_timeout")
+            # A preparation timeout is retryable deferred work, not a handled
+            # System2 turn.  Marking it handled would make deferred replay
+            # reject the same turn before the retry factory gets a chance to
+            # run.
             main_event.set_extra("astrmai_queue_timeout_stage", "system2.energy_prepare")
             raise System2QueueTimeout("system2.energy_prepare")
         except asyncio.CancelledError:
