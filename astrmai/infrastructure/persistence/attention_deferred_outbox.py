@@ -51,6 +51,25 @@ class AttentionDeferredOutboxStore:
                 """
             )
             await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS attention_deferred_outbox_terminal_history (
+                    work_id TEXT PRIMARY KEY,
+                    chat_id TEXT NOT NULL,
+                    task_name TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    event_json TEXT NOT NULL DEFAULT '{}',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL,
+                    created_at REAL NOT NULL DEFAULT 0,
+                    updated_at REAL NOT NULL DEFAULT 0,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    diagnostics_json TEXT NOT NULL DEFAULT '{}',
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    terminal_at REAL NOT NULL DEFAULT 0
+                )
+                """
+            )
+            await db.execute(
                 "CREATE INDEX IF NOT EXISTS ix_attention_deferred_due "
                 "ON attention_deferred_outbox(status, next_retry_at, created_at)"
             )
@@ -246,11 +265,71 @@ class AttentionDeferredOutboxStore:
             changed = int(cursor.rowcount or 0) > 0
             if changed and terminal:
                 await db.execute(
+                    """
+                    INSERT INTO attention_deferred_outbox_terminal_history(
+                        work_id, chat_id, task_name, reason, event_json,
+                        attempts, status, created_at, updated_at, last_error,
+                        diagnostics_json, revision, terminal_at
+                    )
+                    SELECT work_id, chat_id, task_name, reason, event_json,
+                           attempts, status, created_at, updated_at, last_error,
+                           diagnostics_json, revision, ?
+                    FROM attention_deferred_outbox
+                    WHERE work_id=? AND lease_token=''
+                    ON CONFLICT(work_id) DO UPDATE SET
+                        chat_id=excluded.chat_id,
+                        task_name=excluded.task_name,
+                        reason=excluded.reason,
+                        event_json=excluded.event_json,
+                        attempts=excluded.attempts,
+                        status=excluded.status,
+                        updated_at=excluded.updated_at,
+                        last_error=excluded.last_error,
+                        diagnostics_json=excluded.diagnostics_json,
+                        revision=excluded.revision,
+                        terminal_at=excluded.terminal_at
+                    """,
+                    (time.time(), str(work_id or "")),
+                )
+                await db.execute(
                     "DELETE FROM attention_deferred_outbox WHERE work_id=? AND lease_token=''",
                     (str(work_id or ""),),
                 )
             await db.commit()
         return changed
+
+    async def get_terminal(self, work_id: str) -> dict[str, Any] | None:
+        """Return an immutable terminal record retained for diagnostics."""
+        if not self.db_path:
+            return None
+        await self._ensure_schema()
+        async with connect_aiosqlite(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT work_id, chat_id, task_name, reason, event_json, attempts, "
+                "status, created_at, updated_at, last_error, diagnostics_json, "
+                "revision, terminal_at FROM attention_deferred_outbox_terminal_history "
+                "WHERE work_id=?",
+                (str(work_id or ""),),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        if row is None:
+            return None
+        fields = (
+            "work_id", "chat_id", "task_name", "reason", "event_json", "attempts",
+            "status", "created_at", "updated_at", "last_error", "diagnostics_json",
+            "revision", "terminal_at",
+        )
+        result = dict(zip(fields, row))
+        for source_key, result_key in (
+            ("event_json", "event_data"),
+            ("diagnostics_json", "diagnostics"),
+        ):
+            try:
+                result[result_key] = json.loads(str(result.pop(source_key) or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                result[result_key] = {}
+        return result
 
     async def describe(self) -> dict[str, Any]:
         if not self.db_path:

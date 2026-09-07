@@ -52,6 +52,14 @@ class AttentionDeferredOutboxTests(unittest.TestCase):
                 rows = await store.claim_due()
                 self.assertEqual(rows[0]["revision"], 1)
                 self.assertTrue(rows[0]["diagnostics"]["legacy"])
+                with sqlite3.connect(db_path) as db:
+                    tables = {
+                        row[0]
+                        for row in db.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table'"
+                        )
+                    }
+                self.assertIn("attention_deferred_outbox_terminal_history", tables)
                 # Allow the aiosqlite worker thread to finish closing before
                 # Windows removes the temporary database file.
                 await asyncio.sleep(0.05)
@@ -176,6 +184,40 @@ class AttentionDeferredOutboxTests(unittest.TestCase):
                 )
                 final = await store.describe()
                 self.assertEqual(final["total"], 0)
+                terminal = await store.get_terminal(item["work_id"])
+                self.assertIsNotNone(terminal)
+                self.assertEqual(terminal["status"], "replayed")
+                self.assertEqual(terminal["attempts"], 2)
+                self.assertEqual(terminal["last_error"], "")
+                self.assertEqual(
+                    terminal["diagnostics"]["last_failure_kind"],
+                    "background_queue_wait",
+                )
+                self.assertEqual(terminal["event_data"]["message_str"], "updated")
+                self.assertGreaterEqual(terminal["revision"], 1)
+                self.assertGreater(terminal["terminal_at"], 0)
+
+                # A later run with the same work id updates the retained
+                # terminal record instead of reviving stale history.
+                item["revision"] = int(terminal["revision"]) + 1
+                item["next_retry_at_wall"] = time.time()
+                self.assertTrue(await store.enqueue(item, event_data={"message_str": "latest"}))
+                latest = await store.claim_due()
+                self.assertEqual(len(latest), 1)
+                self.assertTrue(
+                    await store.finish(
+                        item["work_id"],
+                        lease_token=latest[0]["lease_token"],
+                        status="failed",
+                        attempts=3,
+                        error="latest failure",
+                        diagnostics={"last_failure_stage": "replay"},
+                    )
+                )
+                terminal = await store.get_terminal(item["work_id"])
+                self.assertEqual(terminal["status"], "failed")
+                self.assertEqual(terminal["last_error"], "latest failure")
+                self.assertEqual(terminal["event_data"]["message_str"], "latest")
 
         asyncio.run(run())
 

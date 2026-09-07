@@ -537,6 +537,10 @@ class AttentionDeferredQueueTests(unittest.TestCase):
 
         status = asyncio.run(run())
         self.assertEqual(status, ("retry", "output_claim_exists"))
+        self.assertEqual(status.decision_stage, "replay_preflight")
+        self.assertEqual(status.decision_kind, "output_claim_conflict")
+        self.assertTrue(status.retryable)
+        self.assertFalse(status.terminal)
 
     def test_dispatcher_does_not_terminal_fail_before_retry_preflight(self):
         async def run():
@@ -598,6 +602,10 @@ class AttentionDeferredQueueTests(unittest.TestCase):
 
         status = asyncio.run(run())
         self.assertEqual(status, (None, ""))
+        self.assertEqual(status.decision_stage, "replay_preflight")
+        self.assertEqual(status.decision_kind, "ready")
+        self.assertFalse(status.retryable)
+        self.assertFalse(status.terminal)
 
     def test_started_execution_timeout_is_not_replayed(self):
         async def run():
@@ -960,12 +968,41 @@ class AttentionDeferredQueueTests(unittest.TestCase):
                 "chat_id": "chat-1",
                 "attempts": 1,
                 "_outbox_lease_token": "lease-1",
+                "diagnostics": {
+                    "last_failure_stage": "replay",
+                    "last_failure_kind": "provider_timeout",
+                },
             }
             self.gate._schedule_deferred_finish(item, "replayed", reason="ok")
             await asyncio.gather(*list(self.gate._deferred_persist_tasks), return_exceptions=True)
             self.assertEqual(len(self.gate._deferred_pending_persistence), 1)
+            pending = self.gate._deferred_pending_persistence["finish-failure-1"]
+            self.assertEqual(
+                pending["diagnostics"],
+                {
+                    "last_failure_stage": "replay",
+                    "last_failure_kind": "provider_timeout",
+                },
+            )
+            received = []
+
+            async def finish_with_capture(*args, **kwargs):
+                store.calls += 1
+                received.append(kwargs.get("diagnostics"))
+                return True
+
+            store.finish = finish_with_capture
             await self.gate._retry_pending_persistence()
             self.assertEqual(store.calls, 2)
+            self.assertEqual(
+                received,
+                [
+                    {
+                        "last_failure_stage": "replay",
+                        "last_failure_kind": "provider_timeout",
+                    }
+                ],
+            )
             self.assertEqual(self.gate._deferred_pending_persistence, {})
 
         asyncio.run(run())
