@@ -562,7 +562,8 @@ class Judge:
                     max_retries_override=0,
                     max_models_override=1,
                     allow_cooldown_override=False,
-                    reserve_for_reply=True,
+                    reserve_for_reply=False,
+                    critical_path=False,
                     propagate_queue_timeout_status=False,
                 )
                 result = llm_result.parsed_json or {}

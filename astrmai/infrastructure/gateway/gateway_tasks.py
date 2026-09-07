@@ -243,7 +243,9 @@ class GatewayTaskMixin:
             max_retries_override=0,
             max_models_override=1,
             allow_cooldown_override=False,
-            reserve_for_reply=True,
+            ledger_critical_path=False,
+            reserve_for_reply=False,
+            propagate_queue_timeout_status=False,
         )
         return result.parsed_json or {}
 
@@ -275,6 +277,11 @@ class GatewayTaskMixin:
             workload_policy=workload_policy,
             ledger_stage="attention.mood",
             ledger_family=WorkloadFamily.MOOD.value,
+            ledger_critical_path=False,
+            max_retries_override=0,
+            max_models_override=1,
+            reserve_for_reply=False,
+            propagate_queue_timeout_status=False,
         )
         return result.parsed_json or {}
 
@@ -298,6 +305,12 @@ class GatewayTaskMixin:
         reserve_for_reply: bool = False,
     ) -> Union[str, Dict[str, Any]]:
         task_models = self._task_models()
+        # Background lanes (memory/reflect/dream/etc.) must not consume the
+        # reserved user-reply slot or publish terminal queue-timeout state.
+        lane_is_background = bool(lane_key and lane_key.subsystem == "bg")
+        effective_critical_path = not lane_is_background
+        effective_reserve_for_reply = bool(reserve_for_reply and effective_critical_path)
+        effective_propagate_queue_timeout = not lane_is_background
         resolved_family = workload_family or self.context_economy.infer_workload_family(
             lane_key=lane_key,
             pool_name="task",
@@ -320,7 +333,9 @@ class GatewayTaskMixin:
                 max_retries_override=max_retries_override,
                 max_models_override=max_models_override,
                 allow_cooldown_override=allow_cooldown_override,
-                reserve_for_reply=reserve_for_reply,
+                reserve_for_reply=effective_reserve_for_reply,
+                critical_path=effective_critical_path,
+                propagate_queue_timeout_status=effective_propagate_queue_timeout,
             )
             return result.parsed_json if is_json else result.text
         normalized_origin = str(base_origin or "").strip()
@@ -366,7 +381,9 @@ class GatewayTaskMixin:
             max_models_override=max_models_override,
             use_fallback=use_fallback,
             allow_cooldown_override=allow_cooldown_override,
-            reserve_for_reply=reserve_for_reply,
+            reserve_for_reply=effective_reserve_for_reply,
+            ledger_critical_path=effective_critical_path,
+            propagate_queue_timeout_status=effective_propagate_queue_timeout,
         )
         return result.parsed_json if is_json else result.text
 
@@ -400,6 +417,9 @@ class GatewayTaskMixin:
                 prefix_hash=prefix_hash,
                 persona_id=persona_id,
                 template_envelope=template_envelope,
+                reserve_for_reply=False,
+                critical_path=False,
+                propagate_queue_timeout_status=False,
             )
             return result
         return await self._elastic_call_result(
@@ -432,6 +452,8 @@ class GatewayTaskMixin:
             ledger_stage=f"proactive.{resolved_family.value}",
             ledger_family=resolved_family.value,
             ledger_critical_path=False,
+            reserve_for_reply=False,
+            propagate_queue_timeout_status=False,
         )
 
     async def call_proactive_task(
@@ -483,6 +505,9 @@ class GatewayTaskMixin:
                 prefix_hash=prefix_hash,
                 persona_id=persona_id,
                 template_envelope=template_envelope,
+                reserve_for_reply=False,
+                critical_path=False,
+                propagate_queue_timeout_status=False,
             )
             return result.parsed_json if is_json else result.text
         result = await self._elastic_call_result(

@@ -170,7 +170,7 @@ class VisionSidePathBudgetTests(unittest.TestCase):
 
 
 class MoodAnalysisBudgetTests(unittest.TestCase):
-    def test_mood_analysis_timeout_is_capped_by_remaining_turn_budget(self):
+    def test_mood_analysis_timeout_does_not_consume_reply_reservation(self):
         manager = MoodManager.__new__(MoodManager)
         manager.config = SimpleNamespace(timing=SimpleNamespace(mood_analysis_timeout_sec=30.0))
         event = _Event()
@@ -181,7 +181,8 @@ class MoodAnalysisBudgetTests(unittest.TestCase):
                 return manager._analysis_timeout_seconds()
 
         effective = asyncio.run(_run())
-        self.assertLessEqual(effective, 10.0)
+        self.assertLessEqual(effective, 30.0)
+        self.assertGreater(effective, 10.0)
         self.assertGreater(effective, 0.0)
 
 

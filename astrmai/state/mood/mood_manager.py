@@ -49,7 +49,9 @@ class MoodManager:
         return clamp_timeout_to_turn_budget(
             None,
             max(0.1, configured),
-            reserve_for_reply=True,
+            # Mood analysis is an auxiliary background workload and must not
+            # consume the user-visible reply reservation.
+            reserve_for_reply=False,
         )
 
     @staticmethod
@@ -193,6 +195,11 @@ class MoodManager:
                         models=getattr(self.config.provider, "task_models", []),
                         is_json=True,
                         use_fallback=False,
+                        max_retries_override=0,
+                        max_models_override=1,
+                        reserve_for_reply=False,
+                        critical_path=False,
+                        propagate_queue_timeout_status=False,
                     ),
                     timeout=self._analysis_timeout_seconds(),
                 )

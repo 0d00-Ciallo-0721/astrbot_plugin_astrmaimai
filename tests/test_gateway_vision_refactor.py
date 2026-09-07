@@ -351,6 +351,12 @@ class GatewayVisionRefactorTests(unittest.TestCase):
             [context_mod.WorkloadFamily.JUDGE, context_mod.WorkloadFamily.MOOD],
         )
         self.assertTrue(all(call[1]["is_json"] for call in gateway.elastic_calls))
+        for _, call_kwargs in gateway.elastic_calls:
+            self.assertFalse(call_kwargs["ledger_critical_path"])
+            self.assertFalse(call_kwargs["reserve_for_reply"])
+            self.assertFalse(call_kwargs["propagate_queue_timeout_status"])
+            self.assertEqual(call_kwargs["max_retries_override"], 0)
+            self.assertEqual(call_kwargs["max_models_override"], 1)
 
     def test_direct_judge_call_records_stage_and_exact_model_attempt(self):
         ledger_mod = importlib.import_module("astrmai.infrastructure.runtime.turn_call_ledger")
@@ -469,9 +475,17 @@ class GatewayVisionRefactorTests(unittest.TestCase):
         self.assertEqual(proactive_elastic, "elastic text")
         self.assertEqual(gateway.lane_calls[0]["lane_key"], lane_key)
         self.assertTrue(gateway.lane_calls[0]["is_json"])
+        self.assertFalse(gateway.lane_calls[0]["critical_path"])
+        self.assertFalse(gateway.lane_calls[0]["reserve_for_reply"])
+        self.assertFalse(gateway.lane_calls[0]["propagate_queue_timeout_status"])
         self.assertFalse(gateway.lane_calls[1]["is_json"])
+        self.assertFalse(gateway.lane_calls[1]["critical_path"])
+        self.assertFalse(gateway.lane_calls[1]["reserve_for_reply"])
+        self.assertFalse(gateway.lane_calls[1]["propagate_queue_timeout_status"])
         self.assertEqual(len(gateway.elastic_calls), 2)
         self.assertFalse(gateway.elastic_calls[1][1]["ledger_critical_path"])
+        self.assertFalse(gateway.elastic_calls[1][1]["reserve_for_reply"])
+        self.assertFalse(gateway.elastic_calls[1][1]["propagate_queue_timeout_status"])
         self.assertEqual(gateway.context_economy.requests[0]["scope_id"], "default:GroupMessage:group-1")
         self.assertEqual(gateway.context_economy.requests[0]["scope_kind"], "chat")
 

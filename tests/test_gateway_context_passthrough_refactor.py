@@ -519,12 +519,23 @@ class GatewayContextPassthroughRefactorTests(unittest.TestCase):
         backoff_stages = [
             item for item in stages if item["stage"] == "gateway.retry_backoff"
         ]
+        queue_stages = [
+            item for item in stages if item["stage"] == "gateway.semaphore_wait"
+        ]
         self.assertEqual(
             [item["status"] for item in provider_stages],
             ["timeout", "success"],
         )
+        self.assertTrue(all(item["metadata"]["phase"] == "provider_hold" for item in provider_stages))
+        self.assertTrue(all(item["metadata"]["workload_class"] == "chat_dialog" for item in provider_stages))
+        self.assertTrue(all(item["metadata"]["tool_mode"] is False for item in provider_stages))
         self.assertEqual(len(backoff_stages), 1)
         self.assertEqual(backoff_stages[0]["status"], "success")
+        self.assertEqual(backoff_stages[0]["metadata"]["phase"], "retry_backoff")
+        self.assertTrue(queue_stages)
+        self.assertTrue(all(item["metadata"]["phase"] == "queue_wait" for item in queue_stages))
+        self.assertTrue(all(item["metadata"]["semaphore_name"] == "semaphore_wait" for item in queue_stages))
+        self.assertTrue(all(item["metadata"]["workload_class"] == "chat_dialog" for item in queue_stages))
 
     def test_tool_runner_is_not_wrapped_by_a_lifecycle_wide_slot(self):
         fake_context = _FakeContext()
@@ -569,6 +580,43 @@ class GatewayContextPassthroughRefactorTests(unittest.TestCase):
 
         self.assertEqual(result.text, "tool-ok")
         self.assertEqual(observed_available, [1])
+
+    def test_tool_runner_fallback_records_background_classification(self):
+        fake_context = _FakeContext()
+        config = SimpleNamespace(
+            infra=SimpleNamespace(
+                max_concurrent_llm_calls=2,
+                llm_retries=0,
+                backoff_factor=1.5,
+                api_timeout=10,
+            ),
+            provider=SimpleNamespace(fallback_models=[]),
+        )
+        gateway = self.gateway_mod.GlobalModelGateway(fake_context, config)
+        event = _TraceEvent()
+
+        result = asyncio.run(
+            gateway._run_tool_loop_agent_with_provider_slots(
+                event=event,
+                chat_provider_id="model-a",
+                prompt="background",
+                system_prompt="system",
+                contexts=[],
+                image_urls=None,
+                tools=object(),
+                max_steps=1,
+                tool_call_timeout=10,
+                critical_path=False,
+                workload_class="proactive_generation",
+            )
+        )
+
+        self.assertEqual(result.completion_text, "tool-ok")
+        stages = event.get_extra("astrmai_stage_ledger", [])
+        queue_stage = next(item for item in stages if item["stage"] == "gateway.tool_semaphore_wait")
+        self.assertFalse(queue_stage["critical_path"])
+        self.assertEqual(queue_stage["metadata"]["phase"], "queue_wait")
+        self.assertEqual(queue_stage["metadata"]["workload_class"], "proactive_generation")
 
     def test_three_outer_agents_leave_capacity_for_nested_agent_tasks(self):
         fake_context = _FakeContext()

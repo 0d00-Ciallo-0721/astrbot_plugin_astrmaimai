@@ -922,8 +922,79 @@ class RefactoredExecutorTests(unittest.TestCase):
         self.assertEqual(mode, "chat")
         self.assertEqual(kwargs["lane_key"].task_family, "dialog")
         self.assertEqual(kwargs["base_origin"], "default:GroupMessage:group-1@@topic:1")
+        self.assertTrue(kwargs["critical_path"])
         self.assertEqual(reply_service.calls, [("default:GroupMessage:group-1", "lane-text-reply")])
         self.assertEqual(evolution.calls, [])
+
+    def test_proactive_text_mode_uses_background_gateway_capacity(self):
+        gateway = _FakeGateway()
+        reply_service = _FakeReplyService()
+        executor = self.executor_mod.ConcurrentExecutor(
+            context=SimpleNamespace(),
+            gateway=gateway,
+            reply_engine=reply_service,
+            evolution_manager=_FakeEvolution(),
+            config=gateway.config,
+        )
+        event = _FakeEvent()
+        event.set_extra("astrmai_is_proactive_event", True)
+
+        async def _run():
+            return await executor.execute(event, "prompt", "system")
+
+        self.assertEqual(asyncio.run(_run()), "lane-text-reply")
+        self.assertFalse(gateway.calls[0][1]["critical_path"])
+
+    def test_proactive_tool_mode_uses_background_gateway_capacity(self):
+        gateway = _FakeGateway()
+        reply_service = _FakeReplyService()
+        executor = self.executor_mod.ConcurrentExecutor(
+            context=SimpleNamespace(),
+            gateway=gateway,
+            reply_engine=reply_service,
+            evolution_manager=_FakeEvolution(),
+            config=gateway.config,
+        )
+        event = _FakeEvent()
+        event.set_extra("astrmai_is_proactive_event", True)
+
+        async def _run():
+            return await executor.execute(event, "prompt", "system", tools=[object()])
+
+        self.assertEqual(asyncio.run(_run()), "tool-finished")
+        self.assertFalse(gateway.calls[0][1]["critical_path"])
+
+    def test_proactive_tool_correction_pass_stays_on_background_capacity(self):
+        calls = 0
+
+        def _tool_response(kwargs):
+            nonlocal calls
+            calls += 1
+            kwargs["event"].set_extra(
+                "astrmai_tool_execution_trace",
+                ([{"tool_name": "required", "status": "success"}] if calls == 2 else []),
+            )
+            return "done" if calls == 2 else "missing tool"
+
+        gateway = _FakeGateway(tool_responses={"model-a": _tool_response})
+        reply_service = _FakeReplyService()
+        executor = self.executor_mod.ConcurrentExecutor(
+            context=SimpleNamespace(),
+            gateway=gateway,
+            reply_engine=reply_service,
+            evolution_manager=_FakeEvolution(),
+            config=gateway.config,
+        )
+        event = _FakeEvent()
+        event.set_extra("astrmai_is_proactive_event", True)
+        event.set_extra("astrmai_required_tools", ["required"])
+
+        async def _run():
+            return await executor.execute(event, "prompt", "system", tools=[SimpleNamespace(name="required")])
+
+        self.assertEqual(asyncio.run(_run()), "done")
+        self.assertEqual(calls, 2)
+        self.assertTrue(all(kwargs["critical_path"] is False for mode, kwargs in gateway.calls if mode == "tool"))
 
     def test_tool_mode_yield_is_forwarded_as_terminal_content(self):
         gateway = _FakeGateway()
@@ -944,8 +1015,9 @@ class RefactoredExecutorTests(unittest.TestCase):
 
         self.assertEqual(result, "tool-finished")
         self.assertEqual(len(gateway.calls), 1)
-        mode, _kwargs = gateway.calls[0]
+        mode, kwargs = gateway.calls[0]
         self.assertEqual(mode, "tool")
+        self.assertTrue(kwargs["critical_path"])
         self.assertEqual(reply_service.calls, [("default:GroupMessage:group-1", "tool-finished")])
         self.assertEqual(evolution.calls, [])
 

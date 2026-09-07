@@ -62,15 +62,20 @@ class GatewayCallMixin:
         model_id: str,
         attempt: int = 0,
         tool_mode: bool = False,
+        workload_class: str = "",
+        provider_role: str = "primary",
     ):
         stage_id = begin_stage(
             event,
             "gateway.provider_request",
             critical_path=bool(critical_path),
             metadata={
+                "phase": "provider_hold",
+                "workload_class": str(workload_class or ""),
                 "model_id": str(model_id or ""),
                 "attempt": int(attempt),
                 "tool_mode": bool(tool_mode),
+                "provider_role": str(provider_role or "primary"),
             },
         )
         try:
@@ -96,6 +101,7 @@ class GatewayCallMixin:
         model_id: str,
         attempt: int,
         tool_mode: bool = False,
+        workload_class: str = "",
     ) -> None:
         delay_sec = max(0.0, float(delay_sec or 0.0))
         if delay_sec <= 0.0:
@@ -105,6 +111,8 @@ class GatewayCallMixin:
             "gateway.retry_backoff",
             critical_path=bool(critical_path),
             metadata={
+                "phase": "retry_backoff",
+                "workload_class": str(workload_class or ""),
                 "delay_sec": delay_sec,
                 "model_id": str(model_id or ""),
                 "attempt": int(attempt),
@@ -288,6 +296,8 @@ class GatewayCallMixin:
         event: Any = None,
         stage: str = "gateway.semaphore_wait",
         propagate_queue_timeout_status: bool = True,
+        workload_class: str = "",
+        attempt: int = 0,
     ):
         """G7/RT-11: 关键路径直取全局槽；后台调用须先过子限流器。
 
@@ -304,7 +314,13 @@ class GatewayCallMixin:
                 event,
                 stage,
                 critical_path=bool(critical_path),
-                metadata={"reentrant": True},
+                metadata={
+                    "phase": "queue_wait",
+                    "workload_class": str(workload_class or ""),
+                    "semaphore_name": str(stage or "").replace("gateway.", ""),
+                    "attempt": int(attempt),
+                    "reentrant": True,
+                },
             )
             finish_stage(event, stage_id, metadata={"reentrant": True})
             yield
@@ -318,7 +334,13 @@ class GatewayCallMixin:
                 event,
                 wait_stage,
                 critical_path=bool(critical_path),
-                metadata={"timeout_sec": timeout_sec},
+                metadata={
+                    "phase": "queue_wait",
+                    "workload_class": str(workload_class or ""),
+                    "semaphore_name": str(wait_stage or "").replace("gateway.", ""),
+                    "attempt": int(attempt),
+                    "timeout_sec": timeout_sec,
+                },
             )
             try:
                 if timeout_sec <= 0.0:
@@ -519,12 +541,23 @@ class GatewayCallMixin:
                             event=event,
                             stage="gateway.semaphore_wait",
                             propagate_queue_timeout_status=propagate_queue_timeout_status,
+                            workload_class=(
+                                ledger_family
+                                or str(getattr(getattr(workload_policy, "family", None), "value", "") or "")
+                                or pool_name
+                            ),
+                            attempt=attempt,
                         ):
                             async with self._provider_request_stage(
                                 event,
                                 critical_path=ledger_critical_path,
                                 model_id=model_id,
                                 attempt=attempt,
+                                workload_class=(
+                                    ledger_family
+                                    or str(getattr(getattr(workload_policy, "family", None), "value", "") or "")
+                                    or pool_name
+                                ),
                             ):
                                 self._assert_provider_request_allowed(event)
                                 provider_request_started = True
@@ -612,6 +645,11 @@ class GatewayCallMixin:
                                 critical_path=ledger_critical_path,
                                 model_id=model_id,
                                 attempt=attempt,
+                                workload_class=(
+                                    ledger_family
+                                    or str(getattr(getattr(workload_policy, "family", None), "value", "") or "")
+                                    or pool_name
+                                ),
                             )
                         continue
                     except Exception as exc:
@@ -663,6 +701,11 @@ class GatewayCallMixin:
                                 critical_path=ledger_critical_path,
                                 model_id=model_id,
                                 attempt=attempt,
+                                workload_class=(
+                                    ledger_family
+                                    or str(getattr(getattr(workload_policy, "family", None), "value", "") or "")
+                                    or pool_name
+                                ),
                             )
 
                         if cascade_budget_exhausted:
@@ -830,6 +873,11 @@ class GatewayCallMixin:
                                 critical_path=ledger_critical_path,
                                 model_id=model_id,
                                 attempt=attempt,
+                                workload_class=(
+                                    ledger_family
+                                    or str(getattr(getattr(workload_policy, "family", None), "value", "") or "")
+                                    or pool_name
+                                ),
                             )
 
             if owns_ledger_call:

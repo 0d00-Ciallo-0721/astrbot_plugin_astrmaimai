@@ -2287,6 +2287,7 @@ class ConcurrentExecutor:
         last_failure_kind = "unknown"
         attempted_models: list[str] = []
         agent_models = self.gateway.get_agent_models()
+        critical_path = not bool(event.get_extra("astrmai_is_proactive_event", False))
         selection_meta = dict(getattr(self.gateway, "_last_agent_model_selection", {}) or {})
         for index, provider_id in enumerate(agent_models):
             if not await self._check_pre_model_freshness(event, chat_id, "text execution"):
@@ -2319,6 +2320,7 @@ class ConcurrentExecutor:
                     image_urls=image_urls,
                     use_fallback=False,
                     raw_user_text=runtime["raw_user_text"],
+                    critical_path=critical_path,
                 )
                 reply_text = result.text
                 safe_reply_text, failure_kind = self._validate_visible_output(event, reply_text)
@@ -2394,6 +2396,10 @@ class ConcurrentExecutor:
         last_failure_kind = "unknown"
         attempted_models: list[str] = []
         agent_models = self.gateway.get_agent_models()
+        critical_path = not bool(
+            event.get_extra("astrmai_is_proactive_event", False)
+            or execution_event.get_extra("astrmai_is_proactive_event", False)
+        )
         selection_meta = dict(getattr(self.gateway, "_last_agent_model_selection", {}) or {})
         # OPT-09/TL-04: 级联重试前记录真实副作用基线——工具已发过私聊/戳人/表情后
         # 换模型整轮重跑会重复真实动作（space_transition 去重键含精确文本，跨模型
@@ -2432,6 +2438,7 @@ class ConcurrentExecutor:
                     image_urls=image_urls,
                     prefix_hash=runtime["prefix_hash"],
                     raw_user_text=runtime["raw_user_text"],
+                    critical_path=critical_path,
                 )
                 self._sync_execution_event_trace(execution_event, event)
                 missing_required = self._record_required_tool_outcomes(event)
@@ -2506,6 +2513,7 @@ class ConcurrentExecutor:
                         image_urls=image_urls,
                         prefix_hash=runtime["prefix_hash"],
                         raw_user_text=runtime["raw_user_text"],
+                        critical_path=critical_path,
                     )
                     self._sync_execution_event_trace(execution_event, event)
                     missing_required = self._record_required_tool_outcomes(event)

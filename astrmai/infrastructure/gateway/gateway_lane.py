@@ -35,42 +35,58 @@ class GatewayLaneMixin:
             event.set_extra("astrmai_provider_request_block_reason", "shutdown_rejected")
         raise GatewayShutdownRejected()
 
-    def _lane_prepare_timeout(self, event: Any) -> float:
+    def _lane_prepare_timeout(self, event: Any, *, critical_path: bool = True) -> float:
         timing = getattr(getattr(self, "config", None), "timing", None)
         try:
             configured = float(getattr(timing, "lane_prepare_timeout_sec", 20.0) or 20.0)
         except (TypeError, ValueError):
             configured = 20.0
-        return clamp_timeout_to_turn_budget(event, max(0.1, configured), reserve_for_reply=True)
+        return clamp_timeout_to_turn_budget(
+            event,
+            max(0.1, configured),
+            reserve_for_reply=bool(critical_path),
+        )
 
-    def _lane_persist_timeout(self, event: Any) -> float:
+    def _lane_persist_timeout(self, event: Any, *, critical_path: bool = True) -> float:
         timing = getattr(getattr(self, "config", None), "timing", None)
         try:
             configured = float(getattr(timing, "lane_persist_timeout_sec", 5.0) or 5.0)
         except (TypeError, ValueError):
             configured = 5.0
-        return clamp_timeout_to_turn_budget(event, max(0.1, configured), reserve_for_reply=True)
+        return clamp_timeout_to_turn_budget(
+            event,
+            max(0.1, configured),
+            reserve_for_reply=bool(critical_path),
+        )
 
     async def _ensure_lane_bounded(
         self,
         event: Any,
         *,
         propagate_queue_timeout_status: bool = True,
+        critical_path: bool = True,
         **kwargs,
     ):
+        # ``workload_class`` is telemetry-only; keep it out of the LaneManager
+        # contract so older/fake lane managers continue to accept the request.
+        workload_class = str(kwargs.pop("workload_class", "") or "")
         stage_id = begin_stage(
             event,
             "gateway.lane_prepare",
-            critical_path=True,
-            metadata={"lane_scope": str(getattr(kwargs.get("lane_key"), "scope_id", "") or "")},
+            critical_path=bool(critical_path),
+            metadata={
+                "phase": "queue_wait",
+                "workload_class": workload_class,
+                "lane_scope": str(getattr(kwargs.get("lane_key"), "scope_id", "") or ""),
+            },
         )
-        timeout_sec = self._lane_prepare_timeout(event)
+        timeout_sec = self._lane_prepare_timeout(event, critical_path=critical_path)
         if timeout_sec <= 0.0:
             finish_stage(event, stage_id, status="timeout", reason="queue_timeout")
             if event is not None and hasattr(event, "set_extra"):
                 timeout_record = {
                     "stage": "gateway.lane_prepare",
-                    "critical_path": True,
+                    "critical_path": bool(critical_path),
                     "terminal": bool(propagate_queue_timeout_status),
                 }
                 timeouts = list(event.get_extra("astrmai_gateway_queue_timeouts", []) or [])
@@ -91,7 +107,7 @@ class GatewayLaneMixin:
             if event is not None and hasattr(event, "set_extra"):
                 timeout_record = {
                     "stage": "gateway.lane_prepare",
-                    "critical_path": True,
+                    "critical_path": bool(critical_path),
                     "terminal": bool(propagate_queue_timeout_status),
                 }
                 timeouts = list(event.get_extra("astrmai_gateway_queue_timeouts", []) or [])
@@ -189,6 +205,7 @@ class GatewayLaneMixin:
         protocol_passthrough: Optional[str] = None,
         protocol_type: Optional[str] = None,
         debug_log_prefix: str = "",
+        critical_path: bool = True,
     ) -> None:
         if workload_trace is not None:
             try:
@@ -226,10 +243,14 @@ class GatewayLaneMixin:
             persist_stage = begin_stage(
                 event,
                 "gateway.lane_persist",
-                critical_path=True,
-                metadata={"lane_scope": str(getattr(effective_lane_key, "scope_id", "") or "")},
+                critical_path=bool(critical_path),
+                metadata={
+                    "phase": "lane_persist",
+                    "workload_class": workload_policy.family.value,
+                    "lane_scope": str(getattr(effective_lane_key, "scope_id", "") or ""),
+                },
             )
-            persist_timeout = self._lane_persist_timeout(event)
+            persist_timeout = self._lane_persist_timeout(event, critical_path=critical_path)
             try:
                 if persist_timeout <= 0.0:
                     raise asyncio.TimeoutError("lane persistence exceeded turn budget")
@@ -345,6 +366,8 @@ class GatewayLaneMixin:
         tool_call_timeout: int,
         attempt: int = 0,
         propagate_queue_timeout_status: bool = True,
+        critical_path: bool = True,
+        workload_class: str = "",
         **kwargs: Any,
     ) -> Any:
         """Run AstrBot's agent loop while leasing capacity per provider request.
@@ -356,14 +379,17 @@ class GatewayLaneMixin:
         """
         provider_manager = getattr(self.context, "provider_manager", None)
         get_provider = getattr(provider_manager, "get_provider_by_id", None)
+        workload_class = str(workload_class or "chat_tools")
         if not callable(get_provider):
             # Test doubles and old hosts without an exposed provider manager keep
             # the legacy bounded behavior instead of bypassing concurrency limits.
             async with self._concurrency_slot(
-                True,
+                critical_path,
                 event=event,
                 stage="gateway.tool_semaphore_wait",
                 propagate_queue_timeout_status=propagate_queue_timeout_status,
+                workload_class=workload_class,
+                attempt=attempt,
             ):
                 self._assert_provider_request_allowed(event)
                 return await self.context.tool_loop_agent(
@@ -394,25 +420,30 @@ class GatewayLaneMixin:
         self_gateway = self
 
         class _ProviderAttemptProxy:
-            def __init__(self, wrapped_provider: Any):
+            def __init__(self, wrapped_provider: Any, *, provider_role: str = "primary"):
                 self._wrapped_provider = wrapped_provider
+                self._provider_role = provider_role
 
             def __getattr__(self, name: str) -> Any:
                 return getattr(self._wrapped_provider, name)
 
             async def text_chat(self, **request_kwargs: Any) -> Any:
                 async with self_gateway._concurrency_slot(
-                    True,
+                    critical_path,
                     event=event,
                     stage="gateway.tool_semaphore_wait",
                     propagate_queue_timeout_status=propagate_queue_timeout_status,
+                    workload_class=workload_class,
+                    attempt=attempt,
                 ):
                     async with self_gateway._provider_request_stage(
                         event,
-                        critical_path=True,
+                        critical_path=critical_path,
                         model_id=chat_provider_id,
                         attempt=attempt,
                         tool_mode=True,
+                        workload_class=workload_class,
+                        provider_role=self._provider_role,
                     ):
                         self_gateway._assert_provider_request_allowed(event)
                         return await self._wrapped_provider.text_chat(**request_kwargs)
@@ -420,17 +451,21 @@ class GatewayLaneMixin:
             def text_chat_stream(self, **request_kwargs: Any):
                 async def _stream():
                     async with self_gateway._concurrency_slot(
-                        True,
+                        critical_path,
                         event=event,
                         stage="gateway.tool_semaphore_wait",
                         propagate_queue_timeout_status=propagate_queue_timeout_status,
+                        workload_class=workload_class,
+                        attempt=attempt,
                     ):
                         async with self_gateway._provider_request_stage(
                             event,
-                            critical_path=True,
+                            critical_path=critical_path,
                             model_id=chat_provider_id,
                             attempt=attempt,
                             tool_mode=True,
+                            workload_class=workload_class,
+                            provider_role=self._provider_role,
                         ):
                             self_gateway._assert_provider_request_allowed(event)
                             async for item in self._wrapped_provider.text_chat_stream(
@@ -464,11 +499,12 @@ class GatewayLaneMixin:
         compression_provider = runner_kwargs.get("llm_compress_provider")
         if compression_provider is not None:
             runner_kwargs["llm_compress_provider"] = _ProviderAttemptProxy(
-                compression_provider
+                compression_provider,
+                provider_role="compression",
             )
         runner = ToolLoopAgentRunner()
         await runner.reset(
-            provider=_ProviderAttemptProxy(provider),
+            provider=_ProviderAttemptProxy(provider, provider_role="primary"),
             request=request,
             run_context=AgentContextWrapper(
                 context=agent_context,
@@ -699,6 +735,8 @@ class GatewayLaneMixin:
         lane_umo, conversation_id, history, _ = await self._ensure_lane_bounded(
             event,
             propagate_queue_timeout_status=propagate_queue_timeout_status,
+            critical_path=critical_path,
+            workload_class=workload_policy.family.value,
             lane_key=effective_lane_key,
             base_origin=base_origin,
             prefix_hash=workload_policy.effective_prefix_hash,
@@ -865,6 +903,7 @@ class GatewayLaneMixin:
             skipped_cooldown_models=tuple(result.skipped_cooldown_models),
             cooldown_overridden=bool(result.cooldown_overridden),
             lane_umo=lane_umo,
+            critical_path=critical_path,
         )
         return result
 
@@ -884,6 +923,8 @@ class GatewayLaneMixin:
         persona_id: str = "",
         raw_user_text: str = "",
         template_envelope: Optional[PromptEnvelope] = None,
+        critical_path: bool = True,
+        propagate_queue_timeout_status: bool = True,
     ) -> str:
         result = await self.tool_chat_in_lane_result(
             lane_key=lane_key,
@@ -900,6 +941,8 @@ class GatewayLaneMixin:
             persona_id=persona_id,
             raw_user_text=raw_user_text,
             template_envelope=template_envelope,
+            critical_path=critical_path,
+            propagate_queue_timeout_status=propagate_queue_timeout_status,
         )
         return result.text
 
@@ -919,6 +962,7 @@ class GatewayLaneMixin:
         persona_id: str = "",
         raw_user_text: str = "",
         template_envelope: Optional[PromptEnvelope] = None,
+        critical_path: bool = True,
         propagate_queue_timeout_status: bool = True,
     ) -> LLMCallResult:
         call_id = begin_llm_call(
@@ -931,6 +975,7 @@ class GatewayLaneMixin:
             tools=tools,
             max_steps=max_steps,
             metadata={"model_count": len(models or []), "timeout_sec": int(timeout or 0)},
+            critical_path=critical_path,
         )
         try:
             result = await self._tool_chat_in_lane_result_unlimited(
@@ -949,6 +994,7 @@ class GatewayLaneMixin:
                 raw_user_text=raw_user_text,
                 template_envelope=template_envelope,
                 ledger_call_id=call_id,
+                critical_path=critical_path,
                 propagate_queue_timeout_status=propagate_queue_timeout_status,
             )
         except Exception as exc:
@@ -991,6 +1037,7 @@ class GatewayLaneMixin:
         raw_user_text: str = "",
         template_envelope: Optional[PromptEnvelope] = None,
         ledger_call_id: str = "",
+        critical_path: bool = True,
         propagate_queue_timeout_status: bool = True,
     ) -> LLMCallResult:
         if not self.lane_manager:
@@ -1036,6 +1083,7 @@ class GatewayLaneMixin:
         lane_umo, conversation_id, history, _ = await self._ensure_lane_bounded(
             event,
             propagate_queue_timeout_status=propagate_queue_timeout_status,
+            critical_path=critical_path,
             lane_key=effective_lane_key,
             base_origin=base_origin,
             prefix_hash=workload_policy.effective_prefix_hash,
@@ -1094,6 +1142,8 @@ class GatewayLaneMixin:
                         max_steps=max_steps,
                         tool_call_timeout=timeout,
                         attempt=attempt,
+                        critical_path=critical_path,
+                        workload_class=workload_policy.family.value,
                         propagate_queue_timeout_status=propagate_queue_timeout_status,
                         **tool_kwargs,
                     ),
@@ -1192,6 +1242,7 @@ class GatewayLaneMixin:
                         protocol_passthrough=True,
                         protocol_type="terminal_yield" if "[TERMINAL_YIELD]:" in stripped_reply else "wait_signal",
                         debug_log_prefix=f"trace={trace_id} tool-" if (trace_id := getattr(event, "get_extra", lambda *_args, **_kwargs: "")("astrmai_trace_id", "")) else "tool-",
+                        critical_path=critical_path,
                     )
                     record_llm_attempt(
                         event,
@@ -1304,6 +1355,7 @@ class GatewayLaneMixin:
                     cooldown_overridden=bool(cooldown_overridden),
                     lane_umo=lane_umo,
                     debug_log_prefix=f"trace={trace_id} tool-" if (trace_id := getattr(event, "get_extra", lambda *_args, **_kwargs: "")("astrmai_trace_id", "")) else "tool-",
+                    critical_path=critical_path,
                 )
                 record_llm_attempt(
                     event,
@@ -1390,10 +1442,11 @@ class GatewayLaneMixin:
                         await self._wait_retry_backoff(
                             backoff_factor ** attempt,
                             event=event,
-                            critical_path=True,
+                            critical_path=critical_path,
                             model_id=model_id,
                             attempt=attempt,
                             tool_mode=True,
+                            workload_class=workload_policy.family.value,
                         )
                 else:
                     logger.warning(f"[Gateway] tool_loop model {model_id} failed, trying next: {last_error}")

@@ -249,10 +249,16 @@ class JudgeHistoryWindowRefactorTests(unittest.TestCase):
         )
 
         prompt = gateway.prompts[-1]
+        request = gateway.requests[-1]
         expected_time = datetime.fromtimestamp(recent_ts).strftime("%Y-%m-%d %H:%M")
         self.assertIn(f"[{expected_time}] RecentUser: recent clue", prompt)
         self.assertNotIn("OldUser: stale clue", prompt)
         self.assertNotIn("NoTsUser: missing timestamp", prompt)
+        self.assertFalse(request["critical_path"])
+        self.assertFalse(request["reserve_for_reply"])
+        self.assertFalse(request["propagate_queue_timeout_status"])
+        self.assertEqual(request["max_retries_override"], 0)
+        self.assertEqual(request["max_models_override"], 1)
 
     def test_keyword_wakeup_extends_history_window_to_thirty_minutes(self):
         now = time.time()

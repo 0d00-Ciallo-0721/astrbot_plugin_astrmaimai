@@ -98,6 +98,11 @@ class StateGapCoverageTests(unittest.TestCase):
         self.assertEqual(observed["base_origin"], "chat-1")
         self.assertTrue(observed["is_json"])
         self.assertFalse(observed["use_fallback"])
+        self.assertFalse(observed["critical_path"])
+        self.assertFalse(observed["reserve_for_reply"])
+        self.assertFalse(observed["propagate_queue_timeout_status"])
+        self.assertEqual(observed["max_retries_override"], 0)
+        self.assertEqual(observed["max_models_override"], 1)
 
     def test_apply_natural_decay_epoch0_does_not_catastrophically_decay_mood(self):
         state = SimpleNamespace(
