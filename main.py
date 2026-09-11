@@ -104,6 +104,9 @@ class AstrMaiPlugin(Star):
 
     async def initialize(self) -> None:
         """Start the runtime whenever AstrBot activates or hot-reloads the plugin."""
+        if not self._plugin_is_activated():
+            await self._handle_disabled_runtime("plugin_initialize")
+            return
         repair = repair_plugin_handler_bindings(self, __name__)
         if repair.nested_binding_count:
             logger.warning(
@@ -113,8 +116,70 @@ class AstrMaiPlugin(Star):
         await self._ensure_runtime_started("plugin_initialize")
 
     async def _ensure_runtime_started(self, source: str) -> None:
+        if not self._plugin_is_activated():
+            await self._handle_disabled_runtime(source)
+            return
         logger.info(f"[AstrMai] runtime startup requested source={source}")
         await self.facade.on_program_start(source=source)
+
+    def _plugin_is_activated(self) -> bool:
+        """Read the host activation state so stale reload hooks cannot restart us."""
+        context = getattr(self, "context", None)
+        getter = getattr(context, "get_registered_star", None)
+        all_getter = getattr(context, "get_all_stars", None)
+        registry_available = callable(getter) or callable(all_getter)
+        metadata = None
+
+        if callable(getter):
+            names = [getattr(self, "name", ""), "astrmai"]
+            for name in dict.fromkeys(str(value).strip() for value in names if value):
+                try:
+                    metadata = getter(name)
+                except Exception:
+                    logger.debug("[AstrMai] failed to read plugin activation metadata", exc_info=True)
+                    metadata = None
+                if metadata is not None:
+                    break
+
+        if metadata is None and callable(all_getter):
+            try:
+                stars = all_getter() or []
+            except Exception:
+                logger.debug("[AstrMai] failed to enumerate plugin activation metadata", exc_info=True)
+                stars = []
+            module_path = str(getattr(self.__class__, "__module__", "") or "")
+            for candidate in stars:
+                candidate_name = str(getattr(candidate, "name", "") or "")
+                candidate_module = str(getattr(candidate, "module_path", "") or "")
+                if candidate_name == "astrmai" or candidate_module == module_path or candidate_module.endswith(".astrmai.main"):
+                    metadata = candidate
+                    break
+
+        if metadata is not None and hasattr(metadata, "activated"):
+            bound_instance = getattr(metadata, "star_cls", None)
+            if bound_instance is not None and bound_instance is not self:
+                return False
+            if bound_instance is None and bool(metadata.activated):
+                return False
+            return bool(metadata.activated)
+
+        instance_state = getattr(self, "activated", None)
+        if isinstance(instance_state, bool):
+            return instance_state
+
+        # A host registry that cannot identify this instance is safer treated as
+        # stale than allowed to restart a runtime after a disabled reload.
+        if registry_available:
+            return False
+        return True
+
+    async def _handle_disabled_runtime(self, source: str) -> None:
+        logger.info(f"[AstrMai] runtime startup skipped source={source} reason=plugin_disabled")
+        facade = getattr(self, "facade", None)
+        terminate = getattr(facade, "terminate", None)
+        if not callable(terminate):
+            return
+        await terminate()
 
     @filter.on_astrbot_loaded()
     async def on_program_start(self):

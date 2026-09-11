@@ -141,6 +141,12 @@ class ReverseSessionMainHookTests(unittest.TestCase):
     def test_plugin_initialize_starts_runtime_after_hot_reload(self):
         plugin = object.__new__(self.main_mod.AstrMaiPlugin)
         calls = []
+        plugin.context = SimpleNamespace(
+            get_registered_star=lambda name: SimpleNamespace(
+                activated=True,
+                star_cls=plugin,
+            ),
+        )
 
         class _Facade:
             async def on_program_start(self, *, source: str = ""):
@@ -151,6 +157,182 @@ class ReverseSessionMainHookTests(unittest.TestCase):
         asyncio.run(plugin.initialize())
 
         self.assertEqual(calls, ["start"])
+
+    def test_disabled_plugin_initialize_skips_start_and_terminates_active_runtime(self):
+        plugin = object.__new__(self.main_mod.AstrMaiPlugin)
+        calls = []
+        plugin.context = SimpleNamespace(
+            get_registered_star=lambda name: SimpleNamespace(activated=False),
+        )
+
+        class _Facade:
+            runtime = SimpleNamespace(status=SimpleNamespace(is_running=True, lifecycle_started=True))
+
+            async def on_program_start(self, *, source: str = ""):
+                calls.append(("start", source))
+
+            async def terminate(self):
+                calls.append(("terminate", "disabled"))
+
+        plugin.facade = _Facade()
+
+        asyncio.run(plugin.initialize())
+
+        self.assertEqual(calls, [("terminate", "disabled")])
+
+    def test_disabled_loaded_hook_does_not_restart_runtime(self):
+        plugin = object.__new__(self.main_mod.AstrMaiPlugin)
+        calls = []
+        plugin.context = SimpleNamespace(
+            get_registered_star=lambda name: SimpleNamespace(activated=False),
+        )
+
+        class _Facade:
+            runtime = SimpleNamespace(status=SimpleNamespace(is_running=False, lifecycle_started=False))
+
+            async def on_program_start(self, *, source: str = ""):
+                calls.append(("start", source))
+
+        plugin.facade = _Facade()
+
+        asyncio.run(plugin.on_program_start())
+
+        self.assertEqual(calls, [])
+
+    def test_unregistered_reload_hook_fails_closed(self):
+        plugin = object.__new__(self.main_mod.AstrMaiPlugin)
+        calls = []
+        plugin.context = SimpleNamespace(
+            get_registered_star=lambda name: None,
+        )
+
+        class _Facade:
+            runtime = SimpleNamespace(status=SimpleNamespace(is_running=False, lifecycle_started=False))
+
+            async def on_program_start(self, *, source: str = ""):
+                calls.append(source)
+
+        plugin.facade = _Facade()
+
+        asyncio.run(plugin.on_program_start())
+
+        self.assertEqual(calls, [])
+
+    def test_enabled_metadata_without_bound_instance_fails_closed(self):
+        plugin = object.__new__(self.main_mod.AstrMaiPlugin)
+        calls = []
+        plugin.context = SimpleNamespace(
+            get_registered_star=lambda name: SimpleNamespace(
+                activated=True,
+                star_cls=None,
+            ),
+        )
+
+        class _Facade:
+            async def on_program_start(self, *, source: str = ""):
+                calls.append(source)
+
+        plugin.facade = _Facade()
+
+        asyncio.run(plugin.on_program_start())
+
+        self.assertEqual(calls, [])
+
+    def test_registry_lookup_error_falls_back_to_all_stars_for_current_instance(self):
+        plugin = object.__new__(self.main_mod.AstrMaiPlugin)
+        calls = []
+        plugin.context = SimpleNamespace(
+            get_registered_star=lambda name: (_ for _ in ()).throw(RuntimeError("registry unavailable")),
+            get_all_stars=lambda: [
+                SimpleNamespace(
+                    name="astrmai",
+                    activated=True,
+                    star_cls=plugin,
+                )
+            ],
+        )
+
+        class _Facade:
+            async def on_program_start(self, *, source: str = ""):
+                calls.append(source)
+
+        plugin.facade = _Facade()
+
+        asyncio.run(plugin.on_program_start())
+
+        self.assertEqual(calls, ["astrbot_loaded"])
+
+    def test_registry_enumeration_error_fails_closed(self):
+        plugin = object.__new__(self.main_mod.AstrMaiPlugin)
+        calls = []
+        plugin.context = SimpleNamespace(
+            get_all_stars=lambda: (_ for _ in ()).throw(RuntimeError("enumeration unavailable")),
+        )
+
+        class _Facade:
+            async def on_program_start(self, *, source: str = ""):
+                calls.append(source)
+
+        plugin.facade = _Facade()
+
+        asyncio.run(plugin.on_program_start())
+
+        self.assertEqual(calls, [])
+
+    def test_disabled_runtime_without_terminate_method_does_not_start(self):
+        plugin = object.__new__(self.main_mod.AstrMaiPlugin)
+        calls = []
+        plugin.context = SimpleNamespace(
+            get_registered_star=lambda name: SimpleNamespace(activated=False),
+        )
+
+        class _Facade:
+            async def on_program_start(self, *, source: str = ""):
+                calls.append(source)
+
+        plugin.facade = _Facade()
+
+        asyncio.run(plugin.initialize())
+
+        self.assertEqual(calls, [])
+
+    def test_stale_instance_cannot_start_after_current_instance_reloads(self):
+        plugin = object.__new__(self.main_mod.AstrMaiPlugin)
+        calls = []
+        current_plugin = object()
+        plugin.context = SimpleNamespace(
+            get_registered_star=lambda name: SimpleNamespace(
+                activated=True,
+                star_cls=current_plugin,
+            ),
+        )
+
+        class _Facade:
+            runtime = SimpleNamespace(status=SimpleNamespace(is_running=False, lifecycle_started=False))
+
+            async def on_program_start(self, *, source: str = ""):
+                calls.append(source)
+
+        plugin.facade = _Facade()
+
+        asyncio.run(plugin.on_program_start())
+
+        self.assertEqual(calls, [])
+
+    def test_disabled_cleanup_failure_is_not_hidden(self):
+        plugin = object.__new__(self.main_mod.AstrMaiPlugin)
+        plugin.context = SimpleNamespace(
+            get_registered_star=lambda name: SimpleNamespace(activated=False),
+        )
+
+        class _Facade:
+            async def terminate(self):
+                raise RuntimeError("cleanup failed")
+
+        plugin.facade = _Facade()
+
+        with self.assertRaisesRegex(RuntimeError, "cleanup failed"):
+            asyncio.run(plugin.initialize())
 
 
 if __name__ == "__main__":
