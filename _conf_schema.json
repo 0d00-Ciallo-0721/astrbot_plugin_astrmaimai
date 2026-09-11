@@ -278,13 +278,13 @@
         "description": "启用群聊被动复读",
         "type": "bool",
         "default": true,
-        "hint": "只对群聊纯文本的连续多人复读触发一次原样跟读。"
+        "hint": "只对群聊中连续出现的相同纯文本消息触发一次原样跟读。"
       },
       "group_reread_threshold": {
-        "description": "被动复读触发人数",
+        "description": "被动复读触发消息数",
         "type": "int",
         "default": 5,
-        "hint": "连续发送同一纯文本且发送者互不相同的人数达到此值后触发。"
+        "hint": "连续发送相同纯文本的消息数量达到此值后触发；同一发送者的不同消息也会累计。"
       },
       "group_reread_window_sec": {
         "description": "被动复读时间窗口（秒）",

@@ -115,7 +115,7 @@ class GroupRereadTests(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def test_five_distinct_members_trigger_passive_reread(self):
+    def test_five_messages_trigger_passive_reread(self):
         observer = self.observer_mod.GroupRereadObserver(config=self.config)
 
         async def _run():
@@ -130,20 +130,63 @@ class GroupRereadTests(unittest.TestCase):
         self.assertEqual(decision.trigger_kind, "group_reread_passive")
         self.assertEqual(len(decision.participant_ids), 5)
 
-    def test_bot_seed_and_four_members_trigger_but_reread_is_not_seeded(self):
+    def test_same_sender_distinct_messages_trigger_passive_reread(self):
+        observer = self.observer_mod.GroupRereadObserver(config=self.config)
+
+        async def _run():
+            decisions = []
+            for index in range(5):
+                decisions.append(
+                    await observer.observe(
+                        _Event("早", sender_id="same-user", message_id=f"same-{index}")
+                    )
+                )
+            return decisions
+
+        decisions = asyncio.run(_run())
+        self.assertEqual(decisions[:4], [None, None, None, None])
+        self.assertIsNotNone(decisions[4])
+        self.assertEqual(decisions[4].participant_ids, ("same-user",) * 5)
+        self.assertEqual(decisions[4].source_event_ids, tuple(f"same-{index}" for index in range(5)))
+        self.assertIn("连续出现 5 条", decisions[4].explanation)
+        self.assertNotIn("不同成员", decisions[4].explanation)
+
+    def test_mixed_senders_trigger_by_total_message_count(self):
+        observer = self.observer_mod.GroupRereadObserver(config=self.config)
+        senders = ("user-a", "user-a", "user-b", "user-a", "user-c")
+
+        async def _run():
+            decision = None
+            for index, sender_id in enumerate(senders):
+                decision = await observer.observe(
+                    _Event("早", sender_id=sender_id, message_id=f"mixed-{index}")
+                )
+            return decision
+
+        decision = asyncio.run(_run())
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.participant_ids, senders)
+        self.assertEqual(len(decision.source_event_ids), 5)
+
+    def test_bot_seed_and_four_messages_from_same_sender_trigger(self):
         observer = self.observer_mod.GroupRereadObserver(config=self.config)
 
         async def _run():
             await observer.record_outbound_text_seed("default:GroupMessage:group-1", "早", bot_id="bot-1", event_id="bot-original")
             decision = None
             for index in range(4):
-                decision = await observer.observe(_Event("早", sender_id=f"user-{index}", message_id=f"m-{index}"))
+                decision = await observer.observe(
+                    _Event("早", sender_id="same-user", message_id=f"m-{index}")
+                )
             return decision
 
         decision = asyncio.run(_run())
         self.assertIsNotNone(decision)
         self.assertIn("Bot 先前", decision.explanation)
+        self.assertIn("连续出现 4 条", decision.explanation)
+        self.assertNotIn("不同群成员", decision.explanation)
         self.assertEqual(decision.participant_ids[0], "bot-1")
+        self.assertEqual(decision.participant_ids[1:], ("same-user",) * 4)
 
     def test_completed_turn_outcome_blocks_reread_text(self):
         from astrmai.conversation.contracts.turn_outcome import record_text_sent
@@ -192,17 +235,95 @@ class GroupRereadTests(unittest.TestCase):
         self.assertIsNotNone(decision)
         self.assertEqual(decision.participant_ids[0], "bot-1")
 
-    def test_repeated_sender_or_non_plain_message_does_not_trigger(self):
+    def test_duplicate_platform_event_does_not_advance_or_reset_chain(self):
+        observer = self.observer_mod.GroupRereadObserver(config=self.config)
+
+        async def _run():
+            first = await observer.observe(_Event("早", sender_id="same-user", message_id="same-event"))
+            duplicates = [
+                await observer.observe(_Event("早", sender_id="same-user", message_id="same-event"))
+                for _index in range(4)
+            ]
+            state = observer._states["default:GroupMessage:group-1"]
+            return first, duplicates, list(state.records), observer.describe_status()
+
+        first, duplicates, records, status = asyncio.run(_run())
+        self.assertIsNone(first)
+        self.assertEqual(duplicates, [None, None, None, None])
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].event_id, "same-event")
+        self.assertEqual(status["stats"].get("duplicate_event_ignored"), 4)
+
+    def test_duplicate_event_inside_chain_does_not_delay_threshold(self):
+        observer = self.observer_mod.GroupRereadObserver(config=self.config)
+
+        async def _run():
+            results = [
+                await observer.observe(_Event("早", sender_id="user-1", message_id="m-1")),
+                await observer.observe(_Event("早", sender_id="user-1", message_id="m-2")),
+                await observer.observe(_Event("早", sender_id="user-1", message_id="m-2")),
+                await observer.observe(_Event("早", sender_id="user-2", message_id="m-3")),
+                await observer.observe(_Event("早", sender_id="user-2", message_id="m-4")),
+                await observer.observe(_Event("早", sender_id="user-3", message_id="m-5")),
+            ]
+            return results
+
+        results = asyncio.run(_run())
+        self.assertEqual(results[:5], [None, None, None, None, None])
+        self.assertIsNotNone(results[5])
+        self.assertEqual(results[5].source_event_ids, ("m-1", "m-2", "m-3", "m-4", "m-5"))
+
+    def test_non_plain_message_does_not_enter_reread_window(self):
         observer = self.observer_mod.GroupRereadObserver(config=self.config)
         image = SimpleNamespace(type="Image")
 
-        async def _run():
-            for index in range(5):
-                result = await observer.observe(_Event("早", sender_id="same-user", message_id=f"m-{index}"))
-                self.assertIsNone(result)
-            return await observer.observe(_Event("早", sender_id="user-image", message_id="image", chain=[image]))
+        result = asyncio.run(
+            observer.observe(_Event("早", sender_id="user-image", message_id="image", chain=[image]))
+        )
+        self.assertIsNone(result)
+        self.assertEqual(observer.describe_status()["active_groups"], 0)
 
-        self.assertIsNone(asyncio.run(_run()))
+    def test_text_change_resets_consecutive_message_count(self):
+        observer = self.observer_mod.GroupRereadObserver(config=self.config)
+
+        async def _run():
+            for index in range(3):
+                self.assertIsNone(
+                    await observer.observe(_Event("早", sender_id="same-user", message_id=f"early-{index}"))
+                )
+            self.assertIsNone(
+                await observer.observe(_Event("晚", sender_id="same-user", message_id="different"))
+            )
+            decisions = []
+            for index in range(5):
+                decisions.append(
+                    await observer.observe(_Event("早", sender_id="same-user", message_id=f"late-{index}"))
+                )
+            return decisions
+
+        decisions = asyncio.run(_run())
+        self.assertEqual(decisions[:4], [None, None, None, None])
+        self.assertIsNotNone(decisions[4])
+
+    def test_missing_event_id_deduplicates_same_object_but_counts_distinct_events(self):
+        observer = self.observer_mod.GroupRereadObserver(config=self.config)
+        self.config.conversation.group_reread_threshold = 2
+        repeated_object = _Event("早", sender_id="same-user", message_id="")
+        repeated_object.message_obj.message_id = ""
+        distinct_object = _Event("早", sender_id="same-user", message_id="")
+        distinct_object.message_obj.message_id = ""
+
+        async def _run():
+            first = await observer.observe(repeated_object)
+            duplicate = await observer.observe(repeated_object)
+            triggered = await observer.observe(distinct_object)
+            return first, duplicate, triggered
+
+        first, duplicate, triggered = asyncio.run(_run())
+        self.assertIsNone(first)
+        self.assertIsNone(duplicate)
+        self.assertIsNotNone(triggered)
+        self.assertEqual(triggered.participant_ids, ("same-user", "same-user"))
 
     def test_commands_anonymous_and_self_messages_do_not_enter_reread_window(self):
         observer = self.observer_mod.GroupRereadObserver(config=self.config)

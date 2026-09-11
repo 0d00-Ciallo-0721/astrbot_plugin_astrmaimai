@@ -43,7 +43,7 @@ class _GroupRereadState:
 
 
 class GroupRereadObserver:
-    """Tracks short, distinct-member pure-text echo chains in group chats."""
+    """Tracks short, consecutive pure-text echo chains in group chats."""
 
     def __init__(self, *, config=None):
         self.config = config
@@ -351,8 +351,11 @@ class GroupRereadObserver:
                 state.records = []
                 self._stats["observed_cooldown_blocked"] += 1
                 return None
+            if record.event_id and any(item.event_id == record.event_id for item in state.records):
+                self._stats["duplicate_event_ignored"] += 1
+                return None
             tail = state.records[-1] if state.records else None
-            if tail is None or tail.fingerprint != record.fingerprint or sender_id in {item.sender_id for item in state.records}:
+            if tail is None or tail.fingerprint != record.fingerprint:
                 state.records = [record]
                 self._stats["window_reset"] += 1
                 return None
@@ -368,12 +371,12 @@ class GroupRereadObserver:
         source_ids = tuple(item.event_id for item in records if item.event_id)
         includes_bot_seed = bool(records and records[0].sender_id == str(getattr(event, "get_self_id", lambda: "")() or ""))
         threshold = self._threshold()
-        participant_count = len(set(participants))
+        message_count = len(records)
         if includes_bot_seed:
-            member_count = max(0, participant_count - 1)
-            explanation = f"Bot 先前的纯文本被 {member_count} 位不同群成员连续原样跟读，因此执行一次被动社交跟读；这不表示事实认可、立场承诺或独立判断。"
+            repeated_message_count = max(0, message_count - 1)
+            explanation = f"Bot 先前发送该纯文本，随后群内连续出现 {repeated_message_count} 条相同消息，链路累计达到阈值 {threshold}，因此执行一次被动社交跟读；这不表示事实认可、立场承诺或独立判断。"
         else:
-            explanation = f"群内 {participant_count} 位不同成员连续原样复读该文本（阈值 {threshold}），因此执行一次被动社交跟读；这不表示事实认可、立场承诺或独立判断。"
+            explanation = f"群内连续出现 {message_count} 条相同纯文本消息，达到复读阈值 {threshold}，因此执行一次被动社交跟读；这不表示事实认可、立场承诺或独立判断。"
         request = RereadActionRequest(
             chat_id=chat_id,
             text=records[-1].display_text,
