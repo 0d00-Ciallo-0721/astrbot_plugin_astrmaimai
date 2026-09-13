@@ -2355,10 +2355,17 @@ class AttentionGate:
                             )
                     raise
                 except asyncio.TimeoutError:
-                    if _deferred_replay and budget_acquired:
-                        raise DeferredReplayExecutionTimeout(
-                            "deferred replay task exceeded execution deadline"
-                        )
+                    # Once the budget lease has been granted, a timeout comes
+                    # from the admitted task (typically the Provider call),
+                    # not from queue admission.  Preserve it so the gateway
+                    # or replay executor can record provider/task failure
+                    # instead of rewriting it as a background queue timeout.
+                    if started or budget_acquired:
+                        if _deferred_replay:
+                            raise DeferredReplayExecutionTimeout(
+                                "deferred replay task exceeded execution deadline"
+                            )
+                        raise
                     if budget_wait_stage and not budget_acquired:
                         finish_stage(
                             event,

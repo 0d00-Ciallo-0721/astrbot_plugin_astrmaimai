@@ -364,6 +364,39 @@ class AttentionDeferredQueueTests(unittest.TestCase):
         self.assertEqual(sent, ["formal"])
         self.assertEqual(status, "replayed")
 
+    def test_execution_timeout_after_budget_admission_is_not_queue_timeout(self):
+        async def run():
+            budget_mod = importlib.import_module(
+                "astrmai.infrastructure.runtime.background_task_budget"
+            )
+            self.gate.background_task_budget = budget_mod.BackgroundTaskBudget(
+                1,
+                max_queue=1,
+                wait_timeout_sec=0.1,
+            )
+
+            async def passthrough(coro, event, **_kwargs):
+                return await coro
+
+            async def provider_timeout():
+                raise asyncio.TimeoutError("provider timeout")
+
+            self.gate._run_managed_system2_task = passthrough
+            event = _Event()
+            with self.assertRaises(asyncio.TimeoutError):
+                await self.gate._run_background_task(
+                    provider_timeout(),
+                    event,
+                    task_name="attention.system2",
+                )
+            return event.get_extra("astrmai_execution_status", ""), event.get_extra(
+                "astrmai_queue_timeout_stage", ""
+            )
+
+        status, stage = asyncio.run(run())
+        self.assertNotEqual(status, "background_queue_timeout")
+        self.assertNotEqual(stage, "attention.background_budget_wait")
+
     def test_budget_queue_full_is_deferred(self):
         async def run():
             budget_mod = importlib.import_module("astrmai.infrastructure.runtime.background_task_budget")

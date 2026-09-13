@@ -117,6 +117,41 @@ class ConcurrencyPriorityTests(unittest.TestCase):
 
         self.assertTrue(asyncio.run(_run()), "关键路径必须能在后台占满子槽时立即执行")
 
+    def test_dialog_slot_is_reserved_while_slow_judge_holds_background_slot(self):
+        limiter = _Limiter(total=2, background=1)
+
+        async def _run():
+            judge_started = asyncio.Event()
+            release_judge = asyncio.Event()
+            dialog_entered = asyncio.Event()
+
+            async def slow_judge():
+                async with limiter._concurrency_slot(
+                    False,
+                    workload_class="judge",
+                ):
+                    judge_started.set()
+                    await release_judge.wait()
+
+            async def dialog():
+                async with limiter._concurrency_slot(
+                    True,
+                    workload_class="dialog",
+                ):
+                    dialog_entered.set()
+
+            judge_task = asyncio.create_task(slow_judge())
+            await asyncio.wait_for(judge_started.wait(), timeout=1.0)
+            await asyncio.wait_for(dialog(), timeout=1.0)
+            release_judge.set()
+            await asyncio.wait_for(judge_task, timeout=1.0)
+            return dialog_entered.is_set()
+
+        self.assertTrue(
+            asyncio.run(_run()),
+            "slow judge must not consume the reserved dialog gateway slot",
+        )
+
     def test_background_calls_are_capped_below_total(self):
         limiter = _Limiter(total=3, background=2)
 

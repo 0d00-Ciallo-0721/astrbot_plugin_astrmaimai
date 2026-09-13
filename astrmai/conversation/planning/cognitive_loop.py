@@ -247,6 +247,9 @@ class CognitiveLoop:
                 self._soft_timeout_seconds(),
                 reserve_for_reply=True,
             )
+            # Avoid tiny monotonic-clock floating-point spillover (for example
+            # 10.000000000000057) crossing an exact configured budget boundary.
+            timeout_sec = round(timeout_sec, 6)
             return await asyncio.wait_for(
                 self._decide_inner(event=event, prompt_envelope=prompt_envelope),
                 timeout=timeout_sec,
