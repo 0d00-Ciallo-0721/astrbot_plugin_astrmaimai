@@ -62,6 +62,7 @@ class ExpressionGovernanceRunner:
     async def start(self):
         if self._is_running:
             return
+        await self._await_schema_ready()
         if self._task_ledger is not None:
             try:
                 recovered = await self._task_ledger.recover_expired_leases()
@@ -86,6 +87,15 @@ class ExpressionGovernanceRunner:
                 owner="ExpressionGovernanceRunner",
                 generation=getattr(self.owner_registry, "generation", None),
             )
+
+    async def _await_schema_ready(self) -> None:
+        persistence = getattr(self.state_engine, "persistence", None)
+        waiter = getattr(persistence, "wait_until_ready", None)
+        if not callable(waiter):
+            return
+        result = waiter()
+        if hasattr(result, "__await__"):
+            await result
 
     async def stop(self):
         self._is_running = False

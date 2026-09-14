@@ -121,6 +121,7 @@ class MemoryTurnPipeline:
     async def start(self) -> None:
         if self._running:
             return
+        await self._await_schema_ready()
         await self._restore_checkpoints()
         self._accepting = True
         self._running = True
@@ -135,6 +136,27 @@ class MemoryTurnPipeline:
         )
         self._sweep_task.add_done_callback(self._handle_task_result)
         await self._observe_global("memory_pipeline", "pipeline_started", summary="Memory pipeline started")
+
+    async def _await_schema_ready(self) -> None:
+        """Honor the persistence schema barrier for direct pipeline users.
+
+        The application lifecycle already waits centrally, but tests and
+        embedders may start the pipeline directly.  In that case checkpoint
+        restore must not race the asynchronous migration task.
+        """
+        candidates = (
+            getattr(getattr(self.engine, "db_service", None), "persistence", None),
+            getattr(self.engine, "persistence", None),
+            getattr(self.context, "persistence", None),
+        )
+        for candidate in candidates:
+            waiter = getattr(candidate, "wait_until_ready", None)
+            if not callable(waiter):
+                continue
+            result = waiter()
+            if hasattr(result, "__await__"):
+                await result
+            return
 
     async def stop(self) -> None:
         self.begin_shutdown()

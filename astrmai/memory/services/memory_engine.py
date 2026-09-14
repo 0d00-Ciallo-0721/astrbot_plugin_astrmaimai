@@ -5397,6 +5397,7 @@ class MemoryEngine:
         return await self.recall_persona_lore(query=query, persona_id=persona_id, top_k=kwargs.get("top_k", 3))
 
     async def start_background_tasks(self):
+        await self._await_schema_ready()
         self._accepting_vector_work = True
         self._accepting_dimension_probe = True
         projector = getattr(self, "index_projector", None)
@@ -5438,6 +5439,15 @@ class MemoryEngine:
             owner_registry=getattr(self, "owner_registry", None),
         )
         await self.memory_pipeline.start()
+
+    async def _await_schema_ready(self) -> None:
+        persistence = getattr(getattr(self, "db_service", None), "persistence", None)
+        waiter = getattr(persistence, "wait_until_ready", None)
+        if not callable(waiter):
+            return
+        result = waiter()
+        if hasattr(result, "__await__"):
+            await result
 
     def schedule_vector_bootstrap_after_startup(self, *, delay_sec: float = 0.25) -> None:
         """Start vector bootstrap only after the basic runtime is accepting events."""

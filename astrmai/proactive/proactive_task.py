@@ -489,6 +489,7 @@ class ProactiveTask:
     async def start(self):
         if self._is_running:
             return
+        await self._await_schema_ready()
         if self._task_ledger is not None:
             try:
                 recovered = await self._task_ledger.recover_expired_leases()
@@ -555,6 +556,15 @@ class ProactiveTask:
                     "[ProactiveTask] settlement recovery owner registration degraded: %s",
                     exc,
                 )
+
+    async def _await_schema_ready(self) -> None:
+        persistence = getattr(self, "persistence", None)
+        waiter = getattr(persistence, "wait_until_ready", None)
+        if not callable(waiter):
+            return
+        result = waiter()
+        if hasattr(result, "__await__"):
+            await result
 
     async def _replay_pending_lease_settlements(self, *, source: str) -> dict[str, int]:
         ledger = getattr(self, "_task_ledger", None)

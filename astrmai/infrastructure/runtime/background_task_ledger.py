@@ -26,17 +26,39 @@ async def settle_task_lease(
     lease: TaskLease,
     *,
     run_id: str = "",
+    diagnostics: dict[str, Any] | None = None,
     **kwargs: Any,
 ) -> bool:
     """Use durable settlement when supported, preserving legacy adapters."""
     settle = getattr(ledger, "finish_with_recovery", None)
     if callable(settle):
-        return bool(await settle(lease, run_id=run_id, **kwargs))
+        settle_kwargs = dict(kwargs)
+        if diagnostics is not None:
+            settle_kwargs["diagnostics"] = diagnostics
+        try:
+            return bool(await settle(lease, run_id=run_id, **settle_kwargs))
+        except TypeError as exc:
+            # Older host adapters may expose finish_with_recovery without the
+            # diagnostics keyword.  The native ledger accepts it; preserve
+            # compatibility for lightweight test/embedding adapters.
+            if diagnostics is None or "unexpected keyword argument 'diagnostics'" not in str(exc):
+                raise
+            return bool(await settle(lease, run_id=run_id, **kwargs))
     finish = getattr(ledger, "finish")
     last_error = ""
     for attempt in range(3):
         try:
-            changed = await finish(lease, **kwargs)
+            finish_kwargs = dict(kwargs)
+            if diagnostics is not None:
+                finish_kwargs["diagnostics"] = diagnostics
+            try:
+                changed = await finish(lease, **finish_kwargs)
+            except TypeError as exc:
+                # Legacy test/host adapters may not yet accept diagnostics;
+                # persistence of the retry payload below still preserves it.
+                if diagnostics is None or "unexpected keyword argument 'diagnostics'" not in str(exc):
+                    raise
+                changed = await finish(lease, **kwargs)
             if changed:
                 return True
             last_error = "lease settlement CAS did not change a row"
@@ -57,6 +79,7 @@ async def settle_task_lease(
                 llm_call_count=kwargs.get("llm_call_count", 0),
                 error=str(kwargs.get("error") or last_error),
                 retry_after_seconds=kwargs.get("retry_after_seconds"),
+                diagnostics=diagnostics,
             )
         except Exception:
             pass
@@ -214,6 +237,7 @@ class BackgroundTaskLedger:
         llm_call_count: int = 0,
         error: str = "",
         retry_after_seconds: float = 0.0,
+        diagnostics: dict[str, Any] | None = None,
     ) -> bool:
         now = time.time()
         normalized_status = str(status or "succeeded").strip().lower() or "succeeded"
@@ -229,11 +253,28 @@ class BackgroundTaskLedger:
         finished_at = 0.0 if normalized_status == "retry_wait" else now
         retry_increment = 1 if normalized_status == "retry_wait" else 0
         async with connect_aiosqlite(self.db_path) as db:
+            payload_json = None
+            if diagnostics is not None:
+                await db.execute("BEGIN IMMEDIATE")
+                payload_cursor = await db.execute(
+                    "SELECT payload_json FROM background_task_ledger WHERE task_id=? AND lease_token=?",
+                    (lease.task_id, lease.lease_token),
+                )
+                payload_row = await payload_cursor.fetchone()
+                await payload_cursor.close()
+                try:
+                    payload_json = json.loads(str(payload_row[0] or "{}")) if payload_row else {}
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    payload_json = {}
+                if not isinstance(payload_json, dict):
+                    payload_json = {}
+                payload_json["diagnostics"] = dict(diagnostics)
             cursor = await db.execute(
                 """
                 UPDATE background_task_ledger
                 SET status=?, finished_at=?, checkpoint_after=?, llm_call_count=?,
                     last_error=?, lease_until=?, lease_token='',
+                    payload_json=COALESCE(?, payload_json),
                     retry_count=retry_count+?, updated_at=?
                 WHERE task_id=? AND lease_token=?
                 """,
@@ -241,7 +282,9 @@ class BackgroundTaskLedger:
                     normalized_status, finished_at,
                     json.dumps(checkpoint_after or {}, ensure_ascii=False, default=str),
                     max(0, int(llm_call_count or 0)), str(error or "")[:500],
-                    next_lease_until, retry_increment, now,
+                    next_lease_until,
+                    json.dumps(payload_json, ensure_ascii=False, default=str) if payload_json is not None else None,
+                    retry_increment, now,
                     lease.task_id, lease.lease_token,
                 ),
             )
@@ -274,6 +317,7 @@ class BackgroundTaskLedger:
         *,
         run_id: str = "",
         max_attempts: int = 3,
+        diagnostics: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> bool:
         """Settle a lease and durably retain failures for a later replay.
@@ -287,7 +331,10 @@ class BackgroundTaskLedger:
         last_error = ""
         for attempt in range(attempts):
             try:
-                changed = await self.finish(lease, **kwargs)
+                finish_kwargs = dict(kwargs)
+                if diagnostics is not None:
+                    finish_kwargs["diagnostics"] = diagnostics
+                changed = await self.finish(lease, **finish_kwargs)
                 if changed:
                     return True
                 current = await self._lease_is_current(lease)
@@ -315,6 +362,7 @@ class BackgroundTaskLedger:
                 llm_call_count=kwargs.get("llm_call_count", 0),
                 error=str(kwargs.get("error") or last_error),
                 retry_after_seconds=kwargs.get("retry_after_seconds"),
+                diagnostics=diagnostics,
             )
         except asyncio.CancelledError:
             raise
@@ -371,6 +419,7 @@ class BackgroundTaskLedger:
         llm_call_count: int = 0,
         error: str = "",
         retry_after_seconds: float | None = None,
+        diagnostics: dict[str, Any] | None = None,
     ) -> bool:
         """Persist a settlement that could not be written immediately."""
         await self._ensure_pending_settlement_schema()
@@ -385,6 +434,7 @@ class BackgroundTaskLedger:
             "llm_call_count": max(0, int(llm_call_count or 0)),
             "error": str(error or "")[:500],
             "retry_after_seconds": business_retry_delay,
+            "diagnostics": dict(diagnostics or {}),
         }
         async with connect_aiosqlite(self.db_path) as db:
             await db.execute("BEGIN IMMEDIATE")
@@ -489,6 +539,7 @@ class BackgroundTaskLedger:
                     llm_call_count=int(payload.get("llm_call_count", 0) or 0),
                     error=str(payload.get("error") or ""),
                     retry_after_seconds=float(payload.get("retry_after_seconds", 0.0) or 0.0),
+                    diagnostics=(payload.get("diagnostics") if isinstance(payload.get("diagnostics"), dict) else None),
                 )
                 if changed:
                     async with connect_aiosqlite(self.db_path) as db:
