@@ -370,7 +370,7 @@ class ScheduledScenarioServiceTests(unittest.TestCase):
         self.assertFalse(asyncio.run(store.is_claim_current(key, claim_token="other")))
         asyncio.run(store.update(key, status="sent", claim_token=token))
         self.assertFalse(asyncio.run(store.is_claim_current(key, claim_token=token)))
-        self.assertIsNone(
+        self.assertFalse(
             asyncio.run(
                 store.claim(key, chat_id="private:1", scenario="morning_greeting", local_date="2026-05-11")
             )
@@ -617,6 +617,161 @@ class ScheduledScenarioServiceTests(unittest.TestCase):
             count = db.execute("SELECT COUNT(*) FROM proactive_daily_plan").fetchone()[0]
         self.assertEqual(count, 0)
 
+    def test_quiet_hours_preflight_skips_weather_schedule_and_claim(self):
+        timestamp = datetime(2026, 5, 11, 8, 20).timestamp()
+        dispatcher = _Dispatcher()
+        service = self._service(
+            dispatcher,
+            _config(
+                proactive_quiet_hours=["00:00-23:59"],
+                daily_schedule_ai_enabled=True,
+            ),
+        )
+
+        async def _unexpected_weather():
+            raise AssertionError("weather must not run during policy preflight")
+
+        service.weather.get = _unexpected_weather
+        service.task_launcher = lambda _factory: (_ for _ in ()).throw(
+            AssertionError("schedule generation must not start during policy preflight")
+        )
+
+        report = asyncio.run(service.tick(now=timestamp))
+
+        self.assertEqual(report["dispatched"], 0)
+        self.assertEqual(report["preflight_blocked"], {"quiet_hours": 1})
+        self.assertEqual(dispatcher.intents, [])
+        with sqlite3.connect(self.db_path) as db:
+            self.assertEqual(
+                db.execute("SELECT COUNT(*) FROM proactive_scenario_delivery").fetchone()[0],
+                0,
+            )
+
+    def test_cooldown_preflight_does_not_create_delivery_claim(self):
+        timestamp = datetime(2026, 5, 11, 8, 20).timestamp()
+        dispatcher = _Dispatcher()
+        state = SimpleNamespace(
+            chat_id="ff:GroupMessage:10001",
+            chat_kind="group",
+            next_proactive_due_at=timestamp + 600,
+            unanswered_proactive_count=0,
+        )
+        service = self.module.ScheduledScenarioService(
+            state_engine=SimpleNamespace(get_active_states=lambda: [state]),
+            dispatcher=dispatcher,
+            config=_config(),
+            db_path=self.db_path,
+            call_background_lane=lambda *args, **kwargs: asyncio.sleep(0, result="{}"),
+            task_launcher=lambda factory: factory().close(),
+        )
+        report = asyncio.run(service.tick(now=timestamp))
+        self.assertEqual(report["preflight_blocked"], {"cooldown": 1})
+        self.assertEqual(dispatcher.intents, [])
+        with sqlite3.connect(self.db_path) as db:
+            self.assertEqual(
+                db.execute("SELECT COUNT(*) FROM proactive_scenario_delivery").fetchone()[0],
+                0,
+            )
+
+    def test_scheduled_candidate_contains_stable_correlation_metadata(self):
+        timestamp = datetime(2026, 5, 11, 8, 20).timestamp()
+        dispatcher = _Dispatcher()
+        state = SimpleNamespace(
+            chat_id="ff:GroupMessage:10001",
+            chat_kind="group",
+            proactive_generation=7,
+        )
+        service = self.module.ScheduledScenarioService(
+            state_engine=SimpleNamespace(get_active_states=lambda: [state]),
+            dispatcher=dispatcher,
+            config=_config(),
+            db_path=self.db_path,
+            call_background_lane=lambda *args, **kwargs: asyncio.sleep(0, result="{}"),
+            task_launcher=lambda factory: factory().close(),
+        )
+        asyncio.run(service.tick(now=timestamp))
+        metadata = dispatcher.intents[0].metadata
+        self.assertEqual(metadata["scenario_id"], "2026-05-11:morning_greeting:ff:GroupMessage:10001")
+        self.assertEqual(metadata["candidate_version"], 7)
+        self.assertIn(metadata["claim_id"], metadata["dispatch_id"])
+
+    def test_new_candidate_version_supersedes_previous_delivery_key(self):
+        timestamp = datetime(2026, 5, 11, 8, 20).timestamp()
+        state = SimpleNamespace(
+            chat_id="ff:GroupMessage:10001",
+            chat_kind="group",
+            proactive_generation=1,
+        )
+        dispatcher = _Dispatcher()
+        service = self.module.ScheduledScenarioService(
+            state_engine=SimpleNamespace(get_active_states=lambda: [state]),
+            dispatcher=dispatcher,
+            config=_config(),
+            db_path=self.db_path,
+            call_background_lane=lambda *args, **kwargs: asyncio.sleep(0, result="{}"),
+            task_launcher=lambda factory: factory().close(),
+        )
+
+        asyncio.run(service.tick(now=timestamp))
+        state.proactive_generation = 2
+        asyncio.run(service.tick(now=timestamp + 120))
+
+        with sqlite3.connect(self.db_path) as db:
+            rows = db.execute(
+                "SELECT delivery_key, status, last_error FROM proactive_scenario_delivery ORDER BY delivery_key"
+            ).fetchall()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0][1], "superseded")
+        self.assertIn("superseded_by:", rows[0][2])
+        self.assertTrue(rows[1][0].endswith(":v2"))
+
+    def test_superseded_delivery_cannot_be_claimed_again(self):
+        store = self.module.ScenarioDeliveryStore(self.db_path)
+        key = "2026-05-11:morning_greeting:ff:GroupMessage:10001"
+        token = asyncio.run(
+            store.claim(key, chat_id="ff:GroupMessage:10001", scenario="morning_greeting", local_date="2026-05-11")
+        )
+        self.assertTrue(token)
+        asyncio.run(
+            store.supersede_previous(
+                chat_id="ff:GroupMessage:10001",
+                scenario="morning_greeting",
+                local_date="2026-05-11",
+                current_delivery_key=key + ":v2",
+                superseded_by=key + ":v2",
+            )
+        )
+        self.assertFalse(
+            asyncio.run(
+                store.claim(key, chat_id="ff:GroupMessage:10001", scenario="morning_greeting", local_date="2026-05-11")
+            )
+        )
+
+        asyncio.run(store.update(key, status="sent", claim_token=token))
+        with sqlite3.connect(self.db_path) as db:
+            self.assertEqual(
+                db.execute(
+                    "SELECT status FROM proactive_scenario_delivery WHERE delivery_key=?",
+                    (key,),
+                ).fetchone()[0],
+                "superseded",
+            )
+
+    def test_blocked_and_sending_delivery_cannot_be_reclaimed(self):
+        store = self.module.ScenarioDeliveryStore(self.db_path)
+        for index, status in enumerate(("blocked", "sending")):
+            key = f"blocked-{index}"
+            token = asyncio.run(
+                store.claim(key, chat_id="private:1", scenario="morning_greeting", local_date="2026-05-11")
+            )
+            self.assertTrue(token)
+            asyncio.run(store.update(key, status=status, claim_token=token))
+            self.assertFalse(
+                asyncio.run(
+                    store.claim(key, chat_id="private:1", scenario="morning_greeting", local_date="2026-05-11")
+                )
+            )
+
 
 class ScheduledScenarioDispatcherTests(unittest.TestCase):
     def setUp(self):
@@ -701,6 +856,92 @@ class ScheduledScenarioDispatcherTests(unittest.TestCase):
 
         self.assertFalse(decision.allowed)
         self.assertEqual(decision.blocked_reason, "max_unanswered")
+
+    def test_explicit_capacity_signal_blocks_before_synthetic_event_injection(self):
+        calls = []
+
+        class _AttentionGate:
+            async def inject_external_event(self, chat_id, event_data):
+                calls.append((chat_id, event_data))
+                return True
+
+        dispatcher = self.module.ProactiveDispatcher(
+            attention_gate=_AttentionGate(),
+            runtime_coordinator=SimpleNamespace(
+                get_activity_snapshot=lambda _chat_id: asyncio.sleep(
+                    0,
+                    result={
+                        "latest_activity_ts": time.time(),
+                        "wait_targets": [],
+                        "executor_pending": 0,
+                        "proactive_capacity_available": False,
+                    },
+                )
+            ),
+            state_engine=SimpleNamespace(
+                get_state=lambda _chat_id: asyncio.sleep(0, result=SimpleNamespace(energy=1.0)),
+            ),
+            config=_config(),
+        )
+
+        decision = asyncio.run(
+            dispatcher.dispatch(
+                self.module.ProactiveMessageIntent(
+                    chat_id="ff:GroupMessage:10001",
+                    source="scheduled_scenario",
+                    reason="morning_greeting",
+                    guidance="自然地问候",
+                    metadata={"allow_inactive_chat": True},
+                )
+            )
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.blocked_reason, "capacity_unavailable")
+        self.assertFalse(calls)
+
+    def test_send_prepare_and_commit_stages_are_distinct(self):
+        class _AttentionGate:
+            def __init__(self):
+                self.event_data = None
+
+            async def inject_external_event(self, _chat_id, event_data):
+                self.event_data = event_data
+                return True
+
+        gate = _AttentionGate()
+        dispatcher = self.module.ProactiveDispatcher(
+            attention_gate=gate,
+            runtime_coordinator=SimpleNamespace(
+                get_activity_snapshot=lambda _chat_id: asyncio.sleep(
+                    0,
+                    result={"latest_activity_ts": time.time(), "wait_targets": [], "executor_pending": 0},
+                )
+            ),
+            state_engine=SimpleNamespace(
+                get_state=lambda _chat_id: asyncio.sleep(0, result=SimpleNamespace(energy=1.0)),
+            ),
+            config=_config(),
+        )
+
+        async def _run():
+            decision = await dispatcher.dispatch(
+                self.module.ProactiveMessageIntent(
+                    chat_id="ff:GroupMessage:10001",
+                    source="scheduled_scenario",
+                    reason="morning_greeting",
+                    guidance="自然地问候",
+                    metadata={"allow_inactive_chat": True},
+                )
+            )
+            callback = gate.event_data["extra"]["astrmai_proactive_completion_callback"]
+            await callback(True, "早安")
+            return decision
+
+        decision = asyncio.run(_run())
+        stages = {item["stage"]: item for item in decision.stage_ledger}
+        self.assertEqual(stages["proactive.send_prepare"]["status"], "ready")
+        self.assertEqual(stages["proactive.send_commit"]["status"], "success")
 
 
 if __name__ == "__main__":

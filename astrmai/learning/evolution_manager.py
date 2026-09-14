@@ -1902,10 +1902,13 @@ class EvolutionManager:
             except asyncio.TimeoutError as exc:
                 raise TimeoutError(f"learning_pipeline_timeout:{timeout_sec:g}s") from exc
 
-        cursor_before = max(0, int(self._field(logs[0], "id", 1) or 1) - 1) if logs else 0
         batch_id = self._mining_batch_id(group_id, logs, prefix=pipeline)
         failure_key = f"{pipeline}:{group_id}"
         checkpoint = await self._get_pipeline_checkpoint(pipeline, group_id)
+        # The global message-log ids are interleaved across chats.  The
+        # checkpoint is the authoritative cursor; deriving it from the first
+        # batch row can invent a cursor gap and misreport failed retries.
+        cursor_before = int(checkpoint.get("cursor_log_id", 0) or 0)
         failure_report: dict[str, Any] = {}
         try:
             if pipeline == "expression":

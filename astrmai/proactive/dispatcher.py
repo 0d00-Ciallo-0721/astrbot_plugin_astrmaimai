@@ -59,6 +59,8 @@ class ProactiveDispatchDecision:
     status: str = "blocked"
     reply_preview: str = ""
     completion_reason: str = ""
+    candidate_version: int = 0
+    revision: int = 0
     stage_ledger: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -509,6 +511,14 @@ class ProactiveDispatcher:
             executor_pending = int(snapshot.get("executor_pending", 0) or 0)
         except (TypeError, ValueError):
             executor_pending = 1
+        # Newer coordinators may expose explicit proactive capacity.  An
+        # explicit negative signal blocks before synthetic-event injection;
+        # older coordinators omit the field and keep the existing checks.
+        raw_capacity = snapshot.get(
+            "proactive_capacity_available",
+            snapshot.get("capacity_available", None),
+        )
+        capacity_available = None if raw_capacity is None else bool(raw_capacity)
         try:
             recent_activity_count_60s = int(snapshot.get("recent_activity_count_60s", 0) or 0)
         except (TypeError, ValueError):
@@ -535,6 +545,7 @@ class ProactiveDispatcher:
             "active_age_seconds": round(active_age, 2),
             "wait_targets_empty": not wait_targets,
             "executor_idle": executor_pending <= 0,
+            "capacity_available": capacity_available,
             "energy": energy,
             "min_energy": min_energy,
             "talk_willingness": talk_value,
@@ -565,6 +576,8 @@ class ProactiveDispatcher:
             return False, "chat_inactive", checks
         if wait_targets or executor_pending > 0:
             return False, "user_waiting", checks
+        if capacity_available is False:
+            return False, "capacity_unavailable", checks
         if noise_block:
             return False, noise_block, checks
         if cooldown_until and now < cooldown_until:
@@ -585,6 +598,9 @@ class ProactiveDispatcher:
         # Runtime validators are callables and must not leak into management
         # or export payloads.
         intent_payload.pop("claim_validator", None)
+        metadata = dict(intent_payload.get("metadata", {}) or {})
+        intent_payload["candidate_version"] = int(metadata.get("candidate_version", 0) or 0)
+        intent_payload["revision"] = int(metadata.get("revision", intent_payload["candidate_version"]) or 0)
         return {
             "created_at": decision.timestamp,
             "intent": intent_payload,
@@ -612,6 +628,16 @@ class ProactiveDispatcher:
         for item in reversed(self._history):
             if str(item.get("decision", {}).get("intent_id", "")) != intent_id:
                 continue
+            # A late callback from an older candidate/revision must not replace
+            # the newer logical state merely because it arrived later in wall
+            # clock time.
+            current_intent = dict(item.get("intent", {}) or {})
+            current_revision = int(
+                current_intent.get("revision", current_intent.get("candidate_version", 0)) or 0
+            )
+            incoming_revision = int(getattr(decision, "revision", 0) or getattr(decision, "candidate_version", 0) or 0)
+            if incoming_revision < current_revision:
+                return
             item["decision"] = asdict(decision)
             item["status"] = decision.status
             item["blocked_reason"] = decision.blocked_reason
@@ -928,6 +954,8 @@ class ProactiveDispatcher:
             blocked_reason=blocked_reason,
             safety_checks=checks,
             status="queued" if allowed else "blocked",
+            candidate_version=int(intent.metadata.get("candidate_version", 0) or 0),
+            revision=int(intent.metadata.get("revision", intent.metadata.get("candidate_version", 0)) or 0),
             stage_ledger=stage_ledger,
         )
         await self._remember(intent, decision)
@@ -942,6 +970,7 @@ class ProactiveDispatcher:
             return decision
 
         record_stage("proactive.sensor", "delegated", "attention_gate")
+        record_stage("proactive.send_prepare", "ready", "awaiting_attention_chain")
 
         if on_complete:
             self._callbacks[intent.intent_id] = on_complete
@@ -990,6 +1019,22 @@ class ProactiveDispatcher:
                         reason=completion_reason,
                         at=time.time(),
                     )
+                send_commit = next(
+                    (item for item in decision.stage_ledger if item.get("stage") == "proactive.send_commit"),
+                    None,
+                )
+                send_status = "success" if reply_sent else "failed"
+                if send_commit is None:
+                    decision.stage_ledger.append(
+                        {
+                            "stage": "proactive.send_commit",
+                            "status": send_status,
+                            "reason": completion_reason,
+                            "at": time.time(),
+                        }
+                    )
+                else:
+                    send_commit.update(status=send_status, reason=completion_reason, at=time.time())
                 await self._sync_history_for_dispatch(intent_id, decision)
                 try:
                     await self.complete(
@@ -1079,6 +1124,14 @@ class ProactiveDispatcher:
                 "astrmai_daily_schedule_source": str(intent.metadata.get("schedule_source", "") or ""),
                 "astrmai_scheduled_festival": str(intent.metadata.get("festival", "") or ""),
                 "astrmai_scheduled_weather_available": bool(intent.metadata.get("weather_available", False)),
+                # Preserve stable business correlation keys on the synthetic
+                # event so downstream traces can join candidate, dispatch and
+                # send stages without parsing free-form guidance.
+                "astrmai_proactive_scenario_id": str(intent.metadata.get("scenario_id", "") or ""),
+                "astrmai_proactive_candidate_version": str(intent.metadata.get("candidate_version", "") or ""),
+                "astrmai_proactive_dispatch_id": str(
+                    intent.metadata.get("dispatch_id", intent.intent_id) or intent.intent_id
+                ),
             },
         }
         if str(intent.metadata.get("chat_kind", "") or "") == "group":

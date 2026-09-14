@@ -92,6 +92,35 @@ def test_pipeline_cursors_advance_independently_and_survive_service_restart(tmp_
     assert [item.content for item in jargon] == [f"消息{index}" for index in range(1, 7)]
 
 
+def test_pipeline_reports_checkpoint_cursor_when_global_message_ids_are_interleaved(tmp_path):
+    service = _database_service(tmp_path)
+    target = "ff:GroupMessage:interleaved"
+    _add_logs(service, target, 1)
+    _add_logs(service, "ff:GroupMessage:other", 3)
+    _add_logs(service, target, 3)
+    initial = service.get_learning_logs("expression", target, limit=10)
+    service.advance_learning_checkpoint("expression", target, 1, status="completed")
+
+    config = AstrMaiConfig()
+    manager = EvolutionManager(service, SimpleNamespace(config=config), config=config)
+
+    async def _insufficient(_group_id, _logs):
+        manager.expression_miner.last_report = {
+            "reason": "insufficient_context",
+            "enrichment": {"terminal": True},
+        }
+        return []
+
+    manager.expression_miner.mine = _insufficient
+    logs = service.get_learning_logs("expression", target, limit=10)
+    result = asyncio.run(manager._run_learning_pipeline("expression", target, logs))
+
+    assert logs[0].id > 1
+    assert result["status"] == "waiting"
+    assert result["cursor_before"] == 1
+    assert result["cursor_after"] == 1
+
+
 def test_legacy_processed_flag_waits_for_both_pipeline_checkpoints(tmp_path):
     service = _database_service(tmp_path)
     _add_logs(service, "ff:GroupMessage:3", 5)

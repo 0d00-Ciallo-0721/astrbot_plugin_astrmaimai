@@ -33,6 +33,7 @@ except ImportError:  # Optional at import time; strict parsing remains available
 from ..infrastructure.persistence.sqlite_helpers import connect_aiosqlite
 from ..infrastructure.runtime.background_task_budget import BackgroundTaskQueueFull
 from .dispatcher import ProactiveMessageIntent
+from .rhythm import evaluate_proactive_rhythm
 
 
 SCHEDULE_SLOTS = ("morning", "forenoon", "lunch", "afternoon", "dinner", "evening", "night")
@@ -188,7 +189,17 @@ class ScenarioDeliveryStore:
                 status = str(current.get("status", "") or "")
                 updated_at = float(current.get("updated_at", 0.0) or 0.0)
                 next_retry_at = float(current.get("next_retry_at", 0.0) or 0.0)
-                if status in {"queued", "sent"}:
+                if status in {
+                    "filtered",
+                    "blocked",
+                    "queued",
+                    "sending",
+                    "sent",
+                    "superseded",
+                    "expired",
+                    "cancelled",
+                    "delivery_unknown",
+                }:
                     return None
                 if status == "claimed" and now - updated_at < self.CLAIM_LEASE_SECONDS:
                     return None
@@ -222,7 +233,17 @@ class ScenarioDeliveryStore:
                 status = str(row[0] or "")
                 updated_at = float(row[1] or 0.0)
                 next_retry_at = float(row[2] or 0.0)
-                if status in {"queued", "sent"}:
+                if status in {
+                    "filtered",
+                    "blocked",
+                    "queued",
+                    "sending",
+                    "sent",
+                    "superseded",
+                    "expired",
+                    "cancelled",
+                    "delivery_unknown",
+                }:
                     await db.rollback()
                     return False
                 if status == "claimed" and now - updated_at < self.CLAIM_LEASE_SECONDS:
@@ -249,6 +270,57 @@ class ScenarioDeliveryStore:
             )
             await db.commit()
         return claim_token
+
+    async def supersede_previous(
+        self,
+        *,
+        chat_id: str,
+        scenario: str,
+        local_date: str,
+        current_delivery_key: str,
+        superseded_by: str,
+    ) -> int:
+        """Mark older active candidates as superseded before claiming a new version.
+
+        The existing delivery table has no dedicated version columns, so the
+        stable version is carried by ``delivery_key`` and the audit reason is
+        retained in ``last_error``.  Updates are restricted to active rows and
+        never delete history or touch already terminal sends.
+        """
+        reason = f"superseded_by:{str(superseded_by or '')[:160]}"
+        if not self.db_path:
+            self._prune_memory_claims()
+            changed = 0
+            now = time.time()
+            for key, record in self._memory_claims.items():
+                if key == current_delivery_key:
+                    continue
+                if str(record.get("chat_id", "") or "") != str(chat_id or ""):
+                    continue
+                if str(record.get("scenario", "") or "") != str(scenario or ""):
+                    continue
+                if str(record.get("local_date", "") or "") != str(local_date or ""):
+                    continue
+                if str(record.get("status", "") or "") not in {"claimed", "queued", "retry_wait"}:
+                    continue
+                record.update(status="superseded", last_error=reason, superseded_by=str(superseded_by or ""), updated_at=now)
+                changed += 1
+            return changed
+        now = time.time()
+        async with connect_aiosqlite(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                UPDATE proactive_scenario_delivery
+                SET status='superseded', last_error=?, next_retry_at=0, updated_at=?
+                WHERE chat_id=? AND scenario=? AND local_date=?
+                  AND delivery_key<>?
+                  AND status IN ('claimed','queued','retry_wait')
+                """,
+                (reason, now, str(chat_id or ""), str(scenario or ""), str(local_date or ""), str(current_delivery_key or "")),
+            )
+            changed = int(cursor.rowcount or 0)
+            await db.commit()
+        return changed
 
     async def is_claim_current(self, delivery_key: str, *, claim_token: str) -> bool | None:
         """Check that a scheduled delivery lease is still owned and live."""
@@ -299,6 +371,12 @@ class ScenarioDeliveryStore:
             current = self._memory_claims.get(delivery_key)
             if not current or str(current.get("claim_token", "") or "") != str(claim_token or ""):
                 return
+            if str(current.get("status", "") or "") in {
+                "superseded",
+                "expired",
+                "cancelled",
+            }:
+                return
             current["status"] = status
             current["next_retry_at"] = time.time() + max(0.0, retry_after)
             current["updated_at"] = time.time()
@@ -310,6 +388,7 @@ class ScenarioDeliveryStore:
                 UPDATE proactive_scenario_delivery
                 SET status=?, next_retry_at=?, last_error=?, updated_at=?
                 WHERE delivery_key=? AND claim_token=?
+                  AND status NOT IN ('superseded','expired','cancelled')
                   AND NOT (status='sent' AND ?='queued')
                 """,
                 (
@@ -845,31 +924,80 @@ class ScheduledScenarioService:
         self._last_tick_at = timestamp
         local_now = datetime.fromtimestamp(timestamp)
         plan_date = local_now.date().isoformat()
-        schedule_enabled = bool(getattr(life, "daily_schedule_enabled", True))
-        if schedule_enabled:
-            schedule, schedule_source = await self._get_schedule(plan_date)
-            self._start_schedule_generation(plan_date)
-        else:
-            schedule, schedule_source = {}, "disabled"
         scenario = self._scenario_for(local_now)
         if not scenario:
             self._last_report = {
                 "enabled": True,
                 "timestamp": timestamp,
                 "scenario": "",
-                "schedule_source": schedule_source,
+                "schedule_source": "not_needed",
                 "dispatched": 0,
             }
             return self._last_report
+
+        # Run cheap, deterministic gates before loading weather or starting a
+        # schedule-model task.  This keeps policy-skipped candidates from
+        # consuming external/provider resources and avoids creating claims that
+        # can only be superseded immediately afterwards.
+        rhythm = evaluate_proactive_rhythm(self.config, now=timestamp)
+        states = list(self.state_engine.get_active_states() or []) if hasattr(self.state_engine, "get_active_states") else []
+        eligible_states: list[Any] = []
+        preflight_blocked: dict[str, int] = {}
+        for state in states[:64]:
+            chat_id = str(getattr(state, "chat_id", "") or "")
+            chat_kind = self._chat_kind(state)
+            if not chat_id:
+                continue
+            if chat_kind == "group" and not bool(getattr(life, "enable_group_proactive", True)):
+                preflight_blocked["group_proactive_disabled"] = preflight_blocked.get("group_proactive_disabled", 0) + 1
+                continue
+            if chat_kind == "private" and not bool(getattr(life, "enable_private_proactive", True)):
+                preflight_blocked["private_proactive_disabled"] = preflight_blocked.get("private_proactive_disabled", 0) + 1
+                continue
+            if rhythm.quiet_hours:
+                preflight_blocked["quiet_hours"] = preflight_blocked.get("quiet_hours", 0) + 1
+                continue
+            max_unanswered = int(getattr(life, "proactive_max_unanswered", 2) or 0)
+            if max_unanswered >= 0 and int(getattr(state, "unanswered_proactive_count", 0) or 0) >= max_unanswered:
+                preflight_blocked["max_unanswered"] = preflight_blocked.get("max_unanswered", 0) + 1
+                continue
+            next_due = float(
+                getattr(state, "next_proactive_due_at", 0.0)
+                or getattr(state, "next_wakeup_timestamp", 0.0)
+                or 0.0
+            )
+            if next_due > timestamp:
+                preflight_blocked["cooldown"] = preflight_blocked.get("cooldown", 0) + 1
+                continue
+            eligible_states.append(state)
+
+        if not eligible_states:
+            self._last_report = {
+                "enabled": True,
+                "timestamp": timestamp,
+                "scenario": scenario,
+                "schedule_source": "not_needed",
+                "attempted": 0,
+                "dispatched": 0,
+                "blocked": dict(preflight_blocked),
+                "preflight_blocked": dict(preflight_blocked),
+            }
+            return dict(self._last_report)
+
+        schedule_enabled = bool(getattr(life, "daily_schedule_enabled", True))
+        if schedule_enabled:
+            schedule, schedule_source = await self._get_schedule(plan_date)
+            self._start_schedule_generation(plan_date)
+        else:
+            schedule, schedule_source = {}, "disabled"
         festival = FestivalProvider.get_name(local_now.date()) if bool(
             getattr(life, "festival_greeting_enabled", True)
         ) else ""
         weather = await self.weather.get()
-        states = list(self.state_engine.get_active_states() or []) if hasattr(self.state_engine, "get_active_states") else []
         attempted = 0
         queued = 0
-        blocked: dict[str, int] = {}
-        for state in states[:64]:
+        blocked: dict[str, int] = dict(preflight_blocked)
+        for state in eligible_states:
             chat_id = str(getattr(state, "chat_id", "") or "")
             chat_kind = self._chat_kind(state)
             if not chat_id:
@@ -878,7 +1006,22 @@ class ScheduledScenarioService:
                 continue
             if chat_kind == "private" and not bool(getattr(life, "enable_private_proactive", True)):
                 continue
-            delivery_key = f"{plan_date}:{scenario}:{chat_id}"
+            candidate_version = int(getattr(state, "proactive_generation", 0) or 0)
+            base_delivery_key = f"{plan_date}:{scenario}:{chat_id}"
+            # Keep the legacy key for generation zero, while making later
+            # candidates distinct across user-activity generations.
+            delivery_key = (
+                f"{base_delivery_key}:v{candidate_version}"
+                if candidate_version > 0
+                else base_delivery_key
+            )
+            await self.delivery_store.supersede_previous(
+                chat_id=chat_id,
+                scenario=scenario,
+                local_date=plan_date,
+                current_delivery_key=delivery_key,
+                superseded_by=delivery_key,
+            )
             claim_token = await self.delivery_store.claim(
                 delivery_key,
                 chat_id=chat_id,
@@ -938,6 +1081,10 @@ class ScheduledScenarioService:
                         "schedule_source": schedule_source,
                         "festival": festival,
                         "weather_available": bool(weather),
+                        "scenario_id": f"{plan_date}:{scenario}:{chat_id}",
+                        "candidate_version": candidate_version,
+                        "revision": candidate_version,
+                        "dispatch_id": f"{delivery_key}:{claim_token}",
                         "allow_inactive_chat": bool(
                             getattr(life, "scheduled_scenarios_allow_inactive_chat", False)
                         ),

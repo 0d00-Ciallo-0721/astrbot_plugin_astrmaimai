@@ -852,6 +852,9 @@ class HeartflowManager:
                 "heartflow_pulse_type": pulse.pulse_type,
                 "topic_source_priority": ["conversation_continuity", "recent_memory", "fresh_small_talk"],
                 "time_bucket": decision.safety_checks.get("time_bucket", ""),
+                "scenario_id": f"heartflow:{state.chat_id}:{pulse.pulse_type}",
+                "candidate_version": int(getattr(state, "proactive_generation", 0) or 0),
+                "revision": int(getattr(state, "proactive_generation", 0) or 0),
             },
         )
 
