@@ -3749,10 +3749,28 @@ class SpaceTransitionTool(FunctionTool[AstrAgentContext]):
                 )
                 await self.handoff_store.put(handoff)
                 if delivery_mode == "relay":
-                    await self.handoff_store.complete_for_recipient(
+                    completion_owner = f"space-transition:{handoff.handoff_id}"
+                    prior_handoff = await self.handoff_store.claim_for_recipient(
                         platform_id,
                         str(current_event.get_sender_id() or ""),
+                        owner=completion_owner,
                     )
+                    if prior_handoff is not None:
+                        completed = await self.handoff_store.complete_for_recipient(
+                            platform_id,
+                            str(current_event.get_sender_id() or ""),
+                            handoff_id=prior_handoff.handoff_id,
+                            owner=completion_owner,
+                            lease_token=prior_handoff.lease_token,
+                            expected_revision=prior_handoff.revision,
+                        )
+                        if not completed:
+                            logger.warning(
+                                "[SpaceTransitionTool] prior handoff completion rejected "
+                                "id=%s revision=%s",
+                                prior_handoff.handoff_id,
+                                prior_handoff.revision,
+                            )
                 logger.info(
                     "[SpaceTransitionTool] handoff stored id=%s target=%s",
                     handoff.handoff_id,

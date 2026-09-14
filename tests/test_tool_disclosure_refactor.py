@@ -375,6 +375,40 @@ def test_production_relay_phrase_resolves_private_capability_before_friend_looku
     assert friend_word_resolution.tool_name == "space_transition_action"
 
 
+def test_capability_need_does_not_treat_ordinary_questions_as_cross_session_send():
+    ordinary = (
+        "告诉我这个词什么意思",
+        "问一下群里发生了什么",
+        "联系上下文回答",
+        "询问一下你的设定",
+        "帮我问问这是什么意思",
+        "查一下好友关系",
+    )
+    for message in ordinary:
+        resolution = resolve_capability_need(
+            message,
+            available_tool_names=["space_transition_action"],
+        )
+        assert resolution is None, message
+
+
+def test_capability_need_requires_explicit_send_language_for_cross_session_action():
+    explicit = (
+        "给空酱发消息说晚安",
+        "私聊空酱说我到了",
+        "转告空酱明天见",
+        "把这句话发出去",
+        "带话给空酱说晚安",
+    )
+    for message in explicit:
+        resolution = resolve_capability_need(
+            message,
+            available_tool_names=["space_transition_action"],
+        )
+        assert resolution is not None, message
+        assert resolution.tool_name == "space_transition_action"
+
+
 def test_disclosure_caps_dynamic_tools_without_removing_default_tools():
     plan = ToolDisclosurePlanner().plan(
         message="闲聊",

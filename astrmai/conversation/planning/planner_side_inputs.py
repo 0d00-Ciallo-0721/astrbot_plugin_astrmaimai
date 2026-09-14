@@ -1798,16 +1798,43 @@ class PlannerSideInputMixin:
         platform_id = source_umo.split(":", 1)[0] if ":" in source_umo else "default"
         handoff_store = getattr(self, "cross_session_handoff_store", None)
         handoff_id = ""
+        handoff_lease_token = ""
+        handoff_revision = 0
         jumps = None
         jump_info = None
         if handoff_store is not None:
             try:
-                handoff = await handoff_store.peek_for_recipient(platform_id, sender_id)
+                claim = getattr(handoff_store, "claim_for_recipient", None)
+                if callable(claim):
+                    owner = str(
+                        event.get_extra("astrmai_turn_id", "")
+                        if hasattr(event, "get_extra")
+                        else ""
+                    ).strip() or f"planner:{id(event)}"
+                    handoff = await claim(platform_id, sender_id, owner=owner)
+                else:
+                    logger.warning(
+                        "[Planner] cross-session handoff blocked reason=claim_unavailable"
+                    )
+                    handoff = None
+                if handoff is not None and (
+                    str(getattr(handoff, "status", "active") or "active")
+                    not in {"active", "claimed"}
+                    or float(getattr(handoff, "expires_at", 0.0) or 0.0) <= time.time()
+                ):
+                    logger.info(
+                        "[Planner] cross-session handoff blocked id=%s status=%s reason=expired_or_inactive",
+                        getattr(handoff, "handoff_id", ""),
+                        getattr(handoff, "status", ""),
+                    )
+                    handoff = None
             except Exception as exc:
                 logger.warning(f"[Planner] cross-session handoff lookup degraded: {exc}")
                 handoff = None
             if handoff is not None:
                 handoff_id = str(handoff.handoff_id or "")
+                handoff_lease_token = str(getattr(handoff, "lease_token", "") or "")
+                handoff_revision = int(getattr(handoff, "revision", 0) or 0)
                 jump_info = {
                     "timestamp": handoff.created_at,
                     "source_umo": handoff.source_umo,
@@ -1819,7 +1846,7 @@ class PlannerSideInputMixin:
                     "context_summary": handoff.context_summary,
                     "delivery_mode": handoff.delivery_mode,
                 }
-        if jump_info is None and ctx is not None:
+        if jump_info is None and handoff_store is None and ctx is not None:
             shared_dict = getattr(ctx, "shared_dict", {})
             jumps = shared_dict.get("astrmai_space_jumps", {})
             jump_info = jumps.get(sender_id)
@@ -1914,7 +1941,31 @@ class PlannerSideInputMixin:
         finally:
             if injected and handoff_id and handoff_store is not None:
                 try:
-                    await handoff_store.acknowledge(handoff_id)
+                    acknowledge = getattr(handoff_store, "acknowledge")
+                    consumed = await acknowledge(
+                        handoff_id,
+                        lease_token=handoff_lease_token,
+                        expected_revision=handoff_revision,
+                    )
+                    settlement = {
+                        "handoff_id": handoff_id,
+                        "context_injection_consumed": bool(consumed),
+                        "expected_revision": handoff_revision,
+                    }
+                    if hasattr(event, "set_extra"):
+                        event.set_extra(
+                            "astrmai_cross_session_handoff_settlement",
+                            settlement,
+                        )
+                    if not consumed:
+                        failure = getattr(handoff_store, "last_failure", {}) or {}
+                        logger.warning(
+                            "[Planner] cross-session context injection settlement rejected "
+                            "id=%s revision=%s reason=%s",
+                            handoff_id,
+                            handoff_revision,
+                            failure.get("failure_kind", "unknown"),
+                        )
                 except Exception as exc:
                     logger.warning(f"[Planner] cross-session handoff acknowledge degraded: {exc}")
             elif jumps is not None:

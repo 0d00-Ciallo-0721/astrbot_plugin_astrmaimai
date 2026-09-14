@@ -1141,6 +1141,48 @@ class PluginLifecycleShutdownRegressionTests(unittest.TestCase):
                 self.assertFalse(status.persona_persisted)
                 self.assertIn("persona.core", status.degraded_components)
 
+    def test_persona_startup_fails_closed_when_provider_identity_is_incomplete(self):
+        from astrmai.app.lifecycle import PluginLifecycleManager
+        from astrmai.app.runtime_context import RuntimeStatus
+
+        class _Summarizer:
+            REQUIRED_SHARDS = ()
+            pending_tasks = {}
+
+            @staticmethod
+            def _cache_key(persona_id, _session_id):
+                return persona_id or "global"
+
+            async def ensure_core_ready(self, *_args, **_kwargs):
+                raise AssertionError("provider identity is incomplete; persona must remain blocked")
+
+        status = RuntimeStatus()
+        runtime = SimpleNamespace(
+            background_tasks=set(),
+            lifecycle=SimpleNamespace(manager=None),
+            status=status,
+            config=SimpleNamespace(
+                provider=SimpleNamespace(task_models=["configured/model"], fallback_models=[]),
+                persona=SimpleNamespace(),
+            ),
+            context=SimpleNamespace(
+                provider_manager=SimpleNamespace(
+                    get_provider_by_id=lambda _model_id: SimpleNamespace()
+                )
+            ),
+            context_engine=SimpleNamespace(resolve_active_persona=lambda: ("persona", "raw prompt")),
+            persona_summarizer=_Summarizer(),
+            set_boot_phase=status.set_phase,
+            mark_degraded=status.mark_degraded,
+        )
+
+        ready = asyncio.run(PluginLifecycleManager(runtime)._initialize_persona_core_until_ready())
+
+        self.assertTrue(ready)
+        self.assertEqual(status.persona_state, "provider_unavailable")
+        self.assertFalse(status.persona_persisted)
+        self.assertIn("identity_incomplete", status.persona_last_error)
+
     def test_persona_startup_timeout_marks_not_ready_without_opening_ingress(self):
         async def _run():
             from astrmai.app.lifecycle import PluginLifecycleManager

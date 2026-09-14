@@ -226,6 +226,9 @@ class MemoryEngine:
         self._vector_close_tasks: dict[int, tuple[Any, Any]] = {}
         self._vector_close_retry_after: dict[int, tuple[Any, float]] = {}
         self._vector_last_error = ""
+        self._vector_bootstrap_failure_kind = ""
+        self._vector_bootstrap_failure_signature = ""
+        self._vector_bootstrap_failure_log_count = 0
         self._projection_replay_status = "idle"
         self._projection_replay_error = ""
         self._projection_replay_completed_at = 0.0
@@ -1620,10 +1623,48 @@ class MemoryEngine:
         self._vector_state = "degraded"
         self._vector_last_error = f"{type(exc).__name__}: {exc}"[:500]
         self._vector_bootstrap_completed_at = time.time()
+        failure_kind = self._classify_vector_bootstrap_failure(exc)
+        signature = f"{failure_kind}:{self._vector_last_error}"
+        self._vector_bootstrap_failure_kind = failure_kind
+        if signature == self._vector_bootstrap_failure_signature:
+            self._vector_bootstrap_failure_log_count += 1
+        else:
+            self._vector_bootstrap_failure_signature = signature
+            self._vector_bootstrap_failure_log_count = 1
+
+        if failure_kind == "provider_unconfigured":
+            repeated = self._vector_bootstrap_failure_log_count
+            message = (
+                f"[AstrMai] vector bootstrap degraded reason={failure_kind}; "
+                f"retry in {backoff}s (repeated={repeated})."
+            )
+            if repeated == 1:
+                logger.warning(message)
+            else:
+                logger.debug(message)
+            return
+
         logger.error(
-            f"[AstrMai] vector bootstrap failed: {exc}; retry in {backoff}s.",
+            f"[AstrMai] vector bootstrap failed reason={failure_kind}: {exc}; "
+            f"retry in {backoff}s.",
             exc_info=include_trace,
         )
+
+    @staticmethod
+    def _classify_vector_bootstrap_failure(exc: Exception) -> str:
+        message = str(exc).lower()
+        if (
+            "[unconfigured]" in message
+            or "no embedding model or default provider configured" in message
+        ):
+            return "provider_unconfigured"
+        if "no valid embedding model found" in message:
+            return "provider_unavailable"
+        if "dimension probe failed" in message or "dimension mismatch" in message:
+            return "identity/dimension_mismatch"
+        if "embedding provider" in message or "provider" in message:
+            return "provider_request_failed"
+        return "bootstrap_failed"
 
     @staticmethod
     async def _close_vector_stack(retriever, faiss_db, *, timeout_sec: float | None = None) -> bool:
@@ -4725,6 +4766,8 @@ class MemoryEngine:
                 "bootstrap_started_at": self._vector_bootstrap_started_at or None,
                 "bootstrap_completed_at": self._vector_bootstrap_completed_at or None,
                 "last_error": self._vector_last_error,
+                "failure_kind": self._vector_bootstrap_failure_kind,
+                "failure_log_count": int(self._vector_bootstrap_failure_log_count),
                 "next_retry_at": self._next_retry_time or None,
                 "consistency": dict(self._vector_consistency_report),
                 "index_path": self._vector_index_path,

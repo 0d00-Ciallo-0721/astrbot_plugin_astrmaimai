@@ -216,7 +216,7 @@ def test_v129_creates_diary_checkpoints_from_v128(tmp_path):
         version = int(db.execute("PRAGMA user_version").fetchone()[0])
 
     assert table == (1,)
-    assert version == 129
+    assert version == LATEST_ARCHITECTURE_SCHEMA_VERSION
 
 
 def test_async_v129_creates_diary_checkpoints_from_v128(tmp_path):
@@ -239,7 +239,79 @@ def test_async_v129_creates_diary_checkpoints_from_v128(tmp_path):
 
     table, version = asyncio.run(run())
     assert table == (1,)
-    assert version == 129
+    assert version == LATEST_ARCHITECTURE_SCHEMA_VERSION
+
+
+def test_v138_adds_cross_session_handoff_claim_contract_from_v129(tmp_path):
+    path = tmp_path / "astrmai-v129.db"
+    with sqlite3.connect(path) as db:
+        db.executescript(
+            """
+            CREATE TABLE cross_session_handoff (
+                handoff_id TEXT PRIMARY KEY, platform_id TEXT NOT NULL,
+                source_umo TEXT NOT NULL DEFAULT '', source_sender_id TEXT NOT NULL DEFAULT '',
+                source_sender_name TEXT NOT NULL DEFAULT '', target_umo TEXT NOT NULL DEFAULT '',
+                target_id TEXT NOT NULL, target_name TEXT NOT NULL DEFAULT '',
+                outbound_message TEXT NOT NULL DEFAULT '', context_summary TEXT NOT NULL DEFAULT '',
+                delivery_mode TEXT NOT NULL DEFAULT 'relay', observed_turns INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'active', created_at REAL NOT NULL DEFAULT 0,
+                expires_at REAL NOT NULL DEFAULT 0, updated_at REAL NOT NULL DEFAULT 0
+            );
+            PRAGMA user_version = 129;
+            """
+        )
+        _run_migrations(db)
+        columns = {
+            str(row[1])
+            for row in db.execute("PRAGMA table_info(cross_session_handoff)").fetchall()
+        }
+        indexes = {
+            str(row[1])
+            for row in db.execute("PRAGMA index_list(cross_session_handoff)").fetchall()
+        }
+        version = int(db.execute("PRAGMA user_version").fetchone()[0])
+
+    assert version == LATEST_ARCHITECTURE_SCHEMA_VERSION
+    assert {
+        "owner", "lease_token", "lease_until", "revision", "failure_stage",
+        "failure_kind", "error_type", "error_summary",
+    } <= columns
+    assert "ix_cross_session_handoff_claim" in indexes
+
+
+def test_async_v138_adds_cross_session_handoff_claim_contract_from_v129(tmp_path):
+    path = tmp_path / "astrmai-v129-async.db"
+
+    async def run():
+        async with aiosqlite.connect(path) as db:
+            await db.executescript(
+                """
+                CREATE TABLE cross_session_handoff (
+                    handoff_id TEXT PRIMARY KEY, platform_id TEXT NOT NULL,
+                    source_umo TEXT NOT NULL DEFAULT '', source_sender_id TEXT NOT NULL DEFAULT '',
+                    source_sender_name TEXT NOT NULL DEFAULT '', target_umo TEXT NOT NULL DEFAULT '',
+                    target_id TEXT NOT NULL, target_name TEXT NOT NULL DEFAULT '',
+                    outbound_message TEXT NOT NULL DEFAULT '', context_summary TEXT NOT NULL DEFAULT '',
+                    delivery_mode TEXT NOT NULL DEFAULT 'relay', observed_turns INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'active', created_at REAL NOT NULL DEFAULT 0,
+                    expires_at REAL NOT NULL DEFAULT 0, updated_at REAL NOT NULL DEFAULT 0
+                );
+                PRAGMA user_version = 129;
+                """
+            )
+            await _run_migrations_async(db)
+            await db.commit()
+            cursor = await db.execute("PRAGMA table_info(cross_session_handoff)")
+            columns = {str(row[1]) for row in await cursor.fetchall()}
+            await cursor.close()
+            cursor = await db.execute("PRAGMA user_version")
+            row = await cursor.fetchone()
+            await cursor.close()
+            return columns, int(row[0] if row else 0)
+
+    columns, version = asyncio.run(run())
+    assert version == LATEST_ARCHITECTURE_SCHEMA_VERSION
+    assert {"owner", "lease_token", "lease_until", "revision"} <= columns
 
 
 def test_migration_audit_is_repeatable_and_never_repairs_unknown_actor(tmp_path):

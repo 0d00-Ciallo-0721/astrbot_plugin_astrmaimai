@@ -434,6 +434,15 @@ _MIGRATIONS: list[tuple[int, str]] = [
         checkpoint_json TEXT NOT NULL DEFAULT '{}',
         updated_at REAL NOT NULL DEFAULT 0
     )"""),
+    (130, "ALTER TABLE cross_session_handoff ADD COLUMN owner TEXT NOT NULL DEFAULT ''"),
+    (131, "ALTER TABLE cross_session_handoff ADD COLUMN lease_token TEXT NOT NULL DEFAULT ''"),
+    (132, "ALTER TABLE cross_session_handoff ADD COLUMN lease_until REAL NOT NULL DEFAULT 0"),
+    (133, "ALTER TABLE cross_session_handoff ADD COLUMN revision INTEGER NOT NULL DEFAULT 1"),
+    (134, "ALTER TABLE cross_session_handoff ADD COLUMN failure_stage TEXT NOT NULL DEFAULT ''"),
+    (135, "ALTER TABLE cross_session_handoff ADD COLUMN failure_kind TEXT NOT NULL DEFAULT ''"),
+    (136, "ALTER TABLE cross_session_handoff ADD COLUMN error_type TEXT NOT NULL DEFAULT ''"),
+    (137, "ALTER TABLE cross_session_handoff ADD COLUMN error_summary TEXT NOT NULL DEFAULT ''"),
+    (138, "CREATE INDEX IF NOT EXISTS ix_cross_session_handoff_claim ON cross_session_handoff(status, lease_until, revision)"),
 ]
 
 
@@ -501,6 +510,17 @@ def _run_migrations(db: sqlite3.Connection) -> None:
                 logger.info(
                     f"[AstrMai-DB] migration v{version} skipped "
                     "(learning_ingest_outbox table absent)"
+                )
+                continue
+        if version in range(130, 139):
+            table = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cross_session_handoff'"
+            ).fetchone()
+            if not table:
+                db.execute(f"PRAGMA user_version = {version}")
+                logger.info(
+                    f"[AstrMai-DB] migration v{version} skipped "
+                    "(cross_session_handoff table absent)"
                 )
                 continue
         if version == 93:
@@ -608,6 +628,19 @@ async def _run_migrations_async(db: aiosqlite.Connection) -> None:
                 logger.info(
                     f"[AstrMai-DB] migration v{version} skipped "
                     "(learning_ingest_outbox table absent)"
+                )
+                continue
+        if version in range(130, 139):
+            cursor = await db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cross_session_handoff'"
+            )
+            table = await cursor.fetchone()
+            await cursor.close()
+            if not table:
+                await db.execute(f"PRAGMA user_version = {version}")
+                logger.info(
+                    f"[AstrMai-DB] migration v{version} skipped "
+                    "(cross_session_handoff table absent)"
                 )
                 continue
         if version == 93:

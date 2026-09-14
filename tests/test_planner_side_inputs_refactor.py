@@ -1,5 +1,6 @@
 import asyncio
 import importlib
+import sqlite3
 import sys
 import tempfile
 import time
@@ -545,7 +546,79 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         self.assertIn("已经发给当前对方的消息", blocks[2])
         self.assertIsNone(remaining)
 
-    def test_private_jump_context_falls_back_when_runtime_store_is_unavailable(self):
+    def test_private_jump_context_records_rejected_stale_settlement(self):
+        store_mod = importlib.import_module(
+            "astrmai.infrastructure.runtime.cross_session_handoff_store"
+        )
+
+        class _StaleStore:
+            def __init__(self):
+                self.acknowledgements = []
+                self.last_failure = {
+                    "failure_stage": "acknowledge",
+                    "failure_kind": "persistent_cas_conflict",
+                }
+
+            async def claim_for_recipient(self, platform_id, target_id, *, owner):
+                handoff = store_mod.CrossSessionHandoff(
+                    platform_id=platform_id,
+                    source_umo="default:FriendMessage:origin",
+                    source_sender_id="origin",
+                    source_sender_name="Alice",
+                    target_umo=f"default:FriendMessage:{target_id}",
+                    target_id=target_id,
+                    target_name="Bob",
+                    outbound_message="Alice让我转告你：明天见",
+                    context_summary="Alice 委托我通知 Bob 明天见。",
+                    delivery_mode="relay",
+                )
+                handoff.status = "claimed"
+                handoff.owner = owner
+                handoff.lease_token = "lease-token"
+                handoff.lease_until = time.time() + 30
+                handoff.revision = 2
+                return handoff
+
+            async def acknowledge(
+                self,
+                handoff_id,
+                *,
+                lease_token,
+                expected_revision,
+            ):
+                self.acknowledgements.append(
+                    (handoff_id, lease_token, expected_revision)
+                )
+                return False
+
+        store = _StaleStore()
+        self.mixin.cross_session_handoff_store = store
+        event = _FakeEvent(group_id=None)
+        event.unified_msg_origin = "default:FriendMessage:recipient"
+        envelope = self.side_inputs_mod.PromptEnvelope()
+
+        asyncio.run(
+            self.mixin._apply_private_jump_context(
+                SimpleNamespace(),
+                event,
+                "recipient",
+                prompt_envelope=envelope,
+            )
+        )
+
+        self.assertIn("Alice让我转告你", envelope.planner_runtime_instruction_block)
+        self.assertEqual(len(store.acknowledgements), 1)
+        self.assertEqual(store.acknowledgements[0][1:], ("lease-token", 2))
+        self.assertEqual(
+            event.get_extra("astrmai_cross_session_handoff_settlement"),
+            {
+                "handoff_id": store.acknowledgements[0][0],
+                "context_injection_consumed": False,
+                "expected_revision": 2,
+            },
+        )
+
+    def test_private_jump_context_does_not_bypass_unavailable_runtime_store(self):
         class _BrokenStore:
             async def peek_for_recipient(self, platform_id, target_id):
                 raise RuntimeError("store unavailable")
@@ -574,8 +647,71 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
             )
         )
 
-        self.assertIn("旧兼容桥仍可续接", envelope.planner_runtime_instruction_block)
-        self.assertEqual(ctx.shared_dict["astrmai_space_jumps"], {})
+        self.assertEqual(envelope.planner_runtime_instruction_block, "")
+        self.assertIn("recipient-1", ctx.shared_dict["astrmai_space_jumps"])
+
+    def test_private_jump_context_fails_closed_for_legacy_store_schema(self):
+        store_mod = importlib.import_module(
+            "astrmai.infrastructure.runtime.cross_session_handoff_store"
+        )
+        db_path = f"{self.temp_dir.name}/legacy-handoff.db"
+        with sqlite3.connect(db_path) as db:
+            db.execute(
+                """CREATE TABLE cross_session_handoff (
+                    handoff_id TEXT PRIMARY KEY, platform_id TEXT, source_umo TEXT,
+                    source_sender_id TEXT, source_sender_name TEXT, target_umo TEXT,
+                    target_id TEXT, target_name TEXT, outbound_message TEXT,
+                    context_summary TEXT, delivery_mode TEXT, observed_turns INTEGER,
+                    status TEXT, created_at REAL, expires_at REAL, updated_at REAL
+                )"""
+            )
+        store = store_mod.CrossSessionHandoffStore(db_path)
+        self.mixin.cross_session_handoff_store = store
+        event = _FakeEvent(group_id=None)
+        event.unified_msg_origin = "default:FriendMessage:recipient"
+        envelope = self.side_inputs_mod.PromptEnvelope()
+
+        async def _run():
+            await store.put(
+                store_mod.CrossSessionHandoff(
+                    platform_id="default",
+                    source_umo="default:FriendMessage:origin",
+                    source_sender_id="origin",
+                    source_sender_name="Alice",
+                    target_umo=event.unified_msg_origin,
+                    target_id="recipient",
+                    target_name="Bob",
+                    outbound_message="Alice让我转告你：明天见",
+                    context_summary="Alice 委托我通知 Bob 明天见。",
+                    delivery_mode="relay",
+                )
+            )
+            await self.mixin._apply_private_jump_context(
+                SimpleNamespace(
+                    shared_dict={
+                        "astrmai_space_jumps": {
+                            "recipient": {
+                                "timestamp": time.time(),
+                                "private_message": "不应走兼容回退",
+                            }
+                        }
+                    }
+                ),
+                event,
+                "recipient",
+                prompt_envelope=envelope,
+            )
+
+        asyncio.run(_run())
+
+        self.assertEqual(envelope.planner_runtime_instruction_block, "")
+        self.assertEqual(
+            store.last_failure.get("failure_kind"),
+            "lease_schema_unavailable",
+        )
+        self.assertIsNone(
+            event.get_extra("astrmai_cross_session_handoff_settlement")
+        )
 
     def test_cross_session_relay_intent_covers_natural_commands_without_false_positives(self):
         positives = [

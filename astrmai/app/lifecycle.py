@@ -613,17 +613,47 @@ class PluginLifecycleManager:
         manager = getattr(context, "provider_manager", None)
         getter = getattr(manager, "get_provider_by_id", None)
         if not callable(getter):
+            self.runtime.status.persona_last_error = "provider_registry_unavailable:get_provider_by_id_missing"
             return False
         for model_id in models:
             try:
                 provider = getter(model_id)
                 if inspect.isawaitable(provider):
                     provider = await provider
-            except Exception:
+            except Exception as exc:
+                self.runtime.status.persona_last_error = (
+                    f"provider_registry_unavailable:{type(exc).__name__}"
+                )
                 continue
-            if provider is not None:
+            if provider is not None and self._provider_identity_complete(provider, model_id):
                 return True
+            if provider is not None:
+                self.runtime.status.persona_last_error = "provider_unavailable:identity_incomplete"
         return False
+
+    @staticmethod
+    def _provider_identity_complete(provider: Any, model_id: str) -> bool:
+        """Require a registry object with a stable identity before LLM startup."""
+        identity_values: list[str] = []
+        for source in (provider, getattr(provider, "meta", None)):
+            if callable(source):
+                try:
+                    source = source()
+                except Exception:
+                    source = None
+            if source is None:
+                continue
+            if isinstance(source, dict):
+                identity_values.extend(
+                    str(source.get(key) or "").strip()
+                    for key in ("id", "provider_id", "model_id", "name", "type")
+                )
+            else:
+                identity_values.extend(
+                    str(getattr(source, key, "") or "").strip()
+                    for key in ("id", "provider_id", "model_id", "name", "type")
+                )
+        return bool(any(identity_values) and str(model_id or "").strip())
 
     async def _restore_dialogue_snapshot(self) -> None:
         # G4/PL-09: 重载后恢复群对话热/温区（TTL 与 schema 版本双重约束在 store 内部）
@@ -830,15 +860,18 @@ class PluginLifecycleManager:
             if provider_available is None and not hasattr(self.runtime, "context"):
                 pass
             else:
+                provider_error = str(
+                    getattr(self.runtime.status, "persona_last_error", "") or ""
+                ).strip() or "provider_unavailable"
                 self.runtime.status.persona_state = "provider_unavailable"
                 self.runtime.status.persona_persisted = False
-                self.runtime.status.persona_last_error = "provider_unavailable"
+                self.runtime.status.persona_last_error = provider_error
                 self.runtime.status.startup_blocked_reason = ""
                 self.runtime.status.startup_retry_at = 0.0
                 self.runtime.set_boot_phase("lifecycle.persona_degraded")
                 self.runtime.mark_degraded(
                     "persona.core",
-                    "provider_unavailable; startup persona generation skipped",
+                    f"{provider_error}; startup persona generation skipped",
                 )
                 logger.warning(
                     "[AstrMai] persona startup generation skipped: configured models are not registered"
