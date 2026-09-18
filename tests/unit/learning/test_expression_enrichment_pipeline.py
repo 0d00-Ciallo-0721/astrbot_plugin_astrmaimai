@@ -464,7 +464,7 @@ class ExpressionEnrichmentPipelineTests(unittest.TestCase):
 
         outcomes = asyncio.run(manager.process_logs_and_mine("chat-1", logs))
         self.assertEqual(db.marked, [])
-        self.assertEqual(outcomes["expression"]["status"], "failed")
+        self.assertEqual(outcomes["expression"]["status"], "retry_wait")
         self.assertTrue(manager._last_mining_outcomes["chat-1"]["retryable"])
 
     def test_jargon_all_rejected_is_terminal_and_consumes_logs(self):
@@ -538,7 +538,7 @@ class ExpressionEnrichmentPipelineTests(unittest.TestCase):
 
         self.assertEqual(db.marked, [])
         self.assertEqual(outcomes["expression"]["status"], "completed")
-        self.assertEqual(outcomes["jargon"]["status"], "failed")
+        self.assertEqual(outcomes["jargon"]["status"], "retry_wait")
         outcome = manager._last_mining_outcomes["chat-1"]
         self.assertTrue(outcome["retryable"])
         self.assertEqual(outcome["jargon"]["enrichment"]["status"], "provider_failure")

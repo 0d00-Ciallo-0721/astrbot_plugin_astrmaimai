@@ -402,8 +402,8 @@ def test_pipeline_failure_count_survives_manager_restart_and_quarantines(tmp_pat
     second = asyncio.run(fail_once())
     third = asyncio.run(fail_once())
 
-    assert first["status"] == "failed"
-    assert second["status"] == "failed"
+    assert first["status"] == "retry_wait"
+    assert second["status"] == "retry_wait"
     assert third["status"] == "quarantined"
     checkpoint = service.list_learning_checkpoints(
         pipeline="expression",
@@ -450,7 +450,7 @@ def test_learning_pipeline_shared_timeout_keeps_cursor_for_retry(tmp_path):
         )
     )
 
-    assert result["status"] == "failed"
+    assert result["status"] == "retry_wait"
     assert result["reason"] == "learning_pipeline_timeout:0.02s"
     assert result["error_type"] == "TimeoutError"
     assert result["cursor_after"] == result["cursor_before"]

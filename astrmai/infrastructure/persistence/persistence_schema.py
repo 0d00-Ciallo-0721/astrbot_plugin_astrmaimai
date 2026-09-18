@@ -447,6 +447,8 @@ _MIGRATIONS: list[tuple[int, str]] = [
     (140, "ALTER TABLE learning_pipeline_checkpoint ADD COLUMN cursor_semantics TEXT NOT NULL DEFAULT 'legacy_batch_atomic_v1'"),
     (141, "ALTER TABLE learning_pipeline_checkpoint ADD COLUMN pipeline_version TEXT NOT NULL DEFAULT 'legacy-unversioned'"),
     (142, "CREATE INDEX IF NOT EXISTS ix_learning_pipeline_checkpoint_revision ON learning_pipeline_checkpoint(pipeline, chat_id, revision)"),
+    (143, "ALTER TABLE learning_mining_run ADD COLUMN result_digest TEXT NOT NULL DEFAULT ''"),
+    (144, "ALTER TABLE learning_mining_run ADD COLUMN pipeline_version TEXT NOT NULL DEFAULT 'legacy-unversioned'"),
 ]
 
 

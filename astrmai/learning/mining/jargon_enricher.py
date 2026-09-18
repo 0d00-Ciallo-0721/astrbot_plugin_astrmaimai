@@ -139,13 +139,15 @@ class JargonEnricher:
             )
         rows = result["items"]
         by_index: dict[int, dict[str, Any]] = {}
-        invalid_indexes: list[int] = []
+        invalid_indexes: list[Any] = []
         for row in rows:
             if not isinstance(row, dict):
+                invalid_indexes.append("malformed_row")
                 continue
             try:
                 index = int(row.get("index"))
             except (TypeError, ValueError):
+                invalid_indexes.append(str(row.get("index") or "missing_index")[:40])
                 continue
             if not 1 <= index <= len(candidates):
                 invalid_indexes.append(index)
@@ -163,7 +165,7 @@ class JargonEnricher:
                 reason="no_indexed_items",
                 error_type="MissingCandidateIndex",
                 returned_count=len(rows),
-                invalid_indexes=sorted(set(invalid_indexes)),
+                invalid_indexes=list(dict.fromkeys(invalid_indexes)),
             )
         enriched: list[dict[str, Any]] = []
         rejected_count = 0
@@ -283,7 +285,7 @@ class JargonEnricher:
             accepted_count=len(enriched),
             rejected_count=rejected_count,
             missing_indexes=missing_indexes,
-            invalid_indexes=sorted(set(invalid_indexes)),
+            invalid_indexes=list(dict.fromkeys(invalid_indexes)),
             retryable=bool(retryable),
             reason=reason,
         )

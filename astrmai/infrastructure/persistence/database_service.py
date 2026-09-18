@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import time
 import uuid
@@ -861,6 +862,7 @@ class DatabaseService(
         cursor_semantics: str = "legacy_batch_atomic_v1",
         pipeline_version: str = "legacy-unversioned",
         run_payload: dict[str, Any] | None = None,
+        cursor_upper_bound: int | None = None,
     ) -> dict[str, Any]:
         """Atomically upsert one mining run and settle its checkpoint.
 
@@ -876,10 +878,52 @@ class DatabaseService(
             raise ValueError("unsupported cursor semantics")
         if not str(pipeline_version or "").strip():
             raise ValueError("pipeline_version is required")
+        status_name = str(status or "").strip().lower()
+        allowed_statuses = {
+            "completed", "skipped", "skipped_non_group", "waiting_for_evidence",
+            "retry_wait", "failed", "quarantined", "blocked",
+        }
+        if status_name not in allowed_statuses:
+            return {"committed": False, "idempotent": False, "conflict": False,
+                    "blocked": True, "failure_kind": "unknown_status",
+                    "revision_before": int(expected_revision),
+                    "revision_after": int(expected_revision),
+                    "cursor_after": int(expected_cursor)}
+        requested_cursor = int(cursor_after or 0)
+        if requested_cursor < int(expected_cursor):
+            return {"committed": False, "idempotent": False, "conflict": False,
+                    "blocked": True, "failure_kind": "cursor_regression",
+                    "revision_before": int(expected_revision),
+                    "revision_after": int(expected_revision),
+                    "cursor_after": int(expected_cursor)}
+        advancing_statuses = {"completed", "skipped", "skipped_non_group"}
+        if status_name not in advancing_statuses:
+            requested_cursor = int(expected_cursor)
+        if cursor_upper_bound is not None and requested_cursor > int(cursor_upper_bound):
+            return {"committed": False, "idempotent": False, "conflict": False,
+                    "blocked": True, "failure_kind": "cursor_out_of_scope",
+                    "revision_before": int(expected_revision),
+                    "revision_after": int(expected_revision),
+                    "cursor_after": int(expected_cursor)}
         payload = dict(run_payload or {})
         run_id = str(payload.get("run_id") or uuid.uuid4().hex)
         details = payload.get("details", payload.get("details_json", {}))
-        details_json = details if isinstance(details, str) else json.dumps(details or {}, ensure_ascii=False, default=str)
+        details_json = details if isinstance(details, str) else json.dumps(details or {}, ensure_ascii=False, default=str, sort_keys=True)
+        result_material = {
+            "pipeline": pipeline_name, "chat_id": normalized_chat_id,
+            "batch_id": str(batch_id or ""), "pipeline_version": str(pipeline_version),
+            "status": status_name, "cursor_before": int(expected_cursor),
+            "cursor_after": requested_cursor,
+            "raw_count": int(payload.get("raw_count") or 0),
+            "normalized_count": int(payload.get("normalized_count") or 0),
+            "candidate_count": int(payload.get("candidate_count") or 0),
+            "saved_count": int(payload.get("saved_count") or 0),
+            "deduplicated_count": int(payload.get("deduplicated_count") or 0),
+            "details": details_json,
+        }
+        result_digest = hashlib.sha256(
+            json.dumps(result_material, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
         now = float(payload.get("created_at") or time.time())
         with connect_sqlite(self.persistence.db_path) as conn:
             columns = {str(row[1]) for row in conn.execute(
@@ -899,7 +943,9 @@ class DatabaseService(
                 raise RuntimeError("learning_checkpoint_missing")
             revision_before, current_cursor, current_batch, current_status = map(lambda item: item, current)
             existing = conn.execute(
-                "SELECT batch_id, details_json, status FROM learning_mining_run WHERE run_id = ?",
+                """SELECT batch_id, details_json, status, result_digest, cursor_before,
+                        cursor_after, candidate_count, saved_count, deduplicated_count,
+                        pipeline, chat_id, model_id FROM learning_mining_run WHERE run_id = ?""",
                 (run_id,),
             ).fetchone()
             if existing is not None:
@@ -913,6 +959,14 @@ class DatabaseService(
                     str(existing[0] or "") == str(batch_id or "")
                     and str(existing[1] or "") == details_json
                     and str(existing[2] or "") == str(payload.get("status", status) or "")
+                    and str(existing[3] or "") == result_digest
+                    and int(existing[4] or 0) == int(expected_cursor)
+                    and int(existing[5] or 0) == requested_cursor
+                    and int(existing[6] or 0) == int(payload.get("candidate_count") or 0)
+                    and int(existing[7] or 0) == int(payload.get("saved_count") or 0)
+                    and int(existing[8] or 0) == int(payload.get("deduplicated_count") or 0)
+                    and str(existing[9] or "") == pipeline_name
+                    and str(existing[10] or "") == normalized_chat_id
                 )
                 if same_payload:
                     conn.commit()
@@ -942,7 +996,7 @@ class DatabaseService(
                    WHERE pipeline = ? AND chat_id = ? AND revision = ?
                      AND cursor_log_id = ?""",
                 (
-                    max(0, int(cursor_after or 0)), str(batch_id or ""),
+                    requested_cursor, str(batch_id or ""),
                     str(status or ""), max(0, int(failure_count or 0)),
                     max(0.0, float(retry_at or 0.0)), str(last_error or "")[:1000],
                     str(cursor_semantics), str(pipeline_version), time.time(),
@@ -973,12 +1027,16 @@ class DatabaseService(
                     int(payload.get("required_count") or 0), int(payload.get("candidate_count") or 0),
                     int(payload.get("saved_count") or 0), int(payload.get("deduplicated_count") or 0),
                     int(payload.get("cursor_before", expected_cursor) or 0),
-                    int(payload.get("cursor_after", cursor_after) or 0), int(payload.get("retained_count") or 0),
+                    requested_cursor, int(payload.get("retained_count") or 0),
                     str(payload.get("status", status) or ""), str(payload.get("reason") or ""),
                     float(payload.get("duration_ms") or 0.0), str(payload.get("model_id") or ""),
                     int(bool(payload.get("retryable", False))), str(payload.get("error_type") or ""),
                     details_json, now,
                 ),
+            )
+            conn.execute(
+                "UPDATE learning_mining_run SET result_digest = ?, pipeline_version = ? WHERE run_id = ?",
+                (result_digest, str(pipeline_version), run_id),
             )
             conn.commit()
         return {
@@ -987,7 +1045,8 @@ class DatabaseService(
             "conflict": False,
             "revision_before": int(revision_before or 0),
             "revision_after": int(revision_before or 0) + 1,
-            "cursor_after": max(0, int(cursor_after or 0)),
+            "cursor_after": requested_cursor,
+            "result_digest": result_digest,
         }
 
     def reset_learning_checkpoint(

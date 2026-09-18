@@ -229,6 +229,28 @@ class JargonPipelineMigratedTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_enricher_marks_malformed_rows_as_partial(self):
+        async def run():
+            gateway = _Gateway(
+                response={
+                    "items": [
+                        {"index": 1, "meaning": "raid boss nickname", "scene": "raid", "confidence": 0.9,
+                         "is_jargon": True, "term_type": "jargon", "evidence_sufficient": True,
+                         "supported_by": [], "senses": [{"meaning": "raid boss nickname"}]},
+                        "malformed-row",
+                    ]
+                }
+            )
+            result = await self.enricher_mod.JargonEnricher(gateway).enrich(
+                "group-1", [{"content": "bigbird", "raw_content": "bigbird", "count": 2, "examples": ["bigbird"]}]
+            )
+            self.assertEqual(result.status, "partial")
+            self.assertFalse(result.terminal)
+            self.assertIn("malformed_row", result.invalid_indexes)
+            self.assertTrue(result.retryable)
+
+        asyncio.run(run())
+
     def test_jargon_retrieval_policy_matches_scene_and_examples(self):
         async def run():
             store = self.store_mod.MemoryV2Store(self.db_path, data_path=self.temp_dir.name)

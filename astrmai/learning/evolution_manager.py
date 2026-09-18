@@ -866,6 +866,9 @@ class EvolutionManager:
         failure_count: int = 0,
         retry_at: float = 0.0,
         last_error: str = "",
+        persist_run: bool = True,
+        retained_count: int = 0,
+        duration_ms: float = 0.0,
     ) -> dict[str, Any]:
         expected_revision = int(checkpoint.get("revision", 0) or 0)
         expected_cursor = int(checkpoint.get("cursor_log_id", 0) or 0)
@@ -883,6 +886,8 @@ class EvolutionManager:
             "deduplicated_count": int(deduplicated_count or 0),
             "cursor_before": expected_cursor,
             "cursor_after": int(cursor_after or 0),
+            "retained_count": int(retained_count or 0),
+            "duration_ms": float(duration_ms or 0.0),
             "status": status,
             "reason": reason,
             "retryable": retryable,
@@ -935,6 +940,9 @@ class EvolutionManager:
                 last_error=last_error,
                 cursor_semantics=str(checkpoint.get("cursor_semantics") or "legacy_batch_atomic_v1"),
                 pipeline_version=str(checkpoint.get("pipeline_version") or f"{pipeline}-cursor-state-v1"),
+                cursor_upper_bound=(
+                    max((int(self._field(item, "id", 0) or 0) for item in logs), default=expected_cursor)
+                ),
                 run_payload=run_payload,
             ) or {})
         await self._advance_pipeline_checkpoint(
@@ -1908,6 +1916,7 @@ class EvolutionManager:
         retryable: bool = False,
         error_type: str = "",
         duration_ms: float = 0.0,
+        persist_run: bool = True,
     ) -> dict[str, Any]:
         report = dict(report or {})
         if not isinstance(report.get("stages"), list):
@@ -1978,8 +1987,8 @@ class EvolutionManager:
         self._last_mining_outcomes[key] = outcome
         if len(self._last_mining_outcomes) > 40:
             self._last_mining_outcomes.pop(next(iter(self._last_mining_outcomes)), None)
-        await self._record_pipeline_run(
-            {
+        if persist_run:
+            await self._record_pipeline_run({
                 "pipeline": pipeline,
                 "run_id": pipeline_run_id,
                 "mining_run_id": mining_run_id,
@@ -2000,8 +2009,7 @@ class EvolutionManager:
                 "retryable": retryable,
                 "error_type": error_type,
                 "details": report,
-            }
-        )
+            })
         memory_engine = getattr(self.db, "memory_engine", None)
         store = getattr(memory_engine, "v2_store", None)
         setter = getattr(store, "set_meta", None)
@@ -2130,6 +2138,7 @@ class EvolutionManager:
                         retained_count=len(logs),
                         report=report,
                         duration_ms=(time.perf_counter() - started) * 1000,
+                        persist_run=False,
                     )
                 if reason == "all_candidates_in_flight":
                     terminal = False
@@ -2171,6 +2180,7 @@ class EvolutionManager:
                         retained_count=len(logs),
                         report=report,
                         duration_ms=(time.perf_counter() - started) * 1000,
+                        persist_run=False,
                     )
                 enrichment = report.get("enrichment")
                 failure_report = report
@@ -2182,6 +2192,13 @@ class EvolutionManager:
                 persistence = await _within_budget(
                     self._save_jargons(group_id, items, mining_batch_id=batch_id)
                 )
+                if isinstance(persistence, int):
+                    legacy_saved = max(0, int(persistence))
+                    persistence = JargonSaveReport(
+                        attempted=len(items), saved=min(legacy_saved, len(items)),
+                        deduplicated=max(0, len(items) - legacy_saved), failed=0,
+                        memory_ids=tuple(f"legacy:{index}" for index in range(min(legacy_saved, len(items)))),
+                    )
                 saved_count = persistence.saved
                 deduplicated_count = persistence.deduplicated
                 failure_report = {**report, "persistence": persistence.to_report()}
@@ -2201,6 +2218,8 @@ class EvolutionManager:
                 logs=logs, report=extra_report, saved_count=saved_count,
                 deduplicated_count=deduplicated_count,
                 reason="candidates_saved" if saved_count or deduplicated_count else "no_candidates",
+                retained_count=retained_count,
+                duration_ms=(time.perf_counter() - started) * 1000,
             )
             if not commit_result.get("committed", False):
                 raise RuntimeError("cursor_commit_conflict")
@@ -2220,7 +2239,28 @@ class EvolutionManager:
                 saved_count=saved_count,
                 deduplicated_count=deduplicated_count,
                 duration_ms=(time.perf_counter() - started) * 1000,
+                persist_run=False,
             )
+        except asyncio.CancelledError:
+            cancellation_report = {
+                **failure_report,
+                "reason": "cancelled",
+                "failure_stage": "provider",
+                "failure_kind": "cancelled",
+            }
+            try:
+                await asyncio.shield(self._settle_pipeline_checkpoint(
+                    pipeline=pipeline, group_id=group_id, checkpoint=checkpoint,
+                    cursor_after=cursor_before, batch_id=batch_id, status="retry_wait",
+                    failure_count=int(checkpoint.get("failure_count", 0) or 0),
+                    retry_at=time.time() + 60.0, last_error="cancelled",
+                    run_id=run_id, logs=logs, report=cancellation_report,
+                    reason="cancelled", retryable=True, error_type="CancelledError",
+                    retained_count=len(logs),
+                    duration_ms=(time.perf_counter() - started) * 1000,
+                ))
+            finally:
+                raise
         except Exception as exc:
             if str(exc) == "cursor_commit_conflict":
                 conflict_report = {
@@ -2255,8 +2295,22 @@ class EvolutionManager:
                 1,
                 int(getattr(self._evolution_config(), "learning_pipeline_max_failures", 3) or 3),
             )
+            persistence_failures = list(
+                (failure_report.get("persistence") or {}).get("failures") or []
+            ) if isinstance(failure_report.get("persistence"), dict) else []
+            failure_kind = str(
+                (persistence_failures[0].get("failure_kind") if persistence_failures and isinstance(persistence_failures[0], dict) else "")
+                or failure_report.get("failure_kind") or ""
+            )
+            enrichment_report = failure_report.get("enrichment") if isinstance(failure_report, dict) else None
+            provider_retryable = isinstance(enrichment_report, dict) and bool(enrichment_report.get("retryable"))
+            transient = failure_kind in {
+                "persist_locked", "provider_timeout", "provider_error",
+                "dependency_unavailable", "cursor_commit_conflict",
+            } or isinstance(exc, (TimeoutError, asyncio.TimeoutError)) or provider_retryable
+            retryable_failure = bool(transient and failures < max_failures)
             retry_at = 0.0
-            status = "failed"
+            status = "retry_wait" if retryable_failure else "failed"
             if failures >= max_failures:
                 retry_at = time.time() + max(
                     60,
@@ -2269,6 +2323,7 @@ class EvolutionManager:
                 "pipeline_timeout_sec": timeout_sec,
                 "failure_count": failures,
                 "retry_at": retry_at,
+                "failure_kind": failure_kind or ("unknown_error" if not transient else "provider_error"),
             }
             try:
                 await self._settle_pipeline_checkpoint(
@@ -2276,7 +2331,9 @@ class EvolutionManager:
                     cursor_after=cursor_before, batch_id=batch_id, status=status,
                     failure_count=failures, retry_at=retry_at, last_error=str(exc),
                     run_id=run_id, logs=logs, report=failure_details,
-                    reason=str(exc), retryable=True, error_type=type(exc).__name__,
+                    reason=str(exc), retryable=retryable_failure, error_type=type(exc).__name__,
+                    retained_count=len(logs),
+                    duration_ms=(time.perf_counter() - started) * 1000,
                 )
             except Exception as settlement_exc:
                 failure_details["settlement_error"] = type(settlement_exc).__name__
@@ -2295,9 +2352,10 @@ class EvolutionManager:
                 cursor_after=cursor_before,
                 retained_count=len(logs),
                 report=failure_details,
-                retryable=True,
+                retryable=retryable_failure,
                 error_type=type(exc).__name__,
                 duration_ms=(time.perf_counter() - started) * 1000,
+                persist_run=False,
             )
 
     async def process_logs_and_mine(

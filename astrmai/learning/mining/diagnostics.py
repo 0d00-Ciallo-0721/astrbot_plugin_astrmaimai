@@ -15,6 +15,13 @@ _STATUSES = {
     "started", "completed", "partial", "retry_wait", "failed", "cancelled",
     "skipped", "quarantined", "blocked",
 }
+_FAILURE_KINDS = {
+    "", "insufficient_context", "provider_timeout", "provider_error",
+    "invalid_schema", "persist_empty_id", "persist_locked", "persist_error",
+    "validation_error", "dependency_unavailable", "cursor_commit_conflict",
+    "cursor_commit_error", "cancelled", "shutdown", "unknown_error",
+    "unknown_status", "cursor_regression", "cursor_out_of_scope",
+}
 _SECRET = re.compile(r"(?i)(?:bearer\s+|token|secret|api[_-]?key|password|cookie)[^\s,;]*")
 
 
@@ -72,7 +79,7 @@ class LearningStageDiagnostic:
             "candidate_count": int(self.candidate_count),
             "persisted_count": int(self.persisted_count),
             "failure_stage": str(self.failure_stage or ""),
-            "failure_kind": str(self.failure_kind or ""),
+            "failure_kind": str(self.failure_kind or "") if self.failure_kind in _FAILURE_KINDS else "unknown_error",
             "retryable": bool(self.retryable),
             "cursor_before": int(self.cursor_before),
             "cursor_after": int(self.cursor_after),

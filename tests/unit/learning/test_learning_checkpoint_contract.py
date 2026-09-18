@@ -46,6 +46,75 @@ def test_stale_revision_and_cursor_cannot_overwrite_checkpoint(tmp_path):
     assert current["cursor_log_id"] == 1
 
 
+def test_failed_or_partial_settlement_cannot_advance_cursor(tmp_path):
+    service = _database_service(tmp_path)
+    chat_id = "ff:GroupMessage:immutable"
+    _add_logs(service, chat_id, 3)
+    checkpoint = service.ensure_learning_checkpoint("expression", chat_id)
+
+    result = service.commit_learning_pipeline(
+        pipeline="expression", chat_id=chat_id,
+        expected_revision=checkpoint["revision"],
+        expected_cursor=checkpoint["cursor_log_id"], cursor_after=3,
+        cursor_upper_bound=3, batch_id="failed-batch", status="failed",
+        pipeline_version="expression-cursor-state-v1",
+        run_payload={"run_id": "failed-run", "status": "failed", "batch_id": "failed-batch"},
+    )
+
+    assert result["committed"] is True
+    current = service.ensure_learning_checkpoint("expression", chat_id)
+    assert current["cursor_log_id"] == checkpoint["cursor_log_id"]
+    assert current["last_status"] == "failed"
+
+
+def test_cursor_regression_and_out_of_scope_are_blocked(tmp_path):
+    service = _database_service(tmp_path)
+    chat_id = "ff:GroupMessage:bounds"
+    _add_logs(service, chat_id, 2)
+    checkpoint = service.ensure_learning_checkpoint("jargon", chat_id)
+
+    regression = service.commit_learning_pipeline(
+        pipeline="jargon", chat_id=chat_id,
+        expected_revision=checkpoint["revision"], expected_cursor=1,
+        cursor_after=0, batch_id="regression", status="completed",
+        pipeline_version="jargon-cursor-state-v1",
+        run_payload={"run_id": "regression", "status": "completed", "batch_id": "regression"},
+    )
+    out_of_scope = service.commit_learning_pipeline(
+        pipeline="jargon", chat_id=chat_id,
+        expected_revision=checkpoint["revision"], expected_cursor=0,
+        cursor_after=9, cursor_upper_bound=2, batch_id="out-of-scope", status="completed",
+        pipeline_version="jargon-cursor-state-v1",
+        run_payload={"run_id": "out-of-scope", "status": "completed", "batch_id": "out-of-scope"},
+    )
+
+    assert regression["blocked"] and regression["failure_kind"] == "cursor_regression"
+    assert out_of_scope["blocked"] and out_of_scope["failure_kind"] == "cursor_out_of_scope"
+
+
+def test_same_run_result_digest_change_is_conflict(tmp_path):
+    service = _database_service(tmp_path)
+    chat_id = "ff:GroupMessage:digest"
+    _add_logs(service, chat_id, 3)
+    checkpoint = service.ensure_learning_checkpoint("expression", chat_id)
+    base = dict(
+        pipeline="expression", chat_id=chat_id,
+        expected_revision=checkpoint["revision"], expected_cursor=0,
+        cursor_after=2, batch_id="digest-batch", status="completed",
+        pipeline_version="expression-cursor-state-v1",
+    )
+    first = service.commit_learning_pipeline(
+        **base, run_payload={"run_id": "digest-run", "status": "completed", "batch_id": "digest-batch", "candidate_count": 1}
+    )
+    replay = service.commit_learning_pipeline(
+        **base, run_payload={"run_id": "digest-run", "status": "completed", "batch_id": "digest-batch", "candidate_count": 2}
+    )
+
+    assert first["committed"] is True
+    assert replay["conflict"] is True
+    assert replay.get("idempotent") is False
+
+
 def test_missing_planned_columns_fail_closed(tmp_path):
     service = _database_service(tmp_path)
     with sqlite3.connect(service.persistence.db_path) as conn:
