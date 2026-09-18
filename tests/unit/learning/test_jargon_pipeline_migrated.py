@@ -211,7 +211,7 @@ class JargonPipelineMigratedTests(unittest.TestCase):
             self.assertEqual(result.status, "partial")
             self.assertEqual([item["content"] for item in result.items], ["bigbird"])
             self.assertEqual(result.missing_indexes, [2])
-            self.assertTrue(result.terminal)
+            self.assertFalse(result.terminal)
 
         asyncio.run(run())
 

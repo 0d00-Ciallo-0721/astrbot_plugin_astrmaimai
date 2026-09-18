@@ -201,8 +201,12 @@ class JargonCandidateExtractor:
         skipped_noise = 0
         routed_to_expression = 0
         quality_filtered = 0
+        skipped_ineligible_evidence = 0
         route_reasons: dict[str, int] = defaultdict(int)
         for message_index, message in enumerate(messages or []):
+            if hasattr(message, "learning_evidence_eligible") and message.learning_evidence_eligible is False:
+                skipped_ineligible_evidence += 1
+                continue
             content = self._clean_text(getattr(message, "content", ""))
             if not content:
                 continue
@@ -289,6 +293,10 @@ class JargonCandidateExtractor:
             "skipped_noise": skipped_noise,
             "routed_to_expression": routed_to_expression,
             "quality_filtered": quality_filtered,
+            "skipped_ineligible_evidence": skipped_ineligible_evidence,
+            "skipped_by_reason": {
+                "ineligible_evidence": skipped_ineligible_evidence,
+            } if skipped_ineligible_evidence else {},
             "route_reasons": dict(sorted(route_reasons.items())),
             "candidate_count": len(candidates),
             "explicit_definition_candidates": sum(bool(item.get("explicit_definition")) for item in candidates),

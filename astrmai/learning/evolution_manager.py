@@ -34,6 +34,8 @@ from .logging.message_recorder import MessageRecorder
 from .dedup import GLOBAL_JARGON_SESSION_ID, jargon_fingerprint, normalize_jargon_term
 from .mining.expression_miner import ExpressionMiner
 from .mining.expression_results import PatternSaveReport
+from .mining.persistence_results import JargonSaveReport, PersistenceFailure
+from .mining.diagnostics import LearningStageDiagnostic, build_learning_diagnostics
 from .mining.jargon_miner import JargonMiner
 from .mining.learning_evidence import merge_evidence_metadata
 from .mining.learning_input_policy import LearningMessageView
@@ -844,6 +846,104 @@ class EvolutionManager:
                 **kwargs,
             )
 
+    async def _settle_pipeline_checkpoint(
+        self,
+        *,
+        pipeline: str,
+        group_id: str,
+        checkpoint: dict[str, Any],
+        cursor_after: int,
+        batch_id: str,
+        status: str,
+        run_id: str,
+        logs: list[Any],
+        report: dict[str, Any],
+        saved_count: int = 0,
+        deduplicated_count: int = 0,
+        retryable: bool = False,
+        error_type: str = "",
+        reason: str = "",
+        failure_count: int = 0,
+        retry_at: float = 0.0,
+        last_error: str = "",
+    ) -> dict[str, Any]:
+        expected_revision = int(checkpoint.get("revision", 0) or 0)
+        expected_cursor = int(checkpoint.get("cursor_log_id", 0) or 0)
+        run_payload = {
+            "run_id": f"{run_id}:{pipeline}",
+            "mining_run_id": run_id,
+            "pipeline": pipeline,
+            "chat_id": group_id,
+            "batch_id": batch_id,
+            "raw_count": len(logs),
+            "normalized_count": int(report.get("normalized_messages", 0) or 0),
+            "required_count": self._pipeline_threshold(pipeline),
+            "candidate_count": int(report.get("candidate_count", 0) or 0),
+            "saved_count": int(saved_count or 0),
+            "deduplicated_count": int(deduplicated_count or 0),
+            "cursor_before": expected_cursor,
+            "cursor_after": int(cursor_after or 0),
+            "status": status,
+            "reason": reason,
+            "retryable": retryable,
+            "error_type": error_type,
+            "details": report,
+        }
+        if not isinstance(run_payload["details"].get("schema_version"), str):
+            run_payload["details"] = {
+                **run_payload["details"],
+                **build_learning_diagnostics(
+                    [
+                        LearningStageDiagnostic(
+                            stage="persist",
+                            status="completed" if status in {"completed", "skipped"} else "failed",
+                            input_count=len(logs),
+                            output_count=int(saved_count or 0) + int(deduplicated_count or 0),
+                            persisted_count=int(saved_count or 0) + int(deduplicated_count or 0),
+                            cursor_before=expected_cursor,
+                            cursor_after=int(cursor_after or 0),
+                            batch_id_hash=LearningStageDiagnostic.hash_batch(batch_id),
+                            failure_stage="persist" if status not in {"completed", "skipped"} else "",
+                            failure_kind=str(report.get("failure_kind") or ""),
+                            retryable=retryable,
+                        ),
+                        LearningStageDiagnostic(
+                            stage="cursor_commit",
+                            status="completed" if status in {"completed", "skipped"} else "skipped",
+                            cursor_before=expected_cursor,
+                            cursor_after=int(cursor_after or 0),
+                            batch_id_hash=LearningStageDiagnostic.hash_batch(batch_id),
+                        ),
+                    ],
+                    input_scan_complete=True,
+                    enrichment_complete=status in {"completed", "skipped"},
+                    persistence_complete=status in {"completed", "skipped"},
+                    cursor_commit_complete=status in {"completed", "skipped"},
+                ),
+            }
+        if hasattr(self.db, "commit_learning_pipeline_async"):
+            return dict(await self.db.commit_learning_pipeline_async(
+                pipeline=pipeline,
+                chat_id=group_id,
+                expected_revision=expected_revision,
+                expected_cursor=expected_cursor,
+                cursor_after=cursor_after,
+                batch_id=batch_id,
+                status=status,
+                failure_count=failure_count,
+                retry_at=retry_at,
+                last_error=last_error,
+                cursor_semantics=str(checkpoint.get("cursor_semantics") or "legacy_batch_atomic_v1"),
+                pipeline_version=str(checkpoint.get("pipeline_version") or f"{pipeline}-cursor-state-v1"),
+                run_payload=run_payload,
+            ) or {})
+        await self._advance_pipeline_checkpoint(
+            pipeline, group_id, cursor_after, batch_id=batch_id,
+            status=status, failure_count=failure_count, retry_at=retry_at,
+            last_error=last_error,
+        )
+        return {"committed": True, "legacy_compatibility": True}
+
     async def _get_pipeline_checkpoint(
         self,
         pipeline: str,
@@ -1340,18 +1440,42 @@ class EvolutionManager:
         jargons,
         *,
         mining_batch_id: str = "",
-    ) -> int:
+    ) -> JargonSaveReport:
+        attempted = len(jargons or [])
+        saved = 0
+        deduplicated = 0
+        failed = 0
+        memory_ids: list[str] = []
+        failures: list[PersistenceFailure] = []
         memory_engine = getattr(self.db, "memory_engine", None)
         writer = getattr(memory_engine, "write_service", None) if memory_engine else None
         if not writer or not hasattr(writer, "write"):
-            return 0
+            return JargonSaveReport(
+                attempted=attempted, saved=0, deduplicated=0, failed=attempted,
+                memory_ids=(), failures=tuple(
+                    PersistenceFailure(
+                        candidate_id=str(self._field(item, "candidate_id", "") or ""),
+                        content_hash=str(self._field(item, "content_hash", "") or ""),
+                        failure_stage="persist", failure_kind="dependency_unavailable",
+                        retryable=True, detail="write_service_unavailable",
+                    ) for item in (jargons or [])
+                ),
+            )
 
-        requests: list[MemoryWriteRequest] = []
+        requests: list[tuple[MemoryWriteRequest, Any, str, str]] = []
         store = getattr(memory_engine, "v2_store", None)
         for jargon in jargons:
+            candidate_id = str(self._field(jargon, "candidate_id", "") or "").strip()
+            content_hash = str(self._field(jargon, "content_hash", "") or "").strip()
             observed_content = str(self._field(jargon, "content", "") or "").strip()
             content = str(self._field(jargon, "canonical_form", "") or observed_content).strip()
             if not content or not observed_content:
+                failed += 1
+                failures.append(PersistenceFailure(
+                    candidate_id=candidate_id, content_hash=content_hash,
+                    failure_stage="persist", failure_kind="validation_error",
+                    retryable=False, detail="content_missing",
+                ))
                 continue
             meaning = str(self._field(jargon, "meaning", "") or "").strip()
             raw_content = str(self._field(jargon, "raw_content", "") or content).strip()
@@ -1373,6 +1497,17 @@ class EvolutionManager:
                 if str(item or "").strip()
             ]
             if mining_batch_id and mining_batch_id in applied_batches:
+                existing_id = str(getattr(existing, "id", "") or "").strip()
+                if existing_id:
+                    deduplicated += 1
+                    memory_ids.append(existing_id)
+                else:
+                    failed += 1
+                    failures.append(PersistenceFailure(
+                        candidate_id=candidate_id, content_hash=content_hash,
+                        failure_stage="persist", failure_kind="dedup_identity_missing",
+                        retryable=False, detail="applied_batch_without_canonical_id",
+                    ))
                 continue
             incoming_evidence = {
                 key: self._field(jargon, key, [] if key.endswith("s") else "")
@@ -1466,7 +1601,7 @@ class EvolutionManager:
             )
             primary_meaning = str(primary_sense.get("meaning") or meaning or existing_metadata.get("meaning") or "")
             primary_scene = str(primary_sense.get("scene") or scene or existing_metadata.get("scene") or "")
-            requests.append(
+            requests.append((
                 MemoryWriteRequest(
                     source="learning_jargon",
                     kind="jargon",
@@ -1523,22 +1658,41 @@ class EvolutionManager:
                     source_ref=f"learning_jargon:{normalize_jargon_term(content)}",
                     visibility=visibility,
                     status=status,
-                )
-            )
+                ), existing, candidate_id, content_hash
+            ))
 
-        count = 0
-        failures: list[str] = []
-        for request in requests:
+        for request, existing, candidate_id, content_hash in requests:
             try:
                 memory_id = await writer.write(request)
             except Exception as exc:
-                failures.append(f"{request.content}: {exc}")
+                kind = "persist_locked" if "locked" in str(exc).lower() else (
+                    "validation_error" if isinstance(exc, (ValueError, TypeError)) else "persist_error"
+                )
+                failed += 1
+                failures.append(PersistenceFailure(
+                    candidate_id=candidate_id, content_hash=content_hash,
+                    failure_stage="persist", failure_kind=kind,
+                    retryable=kind == "persist_locked", detail=str(exc)[:300],
+                ))
                 continue
-            if memory_id:
-                count += 1
-        if failures:
-            raise RuntimeError("jargon write failures: " + "; ".join(failures[:3]))
-        return count
+            normalized_id = str(memory_id or "").strip()
+            if not normalized_id:
+                failed += 1
+                failures.append(PersistenceFailure(
+                    candidate_id=candidate_id, content_hash=content_hash,
+                    failure_stage="persist", failure_kind="persist_empty_id",
+                    retryable=False, detail="writer_returned_empty_id",
+                ))
+                continue
+            memory_ids.append(normalized_id)
+            if existing is not None:
+                deduplicated += 1
+            else:
+                saved += 1
+        return JargonSaveReport(
+            attempted=attempted, saved=saved, deduplicated=deduplicated,
+            failed=failed, memory_ids=tuple(memory_ids), failures=tuple(failures),
+        )
 
     async def process_feedback(self, event: AstrMessageEvent, is_command: bool = False):
         bot_id = getattr(event.message_obj, "self_id", "SELF_BOT")
@@ -1755,6 +1909,43 @@ class EvolutionManager:
         error_type: str = "",
         duration_ms: float = 0.0,
     ) -> dict[str, Any]:
+        report = dict(report or {})
+        if not isinstance(report.get("stages"), list):
+            stage_status = "completed" if status in {"completed", "skipped"} else (
+                "quarantined" if status == "quarantined" else (
+                    "retry_wait" if status == "retry_wait" else "failed"
+                )
+            )
+            stages = [
+                LearningStageDiagnostic(
+                    stage="persist",
+                    status=stage_status,
+                    input_count=len(logs),
+                    output_count=int(saved_count or 0) + int(deduplicated_count or 0),
+                    persisted_count=int(saved_count or 0) + int(deduplicated_count or 0),
+                    cursor_before=int(cursor_before or 0),
+                    cursor_after=int(cursor_after or 0),
+                    batch_id_hash=LearningStageDiagnostic.hash_batch(batch_id),
+                    failure_stage="persist" if status not in {"completed", "skipped"} else "",
+                    failure_kind=str(report.get("failure_kind") or ""),
+                    retryable=bool(retryable),
+                    diagnostics={"reason": str(reason or "")[:200]},
+                ),
+                LearningStageDiagnostic(
+                    stage="cursor_commit",
+                    status="completed" if status in {"completed", "skipped"} else "skipped",
+                    cursor_before=int(cursor_before or 0),
+                    cursor_after=int(cursor_after or 0),
+                    batch_id_hash=LearningStageDiagnostic.hash_batch(batch_id),
+                ),
+            ]
+            report.update(build_learning_diagnostics(
+                stages,
+                input_scan_complete=True,
+                enrichment_complete=status in {"completed", "skipped"},
+                persistence_complete=status in {"completed", "skipped"} and not bool(report.get("persistence", {}).get("failed", 0)),
+                cursor_commit_complete=status in {"completed", "skipped"},
+            ))
         # Direct/legacy callers may omit ``run_id``. Derive it from the same
         # immutable evidence fingerprint used by realtime and backlog paths so
         # retries cannot create a second ledger row for one mining batch.
@@ -1830,15 +2021,16 @@ class EvolutionManager:
         *,
         run_id: str = "",
     ) -> dict[str, Any]:
-        cursor_before = max(0, int(self._field(logs[0], "id", 1) or 1) - 1) if logs else 0
+        checkpoint = await self._get_pipeline_checkpoint(pipeline, group_id)
+        cursor_before = int(checkpoint.get("cursor_log_id", 0) or 0)
         cursor_after = int(self._field(logs[-1], "id", cursor_before) or cursor_before) if logs else cursor_before
         batch_id = self._mining_batch_id(group_id, logs, prefix=pipeline)
-        await self._advance_pipeline_checkpoint(
-            pipeline,
-            group_id,
-            cursor_after,
-            batch_id=batch_id,
-            status="skipped_non_group",
+        await self._settle_pipeline_checkpoint(
+            pipeline=pipeline, group_id=group_id, checkpoint=checkpoint,
+            cursor_after=cursor_after, batch_id=batch_id,
+            status="skipped_non_group", run_id=run_id, logs=logs,
+            report={"chat_scope": "private", "reason": "non_group_scope"},
+            reason="non_group_scope",
         )
         return await self._record_pipeline_state(
             run_id=run_id,
@@ -1919,12 +2111,11 @@ class EvolutionManager:
                 retryable = isinstance(enrichment, dict) and bool(enrichment.get("retryable"))
                 reason = str(report.get("reason") or "completed")
                 if reason == "insufficient_context":
-                    await self._advance_pipeline_checkpoint(
-                        pipeline,
-                        group_id,
-                        cursor_before,
-                        batch_id=batch_id,
-                        status="waiting_for_evidence",
+                    await self._settle_pipeline_checkpoint(
+                        pipeline=pipeline, group_id=group_id, checkpoint=checkpoint,
+                        cursor_after=cursor_before, batch_id=batch_id,
+                        status="waiting_for_evidence", run_id=run_id, logs=logs,
+                        report=report, reason=reason,
                     )
                     return await self._record_pipeline_state(
                         run_id=run_id,
@@ -1961,12 +2152,11 @@ class EvolutionManager:
                 report = dict(getattr(self.jargon_miner, "last_report", {}) or {})
                 reason = str(report.get("reason") or "completed")
                 if reason == "insufficient_context":
-                    await self._advance_pipeline_checkpoint(
-                        pipeline,
-                        group_id,
-                        cursor_before,
-                        batch_id=batch_id,
-                        status="waiting_for_evidence",
+                    await self._settle_pipeline_checkpoint(
+                        pipeline=pipeline, group_id=group_id, checkpoint=checkpoint,
+                        cursor_after=cursor_before, batch_id=batch_id,
+                        status="waiting_for_evidence", run_id=run_id, logs=logs,
+                        report=report, reason=reason,
                     )
                     return await self._record_pipeline_state(
                         run_id=run_id,
@@ -1989,21 +2179,31 @@ class EvolutionManager:
                     terminal = False
                 if not terminal:
                     raise RuntimeError("jargon_enrichment_failed_closed")
-                saved_count = await _within_budget(self._save_jargons(group_id, items, mining_batch_id=batch_id))
-                deduplicated_count = max(0, len(items) - saved_count)
-                extra_report = report
+                persistence = await _within_budget(
+                    self._save_jargons(group_id, items, mining_batch_id=batch_id)
+                )
+                saved_count = persistence.saved
+                deduplicated_count = persistence.deduplicated
+                failure_report = {**report, "persistence": persistence.to_report()}
+                extra_report = failure_report
+                if not persistence.complete:
+                    raise RuntimeError(
+                        "jargon_persistence_incomplete"
+                        if persistence.conservation_valid
+                        else "jargon_persistence_contract_error"
+                    )
 
             cursor_after, retained_count = self._next_pipeline_cursor(logs, pipeline)
-            await self._advance_pipeline_checkpoint(
-                pipeline,
-                group_id,
-                cursor_after,
-                batch_id=batch_id,
-                status="completed",
-                failure_count=0,
-                retry_at=0.0,
-                last_error="",
+            commit_result = await self._settle_pipeline_checkpoint(
+                pipeline=pipeline, group_id=group_id, checkpoint=checkpoint,
+                cursor_after=cursor_after, batch_id=batch_id, status="completed",
+                failure_count=0, retry_at=0.0, last_error="", run_id=run_id,
+                logs=logs, report=extra_report, saved_count=saved_count,
+                deduplicated_count=deduplicated_count,
+                reason="candidates_saved" if saved_count or deduplicated_count else "no_candidates",
             )
+            if not commit_result.get("committed", False):
+                raise RuntimeError("cursor_commit_conflict")
             self._pipeline_failure_counts.pop(failure_key, None)
             return await self._record_pipeline_state(
                 run_id=run_id,
@@ -2022,6 +2222,29 @@ class EvolutionManager:
                 duration_ms=(time.perf_counter() - started) * 1000,
             )
         except Exception as exc:
+            if str(exc) == "cursor_commit_conflict":
+                conflict_report = {
+                    **failure_report,
+                    "reason": "cursor_commit_conflict",
+                    "failure_stage": "cursor_commit",
+                    "failure_kind": "cursor_commit_conflict",
+                }
+                return await self._record_pipeline_state(
+                    run_id=f"{run_id}:cursor-conflict:{uuid.uuid4().hex[:8]}",
+                    pipeline=pipeline,
+                    group_id=group_id,
+                    logs=logs,
+                    batch_id=batch_id,
+                    status="retry_wait",
+                    reason="cursor_commit_conflict",
+                    cursor_before=cursor_before,
+                    cursor_after=cursor_before,
+                    retained_count=len(logs),
+                    report=conflict_report,
+                    retryable=True,
+                    error_type="CursorCommitConflict",
+                    duration_ms=(time.perf_counter() - started) * 1000,
+                )
             persisted_failures = int(checkpoint.get("failure_count", 0) or 0)
             failures = max(
                 persisted_failures,
@@ -2040,16 +2263,23 @@ class EvolutionManager:
                     int(getattr(self._evolution_config(), "learning_pipeline_quarantine_sec", 3600) or 3600),
                 )
                 status = "quarantined"
-            await self._advance_pipeline_checkpoint(
-                pipeline,
-                group_id,
-                cursor_before,
-                batch_id=batch_id,
-                status=status,
-                failure_count=failures,
-                retry_at=retry_at,
-                last_error=str(exc),
-            )
+            failure_details = {
+                **failure_report,
+                "reason": str(exc),
+                "pipeline_timeout_sec": timeout_sec,
+                "failure_count": failures,
+                "retry_at": retry_at,
+            }
+            try:
+                await self._settle_pipeline_checkpoint(
+                    pipeline=pipeline, group_id=group_id, checkpoint=checkpoint,
+                    cursor_after=cursor_before, batch_id=batch_id, status=status,
+                    failure_count=failures, retry_at=retry_at, last_error=str(exc),
+                    run_id=run_id, logs=logs, report=failure_details,
+                    reason=str(exc), retryable=True, error_type=type(exc).__name__,
+                )
+            except Exception as settlement_exc:
+                failure_details["settlement_error"] = type(settlement_exc).__name__
             logger.warning(
                 f"[Evolution-{pipeline}] mining {status} for {group_id}: {exc}"
             )
@@ -2064,13 +2294,7 @@ class EvolutionManager:
                 cursor_before=cursor_before,
                 cursor_after=cursor_before,
                 retained_count=len(logs),
-                report={
-                    **failure_report,
-                    "reason": str(exc),
-                    "pipeline_timeout_sec": timeout_sec,
-                    "failure_count": failures,
-                    "retry_at": retry_at,
-                },
+                report=failure_details,
                 retryable=True,
                 error_type=type(exc).__name__,
                 duration_ms=(time.perf_counter() - started) * 1000,

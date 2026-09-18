@@ -443,6 +443,10 @@ _MIGRATIONS: list[tuple[int, str]] = [
     (136, "ALTER TABLE cross_session_handoff ADD COLUMN error_type TEXT NOT NULL DEFAULT ''"),
     (137, "ALTER TABLE cross_session_handoff ADD COLUMN error_summary TEXT NOT NULL DEFAULT ''"),
     (138, "CREATE INDEX IF NOT EXISTS ix_cross_session_handoff_claim ON cross_session_handoff(status, lease_until, revision)"),
+    (139, "ALTER TABLE learning_pipeline_checkpoint ADD COLUMN revision INTEGER NOT NULL DEFAULT 0"),
+    (140, "ALTER TABLE learning_pipeline_checkpoint ADD COLUMN cursor_semantics TEXT NOT NULL DEFAULT 'legacy_batch_atomic_v1'"),
+    (141, "ALTER TABLE learning_pipeline_checkpoint ADD COLUMN pipeline_version TEXT NOT NULL DEFAULT 'legacy-unversioned'"),
+    (142, "CREATE INDEX IF NOT EXISTS ix_learning_pipeline_checkpoint_revision ON learning_pipeline_checkpoint(pipeline, chat_id, revision)"),
 ]
 
 

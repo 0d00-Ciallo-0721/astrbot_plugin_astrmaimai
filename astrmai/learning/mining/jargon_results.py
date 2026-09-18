@@ -13,6 +13,7 @@ class JargonEnrichmentResult:
     accepted_count: int = 0
     rejected_count: int = 0
     missing_indexes: list[int] = field(default_factory=list)
+    invalid_indexes: list[int] = field(default_factory=list)
     retryable: bool = False
     reason: str = ""
     error_type: str = ""
@@ -20,7 +21,9 @@ class JargonEnrichmentResult:
 
     @property
     def terminal(self) -> bool:
-        return self.status in {"completed", "all_rejected", "partial"}
+        # A partial provider response is not complete coverage.  Persisting
+        # the returned subset must not authorize a source-cursor advance.
+        return self.status in {"completed", "all_rejected"}
 
     def to_report(self) -> dict[str, Any]:
         return {
@@ -34,6 +37,7 @@ class JargonEnrichmentResult:
             "accepted_count": self.accepted_count,
             "rejected_count": self.rejected_count,
             "missing_indexes": list(self.missing_indexes),
+            "invalid_indexes": list(self.invalid_indexes),
             "attempts": self.attempts,
         }
 

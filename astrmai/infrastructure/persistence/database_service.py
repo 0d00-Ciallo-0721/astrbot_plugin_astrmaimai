@@ -398,10 +398,21 @@ class DatabaseService(
             raise ValueError("chat_id is required")
         now = time.time()
         with connect_sqlite(self.persistence.db_path) as conn:
+            columns = {
+                str(row[1]) for row in conn.execute(
+                    "PRAGMA table_info(learning_pipeline_checkpoint)"
+                ).fetchall()
+            }
+            required_columns = {
+                "revision", "cursor_semantics", "pipeline_version", "last_batch_id"
+            }
+            if not required_columns.issubset(columns):
+                raise RuntimeError("learning_checkpoint_readiness_missing_planned_columns")
             row = conn.execute(
                 """
                 SELECT pipeline, chat_id, cursor_log_id, last_batch_id, last_status,
-                       failure_count, retry_at, last_error, created_at, updated_at
+                       failure_count, retry_at, last_error, revision,
+                       cursor_semantics, pipeline_version, created_at, updated_at
                 FROM learning_pipeline_checkpoint
                 WHERE pipeline = ? AND chat_id = ?
                 """,
@@ -434,8 +445,10 @@ class DatabaseService(
                 conn.execute(
                     """
                     INSERT INTO learning_pipeline_checkpoint (
-                        pipeline, chat_id, cursor_log_id, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?)
+                        pipeline, chat_id, cursor_log_id, revision,
+                        cursor_semantics, pipeline_version, created_at, updated_at
+                    ) VALUES (?, ?, ?, 0, 'legacy_batch_atomic_v1',
+                              'legacy-unversioned', ?, ?)
                     """,
                     (pipeline_name, normalized_chat_id, cursor_log_id, now, now),
                 )
@@ -449,6 +462,9 @@ class DatabaseService(
                     0,
                     0.0,
                     "",
+                    0,
+                    "legacy_batch_atomic_v1",
+                    "legacy-unversioned",
                     now,
                     now,
                 )
@@ -461,6 +477,9 @@ class DatabaseService(
             "failure_count",
             "retry_at",
             "last_error",
+            "revision",
+            "cursor_semantics",
+            "pipeline_version",
             "created_at",
             "updated_at",
         )
@@ -483,11 +502,12 @@ class DatabaseService(
                 conn.execute(
                     """
                     INSERT OR IGNORE INTO learning_pipeline_checkpoint (
-                        pipeline, chat_id, cursor_log_id, created_at, updated_at
+                        pipeline, chat_id, cursor_log_id, revision,
+                        cursor_semantics, pipeline_version, created_at, updated_at
                     )
                     SELECT ?, group_id,
                            COALESCE(MAX(CASE WHEN processed = 1 THEN id ELSE 0 END), 0),
-                           ?, ?
+                           0, 'legacy_batch_atomic_v1', 'legacy-unversioned', ?, ?
                     FROM messagelog
                     WHERE group_id != ''
                     GROUP BY group_id
@@ -523,8 +543,10 @@ class DatabaseService(
                     conn.execute(
                         """
                         INSERT OR IGNORE INTO learning_pipeline_checkpoint (
-                            pipeline, chat_id, cursor_log_id, created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?)
+                            pipeline, chat_id, cursor_log_id, revision,
+                            cursor_semantics, pipeline_version, created_at, updated_at
+                        ) VALUES (?, ?, ?, 0, 'legacy_batch_atomic_v1',
+                                  'legacy-unversioned', ?, ?)
                         """,
                         (pipeline_name, chat_id, cursor_log_id, now, now),
                     )
@@ -686,10 +708,16 @@ class DatabaseService(
         params.append(max(1, min(int(limit or 100), 1000)))
         params.append(max(0, int(offset or 0)))
         with connect_sqlite(self.persistence.db_path) as conn:
+            columns = {str(row[1]) for row in conn.execute(
+                "PRAGMA table_info(learning_pipeline_checkpoint)"
+            ).fetchall()}
+            if not {"revision", "cursor_semantics", "pipeline_version"}.issubset(columns):
+                raise RuntimeError("learning_checkpoint_readiness_missing_planned_columns")
             rows = conn.execute(
                 f"""
                 SELECT pipeline, chat_id, cursor_log_id, last_batch_id,
                        last_status, failure_count, retry_at, last_error,
+                       revision, cursor_semantics, pipeline_version,
                        created_at, updated_at
                 FROM learning_pipeline_checkpoint
                 {where_sql}
@@ -701,6 +729,7 @@ class DatabaseService(
         keys = (
             "pipeline", "chat_id", "cursor_log_id", "last_batch_id",
             "last_status", "failure_count", "retry_at", "last_error",
+            "revision", "cursor_semantics", "pipeline_version",
             "created_at", "updated_at",
         )
         return [dict(zip(keys, row)) for row in rows]
@@ -798,6 +827,7 @@ class DatabaseService(
                 UPDATE learning_pipeline_checkpoint
                 SET cursor_log_id = ?, last_batch_id = ?, last_status = ?,
                     failure_count = ?, retry_at = ?, last_error = ?, updated_at = ?
+                    , revision = revision + 1
                 WHERE pipeline = ? AND chat_id = ?
                 """,
                 (
@@ -815,6 +845,151 @@ class DatabaseService(
             conn.commit()
         return self.ensure_learning_checkpoint(pipeline_name, normalized_chat_id)
 
+    def commit_learning_pipeline(
+        self,
+        *,
+        pipeline: str,
+        chat_id: str,
+        expected_revision: int,
+        expected_cursor: int,
+        cursor_after: int,
+        batch_id: str = "",
+        status: str = "",
+        failure_count: int = 0,
+        retry_at: float = 0.0,
+        last_error: str = "",
+        cursor_semantics: str = "legacy_batch_atomic_v1",
+        pipeline_version: str = "legacy-unversioned",
+        run_payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Atomically upsert one mining run and settle its checkpoint.
+
+        The checkpoint revision and cursor are both part of the compare-and-
+        swap predicate.  A stale worker therefore cannot turn a failed or
+        partial run into a completed cursor advance.
+        """
+        pipeline_name = self._normalize_learning_pipeline(pipeline)
+        normalized_chat_id = str(chat_id or "").strip()
+        if not normalized_chat_id:
+            raise ValueError("chat_id is required")
+        if str(cursor_semantics) != "legacy_batch_atomic_v1":
+            raise ValueError("unsupported cursor semantics")
+        if not str(pipeline_version or "").strip():
+            raise ValueError("pipeline_version is required")
+        payload = dict(run_payload or {})
+        run_id = str(payload.get("run_id") or uuid.uuid4().hex)
+        details = payload.get("details", payload.get("details_json", {}))
+        details_json = details if isinstance(details, str) else json.dumps(details or {}, ensure_ascii=False, default=str)
+        now = float(payload.get("created_at") or time.time())
+        with connect_sqlite(self.persistence.db_path) as conn:
+            columns = {str(row[1]) for row in conn.execute(
+                "PRAGMA table_info(learning_pipeline_checkpoint)"
+            ).fetchall()}
+            required = {"revision", "cursor_semantics", "pipeline_version", "last_batch_id"}
+            if not required.issubset(columns):
+                raise RuntimeError("learning_checkpoint_readiness_missing_planned_columns")
+            current = conn.execute(
+                """SELECT revision, cursor_log_id, last_batch_id, status
+                   FROM (SELECT revision, cursor_log_id, last_batch_id, last_status AS status
+                         FROM learning_pipeline_checkpoint
+                         WHERE pipeline = ? AND chat_id = ?)""",
+                (pipeline_name, normalized_chat_id),
+            ).fetchone()
+            if current is None:
+                raise RuntimeError("learning_checkpoint_missing")
+            revision_before, current_cursor, current_batch, current_status = map(lambda item: item, current)
+            existing = conn.execute(
+                "SELECT batch_id, details_json, status FROM learning_mining_run WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if existing is not None:
+                if str(existing[0] or "") != str(batch_id or ""):
+                    conn.rollback()
+                    return {"committed": False, "idempotent": False, "conflict": True,
+                            "revision_before": int(revision_before or 0),
+                            "revision_after": int(revision_before or 0),
+                            "cursor_after": int(current_cursor or 0)}
+                same_payload = (
+                    str(existing[0] or "") == str(batch_id or "")
+                    and str(existing[1] or "") == details_json
+                    and str(existing[2] or "") == str(payload.get("status", status) or "")
+                )
+                if same_payload:
+                    conn.commit()
+                    return {
+                        "committed": True,
+                        "idempotent": True,
+                        "conflict": False,
+                        "revision_before": int(revision_before or 0),
+                        "revision_after": int(revision_before or 0),
+                        "cursor_after": int(current_cursor or 0),
+                    }
+                # A retry may legitimately refresh the same stable run with a
+                # new failure count/diagnostic payload.  A completed run is
+                # immutable unless the exact payload is replayed.
+                if str(existing[2] or "") in {"completed", "skipped"}:
+                    conn.rollback()
+                    return {"committed": False, "idempotent": False, "conflict": True,
+                            "revision_before": int(revision_before or 0),
+                            "revision_after": int(revision_before or 0),
+                            "cursor_after": int(current_cursor or 0)}
+            update = conn.execute(
+                """UPDATE learning_pipeline_checkpoint
+                   SET cursor_log_id = ?, last_batch_id = ?, last_status = ?,
+                       failure_count = ?, retry_at = ?, last_error = ?,
+                       revision = revision + 1, cursor_semantics = ?,
+                       pipeline_version = ?, updated_at = ?
+                   WHERE pipeline = ? AND chat_id = ? AND revision = ?
+                     AND cursor_log_id = ?""",
+                (
+                    max(0, int(cursor_after or 0)), str(batch_id or ""),
+                    str(status or ""), max(0, int(failure_count or 0)),
+                    max(0.0, float(retry_at or 0.0)), str(last_error or "")[:1000],
+                    str(cursor_semantics), str(pipeline_version), time.time(),
+                    pipeline_name, normalized_chat_id, int(expected_revision), int(expected_cursor),
+                ),
+            )
+            if update.rowcount != 1:
+                conn.rollback()
+                return {"committed": False, "idempotent": False, "conflict": True,
+                        "revision_before": int(revision_before or 0),
+                        "revision_after": int(revision_before or 0),
+                        "cursor_after": int(current_cursor or 0)}
+            conn.execute(
+                """INSERT INTO learning_mining_run (
+                    run_id, mining_run_id, pipeline, chat_id, batch_id, raw_count,
+                    normalized_count, required_count, candidate_count, saved_count,
+                    deduplicated_count, cursor_before, cursor_after, retained_count,
+                    status, reason, duration_ms, model_id, retryable, error_type,
+                    details_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO UPDATE SET details_json=excluded.details_json,
+                    status=excluded.status, reason=excluded.reason,
+                    cursor_after=excluded.cursor_after""",
+                (
+                    run_id, str(payload.get("mining_run_id") or run_id), pipeline_name,
+                    normalized_chat_id, str(payload.get("batch_id", batch_id) or ""),
+                    int(payload.get("raw_count") or 0), int(payload.get("normalized_count") or 0),
+                    int(payload.get("required_count") or 0), int(payload.get("candidate_count") or 0),
+                    int(payload.get("saved_count") or 0), int(payload.get("deduplicated_count") or 0),
+                    int(payload.get("cursor_before", expected_cursor) or 0),
+                    int(payload.get("cursor_after", cursor_after) or 0), int(payload.get("retained_count") or 0),
+                    str(payload.get("status", status) or ""), str(payload.get("reason") or ""),
+                    float(payload.get("duration_ms") or 0.0), str(payload.get("model_id") or ""),
+                    int(bool(payload.get("retryable", False))), str(payload.get("error_type") or ""),
+                    details_json, now,
+                ),
+            )
+            conn.commit()
+        return {
+            "committed": True,
+            "idempotent": False,
+            "conflict": False,
+            "revision_before": int(revision_before or 0),
+            "revision_after": int(revision_before or 0) + 1,
+            "cursor_after": max(0, int(cursor_after or 0)),
+        }
+
     def reset_learning_checkpoint(
         self,
         pipeline: str,
@@ -829,6 +1004,7 @@ class DatabaseService(
                 """
                 UPDATE learning_pipeline_checkpoint
                 SET last_status = ?, failure_count = 0, retry_at = 0,
+                    revision = revision + 1,
                     last_error = '', updated_at = ?
                 WHERE pipeline = ? AND chat_id = ?
                 """,
@@ -1354,6 +1530,13 @@ class DatabaseService(
         return await self._run_blocking(
             self.ensure_learning_checkpoints_for_groups,
             *args,
+            with_lock=True,
+            **kwargs,
+        )
+
+    async def commit_learning_pipeline_async(self, **kwargs):
+        return await self._run_blocking(
+            self.commit_learning_pipeline,
             with_lock=True,
             **kwargs,
         )

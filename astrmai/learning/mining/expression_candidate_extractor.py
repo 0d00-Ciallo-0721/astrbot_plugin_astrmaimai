@@ -286,10 +286,12 @@ class ExpressionCandidateExtractor:
         skipped_existing = 0
         quality_filtered = 0
         quality_filter_reasons: dict[str, int] = defaultdict(int)
+        skipped_ineligible_evidence = 0
 
         for message_index, message in enumerate(messages or []):
             content = self._clean_text(getattr(message, "content", ""))
-            if not bool(getattr(message, "learning_evidence_eligible", True)):
+            if hasattr(message, "learning_evidence_eligible") and message.learning_evidence_eligible is False:
+                skipped_ineligible_evidence += 1
                 continue
             if self._looks_noise(content):
                 skipped_noise += 1
@@ -516,6 +518,10 @@ class ExpressionCandidateExtractor:
             "skipped_existing": skipped_existing,
             "quality_filtered": quality_filtered,
             "quality_filter_reasons": dict(sorted(quality_filter_reasons.items())),
+            "skipped_ineligible_evidence": skipped_ineligible_evidence,
+            "skipped_by_reason": {
+                "ineligible_evidence": skipped_ineligible_evidence,
+            } if skipped_ineligible_evidence else {},
             "exact_candidates": len(qualifying_exact),
             "phrase_candidates": sum(1 for item in candidates if item.get("candidate_type") == "phrase"),
             "rhythm_candidates": rhythm_candidates,

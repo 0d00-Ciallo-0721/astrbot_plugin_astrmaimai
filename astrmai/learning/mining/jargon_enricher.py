@@ -139,6 +139,7 @@ class JargonEnricher:
             )
         rows = result["items"]
         by_index: dict[int, dict[str, Any]] = {}
+        invalid_indexes: list[int] = []
         for row in rows:
             if not isinstance(row, dict):
                 continue
@@ -146,7 +147,13 @@ class JargonEnricher:
                 index = int(row.get("index"))
             except (TypeError, ValueError):
                 continue
-            if 1 <= index <= len(candidates) and index not in by_index:
+            if not 1 <= index <= len(candidates):
+                invalid_indexes.append(index)
+                continue
+            if index in by_index:
+                invalid_indexes.append(index)
+                continue
+            if 1 <= index <= len(candidates):
                 by_index[index] = row
         if not by_index:
             return self._failed_result(
@@ -156,6 +163,7 @@ class JargonEnricher:
                 reason="no_indexed_items",
                 error_type="MissingCandidateIndex",
                 returned_count=len(rows),
+                invalid_indexes=sorted(set(invalid_indexes)),
             )
         enriched: list[dict[str, Any]] = []
         rejected_count = 0
@@ -256,9 +264,11 @@ class JargonEnricher:
                 enriched.append(payload)
             else:
                 rejected_count += 1
-        if missing_indexes:
+        retryable = False
+        if missing_indexes or invalid_indexes:
             status = "partial"
-            reason = "partial_response"
+            reason = "partial_response" if missing_indexes else "invalid_index"
+            retryable = True
         elif enriched:
             status = "completed"
             reason = "enrichment_completed"
@@ -273,7 +283,8 @@ class JargonEnricher:
             accepted_count=len(enriched),
             rejected_count=rejected_count,
             missing_indexes=missing_indexes,
-            retryable=False,
+            invalid_indexes=sorted(set(invalid_indexes)),
+            retryable=bool(retryable),
             reason=reason,
         )
         logger.info(
@@ -292,6 +303,7 @@ class JargonEnricher:
         reason: str,
         error_type: str,
         returned_count: int = 0,
+        invalid_indexes: list[int] | None = None,
     ) -> JargonEnrichmentResult:
         result = JargonEnrichmentResult(
             status=status,
@@ -300,6 +312,7 @@ class JargonEnricher:
             retryable=True,
             reason=reason,
             error_type=error_type,
+            invalid_indexes=list(invalid_indexes or []),
         )
         logger.warning(
             f"[JargonEnricher] group={group_id or 'global'} status={status} input={len(candidates)} "
