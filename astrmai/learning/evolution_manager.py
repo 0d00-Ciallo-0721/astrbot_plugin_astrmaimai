@@ -2033,13 +2033,37 @@ class EvolutionManager:
         cursor_before = int(checkpoint.get("cursor_log_id", 0) or 0)
         cursor_after = int(self._field(logs[-1], "id", cursor_before) or cursor_before) if logs else cursor_before
         batch_id = self._mining_batch_id(group_id, logs, prefix=pipeline)
-        await self._settle_pipeline_checkpoint(
+        settlement = await self._settle_pipeline_checkpoint(
             pipeline=pipeline, group_id=group_id, checkpoint=checkpoint,
             cursor_after=cursor_after, batch_id=batch_id,
             status="skipped_non_group", run_id=run_id, logs=logs,
             report={"chat_scope": "private", "reason": "non_group_scope"},
             reason="non_group_scope",
         )
+        if not settlement.get("committed", False):
+            failure_kind = str(settlement.get("failure_kind") or "cursor_commit_conflict")
+            blocked = failure_kind == "dependency_unavailable"
+            return await self._record_pipeline_state(
+                run_id=run_id,
+                pipeline=pipeline,
+                group_id=group_id,
+                logs=logs,
+                batch_id=batch_id,
+                status="blocked" if blocked else "retry_wait",
+                reason="non_group_settlement_failed",
+                cursor_before=cursor_before,
+                cursor_after=cursor_before,
+                retained_count=0,
+                report={
+                    "chat_scope": "private",
+                    "reason": "non_group_settlement_failed",
+                    "failure_stage": "cursor_commit",
+                    "failure_kind": failure_kind,
+                    "settlement": settlement,
+                },
+                retryable=not blocked,
+                error_type="CursorCommitConflict",
+            )
         return await self._record_pipeline_state(
             run_id=run_id,
             pipeline=pipeline,
@@ -2119,12 +2143,20 @@ class EvolutionManager:
                 retryable = isinstance(enrichment, dict) and bool(enrichment.get("retryable"))
                 reason = str(report.get("reason") or "completed")
                 if reason == "insufficient_context":
-                    await self._settle_pipeline_checkpoint(
+                    settlement = await self._settle_pipeline_checkpoint(
                         pipeline=pipeline, group_id=group_id, checkpoint=checkpoint,
                         cursor_after=cursor_before, batch_id=batch_id,
                         status="waiting_for_evidence", run_id=run_id, logs=logs,
                         report=report, reason=reason,
                     )
+                    if not settlement.get("committed", False):
+                        failure_report = {
+                            **report,
+                            "failure_stage": "cursor_commit",
+                            "failure_kind": settlement.get("failure_kind") or "cursor_commit_conflict",
+                            "settlement": settlement,
+                        }
+                        raise RuntimeError("cursor_commit_conflict")
                     return await self._record_pipeline_state(
                         run_id=run_id,
                         pipeline=pipeline,
@@ -2161,12 +2193,20 @@ class EvolutionManager:
                 report = dict(getattr(self.jargon_miner, "last_report", {}) or {})
                 reason = str(report.get("reason") or "completed")
                 if reason == "insufficient_context":
-                    await self._settle_pipeline_checkpoint(
+                    settlement = await self._settle_pipeline_checkpoint(
                         pipeline=pipeline, group_id=group_id, checkpoint=checkpoint,
                         cursor_after=cursor_before, batch_id=batch_id,
                         status="waiting_for_evidence", run_id=run_id, logs=logs,
                         report=report, reason=reason,
                     )
+                    if not settlement.get("committed", False):
+                        failure_report = {
+                            **report,
+                            "failure_stage": "cursor_commit",
+                            "failure_kind": settlement.get("failure_kind") or "cursor_commit_conflict",
+                            "settlement": settlement,
+                        }
+                        raise RuntimeError("cursor_commit_conflict")
                     return await self._record_pipeline_state(
                         run_id=run_id,
                         pipeline=pipeline,
@@ -2280,14 +2320,16 @@ class EvolutionManager:
                     "settlement_error": settlement.get("settlement_error", "settlement_not_committed"),
                 }
                 try:
+                    settlement_kind = str(settlement.get("failure_kind") or "cursor_commit_conflict")
+                    settlement_status = "blocked" if settlement_kind == "dependency_unavailable" else "retry_wait"
                     await self._record_pipeline_state(
                         run_id=f"{run_id}:cancel-settlement:{uuid.uuid4().hex[:8]}",
                         pipeline=pipeline, group_id=group_id, logs=logs,
-                        batch_id=batch_id, status="blocked",
+                        batch_id=batch_id, status=settlement_status,
                         reason="cancel_settlement_not_committed",
                         cursor_before=cursor_before, cursor_after=cursor_before,
                         retained_count=len(logs), report=settlement_report,
-                        retryable=True, error_type="CursorCommitConflict",
+                        retryable=settlement_status == "retry_wait", error_type="CursorCommitConflict",
                         duration_ms=(time.perf_counter() - started) * 1000,
                     )
                 except Exception:
@@ -2358,7 +2400,7 @@ class EvolutionManager:
                 "failure_kind": failure_kind or ("unknown_error" if not transient else "provider_error"),
             }
             try:
-                await self._settle_pipeline_checkpoint(
+                settlement = await self._settle_pipeline_checkpoint(
                     pipeline=pipeline, group_id=group_id, checkpoint=checkpoint,
                     cursor_after=cursor_before, batch_id=batch_id, status=status,
                     failure_count=failures, retry_at=retry_at, last_error=str(exc),
@@ -2367,8 +2409,18 @@ class EvolutionManager:
                     retained_count=len(logs),
                     duration_ms=(time.perf_counter() - started) * 1000,
                 )
+                settlement_failed = not settlement.get("committed", False)
+                if settlement_failed:
+                    settlement_kind = str(settlement.get("failure_kind") or "cursor_commit_conflict")
+                    failure_details["settlement"] = settlement
+                    failure_details["settlement_error"] = "settlement_not_committed"
+                    failure_details["failure_kind"] = settlement_kind
+                    if settlement_kind == "dependency_unavailable":
+                        status = "blocked"
+                        retryable_failure = False
             except Exception as settlement_exc:
                 failure_details["settlement_error"] = type(settlement_exc).__name__
+                settlement_failed = True
             logger.warning(
                 f"[Evolution-{pipeline}] mining {status} for {group_id}: {exc}"
             )
@@ -2387,7 +2439,7 @@ class EvolutionManager:
                 retryable=retryable_failure,
                 error_type=type(exc).__name__,
                 duration_ms=(time.perf_counter() - started) * 1000,
-                persist_run=False,
+                persist_run=settlement_failed,
             )
 
     async def process_logs_and_mine(
