@@ -457,6 +457,38 @@ def test_learning_pipeline_shared_timeout_keeps_cursor_for_retry(tmp_path):
     assert len(service.get_learning_logs("expression", "ff:GroupMessage:timeout", limit=10)) == 4
 
 
+def test_exception_settlement_cas_conflict_overrides_nonretryable_failure(tmp_path):
+    service = _database_service(tmp_path)
+    chat_id = "ff:GroupMessage:exception-cas"
+    _add_logs(service, chat_id, 2)
+    config = AstrMaiConfig(evolution={"learning_pipeline_max_failures": 3})
+    manager = EvolutionManager(service, SimpleNamespace(config=config), config=config)
+
+    async def _raise(_group_id, _logs):
+        raise ValueError("non-retryable business failure")
+
+    async def _uncommitted(**_kwargs):
+        return {
+            "committed": False,
+            "conflict": True,
+            "failure_kind": "cursor_commit_conflict",
+        }
+
+    manager.expression_miner.mine = _raise
+    manager._settle_pipeline_checkpoint = _uncommitted
+    logs = service.get_learning_logs("expression", chat_id, limit=10)
+
+    result = asyncio.run(manager._run_learning_pipeline("expression", chat_id, logs))
+
+    assert result["status"] == "retry_wait"
+    assert result["retryable"] is True
+    assert result["report"]["retry_at"] > 0
+    assert result["cursor_after"] == result["cursor_before"] == 0
+    assert result["report"]["failure_kind"] == "cursor_commit_conflict"
+    assert result["report"]["reason"] == "non-retryable business failure"
+    assert result["report"]["settlement"]["conflict"] is True
+
+
 def test_batch_checkpoint_initialization_preserves_pipeline_cursor_rules(tmp_path):
     service = _database_service(tmp_path)
     _add_logs(service, "ff:GroupMessage:8", 8, processed_until=5)

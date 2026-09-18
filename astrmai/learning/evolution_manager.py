@@ -2415,7 +2415,12 @@ class EvolutionManager:
                     failure_details["settlement"] = settlement
                     failure_details["settlement_error"] = "settlement_not_committed"
                     failure_details["failure_kind"] = settlement_kind
-                    if settlement_kind == "dependency_unavailable":
+                    if settlement_kind in {"cursor_commit_conflict", "cursor_commit_error"}:
+                        status = "retry_wait"
+                        retryable_failure = True
+                        retry_at = time.time() + 60.0
+                        failure_details["retry_at"] = retry_at
+                    elif settlement_kind == "dependency_unavailable":
                         status = "blocked"
                         retryable_failure = False
             except Exception as settlement_exc:
