@@ -916,9 +916,17 @@ class DatabaseService(
             "cursor_after": requested_cursor,
             "raw_count": int(payload.get("raw_count") or 0),
             "normalized_count": int(payload.get("normalized_count") or 0),
+            "required_count": int(payload.get("required_count") or 0),
             "candidate_count": int(payload.get("candidate_count") or 0),
             "saved_count": int(payload.get("saved_count") or 0),
             "deduplicated_count": int(payload.get("deduplicated_count") or 0),
+            "retained_count": int(payload.get("retained_count") or 0),
+            "retryable": bool(payload.get("retryable", False)),
+            "error_type": str(payload.get("error_type") or ""),
+            "reason": str(payload.get("reason") or ""),
+            "failure_count": max(0, int(failure_count or 0)),
+            "retry_at": max(0.0, float(retry_at or 0.0)),
+            "model_id": str(payload.get("model_id") or ""),
             "details": details_json,
         }
         result_digest = hashlib.sha256(
@@ -930,7 +938,10 @@ class DatabaseService(
                 "PRAGMA table_info(learning_pipeline_checkpoint)"
             ).fetchall()}
             required = {"revision", "cursor_semantics", "pipeline_version", "last_batch_id"}
-            if not required.issubset(columns):
+            run_columns = {str(row[1]) for row in conn.execute(
+                "PRAGMA table_info(learning_mining_run)"
+            ).fetchall()}
+            if not required.issubset(columns) or not {"result_digest", "pipeline_version"}.issubset(run_columns):
                 raise RuntimeError("learning_checkpoint_readiness_missing_planned_columns")
             current = conn.execute(
                 """SELECT revision, cursor_log_id, last_batch_id, status
@@ -958,7 +969,7 @@ class DatabaseService(
                 same_payload = (
                     str(existing[0] or "") == str(batch_id or "")
                     and str(existing[1] or "") == details_json
-                    and str(existing[2] or "") == str(payload.get("status", status) or "")
+                    and str(existing[2] or "") == status_name
                     and str(existing[3] or "") == result_digest
                     and int(existing[4] or 0) == int(expected_cursor)
                     and int(existing[5] or 0) == requested_cursor
@@ -1015,11 +1026,21 @@ class DatabaseService(
                     normalized_count, required_count, candidate_count, saved_count,
                     deduplicated_count, cursor_before, cursor_after, retained_count,
                     status, reason, duration_ms, model_id, retryable, error_type,
-                    details_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(run_id) DO UPDATE SET details_json=excluded.details_json,
-                    status=excluded.status, reason=excluded.reason,
-                    cursor_after=excluded.cursor_after""",
+                    details_json, created_at, result_digest, pipeline_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO UPDATE SET
+                    mining_run_id=excluded.mining_run_id, pipeline=excluded.pipeline,
+                    chat_id=excluded.chat_id, batch_id=excluded.batch_id,
+                    raw_count=excluded.raw_count, normalized_count=excluded.normalized_count,
+                    required_count=excluded.required_count, candidate_count=excluded.candidate_count,
+                    saved_count=excluded.saved_count, deduplicated_count=excluded.deduplicated_count,
+                    cursor_before=excluded.cursor_before, cursor_after=excluded.cursor_after,
+                    retained_count=excluded.retained_count, status=excluded.status,
+                    reason=excluded.reason, duration_ms=excluded.duration_ms,
+                    model_id=excluded.model_id, retryable=excluded.retryable,
+                    error_type=excluded.error_type, details_json=excluded.details_json,
+                    created_at=excluded.created_at, result_digest=excluded.result_digest,
+                    pipeline_version=excluded.pipeline_version""",
                 (
                     run_id, str(payload.get("mining_run_id") or run_id), pipeline_name,
                     normalized_chat_id, str(payload.get("batch_id", batch_id) or ""),
@@ -1031,7 +1052,7 @@ class DatabaseService(
                     str(payload.get("status", status) or ""), str(payload.get("reason") or ""),
                     float(payload.get("duration_ms") or 0.0), str(payload.get("model_id") or ""),
                     int(bool(payload.get("retryable", False))), str(payload.get("error_type") or ""),
-                    details_json, now,
+                    details_json, now, result_digest, str(pipeline_version),
                 ),
             )
             conn.execute(

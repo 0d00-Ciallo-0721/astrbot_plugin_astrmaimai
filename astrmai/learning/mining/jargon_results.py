@@ -13,7 +13,7 @@ class JargonEnrichmentResult:
     accepted_count: int = 0
     rejected_count: int = 0
     missing_indexes: list[int] = field(default_factory=list)
-    invalid_indexes: list[Any] = field(default_factory=list)
+    invalid_indexes: list[int | str] = field(default_factory=list)
     retryable: bool = False
     reason: str = ""
     error_type: str = ""

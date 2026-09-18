@@ -139,7 +139,7 @@ class JargonEnricher:
             )
         rows = result["items"]
         by_index: dict[int, dict[str, Any]] = {}
-        invalid_indexes: list[Any] = []
+        invalid_indexes: list[int | str] = []
         for row in rows:
             if not isinstance(row, dict):
                 invalid_indexes.append("malformed_row")
@@ -305,7 +305,7 @@ class JargonEnricher:
         reason: str,
         error_type: str,
         returned_count: int = 0,
-        invalid_indexes: list[int] | None = None,
+        invalid_indexes: list[int | str] | None = None,
     ) -> JargonEnrichmentResult:
         result = JargonEnrichmentResult(
             status=status,

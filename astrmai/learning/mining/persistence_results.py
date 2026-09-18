@@ -61,7 +61,7 @@ class JargonSaveReport:
 
     @property
     def complete(self) -> bool:
-        return self.conservation_valid and self.failed == 0
+        return self.conservation_valid and self.failed == 0 and not self.failure_kind
 
     @property
     def retryable(self) -> bool:

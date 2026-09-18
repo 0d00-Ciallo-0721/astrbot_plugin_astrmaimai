@@ -2195,9 +2195,19 @@ class EvolutionManager:
                 if isinstance(persistence, int):
                     legacy_saved = max(0, int(persistence))
                     persistence = JargonSaveReport(
-                        attempted=len(items), saved=min(legacy_saved, len(items)),
-                        deduplicated=max(0, len(items) - legacy_saved), failed=0,
-                        memory_ids=tuple(f"legacy:{index}" for index in range(min(legacy_saved, len(items)))),
+                        attempted=len(items), saved=0, deduplicated=0, failed=len(items),
+                        failures=tuple(
+                            PersistenceFailure(
+                                candidate_id=str(self._field(item, "candidate_id", "") or ""),
+                                content_hash="",
+                                failure_stage="persist",
+                                failure_kind="legacy_compatibility_blocked",
+                                retryable=False,
+                                detail="legacy integer persistence result cannot prove memory ids",
+                            )
+                            for item in items
+                        ),
+                        failure_stage="persist", failure_kind="legacy_compatibility_blocked",
                     )
                 saved_count = persistence.saved
                 deduplicated_count = persistence.deduplicated
@@ -2249,7 +2259,7 @@ class EvolutionManager:
                 "failure_kind": "cancelled",
             }
             try:
-                await asyncio.shield(self._settle_pipeline_checkpoint(
+                settlement = await asyncio.shield(self._settle_pipeline_checkpoint(
                     pipeline=pipeline, group_id=group_id, checkpoint=checkpoint,
                     cursor_after=cursor_before, batch_id=batch_id, status="retry_wait",
                     failure_count=int(checkpoint.get("failure_count", 0) or 0),
@@ -2259,8 +2269,30 @@ class EvolutionManager:
                     retained_count=len(logs),
                     duration_ms=(time.perf_counter() - started) * 1000,
                 ))
-            finally:
-                raise
+            except Exception as settlement_exc:
+                settlement = {"committed": False, "failure_kind": "dependency_unavailable",
+                               "settlement_error": type(settlement_exc).__name__}
+            if not settlement.get("committed", False):
+                settlement_report = {
+                    **cancellation_report,
+                    "failure_stage": "cursor_commit",
+                    "failure_kind": settlement.get("failure_kind") or "cursor_commit_conflict",
+                    "settlement_error": settlement.get("settlement_error", "settlement_not_committed"),
+                }
+                try:
+                    await self._record_pipeline_state(
+                        run_id=f"{run_id}:cancel-settlement:{uuid.uuid4().hex[:8]}",
+                        pipeline=pipeline, group_id=group_id, logs=logs,
+                        batch_id=batch_id, status="blocked",
+                        reason="cancel_settlement_not_committed",
+                        cursor_before=cursor_before, cursor_after=cursor_before,
+                        retained_count=len(logs), report=settlement_report,
+                        retryable=True, error_type="CursorCommitConflict",
+                        duration_ms=(time.perf_counter() - started) * 1000,
+                    )
+                except Exception:
+                    logger.exception("[Evolution-%s] cancellation settlement diagnostic failed", pipeline)
+            raise
         except Exception as exc:
             if str(exc) == "cursor_commit_conflict":
                 conflict_report = {

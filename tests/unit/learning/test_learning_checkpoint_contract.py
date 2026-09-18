@@ -130,3 +130,33 @@ def test_missing_planned_columns_fail_closed(tmp_path):
         conn.commit()
     with pytest.raises(RuntimeError, match="missing_planned_columns"):
         service.ensure_learning_checkpoint("jargon", "ff:GroupMessage:missing")
+
+
+def test_retry_upsert_refreshes_all_run_fields(tmp_path):
+    service = _database_service(tmp_path)
+    chat_id = "ff:GroupMessage:retry-fields"
+    _add_logs(service, chat_id, 3)
+    checkpoint = service.ensure_learning_checkpoint("jargon", chat_id)
+    base = dict(
+        pipeline="jargon", chat_id=chat_id,
+        expected_revision=checkpoint["revision"], expected_cursor=0,
+        cursor_after=0, batch_id="retry-fields", pipeline_version="jargon-cursor-state-v1",
+    )
+    first = service.commit_learning_pipeline(
+        **base, status="retry_wait", failure_count=1, retry_at=10.0,
+        run_payload={"run_id": "retry-fields-run", "status": "retry_wait",
+                     "batch_id": "retry-fields", "candidate_count": 1,
+                     "error_type": "TimeoutError", "retryable": True},
+    )
+    second = service.commit_learning_pipeline(
+        **{**base, "expected_revision": first["revision_after"]}, status="completed",
+        run_payload={"run_id": "retry-fields-run", "status": "completed",
+                     "batch_id": "retry-fields", "candidate_count": 3,
+                     "saved_count": 2, "error_type": "", "retryable": False},
+    )
+    assert first["committed"] and second["committed"]
+    row = service.list_learning_mining_runs(chat_id=chat_id, limit=1)[0]
+    assert row["status"] == "completed"
+    assert row["candidate_count"] == 3
+    assert row["error_type"] == ""
+    assert row["retryable"] in (0, False)

@@ -78,7 +78,7 @@ class LearningStageDiagnostic:
             "output_count": int(self.output_count),
             "candidate_count": int(self.candidate_count),
             "persisted_count": int(self.persisted_count),
-            "failure_stage": str(self.failure_stage or ""),
+            "failure_stage": str(self.failure_stage or "") if self.failure_stage in _STAGES else ("unknown" if self.failure_stage else ""),
             "failure_kind": str(self.failure_kind or "") if self.failure_kind in _FAILURE_KINDS else "unknown_error",
             "retryable": bool(self.retryable),
             "cursor_before": int(self.cursor_before),
