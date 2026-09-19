@@ -650,6 +650,7 @@ class GatewayLaneMixin:
         propagate_queue_timeout_status: bool = True,
         hard_deadline_monotonic: float | None = None,
         selected_model_id: str = "",
+        on_provider_request_start=None,
     ) -> LLMCallResult:
         workload_request = self.context_economy.build_request(
             family=self._lane_workload_family(lane_key, tool_mode=False),
@@ -708,6 +709,7 @@ class GatewayLaneMixin:
                     propagate_queue_timeout_status=propagate_queue_timeout_status,
                     hard_deadline_monotonic=hard_deadline_monotonic,
                     selected_model_id=selected_model_id,
+                    on_provider_request_start=on_provider_request_start,
                 )
             except asyncio.CancelledError:
                 finish_llm_call(
@@ -824,6 +826,7 @@ class GatewayLaneMixin:
                 propagate_queue_timeout_status=propagate_queue_timeout_status,
                 hard_deadline_monotonic=hard_deadline_monotonic,
                 selected_model_id=selected_model_id,
+                on_provider_request_start=on_provider_request_start,
             )
         except asyncio.CancelledError:
             finish_llm_call(

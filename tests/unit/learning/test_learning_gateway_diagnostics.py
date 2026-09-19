@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 import time
 from types import SimpleNamespace
 
@@ -7,6 +8,7 @@ import pytest
 from astrmai.infrastructure.gateway.model_gateway import GlobalModelGateway
 from astrmai.infrastructure.gateway.gateway_exceptions import (
     GatewayQueueTimeout,
+    ProviderRequestStartRejected,
     LLMCascadeFailureException,
 )
 from astrmai.infrastructure.runtime.lane_manager import LaneKey
@@ -149,6 +151,96 @@ async def test_selected_provider_follows_router_order_and_binds_actual_call(monk
     assert result.call_diagnostics is not None
     assert result.call_diagnostics.provider_id == selection.provider_id
     assert context.calls[-1]["chat_provider_id"] == "openai/model-b"
+
+
+@pytest.mark.asyncio
+async def test_provider_start_hook_runs_after_gateway_admission_before_provider():
+    order = []
+
+    class _OrderedContext(_Context):
+        async def llm_generate(self, **kwargs):
+            order.append("Provider")
+            return await super().llm_generate(**kwargs)
+
+    context = _OrderedContext()
+    gateway = _gateway(context)
+
+    async def _mark_started(identity):
+        order.append("Fence")
+        assert identity.provider_id == "openai/model-a"
+        assert identity.model_id == "openai/model-a"
+        assert identity.gateway_call_id
+        return True
+
+    result = await gateway.call_data_process_task_result(
+        prompt="fenced",
+        is_json=True,
+        lane_key=_lane("chat-fenced"),
+        base_origin="chat-fenced",
+        max_retries_override=0,
+        max_models_override=1,
+        use_fallback=False,
+        on_provider_request_start=_mark_started,
+    )
+
+    assert result.ok is True
+    assert order == ["Fence", "Provider"]
+
+
+@pytest.mark.asyncio
+async def test_provider_start_hook_rejection_prevents_provider_call():
+    context = _Context()
+    gateway = _gateway(context)
+
+    async def _reject(_identity):
+        return SimpleNamespace(
+            applied=False,
+            conflict=True,
+            failure_stage="provider_start_fence",
+            failure_kind="cas_conflict",
+        )
+
+    with pytest.raises(ProviderRequestStartRejected) as raised:
+        await gateway.call_data_process_task_result(
+            prompt="rejected",
+            is_json=True,
+            lane_key=_lane("chat-rejected"),
+            base_origin="chat-rejected",
+            max_retries_override=0,
+            max_models_override=1,
+            use_fallback=False,
+            on_provider_request_start=_reject,
+        )
+
+    assert raised.value.failure_kind == "cas_conflict"
+    assert raised.value.call_diagnostics.provider_request_started is False
+    assert context.calls == []
+
+
+@pytest.mark.asyncio
+async def test_provider_start_persistence_lock_is_fail_closed_before_provider():
+    context = _Context()
+    gateway = _gateway(context)
+
+    async def _locked(_identity):
+        raise sqlite3.OperationalError("database is locked")
+
+    with pytest.raises(ProviderRequestStartRejected) as raised:
+        await gateway.call_data_process_task_result(
+            prompt="locked",
+            is_json=True,
+            lane_key=_lane("chat-locked"),
+            base_origin="chat-locked",
+            max_retries_override=0,
+            max_models_override=1,
+            use_fallback=False,
+            on_provider_request_start=_locked,
+        )
+
+    assert raised.value.failure_stage == "persistence"
+    assert raised.value.failure_kind == "persist_locked"
+    assert raised.value.call_diagnostics.provider_request_started is False
+    assert context.calls == []
 
 
 def test_selected_provider_skips_cooled_first_model_without_claiming_probe(monkeypatch):

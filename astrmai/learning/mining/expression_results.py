@@ -44,13 +44,16 @@ class PatternSaveReport:
     failed: int = 0
     memory_ids: list[str] = field(default_factory=list)
     failures: list[str] = field(default_factory=list)
+    failure_stage: str = ""
+    failure_kind: str = ""
+    retryable: bool = True
 
     @property
     def complete(self) -> bool:
         return self.failed == 0 and self.saved + self.deduplicated == self.attempted
 
     def to_report(self) -> dict[str, Any]:
-        return {
+        report = {
             "attempted": self.attempted,
             "saved": self.saved,
             "deduplicated": self.deduplicated,
@@ -58,7 +61,13 @@ class PatternSaveReport:
             "memory_ids": list(self.memory_ids),
             "failures": list(self.failures),
             "complete": self.complete,
+            "retryable": self.retryable,
         }
+        if self.failure_stage:
+            report["failure_stage"] = self.failure_stage
+        if self.failure_kind:
+            report["failure_kind"] = self.failure_kind
+        return report
 
 
 __all__ = ["ExpressionEnrichmentResult", "PatternSaveReport"]

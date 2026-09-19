@@ -46,7 +46,13 @@ class JargonEnricher:
             parsed = float(fallback)
         return max(0.0, min(parsed, 1.0))
 
-    async def enrich(self, group_id: str, candidates: list[dict[str, Any]]) -> JargonEnrichmentResult:
+    async def enrich(
+        self,
+        group_id: str,
+        candidates: list[dict[str, Any]],
+        *,
+        provider_call_kwargs: dict[str, Any] | None = None,
+    ) -> JargonEnrichmentResult:
         self.last_provider_attempt = None
         if not candidates:
             return JargonEnrichmentResult(status="completed", reason="no_input")
@@ -106,6 +112,7 @@ class JargonEnricher:
                     scope_id=group_id,
                     prompt=prompt,
                     is_json=True,
+                    **dict(provider_call_kwargs or {}),
                 )
                 self.last_provider_attempt = attempt
                 if not attempt.ok:

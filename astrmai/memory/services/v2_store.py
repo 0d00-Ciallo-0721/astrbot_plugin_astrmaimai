@@ -40,6 +40,22 @@ class MemoryUpsertResult(dict):
     def new_record_is_superseded(self) -> bool:
         return bool(self.get("new_record_is_superseded", False))
 
+    @property
+    def conflict(self) -> bool:
+        return bool(self.get("conflict", False))
+
+    @property
+    def idempotent(self) -> bool:
+        return bool(self.get("idempotent", False))
+
+    @property
+    def failure_kind(self) -> str:
+        return str(self.get("failure_kind") or "")
+
+    @property
+    def current_candidate_revision(self) -> int:
+        return int(self.get("current_candidate_revision", 0) or 0)
+
 
 class MemoryV2Store:
     """SQL-backed canonical memory store.
@@ -207,12 +223,106 @@ class MemoryV2Store:
                 (memory_id, row[0] or "", row[1] or "", row[2] or ""),
             )
 
+    async def _backfill_candidate_revision_fences(self, db) -> None:
+        cursor = await db.execute(
+            """
+            SELECT id, dedup_key, metadata, update_time
+            FROM canonical_memories
+            WHERE status NOT IN ('deleted', 'superseded', 'merged', 'deprecated')
+            """
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        candidates: dict[
+            str,
+            tuple[int, dict[tuple[str, str], tuple[str, float]]],
+        ] = {}
+        for row in rows:
+            try:
+                metadata = json.loads(str(row[2] or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(metadata, dict):
+                continue
+            identities: list[tuple[str, int, str]] = []
+            top_level = self._candidate_revision_identity(metadata)
+            if top_level is not None:
+                identities.append(top_level)
+            raw_fences = metadata.get("candidate_revision_fences")
+            if isinstance(raw_fences, dict):
+                for candidate_id, raw_fence in raw_fences.items():
+                    if not isinstance(raw_fence, dict):
+                        continue
+                    identity = self._candidate_revision_identity(
+                        {
+                            "candidate_id": candidate_id,
+                            "candidate_revision": raw_fence.get("revision"),
+                            "candidate_persistence_id": raw_fence.get(
+                                "persistence_id"
+                            ),
+                        }
+                    )
+                    if identity is not None:
+                        identities.append(identity)
+            for candidate_id, revision, persistence_id in identities:
+                previous = candidates.get(candidate_id)
+                if previous is None or revision > previous[0]:
+                    candidates[candidate_id] = (
+                        revision,
+                        {
+                            (persistence_id, str(row[0])): (
+                                str(row[1] or ""),
+                                float(row[3] or 0.0),
+                            )
+                        },
+                    )
+                elif revision == previous[0]:
+                    previous[1][(persistence_id, str(row[0]))] = (
+                        str(row[1] or ""),
+                        float(row[3] or 0.0),
+                    )
+        for candidate_id, (revision, highest_identities) in candidates.items():
+            if len(highest_identities) != 1:
+                raise RuntimeError(
+                    "candidate_fence_backfill_conflict:"
+                    f"candidate_id={candidate_id}:revision={revision}:"
+                    f"identities={len(highest_identities)}"
+                )
+            (persistence_id, canonical_memory_id), (
+                dedup_key,
+                updated_at,
+            ) = next(iter(highest_identities.items()))
+            await db.execute(
+                """
+                INSERT INTO memory_candidate_revision_fence(
+                    candidate_id, revision, persistence_id,
+                    canonical_memory_id, dedup_key, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(candidate_id) DO UPDATE SET
+                    revision = excluded.revision,
+                    persistence_id = excluded.persistence_id,
+                    canonical_memory_id = excluded.canonical_memory_id,
+                    dedup_key = excluded.dedup_key,
+                    updated_at = excluded.updated_at
+                WHERE excluded.revision > memory_candidate_revision_fence.revision
+                """,
+                (
+                    candidate_id,
+                    revision,
+                    persistence_id,
+                    canonical_memory_id,
+                    dedup_key,
+                    updated_at,
+                ),
+            )
+
     async def initialize(self) -> None:
         if self._initialized:
             return
         backup_dir = await self._backup_legacy_once()
         await self._migrate_from_legacy_db()
         async with connect_aiosqlite(self.db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS canonical_memories (
@@ -254,6 +364,23 @@ class MemoryV2Store:
             )
             await db.execute(
                 """
+                CREATE TABLE IF NOT EXISTS memory_candidate_revision_fence (
+                    candidate_id TEXT PRIMARY KEY,
+                    revision INTEGER NOT NULL,
+                    persistence_id TEXT NOT NULL,
+                    canonical_memory_id TEXT NOT NULL,
+                    dedup_key TEXT NOT NULL DEFAULT '',
+                    updated_at REAL NOT NULL DEFAULT 0
+                )
+                """
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS ix_memory_candidate_fence_canonical "
+                "ON memory_candidate_revision_fence(canonical_memory_id)"
+            )
+            await self._backfill_candidate_revision_fences(db)
+            await db.execute(
+                """
                 CREATE TABLE IF NOT EXISTS memory_dedup_aliases (
                     alias_key TEXT PRIMARY KEY,
                     canonical_memory_id TEXT NOT NULL,
@@ -281,12 +408,12 @@ class MemoryV2Store:
                 """
             )
             await db.execute(
-                "INSERT OR REPLACE INTO memory_v2_meta(key, value) VALUES ('schema_version', '2')"
+                "INSERT OR REPLACE INTO memory_v2_meta(key, value) VALUES ('schema_version', '3')"
             )
             await db.execute(
                 """
                 INSERT OR REPLACE INTO memory_v2_migrations(version, backup_dir, status, detail, applied_at)
-                VALUES ('2', ?, 'applied', 'canonical schema ready', ?)
+                VALUES ('3', ?, 'applied', 'candidate revision fence ready', ?)
                 """,
                 (str(backup_dir or ""), self._now()),
             )
@@ -1020,6 +1147,42 @@ class MemoryV2Store:
         source = str(request.source or "").strip().lower()
         return source in {"instant_gate", "instant_gate_llm", "dream_audit_pipeline", "authority_backfill"}
 
+    @staticmethod
+    def _candidate_revision_identity(metadata: dict[str, Any]) -> tuple[str, int, str] | None:
+        candidate_id = str(metadata.get("candidate_id") or "").strip()
+        persistence_id = str(metadata.get("candidate_persistence_id") or "").strip()
+        try:
+            revision = int(metadata.get("candidate_revision"))
+        except (TypeError, ValueError):
+            return None
+        if not candidate_id or revision < 0 or not persistence_id:
+            return None
+        return candidate_id, revision, persistence_id
+
+    @staticmethod
+    def _candidate_metadata_with_fence(
+        existing_metadata: dict[str, Any],
+        incoming_metadata: dict[str, Any],
+        identity: tuple[str, int, str],
+    ) -> dict[str, Any]:
+        candidate_id, incoming_revision, persistence_id = identity
+        raw_fences = existing_metadata.get("candidate_revision_fences")
+        fences = dict(raw_fences) if isinstance(raw_fences, dict) else {}
+        merged_metadata = {**existing_metadata, **incoming_metadata}
+        fences[candidate_id] = {
+            "revision": incoming_revision,
+            "persistence_id": persistence_id,
+        }
+        merged_metadata.update(
+            {
+                "candidate_id": candidate_id,
+                "candidate_revision": incoming_revision,
+                "candidate_persistence_id": persistence_id,
+                "candidate_revision_fences": fences,
+            }
+        )
+        return merged_metadata
+
     async def upsert(self, request: MemoryWriteRequest) -> MemoryUpsertResult:
         await self.initialize()
         now = self._now()
@@ -1042,6 +1205,9 @@ class MemoryV2Store:
         }:
             status = ACTIVE_STATUS
         authority_eav = self._looks_like_authority_eav(dedup_key, request)
+        candidate_identity = self._candidate_revision_identity(
+            dict(request.metadata or {})
+        )
 
         scopes = [request.session_id]
         if sender_id:
@@ -1050,12 +1216,127 @@ class MemoryV2Store:
             scopes.append(f"dedup:{dedup_key}")
         async with await self._acquire_session_scopes(scopes) as _locks:
             async with connect_aiosqlite(self.db_path) as db:
-                if dedup_key and not authority_eav:
+                migration_old_memory_id = ""
+                if candidate_identity is not None:
+                    candidate_id, incoming_revision, persistence_id = candidate_identity
+                    await db.execute("BEGIN IMMEDIATE")
                     cursor = await db.execute(
                         """
-                        SELECT id, content, summary, access_count, status
+                        SELECT revision, persistence_id, canonical_memory_id, dedup_key
+                        FROM memory_candidate_revision_fence
+                        WHERE candidate_id = ?
+                        """,
+                        (candidate_id,),
+                    )
+                    fence_row = await cursor.fetchone()
+                    await cursor.close()
+                    if fence_row is not None:
+                        current_revision = int(fence_row[0])
+                        current_persistence_id = str(fence_row[1] or "")
+                        current_memory_id = str(fence_row[2] or "")
+                        current_dedup_key = str(fence_row[3] or "")
+                        if (
+                            incoming_revision < current_revision
+                            or (
+                                incoming_revision == current_revision
+                                and persistence_id != current_persistence_id
+                            )
+                        ):
+                            await db.rollback()
+                            return MemoryUpsertResult(
+                                memory_id=current_memory_id,
+                                superseded_old_ids=[],
+                                new_record_is_superseded=False,
+                                conflict=True,
+                                idempotent=False,
+                                failure_kind="candidate_revision_conflict",
+                                current_candidate_revision=current_revision,
+                            )
+                        if persistence_id == current_persistence_id:
+                            cursor = await db.execute(
+                                "SELECT metadata FROM canonical_memories WHERE id = ?",
+                                (current_memory_id,),
+                            )
+                            canonical_row = await cursor.fetchone()
+                            await cursor.close()
+                            if canonical_row is None:
+                                await db.rollback()
+                                return MemoryUpsertResult(
+                                    memory_id=current_memory_id,
+                                    superseded_old_ids=[],
+                                    new_record_is_superseded=False,
+                                    conflict=True,
+                                    idempotent=False,
+                                    failure_kind="candidate_fence_orphaned",
+                                    current_candidate_revision=current_revision,
+                                )
+                            if incoming_revision > current_revision:
+                                try:
+                                    current_metadata = json.loads(
+                                        str(canonical_row[0] or "{}")
+                                    )
+                                except (
+                                    TypeError,
+                                    ValueError,
+                                    json.JSONDecodeError,
+                                ):
+                                    current_metadata = {}
+                                if not isinstance(current_metadata, dict):
+                                    current_metadata = {}
+                                advanced_metadata = self._candidate_metadata_with_fence(
+                                    current_metadata,
+                                    {},
+                                    candidate_identity,
+                                )
+                                await db.execute(
+                                    """
+                                    UPDATE canonical_memories
+                                    SET metadata = ?, update_time = ?
+                                    WHERE id = ?
+                                    """,
+                                    (
+                                        self._json_dict(advanced_metadata),
+                                        now,
+                                        current_memory_id,
+                                    ),
+                                )
+                                await db.execute(
+                                    """
+                                    UPDATE memory_candidate_revision_fence
+                                    SET revision = ?, updated_at = ?
+                                    WHERE candidate_id = ? AND revision = ?
+                                      AND persistence_id = ?
+                                    """,
+                                    (
+                                        incoming_revision,
+                                        now,
+                                        candidate_id,
+                                        current_revision,
+                                        current_persistence_id,
+                                    ),
+                                )
+                            await db.commit()
+                            return MemoryUpsertResult(
+                                memory_id=current_memory_id,
+                                superseded_old_ids=[],
+                                new_record_is_superseded=False,
+                                conflict=False,
+                                idempotent=True,
+                                current_candidate_revision=incoming_revision,
+                            )
+                        if current_dedup_key != dedup_key:
+                            migration_old_memory_id = current_memory_id
+                if dedup_key and not authority_eav:
+                    candidate_status_sql = (
+                        "status NOT IN ('deleted', 'superseded', 'merged', 'deprecated')"
+                        if candidate_identity is not None
+                        else "status IN ('active', 'stale', 'review_pending')"
+                    )
+                    cursor = await db.execute(
+                        f"""
+                        SELECT id, content, summary, access_count, status, metadata
                         FROM canonical_memories
-                        WHERE dedup_key = ? AND status IN ('active', 'stale', 'review_pending')
+                        WHERE dedup_key = ? AND {candidate_status_sql}
                         LIMIT 1
                         """,
                         (dedup_key,),
@@ -1063,15 +1344,40 @@ class MemoryV2Store:
                     row = await cursor.fetchone()
                     if row:
                         memory_id = str(row[0])
-                        if str(row[4] or "") == ACTIVE_STATUS and status == REVIEW_PENDING_STATUS:
-                            return MemoryUpsertResult(
-                                memory_id=memory_id,
-                                superseded_old_ids=[],
-                                new_record_is_superseded=False,
+                        raw_existing_metadata = str(row[5] or "{}")
+                        try:
+                            existing_metadata = json.loads(raw_existing_metadata)
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            existing_metadata = {}
+                        if not isinstance(existing_metadata, dict):
+                            existing_metadata = {}
+                        if candidate_identity is not None:
+                            write_metadata = self._candidate_metadata_with_fence(
+                                existing_metadata,
+                                dict(request.metadata or {}),
+                                candidate_identity,
                             )
+                            current_revision = candidate_identity[1]
+                        else:
+                            write_metadata = dict(request.metadata or {})
+                            current_revision = 0
+                        if str(row[4] or "") == ACTIVE_STATUS and status == REVIEW_PENDING_STATUS:
+                            if self._candidate_revision_identity(
+                                dict(request.metadata or {})
+                            ) is None:
+                                return MemoryUpsertResult(
+                                    memory_id=memory_id,
+                                    superseded_old_ids=[],
+                                    new_record_is_superseded=False,
+                                )
+                            status = ACTIVE_STATUS
+                            if existing_metadata.get("review_status"):
+                                write_metadata["review_status"] = existing_metadata[
+                                    "review_status"
+                                ]
                         merged_content = str(request.content or row[1] or "")
                         merged_summary = str(summary or row[2] or "")[:500]
-                        await db.execute(
+                        cursor = await db.execute(
                             """
                             UPDATE canonical_memories
                             SET content = ?, summary = ?, source = ?, kind = ?,
@@ -1081,7 +1387,7 @@ class MemoryV2Store:
                                 update_time = ?, last_access_time = ?,
                                 access_count = COALESCE(access_count, 0) + 1,
                                 tags = ?, metadata = ?, source_ref = ?, visibility = ?
-                            WHERE id = ?
+                            WHERE id = ? AND metadata = ?
                             """,
                             (
                                 merged_content,
@@ -1094,20 +1400,81 @@ class MemoryV2Store:
                                 now,
                                 now,
                                 self._json_list(request.tags),
-                                self._json_dict(request.metadata),
+                                self._json_dict(write_metadata),
                                 request.source_ref,
                                 visibility,
                                 memory_id,
+                                raw_existing_metadata,
                             ),
                         )
+                        if cursor.rowcount != 1:
+                            await db.rollback()
+                            return MemoryUpsertResult(
+                                memory_id=memory_id,
+                                superseded_old_ids=[],
+                                new_record_is_superseded=False,
+                                conflict=True,
+                                idempotent=False,
+                                failure_kind="candidate_revision_conflict",
+                                current_candidate_revision=current_revision,
+                            )
+                        superseded_old_ids: list[str] = []
+                        if (
+                            migration_old_memory_id
+                            and migration_old_memory_id != memory_id
+                        ):
+                            await db.execute(
+                                """
+                                UPDATE canonical_memories
+                                SET status = 'superseded', superseded_by = ?,
+                                    update_time = ?
+                                WHERE id = ?
+                                  AND status NOT IN ('deleted', 'superseded', 'merged', 'deprecated')
+                                """,
+                                (memory_id, now, migration_old_memory_id),
+                            )
+                            await self._sync_fts(
+                                db, migration_old_memory_id, delete_only=True
+                            )
+                            superseded_old_ids.append(migration_old_memory_id)
                         await self._sync_fts(db, memory_id)
+                        if candidate_identity is not None:
+                            await db.execute(
+                                """
+                                INSERT INTO memory_candidate_revision_fence(
+                                    candidate_id, revision, persistence_id,
+                                    canonical_memory_id, dedup_key, updated_at
+                                ) VALUES (?, ?, ?, ?, ?, ?)
+                                ON CONFLICT(candidate_id) DO UPDATE SET
+                                    revision = excluded.revision,
+                                    persistence_id = excluded.persistence_id,
+                                    canonical_memory_id = excluded.canonical_memory_id,
+                                    dedup_key = excluded.dedup_key,
+                                    updated_at = excluded.updated_at
+                                """,
+                                (
+                                    candidate_identity[0],
+                                    candidate_identity[1],
+                                    candidate_identity[2],
+                                    memory_id,
+                                    dedup_key,
+                                    now,
+                                ),
+                            )
                         await db.commit()
                         return MemoryUpsertResult(
                             memory_id=memory_id,
-                            superseded_old_ids=[],
+                            superseded_old_ids=superseded_old_ids,
                             new_record_is_superseded=False,
                         )
 
+                insert_metadata = dict(request.metadata or {})
+                insert_revision = 0
+                if candidate_identity is not None:
+                    insert_metadata = self._candidate_metadata_with_fence(
+                        {}, insert_metadata, candidate_identity
+                    )
+                    insert_revision = candidate_identity[1]
                 await db.execute(
                     """
                     INSERT INTO canonical_memories (
@@ -1134,7 +1501,7 @@ class MemoryV2Store:
                         created_at,
                         now,
                         now,
-                        self._json_dict(request.metadata),
+                        self._json_dict(insert_metadata),
                         dedup_key,
                         request.source_ref,
                         visibility,
@@ -1159,11 +1526,50 @@ class MemoryV2Store:
                     new_record_is_superseded = str(row[0] or "") == SUPERSEDED_STATUS if row else False
                 if not new_record_is_superseded:
                     await self._sync_fts(db, memory_id)
+                if candidate_identity is not None:
+                    if migration_old_memory_id and migration_old_memory_id != memory_id:
+                        await db.execute(
+                            """
+                            UPDATE canonical_memories
+                            SET status = 'superseded', superseded_by = ?,
+                                update_time = ?
+                            WHERE id = ?
+                              AND status NOT IN ('deleted', 'superseded', 'merged', 'deprecated')
+                            """,
+                            (memory_id, now, migration_old_memory_id),
+                        )
+                        await self._sync_fts(
+                            db, migration_old_memory_id, delete_only=True
+                        )
+                        superseded_old_ids.append(migration_old_memory_id)
+                    await db.execute(
+                        """
+                        INSERT INTO memory_candidate_revision_fence(
+                            candidate_id, revision, persistence_id,
+                            canonical_memory_id, dedup_key, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(candidate_id) DO UPDATE SET
+                            revision = excluded.revision,
+                            persistence_id = excluded.persistence_id,
+                            canonical_memory_id = excluded.canonical_memory_id,
+                            dedup_key = excluded.dedup_key,
+                            updated_at = excluded.updated_at
+                        """,
+                        (
+                            candidate_identity[0],
+                            candidate_identity[1],
+                            candidate_identity[2],
+                            memory_id,
+                            dedup_key,
+                            now,
+                        ),
+                    )
                 await db.commit()
         return MemoryUpsertResult(
             memory_id=memory_id,
             superseded_old_ids=superseded_old_ids,
             new_record_is_superseded=new_record_is_superseded,
+            current_candidate_revision=insert_revision,
         )
 
     async def get_by_id(self, memory_id: str, *, allow_stale: bool = False) -> MemoryCandidate | None:

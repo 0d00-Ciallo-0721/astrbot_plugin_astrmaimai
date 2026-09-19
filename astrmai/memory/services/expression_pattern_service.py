@@ -471,12 +471,30 @@ class ExpressionPatternService:
         now = time.time()
         existing_metadata = dict(existing.metadata or {}) if existing else {}
         mining_batch_id = str(payload.get("mining_batch_id") or "").strip()
+        candidate_id = str(payload.get("candidate_id") or "").strip()
+        candidate_persistence_id = str(
+            payload.get("candidate_persistence_id") or mining_batch_id
+        ).strip()
+        try:
+            candidate_revision = int(payload.get("candidate_revision"))
+        except (TypeError, ValueError):
+            candidate_revision = None
+        candidate_revision_bound = bool(
+            candidate_id
+            and candidate_revision is not None
+            and candidate_persistence_id
+        )
         applied_batch_ids = [
             str(item)
             for item in (existing_metadata.get("applied_mining_batch_ids") or [])
             if str(item or "").strip()
         ]
-        if existing and mining_batch_id and mining_batch_id in applied_batch_ids:
+        if (
+            existing
+            and mining_batch_id
+            and mining_batch_id in applied_batch_ids
+            and not candidate_revision_bound
+        ):
             return str(existing.id)
         incoming_review_status = self._normalize_incoming_review_status(payload.get("review_status", "pending"), source=source)
         incoming_evidence = {
@@ -568,7 +586,7 @@ class ExpressionPatternService:
             "last_active_time": now,
             "confidence": confidence,
             "summary": summary,
-            "candidate_id": str(payload.get("candidate_id") or existing_metadata.get("candidate_id") or ""),
+            "candidate_id": str(candidate_id or existing_metadata.get("candidate_id") or ""),
             "candidate_origin": str(payload.get("candidate_origin") or existing_metadata.get("candidate_origin") or "expression_miner"),
             "classification": str(payload.get("classification") or existing_metadata.get("classification") or "expression"),
             "classification_reason": str(payload.get("classification_reason") or existing_metadata.get("classification_reason") or ""),
@@ -577,6 +595,14 @@ class ExpressionPatternService:
             "applied_mining_batch_ids": list(
                 dict.fromkeys([*applied_batch_ids, *([mining_batch_id] if mining_batch_id else [])])
             )[-128:],
+            **(
+                {
+                    "candidate_revision": candidate_revision,
+                    "candidate_persistence_id": candidate_persistence_id,
+                }
+                if candidate_revision_bound
+                else {}
+            ),
         }
         if revision_reopened:
             metadata["revision_of"] = str(getattr(existing, "id", "") or "")

@@ -21,6 +21,21 @@ class GatewayShutdownRejected(asyncio.CancelledError):
         super().__init__(self.reason)
 
 
+class ProviderRequestStartRejected(RuntimeError):
+    """The durable provider-start fence rejected an outbound request."""
+
+    def __init__(
+        self,
+        *,
+        failure_stage: str = "provider_start_fence",
+        failure_kind: str = "cas_conflict",
+    ) -> None:
+        self.failure_stage = str(failure_stage or "provider_start_fence")
+        self.failure_kind = str(failure_kind or "cas_conflict")
+        self.call_diagnostics = None
+        super().__init__(f"{self.failure_stage}:{self.failure_kind}")
+
+
 class LLMCascadeFailureException(Exception):
     """Raised when every model candidate in the cascade fails."""
 

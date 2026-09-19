@@ -79,6 +79,8 @@ class ExpressionPatternEnricher:
         self,
         group_id: str,
         candidates: list[dict[str, Any]],
+        *,
+        provider_call_kwargs: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         if not candidates:
             return []
@@ -134,6 +136,7 @@ class ExpressionPatternEnricher:
                 scope_id=group_id,
                 prompt=prompt,
                 is_json=True,
+                **dict(provider_call_kwargs or {}),
             )
             self.last_provider_attempt = attempt
             if not attempt.ok:
@@ -218,7 +221,13 @@ class ExpressionPatternEnricher:
         payload["content_samples"] = list(payload.get("source_examples") or payload.get("content_samples") or [])[:12]
         return payload if payload["expression"] and payload["summary"] else None
 
-    async def enrich(self, group_id: str, candidates: list[dict[str, Any]]) -> ExpressionEnrichmentResult:
+    async def enrich(
+        self,
+        group_id: str,
+        candidates: list[dict[str, Any]],
+        *,
+        provider_call_kwargs: dict[str, Any] | None = None,
+    ) -> ExpressionEnrichmentResult:
         self.last_provider_attempt = None
         if not candidates:
             self.last_result = ExpressionEnrichmentResult(status="completed", reason="no_candidates")
@@ -255,7 +264,11 @@ class ExpressionPatternEnricher:
             if not pending:
                 break
             try:
-                rows = await self._request_rows(group_id, pending)
+                rows = await self._request_rows(
+                    group_id,
+                    pending,
+                    provider_call_kwargs=provider_call_kwargs,
+                )
             except json.JSONDecodeError as exc:
                 last_error_status, last_error = "parse_error", str(exc)
                 logger.warning(f"[ExpressionPatternEnricher] JSON parse failed attempt={attempts}: {exc}")

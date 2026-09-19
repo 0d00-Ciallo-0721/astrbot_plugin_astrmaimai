@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -272,6 +273,359 @@ class ExpressionEnrichmentPipelineTests(unittest.TestCase):
         self.assertEqual(len(writer.calls), 1)
         self.assertEqual(stored.metadata["count"], 3)
         self.assertEqual(stored.metadata["weight"], 0.8)
+
+    def test_stale_candidate_revision_cannot_overwrite_new_canonical_metadata(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            class _Projector:
+                def __init__(self):
+                    self.calls = 0
+
+                async def project(self, **_kwargs):
+                    self.calls += 1
+                    return True
+
+                async def cleanup_deleted(self, _ids):
+                    return None
+
+            store = MemoryV2Store(
+                str(Path(temp_dir) / "memory.db"), data_path=Path(temp_dir)
+            )
+            projector = _Projector()
+            service = ExpressionPatternService(
+                store, MemoryWriteService(store, projector)
+            )
+            new_payload = {
+                **_candidate("candidate-1", count=2),
+                "mining_batch_id": "candidate-persist:new",
+                "candidate_revision": 4,
+                "evidence_digest": "new-digest",
+                "source_message_ids": ["m-1", "m-2"],
+                "support_count": 2,
+            }
+            old_payload = {
+                **_candidate("candidate-1", count=1),
+                "mining_batch_id": "candidate-persist:old",
+                "candidate_revision": 2,
+                "evidence_digest": "old-digest",
+                "source_message_ids": ["m-1"],
+                "support_count": 1,
+            }
+
+            memory_id = asyncio.run(service.write_pattern("chat-1", new_payload))
+            replayed_id = asyncio.run(service.write_pattern("chat-1", new_payload))
+            self.assertEqual(replayed_id, memory_id)
+            advanced_id = asyncio.run(
+                service.write_pattern(
+                    "chat-1", {**new_payload, "candidate_revision": 5}
+                )
+            )
+            self.assertEqual(advanced_id, memory_id)
+            self.assertEqual(projector.calls, 1)
+            before = asyncio.run(store.get_canonical(memory_id, include_inactive=True))
+            with self.assertRaisesRegex(RuntimeError, "candidate_revision_conflict"):
+                asyncio.run(service.write_pattern("chat-1", old_payload))
+            after = asyncio.run(store.get_canonical(memory_id, include_inactive=True))
+
+            self.assertEqual(after.id, before.id)
+            self.assertEqual(after.metadata["count"], 2)
+            self.assertEqual(after.metadata["support_count"], 2)
+            self.assertEqual(after.metadata["evidence_digest"], "new-digest")
+            self.assertEqual(after.metadata["candidate_revision"], 5)
+            self.assertEqual(
+                after.metadata["applied_mining_batch_ids"],
+                ["candidate-persist:new"],
+            )
+
+    def test_stale_jargon_candidate_revision_is_reported_without_overwrite(self):
+        async def _run():
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+                store = MemoryV2Store(
+                    str(Path(temp_dir) / "memory.db"), data_path=Path(temp_dir)
+                )
+                writer = MemoryWriteService(store)
+                manager = object.__new__(EvolutionManager)
+                manager.db = SimpleNamespace(
+                    memory_engine=SimpleNamespace(v2_store=store, write_service=writer)
+                )
+                base = {
+                    "candidate_id": "jargon-candidate-1",
+                    "content": "脱敏词",
+                    "canonical_form": "脱敏词",
+                    "confidence": 0.9,
+                    "activation_score": 0.8,
+                    "is_jargon": True,
+                    "review_status": "review_pending",
+                    "source_message_ids": ["m-1", "m-2"],
+                    "supported_by": ["m-1", "m-2"],
+                    "count": 2,
+                }
+                current = await manager._save_jargons(
+                    "chat-1",
+                    [{**base, "meaning": "new meaning", "evidence_digest": "new-digest"}],
+                    mining_batch_id="candidate-persist:new",
+                    candidate_id="jargon-candidate-1",
+                    candidate_revision=4,
+                    candidate_persistence_id="candidate-persist:new",
+                )
+                stored = await store.get_canonical(
+                    current.memory_ids[0], include_inactive=True
+                )
+                before = dict(stored.metadata)
+                stale = await manager._save_jargons(
+                    "chat-1",
+                    [{**base, "meaning": "old meaning", "evidence_digest": "old-digest"}],
+                    mining_batch_id="candidate-persist:old",
+                    candidate_id="jargon-candidate-1",
+                    candidate_revision=2,
+                    candidate_persistence_id="candidate-persist:old",
+                )
+                after = await store.get_canonical(
+                    current.memory_ids[0], include_inactive=True
+                )
+
+                self.assertTrue(current.complete)
+                self.assertFalse(stale.complete)
+                self.assertEqual(stale.failures[0].failure_kind, "candidate_revision_conflict")
+                self.assertTrue(stale.failures[0].retryable)
+                self.assertEqual(after.metadata, before)
+
+        asyncio.run(_run())
+
+    def test_concurrent_first_candidate_write_is_globally_idempotent(self):
+        async def _run():
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+                for round_index in range(30):
+                    round_dir = Path(temp_dir) / f"round-{round_index}"
+                    round_dir.mkdir()
+                    db_path = str(round_dir / "memory.db")
+                    candidate_id = f"candidate-concurrent-{round_index}"
+                    persistence_id = f"candidate-persist:concurrent-{round_index}"
+                    first_store = MemoryV2Store(db_path, data_path=round_dir)
+                    second_store = MemoryV2Store(db_path, data_path=round_dir)
+                    first = ExpressionPatternService(
+                        first_store, MemoryWriteService(first_store)
+                    )
+                    second = ExpressionPatternService(
+                        second_store, MemoryWriteService(second_store)
+                    )
+                    payload = {
+                        **_candidate(candidate_id, count=2),
+                        "mining_batch_id": persistence_id,
+                        "candidate_revision": 1,
+                        "source_message_ids": ["m-1", "m-2"],
+                        "evidence_digest": "concurrent-digest",
+                    }
+
+                    memory_ids = await asyncio.gather(
+                        first.write_pattern("chat-1", payload),
+                        second.write_pattern("chat-1", payload),
+                    )
+
+                    self.assertEqual(memory_ids[0], memory_ids[1])
+                    with sqlite3.connect(db_path) as db:
+                        canonical_count = db.execute(
+                            "SELECT COUNT(*) FROM canonical_memories WHERE dedup_key <> ''"
+                        ).fetchone()[0]
+                        fence = db.execute(
+                            """
+                            SELECT revision, persistence_id, canonical_memory_id
+                            FROM memory_candidate_revision_fence
+                            WHERE candidate_id = ?
+                            """,
+                            (candidate_id,),
+                        ).fetchone()
+                    self.assertEqual(canonical_count, 1)
+                    self.assertEqual(
+                        fence,
+                        (1, persistence_id, memory_ids[0]),
+                    )
+
+        asyncio.run(_run())
+
+    def test_v2_candidate_fence_backfill_rejects_ambiguous_highest_revision(self):
+        async def _run():
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+                db_path = str(Path(temp_dir) / "memory.db")
+                store = MemoryV2Store(db_path, data_path=Path(temp_dir))
+                service = ExpressionPatternService(store, MemoryWriteService(store))
+                first_id = await service.write_pattern(
+                    "chat-1",
+                    {
+                        **_candidate("candidate-a", count=2),
+                        "expression": "canonical a",
+                        "mining_batch_id": "persist-a",
+                        "candidate_revision": 1,
+                    },
+                )
+                second_id = await service.write_pattern(
+                    "chat-1",
+                    {
+                        **_candidate("candidate-b", count=2),
+                        "expression": "canonical b",
+                        "mining_batch_id": "persist-b",
+                        "candidate_revision": 1,
+                    },
+                )
+                with sqlite3.connect(db_path) as db:
+                    for memory_id, persistence_id in (
+                        (first_id, "persist-a"),
+                        (second_id, "persist-b"),
+                    ):
+                        metadata = json.loads(
+                            db.execute(
+                                "SELECT metadata FROM canonical_memories WHERE id = ?",
+                                (memory_id,),
+                            ).fetchone()[0]
+                        )
+                        metadata.update(
+                            {
+                                "candidate_id": "candidate-conflict",
+                                "candidate_revision": 7,
+                                "candidate_persistence_id": persistence_id,
+                                "candidate_revision_fences": {
+                                    "candidate-conflict": {
+                                        "revision": 7,
+                                        "persistence_id": persistence_id,
+                                    }
+                                },
+                            }
+                        )
+                        db.execute(
+                            "UPDATE canonical_memories SET metadata = ? WHERE id = ?",
+                            (json.dumps(metadata), memory_id),
+                        )
+                    db.execute("DROP TABLE memory_candidate_revision_fence")
+                    db.execute(
+                        "UPDATE memory_v2_meta SET value = '2' "
+                        "WHERE key = 'schema_version'"
+                    )
+                    db.execute(
+                        "DELETE FROM memory_v2_migrations WHERE version = '3'"
+                    )
+                    db.commit()
+
+                recovered_store = MemoryV2Store(
+                    db_path, data_path=Path(temp_dir)
+                )
+                with self.assertRaisesRegex(
+                    RuntimeError, "candidate_fence_backfill_conflict"
+                ):
+                    await recovered_store.initialize()
+
+                with sqlite3.connect(db_path) as db:
+                    schema_version = db.execute(
+                        "SELECT value FROM memory_v2_meta "
+                        "WHERE key = 'schema_version'"
+                    ).fetchone()[0]
+                    migration_v3 = db.execute(
+                        "SELECT status FROM memory_v2_migrations WHERE version = '3'"
+                    ).fetchone()
+                    canonical_rows = db.execute(
+                        "SELECT id, status FROM canonical_memories ORDER BY id"
+                    ).fetchall()
+                    fence_table = db.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type = 'table' "
+                        "AND name = 'memory_candidate_revision_fence'"
+                    ).fetchone()
+
+                self.assertEqual(schema_version, "2")
+                self.assertIsNone(migration_v3)
+                self.assertIsNone(fence_table)
+                self.assertEqual(
+                    {row[0] for row in canonical_rows}, {first_id, second_id}
+                )
+                self.assertEqual(
+                    {row[1] for row in canonical_rows}, {"review_pending"}
+                )
+
+        asyncio.run(_run())
+
+    def test_candidate_revision_fence_rejects_stale_cross_key_and_migrates_newer(self):
+        async def _run():
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+                db_path = str(Path(temp_dir) / "memory.db")
+                store = MemoryV2Store(db_path, data_path=Path(temp_dir))
+                service = ExpressionPatternService(store, MemoryWriteService(store))
+                current_payload = {
+                    **_candidate("candidate-cross-key", count=2),
+                    "expression": "new canonical form",
+                    "mining_batch_id": "candidate-persist:new-key",
+                    "candidate_revision": 5,
+                    "source_message_ids": ["m-1", "m-2"],
+                    "evidence_digest": "new-key-digest",
+                }
+                stale_payload = {
+                    **_candidate("candidate-cross-key", count=1),
+                    "expression": "old canonical form",
+                    "mining_batch_id": "candidate-persist:old-key",
+                    "candidate_revision": 2,
+                    "source_message_ids": ["m-1"],
+                    "evidence_digest": "old-key-digest",
+                }
+
+                current_id = await service.write_pattern("chat-1", current_payload)
+                with sqlite3.connect(db_path) as db:
+                    db.execute(
+                        "DELETE FROM memory_candidate_revision_fence "
+                        "WHERE candidate_id = 'candidate-cross-key'"
+                    )
+                    db.execute(
+                        "UPDATE memory_v2_meta SET value = '2' "
+                        "WHERE key = 'schema_version'"
+                    )
+                    db.commit()
+                recovered_store = MemoryV2Store(
+                    db_path, data_path=Path(temp_dir)
+                )
+                service = ExpressionPatternService(
+                    recovered_store, MemoryWriteService(recovered_store)
+                )
+                with self.assertRaisesRegex(
+                    RuntimeError, "candidate_revision_conflict"
+                ):
+                    await service.write_pattern(
+                        "chat-1", {**stale_payload, "candidate_revision": 5}
+                    )
+                with self.assertRaisesRegex(
+                    RuntimeError, "candidate_revision_conflict"
+                ):
+                    await service.write_pattern("chat-1", stale_payload)
+                migrated_id = await service.write_pattern(
+                    "chat-1",
+                    {
+                        **stale_payload,
+                        "candidate_revision": 6,
+                        "mining_batch_id": "candidate-persist:migrated-key",
+                        "candidate_persistence_id": "candidate-persist:migrated-key",
+                    },
+                )
+
+                self.assertNotEqual(migrated_id, current_id)
+                with sqlite3.connect(db_path) as db:
+                    rows = db.execute(
+                        """
+                        SELECT id, status, superseded_by
+                        FROM canonical_memories
+                        ORDER BY id
+                        """
+                    ).fetchall()
+                    fence = db.execute(
+                        """
+                        SELECT revision, persistence_id, canonical_memory_id, dedup_key
+                        FROM memory_candidate_revision_fence
+                        WHERE candidate_id = 'candidate-cross-key'
+                        """
+                    ).fetchone()
+                self.assertEqual(len(rows), 2)
+                self.assertEqual(
+                    [row for row in rows if row[1] != "superseded"],
+                    [(migrated_id, "review_pending", "")],
+                )
+                self.assertIn((current_id, "superseded", migrated_id), rows)
+                self.assertEqual(fence[:3], (6, "candidate-persist:migrated-key", migrated_id))
+
+        asyncio.run(_run())
 
     def test_automatic_duplicate_does_not_downgrade_human_approval(self):
         store = _Store()

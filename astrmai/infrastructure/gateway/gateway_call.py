@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import time
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -9,7 +10,12 @@ import uuid
 from astrbot.api import logger
 
 from ..context_economy import WorkloadPolicy
-from ..runtime.runtime_contracts import FailureKind, LLMCallDiagnostics, LLMCallResult
+from ..runtime.runtime_contracts import (
+    FailureKind,
+    LLMCallDiagnostics,
+    LLMCallResult,
+    ProviderRequestStartContext,
+)
 from ..runtime.turn_call_ledger import (
     begin_llm_call,
     begin_stage,
@@ -18,7 +24,11 @@ from ..runtime.turn_call_ledger import (
     finish_stage,
     record_llm_attempt,
 )
-from .gateway_exceptions import GatewayQueueTimeout, LLMCascadeFailureException
+from .gateway_exceptions import (
+    GatewayQueueTimeout,
+    LLMCascadeFailureException,
+    ProviderRequestStartRejected,
+)
 from .gateway_exceptions import GatewayShutdownRejected
 from .output_guard import find_internal_tool_name, internal_tool_name_fingerprint, validate_visible_output_text
 from ..runtime.outbound_send_guard import provider_request_allowed
@@ -499,6 +509,7 @@ class GatewayCallMixin:
         propagate_queue_timeout_status: bool = True,
         hard_deadline_monotonic: float | None = None,
         selected_model_id: str = "",
+        on_provider_request_start: Optional[Callable[[ProviderRequestStartContext], Any]] = None,
     ) -> LLMCallResult:
         # OPT-08/RT-11: 记录信号量排队时长（skipped 轮 judge elapsed 51.7s vs
         # attempt 数秒的差值即排队）；G7 起按 critical_path 分流配额
@@ -676,6 +687,53 @@ class GatewayCallMixin:
                                 ),
                             ):
                                 self._assert_provider_request_allowed(event)
+                                if on_provider_request_start is not None:
+                                    start_context = ProviderRequestStartContext(
+                                        gateway_call_id=call_timing.gateway_call_id,
+                                        provider_id=call_timing.provider_id,
+                                        provider_family=call_timing.provider_family,
+                                        model_id=call_timing.model_id,
+                                        identity_source=call_timing.identity_source,
+                                        fallback_used=call_timing.fallback_used,
+                                        started_at=time.time(),
+                                    )
+                                    try:
+                                        hook_result = on_provider_request_start(start_context)
+                                        if inspect.isawaitable(hook_result):
+                                            hook_result = await hook_result
+                                    except ProviderRequestStartRejected:
+                                        raise
+                                    except Exception as exc:
+                                        raise ProviderRequestStartRejected(
+                                            failure_stage="persistence",
+                                            failure_kind=(
+                                                "persist_locked"
+                                                if "locked" in str(exc).lower()
+                                                else "dependency_unavailable"
+                                            ),
+                                        ) from exc
+                                    if hook_result is False or (
+                                        hasattr(hook_result, "applied")
+                                        and not bool(getattr(hook_result, "applied"))
+                                    ):
+                                        raise ProviderRequestStartRejected(
+                                            failure_stage=str(
+                                                getattr(
+                                                    hook_result,
+                                                    "failure_stage",
+                                                    "provider_start_fence",
+                                                )
+                                                or "provider_start_fence"
+                                            ),
+                                            failure_kind=str(
+                                                getattr(
+                                                    hook_result,
+                                                    "failure_kind",
+                                                    "cas_conflict",
+                                                )
+                                                or "cas_conflict"
+                                            ),
+                                        )
                                 provider_request_started = True
                                 provider_request_count += 1
                                 call_timing.provider_request_started = True
@@ -704,6 +762,18 @@ class GatewayCallMixin:
                                 )
                                 if not call_timing.provider_request_id:
                                     call_timing.identity_source = "chat_provider_id;request_id_unavailable"
+                    except ProviderRequestStartRejected as exc:
+                        exc.call_diagnostics = call_timing.diagnostics()
+                        if owns_ledger_call:
+                            finish_llm_call(
+                                event,
+                                ledger_call_id,
+                                status="error",
+                                model=model_id,
+                                error_kind=exc.failure_kind,
+                                error=exc.failure_stage,
+                            )
+                        raise
                     except GatewayQueueTimeout as exc:
                         setattr(exc, "call_diagnostics", call_timing.diagnostics())
                         if owns_ledger_call:

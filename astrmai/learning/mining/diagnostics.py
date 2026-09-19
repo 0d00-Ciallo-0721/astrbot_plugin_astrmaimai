@@ -17,10 +17,15 @@ _STATUSES = {
 }
 _FAILURE_KINDS = {
     "", "insufficient_context", "provider_timeout", "provider_error",
-    "invalid_schema", "persist_empty_id", "persist_locked", "persist_error",
+    "provider_unavailable", "provider_identity_mismatch", "circuit_open",
+    "circuit_settlement_conflict", "invalid_schema", "invalid_response",
+    "partial_response", "json_decode_error", "empty_response",
+    "persist_empty_id", "empty_persistence_id", "persistence_partial",
+    "persist_locked", "persist_error", "retry_exhausted", "lease_expired",
     "validation_error", "dependency_unavailable", "cursor_commit_conflict",
     "cursor_commit_error", "cancelled", "shutdown", "unknown_error",
-    "unknown_status", "cursor_regression", "cursor_out_of_scope",
+    "shutdown_rejected", "unknown_status", "cursor_regression",
+    "cursor_out_of_scope",
 }
 _SECRET = re.compile(r"(?i)(?:bearer\s+|token|secret|api[_-]?key|password|cookie)[^\s,;]*")
 

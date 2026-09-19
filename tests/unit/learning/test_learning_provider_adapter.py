@@ -8,6 +8,7 @@ from astrmai.infrastructure.gateway.gateway_exceptions import (
     GatewayQueueTimeout,
     GatewayShutdownRejected,
     LLMCascadeFailureException,
+    ProviderRequestStartRejected,
 )
 from astrmai.infrastructure.runtime.background_task_budget import BackgroundTaskQueueFull
 from astrmai.infrastructure.runtime.runtime_contracts import (
@@ -90,9 +91,27 @@ class _Gateway:
 
     async def call_data_process_task_result(self, **kwargs):
         self.kwargs = kwargs
-        self.order.extend(["B", "G", "Provider"])
+        self.order.extend(["B", "G"])
         if self.error is not None:
             raise self.error
+        hook = kwargs.get("on_provider_request_start")
+        if hook is not None:
+            hook_result = await hook(
+                LLMProviderSelection(
+                    provider_id=self.selected_model,
+                    provider_family="native_chat",
+                    model_id=self.selected_model,
+                    identity_source="chat_provider_id",
+                )
+            )
+            if hook_result is False or getattr(hook_result, "applied", True) is False:
+                raise ProviderRequestStartRejected(
+                    failure_stage=getattr(
+                        hook_result, "failure_stage", "provider_start_fence"
+                    ),
+                    failure_kind=getattr(hook_result, "failure_kind", "cas_conflict"),
+                )
+        self.order.append("Provider")
         return self.result
 
 
@@ -212,6 +231,78 @@ async def test_adapter_acquires_l_r_b_g_once_and_uses_single_provider_attempt():
     assert gateway.kwargs["lane_key"].subsystem == "bg"
     assert gateway.kwargs["lane_key"].task_family == TASK
     assert gateway.kwargs["lane_key"].scope_kind == "chat"
+
+
+@pytest.mark.asyncio
+async def test_adapter_propagates_candidate_attempt_and_provider_start_fence():
+    order = []
+    gateway = _Gateway(order, result=_success_result())
+    adapter = LearningProviderCallAdapter(
+        learning_lane=_Lane(order),
+        runtime_budget=_RuntimeBudget(order),
+        gateway=gateway,
+    )
+    seen = []
+
+    async def _mark_started(identity):
+        seen.append(identity.model_id)
+        return True
+
+    result = await adapter.call(
+        task_name=TASK,
+        scope_id="chat-1",
+        prompt="prompt",
+        work_attempt_id="attempt-1",
+        candidate_work_attempt=3,
+        on_provider_request_start=_mark_started,
+    )
+
+    assert result.ok is True
+    assert result.work_attempt_id == "attempt-1"
+    assert result.candidate_work_attempt == 3
+    assert result.provider_attempt == 1
+    assert seen == ["provider/model-a"]
+    assert order == ["L", "R", "B", "G", "Provider"]
+
+
+@pytest.mark.asyncio
+async def test_adapter_maps_provider_start_fence_rejection_without_provider_attempt():
+    order = []
+    gateway = _Gateway(order, result=_success_result())
+    adapter = LearningProviderCallAdapter(
+        learning_lane=_Lane(order),
+        runtime_budget=_RuntimeBudget(order),
+        gateway=gateway,
+    )
+
+    async def _reject(_identity):
+        return type(
+            "Rejected",
+            (),
+            {
+                "applied": False,
+                "failure_stage": "provider_start_fence",
+                "failure_kind": "cas_conflict",
+            },
+        )()
+
+    result = await adapter.call(
+        task_name=TASK,
+        scope_id="chat-1",
+        prompt="prompt",
+        work_attempt_id="attempt-1",
+        candidate_work_attempt=2,
+        on_provider_request_start=_reject,
+    )
+
+    assert result.ok is False
+    assert result.failure_stage == "provider_start_fence"
+    assert result.failure_kind == "cas_conflict"
+    assert result.retryable is True
+    assert result.candidate_work_attempt == 2
+    assert result.provider_attempt == 0
+    assert result.provider_request_started is False
+    assert order == ["L", "R", "B", "G"]
 
 
 @pytest.mark.asyncio

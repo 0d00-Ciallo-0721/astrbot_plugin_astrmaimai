@@ -86,6 +86,17 @@ class LLMProviderSelection:
     pool_name: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class ProviderRequestStartContext:
+    gateway_call_id: str
+    provider_id: str
+    provider_family: str
+    model_id: str
+    identity_source: str
+    fallback_used: bool
+    started_at: float
+
+
 @dataclass
 class LLMCallResult:
     ok: bool
@@ -114,6 +125,7 @@ __all__ = [
     "LLMCallDiagnostics",
     "LLMCallResult",
     "LLMProviderSelection",
+    "ProviderRequestStartContext",
     "LaneRuntimeSettings",
     "OutboundPolicy",
     "PromptEnvelope",

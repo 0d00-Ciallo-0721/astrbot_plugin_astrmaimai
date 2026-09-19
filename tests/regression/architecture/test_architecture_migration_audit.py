@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 
 import aiosqlite
 
@@ -458,3 +459,169 @@ def test_context_architecture_migrations_upgrade_v36_and_are_idempotent():
     ).fetchone()
     assert state == (900.0, 900.0, 1200.0)
     db.close()
+
+
+def _learning_l1_shape(db: sqlite3.Connection) -> tuple[set[str], set[str]]:
+    tables = {
+        str(row[0])
+        for row in db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    indexes = {
+        str(row[0])
+        for row in db.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+        ).fetchall()
+    }
+    return tables, indexes
+
+
+def _create_v146_learning_schema(db: sqlite3.Connection) -> None:
+    for version, ddl in _MIGRATIONS:
+        if version in (145, 146):
+            db.execute(ddl)
+    db.execute("PRAGMA user_version = 146")
+
+
+def test_learning_l1_migration_upgrades_v146_with_required_contract(tmp_path):
+    path = tmp_path / "astrmai-v146.db"
+    with sqlite3.connect(path) as db:
+        db.execute("PRAGMA foreign_keys = ON")
+        _create_v146_learning_schema(db)
+        _run_migrations(db)
+        db.commit()
+        tables, indexes = _learning_l1_shape(db)
+        source_columns = {
+            str(row[1])
+            for row in db.execute("PRAGMA table_info(learning_source_batch)")
+        }
+        candidate_columns = {
+            str(row[1])
+            for row in db.execute("PRAGMA table_info(learning_candidate)")
+        }
+        attempt_columns = {
+            str(row[1])
+            for row in db.execute("PRAGMA table_info(learning_candidate_attempt)")
+        }
+        evidence_fks = {
+            str(row[2])
+            for row in db.execute("PRAGMA foreign_key_list(learning_candidate_evidence)")
+        }
+        integrity = db.execute("PRAGMA integrity_check").fetchone()
+        foreign_keys = db.execute("PRAGMA foreign_key_check").fetchall()
+        version = int(db.execute("PRAGMA user_version").fetchone()[0])
+
+    assert version == LATEST_ARCHITECTURE_SCHEMA_VERSION
+    assert {
+        "learning_source_batch",
+        "learning_candidate",
+        "learning_candidate_evidence",
+        "learning_candidate_attempt",
+        "learning_stage_diagnostic",
+    } <= tables
+    assert "source_dispositions_json" in source_columns
+    assert {
+        "revision", "attempt", "lease_owner", "lease_token", "lease_until",
+        "next_retry_at", "source_payload_json", "enrichment_payload_json",
+    } <= candidate_columns
+    assert {
+        "candidate_work_attempt", "provider_attempt", "provider_request_started",
+        "result_digest", "settlement_payload_json",
+    } <= attempt_columns
+    assert {"learning_source_batch", "learning_candidate"} <= evidence_fks
+    assert {
+        "ix_learning_candidate_due",
+        "ix_learning_candidate_scope",
+        "ix_learning_candidate_fingerprint",
+        "ix_learning_source_batch_prefix",
+        "ix_learning_attempt_due",
+        "ix_learning_diagnostic_run",
+        "ix_learning_circuit_due",
+    } <= indexes
+    assert integrity == ("ok",)
+    assert foreign_keys == []
+
+
+def test_learning_l1_migration_from_v129_is_repeatable_and_audit_ready(tmp_path):
+    path = tmp_path / "astrmai-v129.db"
+    with sqlite3.connect(path) as db:
+        db.execute("PRAGMA user_version = 129")
+        _run_migrations(db)
+        db.commit()
+        first_dump = "\n".join(db.iterdump())
+        _run_migrations(db)
+        db.commit()
+        second_dump = "\n".join(db.iterdump())
+        report = inspect_architecture_migration(db)
+
+    assert first_dump == second_dump
+    assert report.ready is False  # unrelated legacy architecture tables are absent
+    assert not {
+        "learning_source_batch",
+        "learning_candidate",
+        "learning_candidate_evidence",
+        "learning_candidate_attempt",
+        "learning_stage_diagnostic",
+    }.intersection(report.missing_tables)
+
+
+def test_learning_l1_async_migration_from_v146(tmp_path):
+    path = tmp_path / "astrmai-v146-async.db"
+
+    async def run():
+        async with aiosqlite.connect(path) as db:
+            for version, ddl in _MIGRATIONS:
+                if version in (145, 146):
+                    await db.execute(ddl)
+            await db.execute("PRAGMA user_version = 146")
+            await _run_migrations_async(db)
+            await db.commit()
+            cursor = await db.execute("PRAGMA user_version")
+            version = int((await cursor.fetchone())[0])
+            await cursor.close()
+            cursor = await db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name LIKE 'learning_%'"
+            )
+            tables = {str(row[0]) for row in await cursor.fetchall()}
+            await cursor.close()
+            return version, tables
+
+    version, tables = asyncio.run(run())
+    assert version == LATEST_ARCHITECTURE_SCHEMA_VERSION
+    assert "learning_candidate_attempt" in tables
+
+
+def test_learning_l1_two_initializers_converge(tmp_path):
+    path = tmp_path / "astrmai-concurrent.db"
+    with sqlite3.connect(path) as db:
+        _create_v146_learning_schema(db)
+        db.commit()
+
+    def migrate() -> int:
+        with sqlite3.connect(path, timeout=30.0) as db:
+            db.execute("PRAGMA busy_timeout=30000")
+            _run_migrations(db)
+            db.commit()
+            return int(db.execute("PRAGMA user_version").fetchone()[0])
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        versions = list(pool.map(lambda _index: migrate(), range(2)))
+
+    assert versions == [LATEST_ARCHITECTURE_SCHEMA_VERSION] * 2
+    with sqlite3.connect(path) as db:
+        assert db.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_learning_l1_audit_fails_closed_when_required_table_is_missing(tmp_path):
+    path = tmp_path / "astrmai-incomplete.db"
+    with sqlite3.connect(path) as db:
+        _create_current_schema(db)
+        db.execute("DROP TABLE learning_candidate_attempt")
+        db.commit()
+        report = inspect_architecture_migration(db)
+
+    assert report.ready is False
+    assert "learning_candidate_attempt" in report.missing_tables

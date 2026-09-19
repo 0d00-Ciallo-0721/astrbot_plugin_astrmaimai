@@ -4,6 +4,9 @@ import sqlite3
 import aiosqlite
 import pytest
 
+from astrmai.infrastructure.persistence.architecture_migration_audit import (
+    LATEST_ARCHITECTURE_SCHEMA_VERSION,
+)
 from astrmai.infrastructure.persistence.persistence_schema import (
     _run_migrations,
     _run_migrations_async,
@@ -23,7 +26,7 @@ def circuit_store(tmp_path):
     return LearningProviderCircuitStore(db_path)
 
 
-def test_provider_circuit_migration_is_additive_and_reaches_v146(tmp_path):
+def test_provider_circuit_migration_is_additive_and_reaches_latest(tmp_path):
     db_path = tmp_path / "migration.db"
     with sqlite3.connect(db_path) as db:
         db.execute("PRAGMA user_version = 144")
@@ -40,14 +43,14 @@ def test_provider_circuit_migration_is_additive_and_reaches_v146(tmp_path):
             "SELECT name FROM sqlite_master WHERE type='table' "
             "AND name='learning_provider_circuit_settlement'"
         ).fetchone()
-    assert version == 146
+    assert version == LATEST_ARCHITECTURE_SCHEMA_VERSION
     assert table == ("learning_provider_circuit",)
     assert settlement_table == ("learning_provider_circuit_settlement",)
     assert {"provider_key", "task_family", "revision", "half_open_token"} <= columns
 
 
 @pytest.mark.asyncio
-async def test_provider_circuit_async_migration_reaches_v146(tmp_path):
+async def test_provider_circuit_async_migration_reaches_latest(tmp_path):
     db_path = tmp_path / "migration-async.db"
     async with aiosqlite.connect(db_path) as db:
         await db.execute("PRAGMA user_version = 144")
@@ -66,7 +69,7 @@ async def test_provider_circuit_async_migration_reaches_v146(tmp_path):
         settlement_table = await cursor.fetchone()
         await cursor.close()
 
-    assert version_row == (146,)
+    assert version_row == (LATEST_ARCHITECTURE_SCHEMA_VERSION,)
     assert settlement_table == ("learning_provider_circuit_settlement",)
     assert {"provider_key", "task_family", "revision", "half_open_token"} <= columns
 

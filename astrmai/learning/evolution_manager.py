@@ -20,6 +20,7 @@ from ..infrastructure.runtime.background_task_budget import (
 from ..infrastructure.runtime.lane_manager import LaneKey
 from ..infrastructure.gateway.json_utils import parse_json_contract, parse_json_payload
 from ..memory.contracts.memory_query import MemoryWriteRequest
+from ..memory.services.memory_write_service import CanonicalRevisionConflict
 from .contracts.learning_events import (
     BotReplyRecordedEvent,
     MiningCompletedEvent,
@@ -40,6 +41,14 @@ from .mining.learning_evidence import merge_evidence_metadata
 from .mining.learning_input_policy import LearningMessageView
 from .mining.jargon_senses import merge_jargon_senses
 from .persistence.provider_circuit_store import LearningProviderCircuitStore
+from .persistence.candidate_ledger import (
+    CandidateEvidence,
+    CandidateLedger,
+    LearningCandidate,
+    LearningSourceBatch,
+    SourceDisposition,
+)
+from .runtime.enrichment_worker import LearningEnrichmentWorker
 from .runtime.learning_lane import LearningLaneBudget, LearningLaneConfig
 from .runtime.provider_adapter import LearningProviderCallAdapter
 
@@ -142,6 +151,7 @@ class EvolutionManager:
             gateway=self.gateway,
             circuit_store=self.provider_circuit_store,
         )
+        self.candidate_ledger = CandidateLedger(db_path) if db_path else None
         self.expression_miner = ExpressionMiner(
             gateway,
             self.config,
@@ -155,6 +165,27 @@ class EvolutionManager:
             background_task_budget=self.background_task_budget,
             provider_adapter=self.provider_adapter,
         )
+        self.enrichment_worker = (
+            LearningEnrichmentWorker(
+                ledger=self.candidate_ledger,
+                expression_enricher=self.expression_miner.enricher,
+                jargon_enricher=self.jargon_miner.enricher,
+                save_patterns=self._save_patterns,
+                save_jargons=self._save_jargons,
+                max_attempts=int(
+                    getattr(
+                        self._evolution_config(),
+                        "learning_enrichment_max_attempts",
+                        3,
+                    )
+                    or 3
+                ),
+                claim_allowed=lambda: self._enrichment_worker_gate()[0],
+            )
+            if self.candidate_ledger is not None
+            else None
+        )
+        self._enrichment_worker_task: asyncio.Task | None = None
         self.recorder = MessageRecorder(
             window_seconds=getattr(self.config.evolution, "mining_window_sec", 60),
             min_messages=getattr(
@@ -263,6 +294,54 @@ class EvolutionManager:
 
     def _evolution_config(self):
         return getattr(self.config, "evolution", None)
+
+    def _candidate_ledger_enabled(self) -> bool:
+        return bool(
+            getattr(
+                self._evolution_config(),
+                "learning_candidate_ledger_enabled",
+                False,
+            )
+        )
+
+    def _enrichment_worker_enabled(self) -> bool:
+        return bool(
+            getattr(
+                self._evolution_config(),
+                "learning_enrichment_worker_enabled",
+                False,
+            )
+        )
+
+    def _discovery_cursor_v2_enabled(self) -> bool:
+        return bool(
+            getattr(
+                self._evolution_config(),
+                "learning_discovery_cursor_v2_enabled",
+                False,
+            )
+        )
+
+    def _enrichment_worker_gate(self) -> tuple[bool, str]:
+        requirements = (
+            (self._candidate_ledger_enabled(), "candidate_ledger_disabled"),
+            (self._discovery_cursor_v2_enabled(), "discovery_cursor_v2_disabled"),
+            (
+                bool(
+                    getattr(
+                        self._evolution_config(),
+                        "learning_enrichment_enabled",
+                        False,
+                    )
+                ),
+                "provider_enrichment_disabled",
+            ),
+            (self._enrichment_worker_enabled(), "enrichment_worker_disabled"),
+        )
+        for enabled, reason in requirements:
+            if not enabled:
+                return False, reason
+        return True, "ready"
 
     def _learning_lane_config(self) -> LearningLaneConfig:
         evolution = getattr(self.config, "evolution", None)
@@ -926,6 +1005,8 @@ class EvolutionManager:
         persist_run: bool = True,
         retained_count: int = 0,
         duration_ms: float = 0.0,
+        cursor_semantics: str | None = None,
+        pipeline_version: str | None = None,
     ) -> dict[str, Any]:
         expected_revision = int(checkpoint.get("revision", 0) or 0)
         expected_cursor = int(checkpoint.get("cursor_log_id", 0) or 0)
@@ -995,8 +1076,16 @@ class EvolutionManager:
                 failure_count=failure_count,
                 retry_at=retry_at,
                 last_error=last_error,
-                cursor_semantics=str(checkpoint.get("cursor_semantics") or "legacy_batch_atomic_v1"),
-                pipeline_version=str(checkpoint.get("pipeline_version") or f"{pipeline}-cursor-state-v1"),
+                cursor_semantics=str(
+                    cursor_semantics
+                    or checkpoint.get("cursor_semantics")
+                    or "legacy_batch_atomic_v1"
+                ),
+                pipeline_version=str(
+                    pipeline_version
+                    or checkpoint.get("pipeline_version")
+                    or f"{pipeline}-cursor-state-v1"
+                ),
                 cursor_upper_bound=(
                     max((int(self._field(item, "id", 0) or 0) for item in logs), default=expected_cursor)
                 ),
@@ -1419,6 +1508,9 @@ class EvolutionManager:
         *,
         mining_batch_id: str = "",
         source: str = "learning_expression_pattern",
+        candidate_id: str = "",
+        candidate_revision: int | None = None,
+        candidate_persistence_id: str = "",
     ) -> PatternSaveReport:
         report = PatternSaveReport(attempted=len(patterns or []))
         memory_engine = getattr(self.db, "memory_engine", None)
@@ -1463,7 +1555,9 @@ class EvolutionManager:
                         "summary": self._field(pattern, "summary", self._field(pattern, "expression", "")),
                         "confidence": float(self._field(pattern, "confidence", self._field(pattern, "activation_score", 0.65)) or 0.65),
                         "activation_score": float(self._field(pattern, "activation_score", 0.65) or 0.65),
-                        "candidate_id": self._field(pattern, "candidate_id", ""),
+                        "candidate_id": candidate_id or self._field(pattern, "candidate_id", ""),
+                        "candidate_revision": candidate_revision,
+                        "candidate_persistence_id": candidate_persistence_id or mining_batch_id,
                         "candidate_origin": self._field(pattern, "candidate_origin", "expression_miner"),
                         "classification": self._field(pattern, "classification", "expression"),
                         "classification_reason": self._field(pattern, "classification_reason", ""),
@@ -1496,6 +1590,10 @@ class EvolutionManager:
             except Exception as exc:
                 report.failed += 1
                 report.failures.append(f"{self._field(pattern, 'candidate_id', '') or expression[:24]}: {exc}")
+                if isinstance(exc, CanonicalRevisionConflict):
+                    report.failure_stage = "persistence"
+                    report.failure_kind = "candidate_revision_conflict"
+                    report.retryable = True
                 logger.warning(f"[Evolution-Expression] persistence failed: {exc}")
         return report
 
@@ -1505,6 +1603,9 @@ class EvolutionManager:
         jargons,
         *,
         mining_batch_id: str = "",
+        candidate_id: str = "",
+        candidate_revision: int | None = None,
+        candidate_persistence_id: str = "",
     ) -> JargonSaveReport:
         attempted = len(jargons or [])
         saved = 0
@@ -1530,14 +1631,16 @@ class EvolutionManager:
         requests: list[tuple[MemoryWriteRequest, Any, str, str]] = []
         store = getattr(memory_engine, "v2_store", None)
         for jargon in jargons:
-            candidate_id = str(self._field(jargon, "candidate_id", "") or "").strip()
+            item_candidate_id = str(
+                candidate_id or self._field(jargon, "candidate_id", "") or ""
+            ).strip()
             content_hash = str(self._field(jargon, "content_hash", "") or "").strip()
             observed_content = str(self._field(jargon, "content", "") or "").strip()
             content = str(self._field(jargon, "canonical_form", "") or observed_content).strip()
             if not content or not observed_content:
                 failed += 1
                 failures.append(PersistenceFailure(
-                    candidate_id=candidate_id, content_hash=content_hash,
+                    candidate_id=item_candidate_id, content_hash=content_hash,
                     failure_stage="persist", failure_kind="validation_error",
                     retryable=False, detail="content_missing",
                 ))
@@ -1561,7 +1664,16 @@ class EvolutionManager:
                 for item in (existing_metadata.get("applied_mining_batch_ids") or [])
                 if str(item or "").strip()
             ]
-            if mining_batch_id and mining_batch_id in applied_batches:
+            revision_bound = bool(
+                item_candidate_id
+                and candidate_revision is not None
+                and (candidate_persistence_id or mining_batch_id)
+            )
+            if (
+                mining_batch_id
+                and mining_batch_id in applied_batches
+                and not revision_bound
+            ):
                 existing_id = str(getattr(existing, "id", "") or "").strip()
                 if existing_id:
                     deduplicated += 1
@@ -1569,7 +1681,7 @@ class EvolutionManager:
                 else:
                     failed += 1
                     failures.append(PersistenceFailure(
-                        candidate_id=candidate_id, content_hash=content_hash,
+                        candidate_id=item_candidate_id, content_hash=content_hash,
                         failure_stage="persist", failure_kind="dedup_identity_missing",
                         retryable=False, detail="applied_batch_without_canonical_id",
                     ))
@@ -1718,26 +1830,44 @@ class EvolutionManager:
                         "applied_mining_batch_ids": list(
                             dict.fromkeys([*applied_batches, *([mining_batch_id] if mining_batch_id else [])])
                         )[-128:],
+                        "candidate_id": item_candidate_id,
+                        **(
+                            {
+                                "candidate_revision": int(candidate_revision),
+                                "candidate_persistence_id": (
+                                    candidate_persistence_id or mining_batch_id
+                                ),
+                            }
+                            if revision_bound
+                            else {}
+                        ),
                     },
                     dedup_key=dedup_key,
                     source_ref=f"learning_jargon:{normalize_jargon_term(content)}",
                     visibility=visibility,
                     status=status,
-                ), existing, candidate_id, content_hash
+                ), existing, item_candidate_id, content_hash
             ))
 
         for request, existing, candidate_id, content_hash in requests:
             try:
                 memory_id = await writer.write(request)
             except Exception as exc:
-                kind = "persist_locked" if "locked" in str(exc).lower() else (
-                    "validation_error" if isinstance(exc, (ValueError, TypeError)) else "persist_error"
+                kind = (
+                    "candidate_revision_conflict"
+                    if isinstance(exc, CanonicalRevisionConflict)
+                    else "persist_locked"
+                    if "locked" in str(exc).lower()
+                    else "validation_error"
+                    if isinstance(exc, (ValueError, TypeError))
+                    else "persist_error"
                 )
                 failed += 1
                 failures.append(PersistenceFailure(
                     candidate_id=candidate_id, content_hash=content_hash,
                     failure_stage="persist", failure_kind=kind,
-                    retryable=kind == "persist_locked", detail=str(exc)[:300],
+                    retryable=kind in {"persist_locked", "candidate_revision_conflict"},
+                    detail=str(exc)[:300],
                 ))
                 continue
             normalized_id = str(memory_id or "").strip()
@@ -2158,6 +2288,283 @@ class EvolutionManager:
             self._active_pipeline_tasks = max(0, self._active_pipeline_tasks - 1)
             self._pipeline_semaphore.release()
 
+    async def _write_candidate_discovery(
+        self,
+        *,
+        pipeline: str,
+        group_id: str,
+        logs: List["MessageLog"],
+        cursor_before: int,
+        run_id: str = "",
+    ) -> dict[str, Any]:
+        if self.candidate_ledger is None or not await self.candidate_ledger.schema_ready():
+            raise RuntimeError("candidate_ledger_schema_unavailable")
+        cursor_after, retained_count = self._next_pipeline_cursor(logs, pipeline)
+        source_logs = [
+            item
+            for item in logs
+            if cursor_before < int(self._field(item, "id", 0) or 0) <= cursor_after
+        ]
+        if not source_logs:
+            return {
+                "status": "waiting_for_evidence",
+                "reason": "no_durable_source_range",
+                "cursor_after": cursor_before,
+                "retained_count": len(logs),
+                "candidate_count": 0,
+            }
+        source_ids = tuple(
+            f"row:{int(self._field(item, 'id', 0) or 0)}" for item in source_logs
+        )
+        now = time.time()
+        batch = LearningSourceBatch.build(
+            pipeline_type=pipeline,
+            scope_id=str(group_id),
+            cursor_before=cursor_before,
+            cursor_after=cursor_after,
+            source_ids=source_ids,
+            created_at=now,
+        )
+        begun = await self.candidate_ledger.begin_source_batch(batch)
+        if begun.conflict:
+            raise RuntimeError("source_batch_conflict")
+
+        if pipeline == "expression":
+            normalized = self.expression_miner.input_policy.normalize(source_logs)
+            existing = await self.expression_miner._existing_patterns(group_id)
+            discovered = await self.expression_miner.candidate_extractor.extract(
+                group_id,
+                normalized,
+                existing_patterns=existing,
+            )
+            min_turns = self.expression_miner.expression_min_distinct_turns
+            discovered = [
+                item
+                for item in discovered
+                if int(
+                    item.get("distinct_turn_count")
+                    or len(item.get("source_message_ids") or ())
+                    or 0
+                )
+                >= min_turns
+            ]
+        else:
+            normalized = self.jargon_miner.input_policy.normalize(source_logs)
+            blocked = await self.jargon_miner._existing_expression_terms(group_id)
+            discovered = await self.jargon_miner.candidate_extractor.extract(
+                group_id,
+                normalized,
+                existing_terms={},
+                blocked_terms=blocked,
+            )
+
+        normalized_source_keys = {
+            f"row:{int(self._field(item, 'id', 0) or 0)}"
+            for item in normalized
+            if int(self._field(item, "id", 0) or 0) > 0
+        }
+        eligible_source_keys = {
+            f"row:{int(self._field(item, 'id', 0) or 0)}"
+            for item in normalized
+            if int(self._field(item, "id", 0) or 0) > 0
+            and bool(self._field(item, "learning_evidence_eligible", True))
+        }
+
+        aliases: dict[str, Any] = {}
+        source_key_by_object: dict[int, str] = {}
+        for item in source_logs:
+            row_id = int(self._field(item, "id", 0) or 0)
+            source_key_by_object[id(item)] = f"row:{row_id}"
+            for value in (
+                self._field(item, "event_id", ""),
+                self._field(item, "platform_message_id", ""),
+                row_id,
+            ):
+                text = str(value or "").strip()
+                if text:
+                    aliases[text] = item
+
+        candidate_ids_by_source: dict[str, list[str]] = {
+            source_id: [] for source_id in source_ids
+        }
+        inserted = deduplicated = evidence_count = 0
+        for raw in discovered:
+            payload = dict(raw or {})
+            fingerprint = hashlib.sha256(
+                json.dumps(
+                    {
+                        "pipeline": pipeline,
+                        "scope_id": group_id,
+                        "candidate_type": payload.get("candidate_type", ""),
+                        "identity": (
+                            payload.get("normalized_expression")
+                            if pipeline == "expression"
+                            else payload.get("canonical_form") or payload.get("content")
+                        ),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()
+            candidate = LearningCandidate.discovered(
+                first_discovered_batch_id=batch.batch_id,
+                scope_id=str(group_id),
+                candidate_family=pipeline,
+                candidate_subtype=str(payload.get("candidate_type") or ""),
+                speaker_id=str(payload.get("speaker_id") or ""),
+                speaker_scope_id=str(payload.get("speaker_scope_id") or ""),
+                fingerprint=f"sha256:{fingerprint}",
+                fingerprint_version=1,
+                extractor_version=f"{pipeline}-extractor-v1",
+                source_message_start=min(
+                    int(self._field(item, "id", 0) or 0) for item in source_logs
+                ),
+                source_message_end=max(
+                    int(self._field(item, "id", 0) or 0) for item in source_logs
+                ),
+                evidence_quality="direct",
+                source_payload=payload,
+                created_at=now,
+            )
+            evidence: list[CandidateEvidence] = []
+            for source_ref in payload.get("source_message_ids") or ():
+                log = aliases.get(str(source_ref))
+                if log is None:
+                    continue
+                row_id = int(self._field(log, "id", 0) or 0)
+                source_key = source_key_by_object[id(log)]
+                item = CandidateEvidence.source(
+                    candidate_id=candidate.candidate_id,
+                    batch_id=batch.batch_id,
+                    source_row_id=row_id,
+                    source_message_id=str(
+                        self._field(log, "platform_message_id", "") or source_ref
+                    ),
+                    identity_source="messagelog.id",
+                    sender_id=str(self._field(log, "sender_id", "") or ""),
+                    scope_id=str(group_id),
+                    speaker_scope_id=(
+                        f"{group_id}:{self._field(log, 'sender_id', '')}"
+                        if self._field(log, "sender_id", "")
+                        else ""
+                    ),
+                    source_type="user_said",
+                    evidence_quality="direct",
+                    eligible=True,
+                    eligibility_reason="learning_evidence_eligible",
+                    payload={
+                        "event_id": str(self._field(log, "event_id", "") or ""),
+                        "candidate_source": pipeline,
+                    },
+                    created_at=float(self._field(log, "timestamp", 0.0) or 0.0),
+                    event_id=str(self._field(log, "event_id", "") or "") or None,
+                    platform_message_id=(
+                        str(self._field(log, "platform_message_id", "") or "") or None
+                    ),
+                    topic_epoch=int(self._field(log, "topic_epoch", 0) or 0),
+                )
+                evidence.append(item)
+                candidate_ids_by_source[source_key].append(candidate.candidate_id)
+            result = await self.candidate_ledger.upsert_discovered(
+                LearningCandidate(
+                    **{
+                        **{
+                            field: getattr(candidate, field)
+                            for field in candidate.__dataclass_fields__
+                            if field != "evidence"
+                        },
+                        "evidence": tuple(evidence),
+                    }
+                )
+            )
+            if result.conflict:
+                raise RuntimeError(
+                    str(
+                        result.diagnostics.get("failure_kind")
+                        or "candidate_replay_conflict"
+                    )
+                )
+            if result.inserted and result.status != "enrichment_pending":
+                raise RuntimeError(
+                    str(
+                        result.diagnostics.get("failure_kind")
+                        or "source_evidence_incomplete"
+                    )
+                )
+            inserted += int(result.inserted)
+            deduplicated += int(result.deduplicated)
+            evidence_count += result.evidence_inserted
+
+        dispositions = tuple(
+            SourceDisposition.for_row(
+                int(source_key.split(":", 1)[1]),
+                candidate_ids=tuple(sorted(set(candidate_ids_by_source[source_key]))),
+                disposition=(
+                    "candidate_ids"
+                    if candidate_ids_by_source[source_key]
+                    else (
+                        "no_candidate"
+                        if source_key in eligible_source_keys
+                        else "skipped"
+                    )
+                ),
+                reason_code=(
+                    ""
+                    if candidate_ids_by_source[source_key]
+                    else (
+                        "no_candidate"
+                        if source_key in eligible_source_keys
+                        else (
+                            "ineligible_evidence"
+                            if source_key in normalized_source_keys
+                            else "input_policy_rejected"
+                        )
+                    )
+                ),
+            )
+            for source_key in source_ids
+        )
+        settled = await self.candidate_ledger.settle_source_batch(
+            batch.batch_id,
+            expected_revision=begun.revision,
+            dispositions=dispositions,
+            now=now,
+        )
+        if not settled.completed:
+            raise RuntimeError(
+                str(settled.diagnostics.get("failure_kind") or "source_batch_incomplete")
+            )
+        contiguous = await self.candidate_ledger.highest_contiguous_completed_cursor(
+            pipeline_type=pipeline,
+            scope_id=str(group_id),
+            cursor_before=cursor_before,
+        )
+        report = {
+            "status": "completed",
+            "reason": "discovery_durable",
+            "batch_id": batch.batch_id,
+            "cursor_after": contiguous,
+            "retained_count": retained_count,
+            "candidate_count": len(discovered),
+            "candidate_inserted": inserted,
+            "candidate_deduplicated": deduplicated,
+            "evidence_inserted": evidence_count,
+            "source_count": len(source_ids),
+            "cursor_semantics": "source_batch_contiguous_v2",
+            "pipeline_version": f"{pipeline}-discovery-v2",
+        }
+        await self.candidate_ledger.append_stage_diagnostic(
+            run_id=str(run_id or batch.batch_id),
+            candidate_id="",
+            stage="discover",
+            status="completed",
+            input_count=len(source_ids),
+            output_count=len(discovered),
+            diagnostics=report,
+            created_at=now,
+        )
+        return report
+
     async def _run_learning_pipeline_unlimited(
         self,
         pipeline: str,
@@ -2192,6 +2599,110 @@ class EvolutionManager:
         cursor_before = int(checkpoint.get("cursor_log_id", 0) or 0)
         failure_report: dict[str, Any] = {}
         try:
+            discovery_report: dict[str, Any] | None = None
+            if self._discovery_cursor_v2_enabled() and not self._candidate_ledger_enabled():
+                raise RuntimeError("discovery_cursor_v2_requires_candidate_ledger")
+            if self._candidate_ledger_enabled():
+                discovery_report = await _within_budget(
+                    self._write_candidate_discovery(
+                        pipeline=pipeline,
+                        group_id=group_id,
+                        logs=logs,
+                        cursor_before=cursor_before,
+                        run_id=run_id,
+                    )
+                )
+                failure_report = {"candidate_discovery": discovery_report}
+                if self._discovery_cursor_v2_enabled():
+                    discovery_status = str(discovery_report.get("status") or "blocked")
+                    discovery_cursor = int(
+                        discovery_report.get("cursor_after", cursor_before)
+                        or cursor_before
+                    )
+                    if discovery_status != "completed":
+                        settlement = await self._settle_pipeline_checkpoint(
+                            pipeline=pipeline,
+                            group_id=group_id,
+                            checkpoint=checkpoint,
+                            cursor_after=cursor_before,
+                            batch_id=str(discovery_report.get("batch_id") or batch_id),
+                            status="waiting_for_evidence",
+                            run_id=run_id,
+                            logs=logs,
+                            report=discovery_report,
+                            reason=str(
+                                discovery_report.get("reason")
+                                or "discovery_waiting_for_evidence"
+                            ),
+                            retained_count=int(
+                                discovery_report.get("retained_count", len(logs))
+                                or 0
+                            ),
+                            cursor_semantics="source_batch_contiguous_v2",
+                            pipeline_version=f"{pipeline}-discovery-v2",
+                        )
+                        if not settlement.get("committed", False):
+                            raise RuntimeError("cursor_commit_conflict")
+                        return await self._record_pipeline_state(
+                            run_id=run_id,
+                            pipeline=pipeline,
+                            group_id=group_id,
+                            logs=logs,
+                            batch_id=str(discovery_report.get("batch_id") or batch_id),
+                            status="waiting",
+                            reason=str(discovery_report.get("reason") or "waiting"),
+                            cursor_before=cursor_before,
+                            cursor_after=cursor_before,
+                            retained_count=int(
+                                discovery_report.get("retained_count", len(logs))
+                                or 0
+                            ),
+                            report=discovery_report,
+                            duration_ms=(time.perf_counter() - started) * 1000,
+                            persist_run=False,
+                        )
+                    commit_result = await self._settle_pipeline_checkpoint(
+                        pipeline=pipeline,
+                        group_id=group_id,
+                        checkpoint=checkpoint,
+                        cursor_after=discovery_cursor,
+                        batch_id=str(discovery_report["batch_id"]),
+                        status="completed",
+                        run_id=run_id,
+                        logs=logs,
+                        report={
+                            **discovery_report,
+                            "enrichment_status": "pending",
+                            "source_cursor_owner": "learning_source_batch",
+                        },
+                        reason="discovery_durable_enrichment_pending",
+                        retained_count=int(
+                            discovery_report.get("retained_count", 0) or 0
+                        ),
+                        duration_ms=(time.perf_counter() - started) * 1000,
+                        cursor_semantics="source_batch_contiguous_v2",
+                        pipeline_version=f"{pipeline}-discovery-v2",
+                    )
+                    if not commit_result.get("committed", False):
+                        raise RuntimeError("cursor_commit_conflict")
+                    self._pipeline_failure_counts.pop(failure_key, None)
+                    return await self._record_pipeline_state(
+                        run_id=run_id,
+                        pipeline=pipeline,
+                        group_id=group_id,
+                        logs=logs,
+                        batch_id=str(discovery_report["batch_id"]),
+                        status="completed",
+                        reason="discovery_durable_enrichment_pending",
+                        cursor_before=cursor_before,
+                        cursor_after=discovery_cursor,
+                        retained_count=int(
+                            discovery_report.get("retained_count", 0) or 0
+                        ),
+                        report=discovery_report,
+                        duration_ms=(time.perf_counter() - started) * 1000,
+                        persist_run=False,
+                    )
             if pipeline == "expression":
                 items = await _within_budget(self.expression_miner.mine(group_id, logs))
                 report = dict(getattr(self.expression_miner, "last_report", {}) or {})
@@ -2233,7 +2744,11 @@ class EvolutionManager:
                     terminal = False
                     retryable = True
                 persistence = await _within_budget(self._save_patterns(items, mining_batch_id=batch_id))
-                failure_report = {**report, "persistence": persistence.to_report()}
+                failure_report = {
+                    **({"candidate_discovery": discovery_report} if discovery_report else {}),
+                    **report,
+                    "persistence": persistence.to_report(),
+                }
                 if not terminal or not persistence.complete:
                     raise RuntimeError(
                         "expression_enrichment_incomplete"
@@ -2242,7 +2757,11 @@ class EvolutionManager:
                     )
                 saved_count = persistence.saved
                 deduplicated_count = persistence.deduplicated
-                extra_report = failure_report
+                extra_report = {
+                    **failure_report,
+                    **report,
+                    "persistence": persistence.to_report(),
+                }
             else:
                 if not getattr(getattr(self.db, "memory_engine", None), "write_service", None):
                     raise RuntimeError("jargon_write_service_unavailable")
@@ -2280,7 +2799,10 @@ class EvolutionManager:
                         persist_run=False,
                     )
                 enrichment = report.get("enrichment")
-                failure_report = report
+                failure_report = {
+                    **({"candidate_discovery": discovery_report} if discovery_report else {}),
+                    **report,
+                }
                 terminal = not isinstance(enrichment, dict) or bool(enrichment.get("terminal"))
                 if reason == "all_candidates_in_flight":
                     terminal = False
@@ -2308,8 +2830,16 @@ class EvolutionManager:
                     )
                 saved_count = persistence.saved
                 deduplicated_count = persistence.deduplicated
-                failure_report = {**report, "persistence": persistence.to_report()}
-                extra_report = failure_report
+                failure_report = {
+                    **({"candidate_discovery": discovery_report} if discovery_report else {}),
+                    **report,
+                    "persistence": persistence.to_report(),
+                }
+                extra_report = {
+                    **failure_report,
+                    **report,
+                    "persistence": persistence.to_report(),
+                }
                 if not persistence.complete:
                     raise RuntimeError(
                         "jargon_persistence_incomplete"
@@ -3080,6 +3610,13 @@ class EvolutionManager:
             logger.info("[Evolution-Backlog] backlog mining worker stopped")
             raise
 
+    async def _enrichment_worker_loop(self) -> None:
+        while self._enrichment_worker_gate()[0]:
+            await self.enrichment_worker.run_due_once(limit=10)
+            if not self._enrichment_worker_gate()[0]:
+                break
+            await asyncio.sleep(5.0)
+
     async def start_background_tasks(self) -> None:
         if self._task_ledger is not None:
             try:
@@ -3091,6 +3628,48 @@ class EvolutionManager:
                     )
             except Exception as exc:
                 logger.warning("[Evolution] background lease recovery degraded: %s", exc)
+        if self._enrichment_worker_enabled():
+            gate_ready, gate_reason = self._enrichment_worker_gate()
+            if not gate_ready:
+                logger.error(
+                    "[Evolution] enrichment worker blocked: %s",
+                    gate_reason,
+                )
+            elif (
+                self.enrichment_worker is None
+                or self.candidate_ledger is None
+                or not await self.candidate_ledger.schema_ready()
+            ):
+                logger.error(
+                    "[Evolution] enrichment worker blocked: candidate ledger schema unavailable"
+                )
+            else:
+                recovered = await self.candidate_ledger.recover_expired_enrichment(
+                    now=time.time()
+                )
+                if recovered:
+                    logger.info(
+                        "[Evolution] recovered expired candidate leases count=%s",
+                        recovered,
+                    )
+                if (
+                    self._enrichment_worker_task is None
+                    or self._enrichment_worker_task.done()
+                ):
+                    self._enrichment_worker_task = asyncio.create_task(
+                        self._enrichment_worker_loop(),
+                        name="astrmai-learning-enrichment-worker",
+                    )
+                    self._background_tasks.add(self._enrichment_worker_task)
+                    self._register_owner_task(
+                        self._enrichment_worker_task,
+                        task_family="learning.enrichment.worker",
+                        scope_id="GLOBAL",
+                        run_id=f"learning-enrichment-worker-{uuid.uuid4().hex[:12]}",
+                    )
+                    self._enrichment_worker_task.add_done_callback(
+                        self._handle_task_result
+                    )
         if self._backlog_task is None or self._backlog_task.done():
             self._backlog_task = asyncio.create_task(
                 self._backlog_mining_loop(),
@@ -3122,6 +3701,8 @@ class EvolutionManager:
 
     async def stop_background_tasks(self) -> None:
         self.learning_lane.begin_drain()
+        if self.enrichment_worker is not None:
+            self.enrichment_worker.begin_drain()
         self._mining_rerun_requested.clear()
         tasks = [
             task
@@ -3133,6 +3714,7 @@ class EvolutionManager:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._backlog_task = None
+        self._enrichment_worker_task = None
         self._ingest_worker = None
         self._ingest_processing.clear()
         await self.learning_lane.wait_until_idle(timeout_sec=1.0)

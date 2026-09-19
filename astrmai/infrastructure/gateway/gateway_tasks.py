@@ -365,6 +365,7 @@ class GatewayTaskMixin:
         reserve_for_reply: bool = False,
         hard_deadline_monotonic: float | None = None,
         selected_model_id: str = "",
+        on_provider_request_start=None,
     ) -> LLMCallResult:
         task_models = self._task_models()
         selected_model_id = str(selected_model_id or "").strip()
@@ -407,6 +408,7 @@ class GatewayTaskMixin:
                 propagate_queue_timeout_status=effective_propagate_queue_timeout,
                 hard_deadline_monotonic=hard_deadline_monotonic,
                 selected_model_id=selected_model_id,
+                on_provider_request_start=on_provider_request_start,
             )
             return result
         normalized_origin = str(base_origin or "").strip()
@@ -457,6 +459,7 @@ class GatewayTaskMixin:
             propagate_queue_timeout_status=effective_propagate_queue_timeout,
             hard_deadline_monotonic=hard_deadline_monotonic,
             selected_model_id=selected_model_id,
+            on_provider_request_start=on_provider_request_start,
         )
         return result
 

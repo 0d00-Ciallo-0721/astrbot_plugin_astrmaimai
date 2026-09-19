@@ -11,6 +11,12 @@ from .memory_admission_service import MemoryAdmissionService
 from .v2_store import MemoryV2Store
 
 
+class CanonicalRevisionConflict(RuntimeError):
+    def __init__(self, current_revision: int = 0):
+        self.current_revision = int(current_revision)
+        super().__init__("candidate_revision_conflict")
+
+
 class MemoryWriteService:
     _NOISY_TOKENS = ("traceback", "exception", "all chat models fail", "apitimesouterror")
     _ERROR_JSON_KEYS = frozenset({"error", "errors", "exception", "traceback", "stack", "stacktrace", "detail", "details"})
@@ -126,7 +132,20 @@ class MemoryWriteService:
             created_at=float(request.created_at or 0.0),
         )
         upsert_result = await self.store.upsert(normalized)
+        if bool(
+            getattr(upsert_result, "conflict", False)
+            or upsert_result.get("conflict", False)
+        ):
+            raise CanonicalRevisionConflict(
+                getattr(upsert_result, "current_candidate_revision", 0)
+                or upsert_result.get("current_candidate_revision", 0)
+            )
         memory_id = getattr(upsert_result, "memory_id", "") or str(upsert_result.get("memory_id") or "")
+        if bool(
+            getattr(upsert_result, "idempotent", False)
+            or upsert_result.get("idempotent", False)
+        ):
+            return memory_id
         superseded_old_ids = getattr(upsert_result, "superseded_old_ids", []) or list(upsert_result.get("superseded_old_ids") or [])
         new_record_is_superseded = bool(
             getattr(upsert_result, "new_record_is_superseded", False) or upsert_result.get("new_record_is_superseded", False)
@@ -150,4 +169,4 @@ class MemoryWriteService:
         return memory_id
 
 
-__all__ = ["MemoryWriteService"]
+__all__ = ["CanonicalRevisionConflict", "MemoryWriteService"]

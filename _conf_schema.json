@@ -1383,6 +1383,24 @@
         "maximum": 5,
         "hint": "由后续候选增强工作器执行；本阶段只冻结配置合同，不在适配器内自动重试。"
       },
+      "learning_candidate_ledger_enabled": {
+        "description": "启用学习候选持久账本",
+        "type": "bool",
+        "default": false,
+        "hint": "默认关闭。开启后以影子模式写入来源批次、候选与证据；单独开启不会改变旧游标。"
+      },
+      "learning_enrichment_worker_enabled": {
+        "description": "启用持久候选增强工作器",
+        "type": "bool",
+        "default": false,
+        "hint": "要求候选账本、第二版发现游标、模型服务增强与正式结构就绪检查全部通过；否则按失败关闭原则不启动。"
+      },
+      "learning_discovery_cursor_v2_enabled": {
+        "description": "启用来源批次发现游标第二版",
+        "type": "bool",
+        "default": false,
+        "hint": "仅在来源处置完整性证明成立后推进发现游标；不等待候选增强。"
+      },
       "learning_enrichment_circuit_window_sec": {
         "description": "学习模型服务熔断失败统计窗口（秒）",
         "type": "int",

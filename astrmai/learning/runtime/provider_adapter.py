@@ -6,12 +6,13 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from ...infrastructure.gateway.gateway_exceptions import (
     GatewayQueueTimeout,
     GatewayShutdownRejected,
     LLMCascadeFailureException,
+    ProviderRequestStartRejected,
 )
 from ...infrastructure.runtime.background_task_budget import (
     BackgroundTaskExecutionTimeout,
@@ -247,6 +248,7 @@ class LearningProviderCallAdapter:
         circuit_state: str = "closed",
         run_id: str = "",
         work_attempt_id: str = "",
+        candidate_work_attempt: int = 0,
         task_name: str = "",
         scope_id: str = "",
         selection: LLMProviderSelection | None = None,
@@ -281,6 +283,7 @@ class LearningProviderCallAdapter:
             value=value,
             run_id=run_id,
             work_attempt_id=work_attempt_id,
+            candidate_work_attempt=int(candidate_work_attempt or 0),
             task_name=task_name,
             scope_id=scope_id,
             provider_attempt=1 if diagnostics.provider_request_started else 0,
@@ -343,6 +346,7 @@ class LearningProviderCallAdapter:
         runtime_wait_ms: float,
         run_id: str,
         work_attempt_id: str,
+        candidate_work_attempt: int,
         task_name: str,
         scope_id: str,
         selection: LLMProviderSelection,
@@ -366,6 +370,7 @@ class LearningProviderCallAdapter:
             circuit_state=circuit.reason,
             run_id=run_id,
             work_attempt_id=work_attempt_id,
+            candidate_work_attempt=candidate_work_attempt,
             task_name=task_name,
             scope_id=scope_id,
             selection=selection,
@@ -423,6 +428,8 @@ class LearningProviderCallAdapter:
         provider_timeout_sec: float = 45.0,
         run_id: str = "",
         work_attempt_id: str = "",
+        candidate_work_attempt: int = 0,
+        on_provider_request_start: Callable[[Any], Any] | None = None,
         candidate_id: str | None = None,
         config_revision: int = 0,
     ) -> LearningProviderAttemptResult:
@@ -450,6 +457,7 @@ class LearningProviderCallAdapter:
         result_context = {
             "run_id": request_run_id,
             "work_attempt_id": durable_work_attempt_id,
+            "candidate_work_attempt": int(candidate_work_attempt or 0),
             "task_name": task_name,
             "scope_id": str(scope_id),
             "selection": selection,
@@ -503,6 +511,7 @@ class LearningProviderCallAdapter:
                 reserve_for_reply=False,
                 hard_deadline_monotonic=hard_deadline,
                 selected_model_id=selection.model_id,
+                on_provider_request_start=on_provider_request_start,
             )
 
         async def _runtime_call() -> LLMCallResult:
@@ -555,6 +564,7 @@ class LearningProviderCallAdapter:
                     scope_id=str(scope_id),
                     selection=selection,
                     work_attempt_id=durable_work_attempt_id,
+                    candidate_work_attempt=int(candidate_work_attempt or 0),
                     settlement_root=settlement_root,
                 )
             settlement = None
@@ -600,6 +610,7 @@ class LearningProviderCallAdapter:
                     scope_id=str(scope_id),
                     selection=selection,
                     work_attempt_id=durable_work_attempt_id,
+                    candidate_work_attempt=int(candidate_work_attempt or 0),
                     settlement_root=settlement_root,
                 )
             settlement = None
@@ -639,6 +650,7 @@ class LearningProviderCallAdapter:
                 scope_id=str(scope_id),
                 selection=selection,
                 work_attempt_id=durable_work_attempt_id,
+                candidate_work_attempt=int(candidate_work_attempt or 0),
                 settlement_root=settlement_root,
             )
 
@@ -741,6 +753,7 @@ class LearningProviderCallAdapter:
                 str(scope_id),
                 selection,
                 durable_work_attempt_id,
+                int(candidate_work_attempt or 0),
                 settlement_root,
             )
         value = gateway_result.parsed_json if is_json else gateway_result.text
@@ -861,6 +874,7 @@ class LearningProviderCallAdapter:
         scope_id: str,
         selection: LLMProviderSelection,
         work_attempt_id: str,
+        candidate_work_attempt: int,
         settlement_root: str,
     ) -> LearningProviderAttemptResult:
         kind = getattr(result.error_kind, "value", str(result.error_kind or "unknown"))
@@ -883,6 +897,7 @@ class LearningProviderCallAdapter:
             scope_id=scope_id,
             selection=selection,
             work_attempt_id=work_attempt_id,
+            candidate_work_attempt=candidate_work_attempt,
             settlement_root=settlement_root,
         )
 
@@ -901,6 +916,7 @@ class LearningProviderCallAdapter:
         scope_id: str,
         selection: LLMProviderSelection,
         work_attempt_id: str,
+        candidate_work_attempt: int,
         settlement_root: str,
     ) -> LearningProviderAttemptResult:
         if isinstance(error, asyncio.CancelledError) and not isinstance(
@@ -939,6 +955,7 @@ class LearningProviderCallAdapter:
                     runtime_wait_ms=runtime_wait_ms,
                     run_id=run_id,
                     work_attempt_id=work_attempt_id,
+                    candidate_work_attempt=candidate_work_attempt,
                     task_name=task_name,
                     scope_id=scope_id,
                     selection=selection,
@@ -959,6 +976,7 @@ class LearningProviderCallAdapter:
                 extra=mismatch_details,
                 run_id=run_id,
                 work_attempt_id=work_attempt_id,
+                candidate_work_attempt=candidate_work_attempt,
                 task_name=task_name,
                 scope_id=scope_id,
                 selection=selection,
@@ -969,6 +987,10 @@ class LearningProviderCallAdapter:
         retryable = True
         if isinstance(error, GatewayShutdownRejected):
             failure_stage, failure_kind = "gateway_admission", "shutdown_rejected"
+        elif isinstance(error, ProviderRequestStartRejected):
+            failure_stage = error.failure_stage
+            failure_kind = error.failure_kind
+            retryable = failure_kind != "dependency_unavailable"
         elif lane_status in {"queue_full", "queue_timeout", "shutdown_rejected"}:
             failure_kind = lane_status
         elif isinstance(error, _RuntimeBudgetUnavailable):
@@ -1066,6 +1088,7 @@ class LearningProviderCallAdapter:
                 runtime_wait_ms=runtime_wait_ms,
                 run_id=run_id,
                 work_attempt_id=work_attempt_id,
+                candidate_work_attempt=candidate_work_attempt,
                 task_name=task_name,
                 scope_id=scope_id,
                 selection=selection,
@@ -1086,6 +1109,7 @@ class LearningProviderCallAdapter:
             extra={"error_type": type(error).__name__ if error is not None else ""},
             run_id=run_id,
             work_attempt_id=work_attempt_id,
+            candidate_work_attempt=candidate_work_attempt,
             task_name=task_name,
             scope_id=scope_id,
             selection=selection,

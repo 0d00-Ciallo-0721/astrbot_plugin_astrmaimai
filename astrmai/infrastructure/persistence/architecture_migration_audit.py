@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 
-LATEST_ARCHITECTURE_SCHEMA_VERSION = 146
+LATEST_ARCHITECTURE_SCHEMA_VERSION = 158
 
 MESSAGELOG_REQUIRED_COLUMNS = (
     "event_id",
@@ -64,6 +64,13 @@ REQUIRED_INDEXES = (
     "ix_dream_completion_outbox_lease",
     "ix_reply_commit_outbox_lease",
     "ix_memory_turn_ledger_lease",
+    "ix_learning_candidate_due",
+    "ix_learning_candidate_scope",
+    "ix_learning_candidate_fingerprint",
+    "ix_learning_source_batch_prefix",
+    "ix_learning_attempt_due",
+    "ix_learning_diagnostic_run",
+    "ix_learning_circuit_due",
 )
 
 
@@ -187,6 +194,11 @@ def inspect_architecture_migration(
         "diary_checkpoints",
         "learning_provider_circuit",
         "learning_provider_circuit_settlement",
+        "learning_source_batch",
+        "learning_candidate",
+        "learning_candidate_evidence",
+        "learning_candidate_attempt",
+        "learning_stage_diagnostic",
     )
     missing_tables = tuple(name for name in required_tables if name not in tables)
     table_row_counts = {
@@ -200,6 +212,43 @@ def inspect_architecture_migration(
         "chat_states": CHAT_STATE_REQUIRED_COLUMNS,
         "dream_completion_outbox": ("lease_until", "lease_token"),
         "memory_turn_ledger": ("lease_until", "lease_token"),
+        "learning_source_batch": (
+            "source_ids_hash",
+            "source_dispositions_json",
+            "revision",
+            "status",
+        ),
+        "learning_candidate": (
+            "candidate_type",
+            "fingerprint",
+            "revision",
+            "attempt",
+            "lease_owner",
+            "lease_token",
+            "lease_until",
+            "next_retry_at",
+        ),
+        "learning_candidate_evidence": (
+            "candidate_id",
+            "evidence_id",
+            "batch_id",
+            "is_generated",
+            "eligible",
+        ),
+        "learning_candidate_attempt": (
+            "attempt_id",
+            "candidate_work_attempt",
+            "provider_attempt",
+            "provider_request_started",
+            "result_digest",
+            "settlement_payload_json",
+        ),
+        "learning_stage_diagnostic": (
+            "diagnostic_id",
+            "run_id",
+            "stage",
+            "status",
+        ),
     }
     missing_columns: dict[str, tuple[str, ...]] = {}
     available_columns: dict[str, set[str]] = {}
@@ -222,6 +271,13 @@ def inspect_architecture_migration(
         "ix_dream_completion_outbox_lease": "dream_completion_outbox",
         "ix_reply_commit_outbox_lease": "reply_commit_outbox",
         "ix_memory_turn_ledger_lease": "memory_turn_ledger",
+        "ix_learning_candidate_due": "learning_candidate",
+        "ix_learning_candidate_scope": "learning_candidate",
+        "ix_learning_candidate_fingerprint": "learning_candidate",
+        "ix_learning_source_batch_prefix": "learning_source_batch",
+        "ix_learning_attempt_due": "learning_candidate_attempt",
+        "ix_learning_diagnostic_run": "learning_stage_diagnostic",
+        "ix_learning_circuit_due": "learning_provider_circuit",
     }
     missing_indexes = tuple(
         name

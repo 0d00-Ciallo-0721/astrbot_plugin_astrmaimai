@@ -874,7 +874,10 @@ class DatabaseService(
         normalized_chat_id = str(chat_id or "").strip()
         if not normalized_chat_id:
             raise ValueError("chat_id is required")
-        if str(cursor_semantics) != "legacy_batch_atomic_v1":
+        if str(cursor_semantics) not in {
+            "legacy_batch_atomic_v1",
+            "source_batch_contiguous_v2",
+        }:
             raise ValueError("unsupported cursor semantics")
         if not str(pipeline_version or "").strip():
             raise ValueError("pipeline_version is required")
