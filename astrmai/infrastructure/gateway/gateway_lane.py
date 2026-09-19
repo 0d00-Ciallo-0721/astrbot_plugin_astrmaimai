@@ -64,6 +64,7 @@ class GatewayLaneMixin:
         event: Any,
         *,
         propagate_queue_timeout_status: bool = True,
+        hard_deadline_monotonic: float | None = None,
         critical_path: bool = True,
         **kwargs,
     ):
@@ -81,6 +82,11 @@ class GatewayLaneMixin:
             },
         )
         timeout_sec = self._lane_prepare_timeout(event, critical_path=critical_path)
+        if hard_deadline_monotonic is not None:
+            timeout_sec = min(
+                timeout_sec,
+                max(0.0, float(hard_deadline_monotonic) - time.monotonic()),
+            )
         if timeout_sec <= 0.0:
             finish_stage(event, stage_id, status="timeout", reason="queue_timeout")
             if event is not None and hasattr(event, "set_extra"):
@@ -642,6 +648,8 @@ class GatewayLaneMixin:
         reserve_for_reply: bool = False,
         critical_path: bool = True,
         propagate_queue_timeout_status: bool = True,
+        hard_deadline_monotonic: float | None = None,
+        selected_model_id: str = "",
     ) -> LLMCallResult:
         workload_request = self.context_economy.build_request(
             family=self._lane_workload_family(lane_key, tool_mode=False),
@@ -698,6 +706,8 @@ class GatewayLaneMixin:
                     ledger_critical_path=critical_path,
                     event=event,
                     propagate_queue_timeout_status=propagate_queue_timeout_status,
+                    hard_deadline_monotonic=hard_deadline_monotonic,
+                    selected_model_id=selected_model_id,
                 )
             except asyncio.CancelledError:
                 finish_llm_call(
@@ -735,6 +745,7 @@ class GatewayLaneMixin:
         lane_umo, conversation_id, history, _ = await self._ensure_lane_bounded(
             event,
             propagate_queue_timeout_status=propagate_queue_timeout_status,
+            hard_deadline_monotonic=hard_deadline_monotonic,
             critical_path=critical_path,
             workload_class=workload_policy.family.value,
             lane_key=effective_lane_key,
@@ -811,6 +822,8 @@ class GatewayLaneMixin:
                 ledger_critical_path=critical_path,
                 event=event,
                 propagate_queue_timeout_status=propagate_queue_timeout_status,
+                hard_deadline_monotonic=hard_deadline_monotonic,
+                selected_model_id=selected_model_id,
             )
         except asyncio.CancelledError:
             finish_llm_call(

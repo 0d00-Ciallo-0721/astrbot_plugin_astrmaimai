@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 from astrbot.api import logger
 
 from ...conversation.contracts.reply_artifact import VisibleReplyArtifact
-from ..runtime.runtime_contracts import FailureKind, LLMCallResult
+from ..runtime.runtime_contracts import FailureKind, LLMCallDiagnostics, LLMCallResult
 from .output_guard import is_safe_visible_text
 from .provider_capabilities import resolve_provider_capabilities
 from .json_utils import parse_json_payload
@@ -176,6 +176,8 @@ class GatewayResultMixin:
         economy: Optional[Dict[str, Any]] = None,
         skipped_cooldown_models: Optional[List[Dict[str, Any]]] = None,
         cooldown_overridden: bool = False,
+        call_diagnostics: LLMCallDiagnostics | None = None,
+        fallback_used: bool = False,
     ) -> LLMCallResult:
         capabilities = self._provider_capabilities(model_id) if model_id else None
         return LLMCallResult(
@@ -189,6 +191,8 @@ class GatewayResultMixin:
             economy=dict(economy or {}),
             skipped_cooldown_models=list(skipped_cooldown_models or []),
             cooldown_overridden=bool(cooldown_overridden),
+            call_diagnostics=call_diagnostics,
+            fallback_used=bool(fallback_used),
         )
 
     @staticmethod
@@ -206,6 +210,8 @@ class GatewayResultMixin:
         model_id: str = "",
         raw_completion: str = "",
         economy: Optional[Dict[str, Any]] = None,
+        call_diagnostics: LLMCallDiagnostics | None = None,
+        fallback_used: bool = False,
     ) -> LLMCallResult:
         capabilities = self._provider_capabilities(model_id) if model_id else None
         return LLMCallResult(
@@ -216,6 +222,8 @@ class GatewayResultMixin:
             provider_family=getattr(capabilities, "provider_family", ""),
             raw_completion=raw_completion,
             economy=dict(economy or {}),
+            call_diagnostics=call_diagnostics,
+            fallback_used=bool(fallback_used),
         )
 
     def _extract_json(self, text: str) -> str:

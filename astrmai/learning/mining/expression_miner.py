@@ -19,7 +19,14 @@ class ExpressionMiner:
     现在采用“确定性候选提取 + LLM 增强”两段式，不再和黑话共用 joint prompt。
     """
 
-    def __init__(self, gateway, config=None, memory_engine=None, background_task_budget=None):
+    def __init__(
+        self,
+        gateway,
+        config=None,
+        memory_engine=None,
+        background_task_budget=None,
+        provider_adapter=None,
+    ):
         self.gateway = gateway
         self.config = config if config else gateway.config
         self.memory_engine = memory_engine
@@ -35,6 +42,7 @@ class ExpressionMiner:
             gateway,
             config=self.config,
             background_task_budget=background_task_budget,
+            provider_adapter=provider_adapter,
         )
         self.input_policy = LearningInputPolicy()
         self.last_report: dict[str, Any] = {}
@@ -93,6 +101,8 @@ class ExpressionMiner:
                 "candidate_count": 0,
                 "enriched_count": 0,
                 "reason": "insufficient_context",
+                "discovery_provider_call_count": 0,
+                "pipeline_contains_enrichment": False,
                 "input_policy": dict(self.input_policy.last_report),
             }
             return []
@@ -116,6 +126,8 @@ class ExpressionMiner:
                 **dict(self.candidate_extractor.last_report or {}),
                 "input_policy": dict(self.input_policy.last_report),
                 "enriched_count": 0,
+                "discovery_provider_call_count": 0,
+                "pipeline_contains_enrichment": False,
             }
             return []
         min_distinct_turns = self.expression_min_distinct_turns
@@ -141,6 +153,8 @@ class ExpressionMiner:
                 "candidate_count": 0,
                 "enriched_count": 0,
                 "reason": "insufficient_distinct_expression_evidence",
+                "discovery_provider_call_count": 0,
+                "pipeline_contains_enrichment": False,
                 "input_policy": dict(self.input_policy.last_report),
             }
             return []
@@ -172,6 +186,8 @@ class ExpressionMiner:
                 "skipped_in_flight": len(in_flight),
                 "enriched_count": 0,
                 "reason": "all_candidates_in_flight",
+                "discovery_provider_call_count": 0,
+                "pipeline_contains_enrichment": False,
                 "input_policy": dict(self.input_policy.last_report),
             }
             return []
@@ -205,6 +221,13 @@ class ExpressionMiner:
             "enriched_count": len(enriched),
             "reason": self.last_result.reason,
             "enrichment": self.last_result.to_report(),
+            "discovery_provider_call_count": 0,
+            "pipeline_contains_enrichment": True,
+            "provider_attempt": (
+                self.enricher.last_provider_attempt.to_report()
+                if getattr(self.enricher, "last_provider_attempt", None) is not None
+                else {"provider_attempt": None, "source": "legacy_gateway_compatibility"}
+            ),
         }
         logger.info(
             f"[ExpressionMiner] 表达习惯挖掘完成: {group_id} -> "

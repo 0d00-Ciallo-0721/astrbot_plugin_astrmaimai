@@ -63,6 +63,29 @@ class SocialTranscriptTurn:
     reply_mode_hint: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class LLMCallDiagnostics:
+    gateway_call_id: str = ""
+    provider_request_id: str = ""
+    provider_id: str = ""
+    provider_family: str = ""
+    model_id: str = ""
+    identity_source: str = ""
+    background_semaphore_wait_ms: float = 0.0
+    global_semaphore_wait_ms: float = 0.0
+    provider_latency_ms: float = 0.0
+    provider_request_started: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class LLMProviderSelection:
+    provider_id: str = ""
+    provider_family: str = ""
+    model_id: str = ""
+    identity_source: str = ""
+    pool_name: str = ""
+
+
 @dataclass
 class LLMCallResult:
     ok: bool
@@ -77,6 +100,8 @@ class LLMCallResult:
     economy: dict[str, Any] = field(default_factory=dict)
     skipped_cooldown_models: list = field(default_factory=list)
     cooldown_overridden: bool = False
+    call_diagnostics: LLMCallDiagnostics | None = None
+    fallback_used: bool = False
 
 
 __all__ = [
@@ -86,7 +111,9 @@ __all__ = [
     "FocusThreadContext",
     "GatewaySettings",
     "InfrastructureSettings",
+    "LLMCallDiagnostics",
     "LLMCallResult",
+    "LLMProviderSelection",
     "LaneRuntimeSettings",
     "OutboundPolicy",
     "PromptEnvelope",

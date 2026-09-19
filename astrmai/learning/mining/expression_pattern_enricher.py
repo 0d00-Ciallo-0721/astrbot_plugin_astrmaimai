@@ -7,21 +7,26 @@ from typing import Any
 from astrbot.api import logger
 
 from ...infrastructure.gateway.json_utils import parse_json_payload
-from ...infrastructure.runtime.lane_manager import LaneKey
-from ...infrastructure.runtime.background_task_budget import BackgroundTaskBudget
 from .expression_results import ExpressionEnrichmentResult
 
 
 class ExpressionPatternEnricher:
-    def __init__(self, gateway, config=None, background_task_budget=None):
+    def __init__(
+        self,
+        gateway,
+        config=None,
+        background_task_budget=None,
+        provider_adapter=None,
+    ):
         self.gateway = gateway
         self.config = config if config else getattr(gateway, "config", None)
-        self.background_task_budget = background_task_budget or BackgroundTaskBudget()
+        self.background_task_budget = background_task_budget
+        self.provider_adapter = provider_adapter
+        self._legacy_provider_test_double = bool(
+            getattr(gateway, "_learning_legacy_provider_test_double", False)
+        )
+        self.last_provider_attempt = None
         self.last_result = ExpressionEnrichmentResult(status="completed")
-
-    @staticmethod
-    def _lane(group_id: str) -> LaneKey:
-        return LaneKey(subsystem="bg", task_family="expression_pattern", scope_id=group_id or "global", scope_kind="global")
 
     @staticmethod
     def _normalize_review_status(value: Any) -> str:
@@ -118,20 +123,34 @@ class ExpressionPatternEnricher:
             "\"contradicted_by\":[\"真实消息ID\"],\"content_samples\":[\"模型示例，不作证据\"]}]}\n"
             f"Candidates: {json.dumps(prompt_items, ensure_ascii=False)}"
         )
-        async def _call():
-            return await self.gateway.call_data_process_task(
+        if self.provider_adapter is not None and hasattr(
+            self.gateway, "call_data_process_task_result"
+        ):
+            evolution = getattr(self.config, "evolution", None)
+            if not bool(getattr(evolution, "learning_enrichment_enabled", False)):
+                raise RuntimeError("learning_enrichment_disabled")
+            attempt = await self.provider_adapter.call(
+                task_name="learning.expression_enrichment",
+                scope_id=group_id,
                 prompt=prompt,
                 is_json=True,
-                lane_key=self._lane(group_id),
+            )
+            self.last_provider_attempt = attempt
+            if not attempt.ok:
+                raise RuntimeError(
+                    f"{attempt.failure_stage}/{attempt.failure_kind}"
+                )
+            result = attempt.value
+        elif self._legacy_provider_test_double and not hasattr(
+            self.gateway, "call_data_process_task_result"
+        ):
+            result = await self.gateway.call_data_process_task(
+                prompt=prompt,
+                is_json=True,
                 base_origin=group_id,
             )
-
-        result = await self.background_task_budget.run(
-            _call,
-            task_name="learning.expression_enrichment",
-            scope_id=group_id,
-            defer_release_on_timeout=True,
-        )
+        else:
+            raise RuntimeError("learning_provider_adapter_unavailable")
         return self._coerce_rows(result)
 
     @staticmethod
@@ -200,11 +219,29 @@ class ExpressionPatternEnricher:
         return payload if payload["expression"] and payload["summary"] else None
 
     async def enrich(self, group_id: str, candidates: list[dict[str, Any]]) -> ExpressionEnrichmentResult:
+        self.last_provider_attempt = None
         if not candidates:
             self.last_result = ExpressionEnrichmentResult(status="completed", reason="no_candidates")
             return self.last_result
+        evolution = getattr(self.config, "evolution", None)
+        if (
+            self.provider_adapter is not None
+            and hasattr(self.gateway, "call_data_process_task_result")
+            and not bool(getattr(evolution, "learning_enrichment_enabled", False))
+        ):
+            self.last_result = ExpressionEnrichmentResult(
+                status="blocked",
+                input_count=len(candidates),
+                missing_candidate_ids=[
+                    str(item.get("candidate_id") or "") for item in candidates
+                ],
+                retryable=False,
+                reason="learning_enrichment_disabled",
+            )
+            return self.last_result
 
         pending = [dict(item) for item in candidates]
+        formal_provider_path = not self._legacy_provider_test_double
         for index, item in enumerate(pending, start=1):
             item.setdefault("candidate_id", f"index:{index}")
         enriched: list[dict[str, Any]] = []
@@ -214,7 +251,7 @@ class ExpressionPatternEnricher:
         last_error_status = ""
         last_error = ""
 
-        for attempts in range(1, 3):
+        for attempts in range(1, 2):
             if not pending:
                 break
             try:
@@ -251,7 +288,7 @@ class ExpressionPatternEnricher:
         fallback: list[dict[str, Any]] = []
         still_missing: list[dict[str, Any]] = []
         for candidate in pending:
-            if self._strict_fallback_candidate(candidate):
+            if not formal_provider_path and self._strict_fallback_candidate(candidate):
                 payload = dict(candidate)
                 payload.update(
                     {

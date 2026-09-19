@@ -29,6 +29,8 @@ def _candidate(candidate_id: str, *, candidate_type: str = "exact", count: int =
 
 
 class _Gateway:
+    _learning_legacy_provider_test_double = True
+
     def __init__(self, *results):
         self.results = list(results)
         self.calls = 0

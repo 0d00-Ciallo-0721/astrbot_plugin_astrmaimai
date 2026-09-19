@@ -6,21 +6,26 @@ from typing import Any
 from astrbot.api import logger
 
 from ...infrastructure.gateway.json_utils import parse_json_contract
-from ...infrastructure.runtime.lane_manager import LaneKey
-from ...infrastructure.runtime.background_task_budget import BackgroundTaskBudget
 from ..dedup import normalize_jargon_term
 from .jargon_results import JargonEnrichmentResult
 
 
 class JargonEnricher:
-    def __init__(self, gateway, config=None, background_task_budget=None):
+    def __init__(
+        self,
+        gateway,
+        config=None,
+        background_task_budget=None,
+        provider_adapter=None,
+    ):
         self.gateway = gateway
         self.config = config if config else getattr(gateway, "config", None)
-        self.background_task_budget = background_task_budget or BackgroundTaskBudget()
-
-    @staticmethod
-    def _reflect_lane(group_id: str) -> LaneKey:
-        return LaneKey(subsystem="bg", task_family="jargon", scope_id=group_id or "global", scope_kind="global")
+        self.background_task_budget = background_task_budget
+        self.provider_adapter = provider_adapter
+        self._legacy_provider_test_double = bool(
+            getattr(gateway, "_learning_legacy_provider_test_double", False)
+        )
+        self.last_provider_attempt = None
 
     @staticmethod
     def _normalize_review_status(value: str) -> str:
@@ -42,6 +47,7 @@ class JargonEnricher:
         return max(0.0, min(parsed, 1.0))
 
     async def enrich(self, group_id: str, candidates: list[dict[str, Any]]) -> JargonEnrichmentResult:
+        self.last_provider_attempt = None
         if not candidates:
             return JargonEnrichmentResult(status="completed", reason="no_input")
         prompt_items = []
@@ -83,20 +89,40 @@ class JargonEnricher:
             f"候选：{json.dumps(prompt_items, ensure_ascii=False)}"
         )
         try:
-            async def _call():
-                return await self.gateway.call_data_process_task(
+            if self.provider_adapter is not None and hasattr(
+                self.gateway, "call_data_process_task_result"
+            ):
+                evolution = getattr(self.config, "evolution", None)
+                if not bool(getattr(evolution, "learning_enrichment_enabled", False)):
+                    return self._failed_result(
+                        group_id,
+                        candidates,
+                        status="blocked",
+                        reason="learning_enrichment_disabled",
+                        error_type="LearningEnrichmentDisabled",
+                    )
+                attempt = await self.provider_adapter.call(
+                    task_name="learning.jargon_enrichment",
+                    scope_id=group_id,
                     prompt=prompt,
                     is_json=True,
-                    lane_key=self._reflect_lane(group_id),
+                )
+                self.last_provider_attempt = attempt
+                if not attempt.ok:
+                    raise RuntimeError(
+                        f"{attempt.failure_stage}/{attempt.failure_kind}"
+                    )
+                result = attempt.value
+            elif self._legacy_provider_test_double and not hasattr(
+                self.gateway, "call_data_process_task_result"
+            ):
+                result = await self.gateway.call_data_process_task(
+                    prompt=prompt,
+                    is_json=True,
                     base_origin=group_id,
                 )
-
-            result = await self.background_task_budget.run(
-                _call,
-                task_name="learning.jargon_enrichment",
-                scope_id=group_id,
-                defer_release_on_timeout=True,
-            )
+            else:
+                raise RuntimeError("learning_provider_adapter_unavailable")
             parsed = parse_json_contract(
                 result,
                 required_keys=("items",),

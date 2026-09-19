@@ -1337,6 +1337,68 @@
         "maximum": 4,
         "hint": "限制不同会话同时运行表达和黑话学习的数量，避免后台学习占满模型、处理器和数据库资源。"
       },
+      "learning_enrichment_enabled": {
+        "description": "启用学习候选的外部模型服务增强",
+        "type": "bool",
+        "default": false,
+        "hint": "默认关闭。仅在受控的模拟或录制服务环境显式开启；关闭时停止新的外部模型服务请求。"
+      },
+      "learning_enrichment_concurrency": {
+        "description": "学习增强逻辑通道最大并发数",
+        "type": "int",
+        "default": 1,
+        "minimum": 1,
+        "maximum": 2,
+        "hint": "仅限制表达和黑话模型增强；不会扩大全局模型网关并发或占用对话保留槽。"
+      },
+      "learning_enrichment_queue_max": {
+        "description": "学习增强逻辑通道最大排队数",
+        "type": "int",
+        "default": 8,
+        "minimum": 0,
+        "maximum": 32,
+        "hint": "超过上限的学习增强会被结构化拒绝，不进入共享运行预算或模型服务。"
+      },
+      "learning_enrichment_wait_timeout_sec": {
+        "description": "学习增强准入等待超时（秒）",
+        "type": "float",
+        "default": 10.0,
+        "minimum": 1.0,
+        "maximum": 120.0,
+        "hint": "仅约束学习逻辑通道排队，不作为模型服务执行超时。"
+      },
+      "learning_enrichment_execution_timeout_sec": {
+        "description": "学习增强单次执行超时（秒）",
+        "type": "float",
+        "default": 45.0,
+        "minimum": 5.0,
+        "maximum": 180.0,
+        "hint": "取得逻辑槽后单次执行的上限，仍受学习管线总时间预算截断。"
+      },
+      "learning_enrichment_max_attempts": {
+        "description": "学习候选增强最大工作尝试数",
+        "type": "int",
+        "default": 3,
+        "minimum": 1,
+        "maximum": 5,
+        "hint": "由后续候选增强工作器执行；本阶段只冻结配置合同，不在适配器内自动重试。"
+      },
+      "learning_enrichment_circuit_window_sec": {
+        "description": "学习模型服务熔断失败统计窗口（秒）",
+        "type": "int",
+        "default": 600,
+        "minimum": 60,
+        "maximum": 3600,
+        "hint": "只统计明确的模型服务错误或超时，不统计排队、解析或持久化失败。"
+      },
+      "learning_enrichment_cooldown_sec": {
+        "description": "学习模型服务熔断冷却时间（秒）",
+        "type": "int",
+        "default": 900,
+        "minimum": 60,
+        "maximum": 86400,
+        "hint": "熔断打开后停止新的学习模型请求；到期仅允许一个半开探测。"
+      },
       "learning_run_retention_days": {
         "description": "学习运行记录保留天数",
         "type": "int",

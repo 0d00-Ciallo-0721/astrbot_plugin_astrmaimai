@@ -15,6 +15,8 @@ class _Message:
 
 
 class _Gateway:
+    _learning_legacy_provider_test_double = True
+
     def __init__(self, response=None, error=None):
         self.response = response if response is not None else {"items": []}
         self.error = error

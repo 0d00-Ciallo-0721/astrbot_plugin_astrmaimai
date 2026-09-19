@@ -34,6 +34,7 @@ class LLMCascadeFailureException(Exception):
         model_id: str = "",
         raw_completion: str = "",
         failure_reason: str = "",
+        call_diagnostics=None,
     ) -> None:
         super().__init__(error_message)
         self.error_message = str(error_message or "")
@@ -43,3 +44,4 @@ class LLMCascadeFailureException(Exception):
         self.model_id = str(model_id or "")
         self.raw_completion = str(raw_completion or "")
         self.failure_reason = str(failure_reason or "")
+        self.call_diagnostics = call_diagnostics

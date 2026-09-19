@@ -11,7 +11,14 @@ from typing import Any, Iterable, List, Sequence
 
 
 class JargonMiner:
-    def __init__(self, expression_miner, min_messages: int = 1, memory_engine=None, background_task_budget=None):
+    def __init__(
+        self,
+        expression_miner,
+        min_messages: int = 1,
+        memory_engine=None,
+        background_task_budget=None,
+        provider_adapter=None,
+    ):
         self.expression_miner = expression_miner
         self.min_messages = max(int(min_messages or 1), 1)
         self.memory_engine = memory_engine
@@ -25,6 +32,7 @@ class JargonMiner:
                 gateway,
                 config=config,
                 background_task_budget=background_task_budget,
+                provider_adapter=provider_adapter,
             )
             if gateway is not None
             else None
@@ -63,7 +71,13 @@ class JargonMiner:
 
     async def mine(self, group_id: str, messages: Sequence | None):
         if not group_id or self.expression_miner is None:
-            self.last_report = {"group_id": group_id, "candidate_count": 0, "reason": "miner_unavailable"}
+            self.last_report = {
+                "group_id": group_id,
+                "candidate_count": 0,
+                "reason": "miner_unavailable",
+                "discovery_provider_call_count": 0,
+                "pipeline_contains_enrichment": False,
+            }
             return []
         normalized = self.input_policy.normalize(messages)
         if len(normalized) < self.min_messages:
@@ -75,6 +89,8 @@ class JargonMiner:
                 "candidate_count": 0,
                 "reason": "insufficient_context",
                 "input_policy": dict(self.input_policy.last_report),
+                "discovery_provider_call_count": 0,
+                "pipeline_contains_enrichment": False,
             }
             return []
         existing_terms: dict[str, str] = {}
@@ -122,6 +138,8 @@ class JargonMiner:
                 "expression_terms": len(expression_terms),
                 **dict(getattr(self.candidate_extractor, "last_report", {}) or {}),
                 "input_policy": dict(self.input_policy.last_report),
+                "discovery_provider_call_count": 0,
+                "pipeline_contains_enrichment": False,
             }
             return []
         if not self.enricher:
@@ -134,6 +152,9 @@ class JargonMiner:
                 "enriched_count": len(candidates),
                 "reason": "completed_without_enricher",
                 "input_policy": dict(self.input_policy.last_report),
+                "discovery_provider_call_count": 0,
+                "pipeline_contains_enrichment": True,
+                "provider_attempt": {"provider_attempt": 0, "reason": "enricher_unavailable"},
             }
             return candidates
         candidate_fingerprints = {
@@ -154,6 +175,8 @@ class JargonMiner:
                 "skipped_in_flight": len(in_flight),
                 "reason": "all_candidates_in_flight",
                 "input_policy": dict(self.input_policy.last_report),
+                "discovery_provider_call_count": 0,
+                "pipeline_contains_enrichment": False,
             }
             return []
         try:
@@ -195,5 +218,12 @@ class JargonMiner:
             ),
             "reason": enrichment_reason,
             "enrichment": enrichment_report,
+            "discovery_provider_call_count": 0,
+            "pipeline_contains_enrichment": True,
+            "provider_attempt": (
+                self.enricher.last_provider_attempt.to_report()
+                if getattr(self.enricher, "last_provider_attempt", None) is not None
+                else {"provider_attempt": None, "source": "legacy_gateway_compatibility"}
+            ),
         }
         return enriched

@@ -190,6 +190,7 @@ class GatewayPolicyMixin:
         attempt_queue: List[str],
         *,
         allow_override: bool = True,
+        claim_half_open_probe: bool = True,
     ) -> tuple[List[str], List[Dict[str, Any]], bool]:
         self._cleanup_model_cooldowns()
         available: List[str] = []
@@ -206,7 +207,8 @@ class GatewayPolicyMixin:
                     health["skipped_requests"] = int(health.get("skipped_requests", 0) or 0) + 1
                     skipped.append({"pool_name": report_pool, "model_id": model_id, "cooldown_until": health.get("cooldown_until", 0.0), "cooldown_reason": "server_error_half_open_busy"})
                     continue
-                health["half_open_probe"] = True
+                if claim_half_open_probe:
+                    health["half_open_probe"] = True
                 available.append(model_id)
                 continue
             meta = self._model_cooldown_meta(report_pool, model_id)

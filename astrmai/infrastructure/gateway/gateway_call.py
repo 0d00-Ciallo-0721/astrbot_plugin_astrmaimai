@@ -2,12 +2,14 @@ import asyncio
 import time
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Union
+import uuid
 
 from astrbot.api import logger
 
 from ..context_economy import WorkloadPolicy
-from ..runtime.runtime_contracts import FailureKind, LLMCallResult
+from ..runtime.runtime_contracts import FailureKind, LLMCallDiagnostics, LLMCallResult
 from ..runtime.turn_call_ledger import (
     begin_llm_call,
     begin_stage,
@@ -26,6 +28,36 @@ _GATEWAY_SLOT_OWNERS: ContextVar[frozenset[tuple[int, int]]] = ContextVar(
     "astrmai_gateway_slot_owners",
     default=frozenset(),
 )
+
+
+@dataclass(slots=True)
+class _GatewayCallTiming:
+    gateway_call_id: str
+    provider_request_id: str = ""
+    provider_id: str = ""
+    provider_family: str = ""
+    model_id: str = ""
+    identity_source: str = ""
+    background_semaphore_wait_ms: float = 0.0
+    global_semaphore_wait_ms: float = 0.0
+    provider_latency_ms: float = 0.0
+    provider_request_started: bool = False
+    provider_started_at: float = 0.0
+    fallback_used: bool = False
+
+    def diagnostics(self) -> LLMCallDiagnostics:
+        return LLMCallDiagnostics(
+            gateway_call_id=self.gateway_call_id,
+            provider_request_id=self.provider_request_id,
+            provider_id=self.provider_id,
+            provider_family=self.provider_family,
+            model_id=self.model_id,
+            identity_source=self.identity_source,
+            background_semaphore_wait_ms=self.background_semaphore_wait_ms,
+            global_semaphore_wait_ms=self.global_semaphore_wait_ms,
+            provider_latency_ms=self.provider_latency_ms,
+            provider_request_started=self.provider_request_started,
+        )
 
 
 class GatewayCallMixin:
@@ -137,6 +169,7 @@ class GatewayCallMixin:
         model_id: str = "",
         raw_completion: str = "",
         failure_reason: str = "",
+        call_diagnostics: LLMCallDiagnostics | None = None,
     ) -> None:
         raise LLMCascadeFailureException(
             error_message,
@@ -146,6 +179,7 @@ class GatewayCallMixin:
             model_id=model_id,
             raw_completion=raw_completion,
             failure_reason=failure_reason,
+            call_diagnostics=call_diagnostics,
         )
 
     async def _record_benchmark_sample(
@@ -274,7 +308,13 @@ class GatewayCallMixin:
             logger.warning(f"[Gateway] benchmark recording degraded after successful call: {exc}")
         return economy_payload
 
-    def _semaphore_wait_timeout(self, event: Any = None, *, critical_path: bool = True) -> float:
+    def _semaphore_wait_timeout(
+        self,
+        event: Any = None,
+        *,
+        critical_path: bool = True,
+        hard_deadline_monotonic: float | None = None,
+    ) -> float:
         try:
             configured = float(
                 getattr(getattr(self, "settings", None), "semaphore_wait_timeout_sec", 30.0)
@@ -282,11 +322,17 @@ class GatewayCallMixin:
             )
         except (TypeError, ValueError):
             configured = 30.0
-        return clamp_timeout_to_turn_budget(
+        timeout_sec = clamp_timeout_to_turn_budget(
             event,
             max(0.1, configured),
             reserve_for_reply=bool(critical_path),
         )
+        if hard_deadline_monotonic is not None:
+            timeout_sec = min(
+                timeout_sec,
+                max(0.0, float(hard_deadline_monotonic) - time.monotonic()),
+            )
+        return timeout_sec
 
     @asynccontextmanager
     async def _concurrency_slot(
@@ -298,6 +344,8 @@ class GatewayCallMixin:
         propagate_queue_timeout_status: bool = True,
         workload_class: str = "",
         attempt: int = 0,
+        call_timing: _GatewayCallTiming | None = None,
+        hard_deadline_monotonic: float | None = None,
     ):
         """G7/RT-11: 关键路径直取全局槽；后台调用须先过子限流器。
 
@@ -327,9 +375,28 @@ class GatewayCallMixin:
             return
 
         background_semaphore = None if critical_path else getattr(self, "_background_semaphore", None)
-        timeout_sec = self._semaphore_wait_timeout(event, critical_path=critical_path)
-
         async def _acquire(semaphore, wait_stage: str) -> None:
+            wait_started = time.perf_counter()
+            try:
+                timeout_sec = self._semaphore_wait_timeout(
+                    event,
+                    critical_path=critical_path,
+                    hard_deadline_monotonic=hard_deadline_monotonic,
+                )
+            except TypeError as exc:
+                # Keep older test doubles and embedders that override the
+                # pre-deadline helper signature compatible.
+                if "hard_deadline_monotonic" not in str(exc):
+                    raise
+                timeout_sec = self._semaphore_wait_timeout(
+                    event,
+                    critical_path=critical_path,
+                )
+                if hard_deadline_monotonic is not None:
+                    timeout_sec = min(
+                        timeout_sec,
+                        max(0.0, float(hard_deadline_monotonic) - time.monotonic()),
+                    )
             stage_id = begin_stage(
                 event,
                 wait_stage,
@@ -347,6 +414,12 @@ class GatewayCallMixin:
                     raise asyncio.TimeoutError
                 await asyncio.wait_for(semaphore.acquire(), timeout=timeout_sec)
             except asyncio.TimeoutError:
+                elapsed_ms = max(0.0, time.perf_counter() - wait_started) * 1000.0
+                if call_timing is not None:
+                    if wait_stage == "gateway.background_semaphore_wait":
+                        call_timing.background_semaphore_wait_ms += elapsed_ms
+                    else:
+                        call_timing.global_semaphore_wait_ms += elapsed_ms
                 finish_stage(event, stage_id, status="timeout", reason="queue_timeout")
                 if event is not None and hasattr(event, "set_extra"):
                     timeout_record = {
@@ -369,6 +442,12 @@ class GatewayCallMixin:
                 finish_stage(event, stage_id, status="error", reason=type(exc).__name__)
                 raise
             else:
+                elapsed_ms = max(0.0, time.perf_counter() - wait_started) * 1000.0
+                if call_timing is not None:
+                    if wait_stage == "gateway.background_semaphore_wait":
+                        call_timing.background_semaphore_wait_ms += elapsed_ms
+                    else:
+                        call_timing.global_semaphore_wait_ms += elapsed_ms
                 finish_stage(event, stage_id, metadata={"timeout_sec": timeout_sec})
 
         acquired_background = False
@@ -418,33 +497,50 @@ class GatewayCallMixin:
         reserve_for_reply: bool = False,
         event: Any = None,
         propagate_queue_timeout_status: bool = True,
+        hard_deadline_monotonic: float | None = None,
+        selected_model_id: str = "",
     ) -> LLMCallResult:
         # OPT-08/RT-11: 记录信号量排队时长（skipped 轮 judge elapsed 51.7s vs
         # attempt 数秒的差值即排队）；G7 起按 critical_path 分流配额
         async with self._model_cascade_scope():
-            primary_models, attempt_queue = self._build_attempt_queue(
-                pool_name,
-                models,
-                use_fallback,
-                workload_policy=workload_policy,
-            )
-            if allow_cooldown_override:
+            call_timing = _GatewayCallTiming(gateway_call_id=uuid.uuid4().hex)
+            selected_model_id = str(selected_model_id or "").strip()
+            if selected_model_id:
+                if selected_model_id not in models:
+                    raise ValueError("selected_model_id must be present in models")
+                primary_models = [selected_model_id]
                 attempt_queue, skipped_cooldown_models, cooldown_overridden = (
                     self._filter_cooldown_attempt_queue(
                         pool_name,
                         primary_models,
-                        attempt_queue,
-                    )
-                )
-            else:
-                attempt_queue, skipped_cooldown_models, cooldown_overridden = (
-                    self._filter_cooldown_attempt_queue(
-                        pool_name,
-                        primary_models,
-                        attempt_queue,
+                        [selected_model_id],
                         allow_override=False,
                     )
                 )
+            else:
+                primary_models, attempt_queue = self._build_attempt_queue(
+                    pool_name,
+                    models,
+                    use_fallback,
+                    workload_policy=workload_policy,
+                )
+                if allow_cooldown_override:
+                    attempt_queue, skipped_cooldown_models, cooldown_overridden = (
+                        self._filter_cooldown_attempt_queue(
+                            pool_name,
+                            primary_models,
+                            attempt_queue,
+                        )
+                    )
+                else:
+                    attempt_queue, skipped_cooldown_models, cooldown_overridden = (
+                        self._filter_cooldown_attempt_queue(
+                            pool_name,
+                            primary_models,
+                            attempt_queue,
+                            allow_override=False,
+                        )
+                    )
             if max_models_override is not None:
                 attempt_queue = attempt_queue[: max(1, int(max_models_override))]
             owns_ledger_call = not bool(ledger_call_id)
@@ -465,6 +561,8 @@ class GatewayCallMixin:
                         "slot_scope": "provider_attempt",
                     },
                 )
+            if ledger_call_id:
+                call_timing.gateway_call_id = str(ledger_call_id)
             if not attempt_queue:
                 failure_reason = "all_models_cooling" if skipped_cooldown_models else "empty_model_pool"
                 if owns_ledger_call:
@@ -485,6 +583,7 @@ class GatewayCallMixin:
                     last_failure_kind=FailureKind.UNKNOWN.value,
                     attempted_models=[],
                     failure_reason=failure_reason,
+                    call_diagnostics=call_timing.diagnostics(),
                 )
 
             timeout_limit = (
@@ -521,6 +620,14 @@ class GatewayCallMixin:
                             timeout_limit,
                             reserve_for_reply=reserve_for_reply,
                         )
+                        if hard_deadline_monotonic is not None:
+                            effective_timeout = min(
+                                effective_timeout,
+                                max(
+                                    0.0,
+                                    float(hard_deadline_monotonic) - time.monotonic(),
+                                ),
+                            )
                         if effective_timeout <= 0.0:
                             self._mark_turn_budget_exhausted(
                                 event,
@@ -535,6 +642,13 @@ class GatewayCallMixin:
                             request_kwargs=request_kwargs,
                             request_kwargs_factory=request_kwargs_factory,
                         )
+                        call_timing.provider_id = str(model_id or "")
+                        call_timing.model_id = str(model_id or "")
+                        call_timing.provider_family = str(
+                            getattr(self._provider_capabilities(model_id), "provider_family", "") or ""
+                        )
+                        call_timing.identity_source = "chat_provider_id"
+                        call_timing.fallback_used = bool(model_id not in primary_models)
                         t0 = time.perf_counter()
                         async with self._concurrency_slot(
                             ledger_critical_path,
@@ -547,6 +661,8 @@ class GatewayCallMixin:
                                 or pool_name
                             ),
                             attempt=attempt,
+                            call_timing=call_timing,
+                            hard_deadline_monotonic=hard_deadline_monotonic,
                         ):
                             async with self._provider_request_stage(
                                 event,
@@ -562,6 +678,8 @@ class GatewayCallMixin:
                                 self._assert_provider_request_allowed(event)
                                 provider_request_started = True
                                 provider_request_count += 1
+                                call_timing.provider_request_started = True
+                                call_timing.provider_started_at = time.perf_counter()
                                 if event is not None and hasattr(event, "set_extra"):
                                     event.set_extra("astrmai_provider_request_started", True)
                                     event.set_extra("astrmai_provider_request_count", provider_request_count)
@@ -574,7 +692,20 @@ class GatewayCallMixin:
                                     ),
                                     timeout=effective_timeout,
                                 )
-                    except GatewayQueueTimeout:
+                                call_timing.provider_latency_ms = max(
+                                    0.0,
+                                    time.perf_counter() - call_timing.provider_started_at,
+                                ) * 1000.0
+                                call_timing.provider_request_id = str(
+                                    getattr(response, "request_id", "")
+                                    or getattr(response, "id", "")
+                                    or getattr(response, "response_id", "")
+                                    or ""
+                                )
+                                if not call_timing.provider_request_id:
+                                    call_timing.identity_source = "chat_provider_id;request_id_unavailable"
+                    except GatewayQueueTimeout as exc:
+                        setattr(exc, "call_diagnostics", call_timing.diagnostics())
                         if owns_ledger_call:
                             finish_llm_call(
                                 event,
@@ -586,6 +717,11 @@ class GatewayCallMixin:
                             )
                         raise
                     except asyncio.TimeoutError as exc:
+                        if call_timing.provider_request_started and call_timing.provider_started_at:
+                            call_timing.provider_latency_ms = max(
+                                0.0,
+                                time.perf_counter() - call_timing.provider_started_at,
+                            ) * 1000.0
                         # Preserve queue timeouts across hot-reloaded exception
                         # modules; they must not be treated as provider retries.
                         if (
@@ -653,6 +789,11 @@ class GatewayCallMixin:
                             )
                         continue
                     except Exception as exc:
+                        if call_timing.provider_request_started and call_timing.provider_started_at:
+                            call_timing.provider_latency_ms = max(
+                                0.0,
+                                time.perf_counter() - call_timing.provider_started_at,
+                            ) * 1000.0
                         last_error = str(exc)
                         last_result = self._build_failure_result(
                             error_kind=self._classify_failure_kind(last_error, error=exc),
@@ -778,6 +919,8 @@ class GatewayCallMixin:
                                 economy=economy_payload,
                                 skipped_cooldown_models=skipped_cooldown_models,
                                 cooldown_overridden=cooldown_overridden,
+                                call_diagnostics=call_timing.diagnostics(),
+                                fallback_used=call_timing.fallback_used,
                             )
 
                         safe_text, failure_kind = validate_visible_output_text(
@@ -833,6 +976,8 @@ class GatewayCallMixin:
                             economy=economy_payload,
                             skipped_cooldown_models=skipped_cooldown_models,
                             cooldown_overridden=cooldown_overridden,
+                            call_diagnostics=call_timing.diagnostics(),
+                            fallback_used=call_timing.fallback_used,
                         )
                     except Exception as exc:
                         last_error = str(exc)
@@ -897,6 +1042,7 @@ class GatewayCallMixin:
                 model_id=last_result.model_id,
                 raw_completion=last_result.raw_completion,
                 failure_reason=last_result.error_message,
+                call_diagnostics=call_timing.diagnostics(),
             )
 
     async def _elastic_call(

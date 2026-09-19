@@ -142,6 +142,8 @@ class ExpressionStyleLearningTests(unittest.TestCase):
 
     def test_enricher_keeps_original_expression_and_rejects_topic_content(self):
         class Gateway:
+            _learning_legacy_provider_test_double = True
+
             def __init__(self):
                 self.prompt = ""
 

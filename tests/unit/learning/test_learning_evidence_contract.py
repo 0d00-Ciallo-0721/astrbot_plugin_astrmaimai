@@ -11,6 +11,8 @@ from astrmai.learning.evolution_manager import _jargon_sense_evidence
 
 
 class _Gateway:
+    _learning_legacy_provider_test_double = True
+
     def __init__(self, result):
         self.result = result
 

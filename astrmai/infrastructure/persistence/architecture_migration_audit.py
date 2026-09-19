@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 
-LATEST_ARCHITECTURE_SCHEMA_VERSION = 138
+LATEST_ARCHITECTURE_SCHEMA_VERSION = 146
 
 MESSAGELOG_REQUIRED_COLUMNS = (
     "event_id",
@@ -185,6 +185,8 @@ def inspect_architecture_migration(
         "reflection_outbox",
         "dream_completion_outbox",
         "diary_checkpoints",
+        "learning_provider_circuit",
+        "learning_provider_circuit_settlement",
     )
     missing_tables = tuple(name for name in required_tables if name not in tables)
     table_row_counts = {

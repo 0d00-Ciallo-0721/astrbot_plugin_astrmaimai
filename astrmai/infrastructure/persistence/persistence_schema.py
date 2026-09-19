@@ -449,6 +449,32 @@ _MIGRATIONS: list[tuple[int, str]] = [
     (142, "CREATE INDEX IF NOT EXISTS ix_learning_pipeline_checkpoint_revision ON learning_pipeline_checkpoint(pipeline, chat_id, revision)"),
     (143, "ALTER TABLE learning_mining_run ADD COLUMN result_digest TEXT NOT NULL DEFAULT ''"),
     (144, "ALTER TABLE learning_mining_run ADD COLUMN pipeline_version TEXT NOT NULL DEFAULT 'legacy-unversioned'"),
+    (145, """CREATE TABLE IF NOT EXISTS learning_provider_circuit (
+        provider_key TEXT NOT NULL,
+        task_family TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'closed',
+        failure_count INTEGER NOT NULL DEFAULT 0,
+        window_started_at REAL NOT NULL DEFAULT 0,
+        last_failure_at REAL NOT NULL DEFAULT 0,
+        circuit_until REAL NOT NULL DEFAULT 0,
+        half_open_owner TEXT NOT NULL DEFAULT '',
+        half_open_token TEXT NOT NULL DEFAULT '',
+        lease_until REAL NOT NULL DEFAULT 0,
+        revision INTEGER NOT NULL DEFAULT 0,
+        created_at REAL NOT NULL DEFAULT 0,
+        updated_at REAL NOT NULL DEFAULT 0,
+        PRIMARY KEY(provider_key, task_family)
+    )"""),
+    (146, """CREATE TABLE IF NOT EXISTS learning_provider_circuit_settlement (
+        settlement_id TEXT PRIMARY KEY,
+        provider_key TEXT NOT NULL,
+        task_family TEXT NOT NULL,
+        action TEXT NOT NULL,
+        failure_kind TEXT NOT NULL DEFAULT '',
+        resulting_state TEXT NOT NULL DEFAULT '',
+        resulting_revision INTEGER NOT NULL DEFAULT 0,
+        created_at REAL NOT NULL DEFAULT 0
+    )"""),
 ]
 
 
@@ -527,6 +553,28 @@ def _run_migrations(db: sqlite3.Connection) -> None:
                 logger.info(
                     f"[AstrMai-DB] migration v{version} skipped "
                     "(cross_session_handoff table absent)"
+                )
+                continue
+        if version in range(139, 143):
+            table = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='learning_pipeline_checkpoint'"
+            ).fetchone()
+            if not table:
+                db.execute(f"PRAGMA user_version = {version}")
+                logger.info(
+                    f"[AstrMai-DB] migration v{version} skipped "
+                    "(learning_pipeline_checkpoint table absent)"
+                )
+                continue
+        if version in (143, 144):
+            table = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='learning_mining_run'"
+            ).fetchone()
+            if not table:
+                db.execute(f"PRAGMA user_version = {version}")
+                logger.info(
+                    f"[AstrMai-DB] migration v{version} skipped "
+                    "(learning_mining_run table absent)"
                 )
                 continue
         if version == 93:
@@ -647,6 +695,32 @@ async def _run_migrations_async(db: aiosqlite.Connection) -> None:
                 logger.info(
                     f"[AstrMai-DB] migration v{version} skipped "
                     "(cross_session_handoff table absent)"
+                )
+                continue
+        if version in range(139, 143):
+            cursor = await db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='learning_pipeline_checkpoint'"
+            )
+            table = await cursor.fetchone()
+            await cursor.close()
+            if not table:
+                await db.execute(f"PRAGMA user_version = {version}")
+                logger.info(
+                    f"[AstrMai-DB] migration v{version} skipped "
+                    "(learning_pipeline_checkpoint table absent)"
+                )
+                continue
+        if version in (143, 144):
+            cursor = await db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='learning_mining_run'"
+            )
+            table = await cursor.fetchone()
+            await cursor.close()
+            if not table:
+                await db.execute(f"PRAGMA user_version = {version}")
+                logger.info(
+                    f"[AstrMai-DB] migration v{version} skipped "
+                    "(learning_mining_run table absent)"
                 )
                 continue
         if version == 93:

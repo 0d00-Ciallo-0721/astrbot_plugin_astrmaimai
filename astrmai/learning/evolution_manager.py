@@ -14,7 +14,6 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
 from ..infrastructure.runtime.background_task_budget import (
-    BackgroundTaskBudget,
     BackgroundTaskQueueFull,
     BackgroundTaskQueueTimeout,
 )
@@ -40,6 +39,9 @@ from .mining.jargon_miner import JargonMiner
 from .mining.learning_evidence import merge_evidence_metadata
 from .mining.learning_input_policy import LearningMessageView
 from .mining.jargon_senses import merge_jargon_senses
+from .persistence.provider_circuit_store import LearningProviderCircuitStore
+from .runtime.learning_lane import LearningLaneBudget, LearningLaneConfig
+from .runtime.provider_adapter import LearningProviderCallAdapter
 
 
 def _jargon_sense_evidence(evidence: dict[str, Any], sense: dict[str, Any]) -> dict[str, Any]:
@@ -114,21 +116,44 @@ class EvolutionManager:
         self.gateway = gateway
         self.config = config if config else gateway.config
         self.event_bus = event_bus
-        # A compatibility host may omit the runtime-shared budget.  Keep the
-        # same admission contract with a bounded local budget instead of
-        # silently running provider work unbounded.
-        self.background_task_budget = background_task_budget or BackgroundTaskBudget()
+        self.background_task_budget = background_task_budget
         self.owner_registry = owner_registry
+        persistence = getattr(db, "persistence", None)
+        db_path = getattr(persistence, "db_path", None)
+        self.learning_lane = LearningLaneBudget(self._learning_lane_config())
+        self.provider_circuit_store = (
+            LearningProviderCircuitStore(
+                db_path,
+                failure_window_sec=int(
+                    getattr(self._evolution_config(), "learning_enrichment_circuit_window_sec", 600)
+                    or 600
+                ),
+                cooldown_sec=int(
+                    getattr(self._evolution_config(), "learning_enrichment_cooldown_sec", 900)
+                    or 900
+                ),
+            )
+            if db_path
+            else None
+        )
+        self.provider_adapter = LearningProviderCallAdapter(
+            learning_lane=self.learning_lane,
+            runtime_budget=self.background_task_budget,
+            gateway=self.gateway,
+            circuit_store=self.provider_circuit_store,
+        )
         self.expression_miner = ExpressionMiner(
             gateway,
             self.config,
             memory_engine=getattr(self.db, "memory_engine", None),
             background_task_budget=self.background_task_budget,
+            provider_adapter=self.provider_adapter,
         )
         self.jargon_miner = JargonMiner(
             self.expression_miner,
             memory_engine=getattr(self.db, "memory_engine", None),
             background_task_budget=self.background_task_budget,
+            provider_adapter=self.provider_adapter,
         )
         self.recorder = MessageRecorder(
             window_seconds=getattr(self.config.evolution, "mining_window_sec", 60),
@@ -165,8 +190,6 @@ class EvolutionManager:
         self._last_learning_run_purge_at = 0.0
         self._last_learning_run_purge: dict[str, Any] = {}
         self._last_message_log_purge: dict[str, Any] = {}
-        persistence = getattr(db, "persistence", None)
-        db_path = getattr(persistence, "db_path", None)
         self._ingest_outbox = LearningIngressOutboxStore(db_path) if db_path else None
         spool_path = Path(ingest_spool_path) if ingest_spool_path else None
         if spool_path is None and db_path:
@@ -188,6 +211,18 @@ class EvolutionManager:
     def refresh_config(self, config):
         self.config = config
         evolution = getattr(config, "evolution", None)
+        self.learning_lane.refresh(self._learning_lane_config())
+        if self.provider_circuit_store is not None:
+            self.provider_circuit_store.refresh(
+                failure_window_sec=int(
+                    getattr(evolution, "learning_enrichment_circuit_window_sec", 600)
+                    or 600
+                ),
+                cooldown_sec=int(
+                    getattr(evolution, "learning_enrichment_cooldown_sec", 900)
+                    or 900
+                ),
+            )
         self.recorder.window_seconds = max(int(getattr(evolution, "mining_window_sec", 60) or 60), 10)
         self.recorder.min_messages = max(
             int(
@@ -228,6 +263,28 @@ class EvolutionManager:
 
     def _evolution_config(self):
         return getattr(self.config, "evolution", None)
+
+    def _learning_lane_config(self) -> LearningLaneConfig:
+        evolution = getattr(self.config, "evolution", None)
+        pipeline_timeout = max(
+            0.1,
+            float(getattr(evolution, "learning_pipeline_timeout_sec", 60.0) or 60.0),
+        )
+        return LearningLaneConfig(
+            limit=int(getattr(evolution, "learning_enrichment_concurrency", 1) or 1),
+            max_queue=int(getattr(evolution, "learning_enrichment_queue_max", 8) or 0),
+            admission_timeout_sec=float(
+                getattr(evolution, "learning_enrichment_wait_timeout_sec", 10.0)
+                or 10.0
+            ),
+            execution_timeout_sec=min(
+                pipeline_timeout,
+                float(
+                    getattr(evolution, "learning_enrichment_execution_timeout_sec", 45.0)
+                    or 45.0
+                ),
+            ),
+        )
 
     def _learning_pipeline_concurrency(self) -> int:
         evolution = self._evolution_config()
@@ -3064,6 +3121,7 @@ class EvolutionManager:
             self._ingest_worker.add_done_callback(self._handle_task_result)
 
     async def stop_background_tasks(self) -> None:
+        self.learning_lane.begin_drain()
         self._mining_rerun_requested.clear()
         tasks = [
             task
@@ -3077,6 +3135,7 @@ class EvolutionManager:
         self._backlog_task = None
         self._ingest_worker = None
         self._ingest_processing.clear()
+        await self.learning_lane.wait_until_idle(timeout_sec=1.0)
 
     async def process_bot_reply(self, chat_id: str, bot_id: str, reply_text: str):
         recorded = await self.bot_reply_recorder.record(chat_id, bot_id, reply_text)

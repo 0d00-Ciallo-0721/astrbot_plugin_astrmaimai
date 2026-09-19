@@ -4,11 +4,71 @@ from astrbot.api import logger
 
 from ..context_economy import PromptEnvelope, WorkloadFamily
 from ..runtime.lane_manager import LaneKey
-from ..runtime.runtime_contracts import LLMCallResult
+from ..runtime.runtime_contracts import LLMCallResult, LLMProviderSelection
 from .gateway_exceptions import LLMCascadeFailureException
 
 
 class GatewayTaskMixin:
+    def select_data_process_provider(
+        self,
+        *,
+        prompt: str,
+        system_prompt: str = "",
+        is_json: bool = False,
+        lane_key: Optional[LaneKey] = None,
+        base_origin: str = "",
+        workload_family: Optional[WorkloadFamily] = None,
+        use_fallback: bool = False,
+        allow_cooldown_override: bool = False,
+    ) -> LLMProviderSelection:
+        task_models = self._task_models()
+        resolved_family = workload_family or self.context_economy.infer_workload_family(
+            lane_key=lane_key,
+            pool_name="task",
+            tool_mode=False,
+        )
+        scope_id = str(getattr(lane_key, "scope_id", "") or base_origin or "global")
+        scope_kind = str(getattr(lane_key, "scope_kind", "") or "global")
+        workload_policy = self.context_economy.resolve_policy(
+            self.context_economy.build_request(
+                family=resolved_family,
+                pool_name="task",
+                prompt=prompt,
+                system_prompt=system_prompt,
+                models=task_models,
+                lane_key=lane_key,
+                base_origin=base_origin,
+                is_json=is_json,
+                scope_id=scope_id,
+                scope_kind=scope_kind,
+            )
+        )
+        pool_name = lane_key.task_family if lane_key else "task"
+        primary_models, attempt_queue = self._build_attempt_queue(
+            pool_name,
+            task_models,
+            use_fallback,
+            workload_policy=workload_policy,
+        )
+        attempt_queue, _, _ = self._filter_cooldown_attempt_queue(
+            pool_name,
+            primary_models,
+            attempt_queue,
+            allow_override=allow_cooldown_override,
+            claim_half_open_probe=False,
+        )
+        if not attempt_queue:
+            return LLMProviderSelection(pool_name=pool_name)
+        model_id = str(attempt_queue[0] or "")
+        capabilities = self._provider_capabilities(model_id)
+        return LLMProviderSelection(
+            provider_id=model_id,
+            provider_family=str(getattr(capabilities, "provider_family", "") or ""),
+            model_id=model_id,
+            identity_source="chat_provider_id",
+            pool_name=pool_name,
+        )
+
     def _normalize_vision_failure_reason(self, result: Any) -> tuple[bool, str]:
         if not isinstance(result, dict) or not result:
             return False, "empty_result"
@@ -285,7 +345,7 @@ class GatewayTaskMixin:
         )
         return result.parsed_json or {}
 
-    async def call_data_process_task(
+    async def call_data_process_task_result(
         self,
         prompt: str,
         system_prompt: str = "",
@@ -303,8 +363,17 @@ class GatewayTaskMixin:
         use_fallback: bool = True,
         allow_cooldown_override: bool = True,
         reserve_for_reply: bool = False,
-    ) -> Union[str, Dict[str, Any]]:
+        hard_deadline_monotonic: float | None = None,
+        selected_model_id: str = "",
+    ) -> LLMCallResult:
         task_models = self._task_models()
+        selected_model_id = str(selected_model_id or "").strip()
+        if selected_model_id:
+            if selected_model_id not in task_models:
+                raise LLMCascadeFailureException(
+                    f"selected model is not configured for task pool: {selected_model_id}"
+                )
+            task_models = [selected_model_id]
         # Background lanes (memory/reflect/dream/etc.) must not consume the
         # reserved user-reply slot or publish terminal queue-timeout state.
         lane_is_background = bool(lane_key and lane_key.subsystem == "bg")
@@ -336,8 +405,10 @@ class GatewayTaskMixin:
                 reserve_for_reply=effective_reserve_for_reply,
                 critical_path=effective_critical_path,
                 propagate_queue_timeout_status=effective_propagate_queue_timeout,
+                hard_deadline_monotonic=hard_deadline_monotonic,
+                selected_model_id=selected_model_id,
             )
-            return result.parsed_json if is_json else result.text
+            return result
         normalized_origin = str(base_origin or "").strip()
         scope_id = normalized_origin or "global"
         scope_kind = "chat" if normalized_origin and normalized_origin != "global" else "global"
@@ -384,6 +455,49 @@ class GatewayTaskMixin:
             reserve_for_reply=effective_reserve_for_reply,
             ledger_critical_path=effective_critical_path,
             propagate_queue_timeout_status=effective_propagate_queue_timeout,
+            hard_deadline_monotonic=hard_deadline_monotonic,
+            selected_model_id=selected_model_id,
+        )
+        return result
+
+    async def call_data_process_task(
+        self,
+        prompt: str,
+        system_prompt: str = "",
+        is_json: bool = False,
+        lane_key: Optional[LaneKey] = None,
+        base_origin: str = "",
+        prefix_hash: str = "",
+        persona_id: str = "",
+        workload_family: Optional[WorkloadFamily] = None,
+        template_envelope: Optional[PromptEnvelope] = None,
+        allow_global_scope: bool = False,
+        timeout_override: Optional[float] = None,
+        max_retries_override: Optional[int] = None,
+        max_models_override: Optional[int] = None,
+        use_fallback: bool = True,
+        allow_cooldown_override: bool = True,
+        reserve_for_reply: bool = False,
+        hard_deadline_monotonic: float | None = None,
+    ) -> Union[str, Dict[str, Any]]:
+        result = await self.call_data_process_task_result(
+            prompt=prompt,
+            system_prompt=system_prompt,
+            is_json=is_json,
+            lane_key=lane_key,
+            base_origin=base_origin,
+            prefix_hash=prefix_hash,
+            persona_id=persona_id,
+            workload_family=workload_family,
+            template_envelope=template_envelope,
+            allow_global_scope=allow_global_scope,
+            timeout_override=timeout_override,
+            max_retries_override=max_retries_override,
+            max_models_override=max_models_override,
+            use_fallback=use_fallback,
+            allow_cooldown_override=allow_cooldown_override,
+            reserve_for_reply=reserve_for_reply,
+            hard_deadline_monotonic=hard_deadline_monotonic,
         )
         return result.parsed_json if is_json else result.text
 
