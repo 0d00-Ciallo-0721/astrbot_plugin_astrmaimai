@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from typing import Any
 
 from astrbot.api.event import AstrMessageEvent
 
@@ -52,8 +53,7 @@ class MemoryInjectionService:
         return cleaned if len(cleaned) <= limit else cleaned[: max(0, limit - 3)] + "..."
 
     @staticmethod
-    def _build_trace_summary(query, trace_payload, trace, skip_reason):
-        selected = trace_payload.get("selected")
+    def _build_trace_summary(query, trace_payload, trace, skip_reason, selected=()):
         retrieved = trace_payload.get("retrieved")
         query_builder = trace_payload.get("query_builder")
         retrieval = trace_payload.get("retrieval")
@@ -63,6 +63,68 @@ class MemoryInjectionService:
             for step in list(trace_payload.get("search_steps") or [])
             if isinstance(step, dict)
         ]
+        selected_attribution: list[dict[str, Any]] = []
+        for item in list(selected or []):
+            metadata = dict(getattr(item, "metadata", {}) or {})
+            source_attributions = [
+                dict(source)
+                for source in (metadata.get("source_attributions") or [])
+                if isinstance(source, dict)
+            ]
+            attribution_identity_available = bool(
+                source_attributions
+                and str(metadata.get("candidate_id") or "")
+                and metadata.get("candidate_revision") is not None
+                and str(metadata.get("candidate_persistence_id") or "")
+                and str(metadata.get("evidence_digest") or "")
+            )
+            selected_attribution.append(
+                {
+                    "memory_id": str(getattr(item, "id", "") or ""),
+                    "scope_ids": list(metadata.get("attribution_scope_ids") or []),
+                    "speaker_scope_ids": list(
+                        metadata.get("attribution_speaker_scope_ids") or []
+                    ),
+                    "source_row_ids": list(metadata.get("source_row_ids") or []),
+                    "source_types": list(metadata.get("source_types") or []),
+                    "evidence_qualities": list(
+                        metadata.get("evidence_qualities") or []
+                    ),
+                    "personal_attribution_eligible": bool(
+                        metadata.get("personal_attribution_eligible", False)
+                    ),
+                    "candidate_id": str(metadata.get("candidate_id") or ""),
+                    "candidate_revision": metadata.get("candidate_revision"),
+                    "candidate_persistence_id": str(
+                        metadata.get("candidate_persistence_id") or ""
+                    ),
+                    "evidence_digest": str(
+                        metadata.get("evidence_digest") or ""
+                    ),
+                    "is_generated": [
+                        bool(source.get("is_generated", False))
+                        for source in source_attributions
+                    ],
+                    "evidence_eligible": [
+                        bool(source.get("evidence_eligible", False))
+                        for source in source_attributions
+                    ],
+                    "propagation_status": (
+                        "available"
+                        if attribution_identity_available
+                        else "unavailable"
+                    ),
+                    "unavailable_reason": (
+                        ""
+                        if attribution_identity_available
+                        else (
+                            "canonical_attribution_missing"
+                            if not source_attributions
+                            else "canonical_attribution_identity_missing"
+                        )
+                    ),
+                }
+            )
         return {
             "tool": "auto_injection",
             "policy": str(getattr(query, "policy", "") or ""),
@@ -83,6 +145,7 @@ class MemoryInjectionService:
             ),
             "skip_reason": str(skip_reason or getattr(trace, "skip_reason", "") or ""),
             "error": str(trace_payload.get("error") or ""),
+            "selected_attribution": selected_attribution,
         }
 
     async def _persist_trace(self, event, query, trace, selected, skip_reason=""):
@@ -102,7 +165,9 @@ class MemoryInjectionService:
         if debug_enabled:
             tool_calls[0]["query"] = persisted_query
         try:
-            trace_summary = self._build_trace_summary(query, trace_payload, trace, skip_reason)
+            trace_summary = self._build_trace_summary(
+                query, trace_payload, trace, skip_reason, selected
+            )
             record = RetrievalTrace(
                 trace_id=getattr(trace, "trace_id", "") or "",
                 chat_id=str(getattr(event, "unified_msg_origin", "") or ""),

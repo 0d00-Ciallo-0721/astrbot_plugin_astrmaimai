@@ -273,6 +273,7 @@ class EvolutionConfig(BaseModel):
     learning_enrichment_execution_timeout_sec: float = Field(default=45.0, ge=5.0, le=180.0, description="学习增强单次执行超时")
     learning_enrichment_max_attempts: int = Field(default=3, ge=1, le=5, description="后续候选增强工作器允许的最大工作尝试数")
     learning_candidate_ledger_enabled: bool = Field(default=False, description="启用候选 ledger shadow 写入；默认关闭")
+    learning_attribution_enabled: bool = Field(default=False, description="启用结构化学习来源归因；默认关闭")
     learning_enrichment_worker_enabled: bool = Field(default=False, description="启用 durable 候选增强工作器；要求 candidate ledger、discovery cursor v2 和 Provider 增强同时开启")
     learning_discovery_cursor_v2_enabled: bool = Field(default=False, description="使用 source-batch completeness proof 推进 discovery cursor；默认关闭")
     learning_enrichment_circuit_window_sec: int = Field(default=600, ge=60, le=3600, description="学习 Provider 熔断失败统计窗口")

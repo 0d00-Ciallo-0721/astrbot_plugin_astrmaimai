@@ -3,6 +3,7 @@ import hashlib
 import json
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, TypeVar
 
 from sqlmodel import Session, select
@@ -29,6 +30,28 @@ T = TypeVar("T")
 
 # TTL for PRAGMA table_info column caches (seconds) — avoids stale schema after runtime DDL
 _COL_CACHE_TTL_SEC = 300
+
+
+@dataclass(frozen=True, slots=True)
+class MessageLogWriteResult:
+    inserted: bool
+    idempotent: bool
+    conflict: bool
+    event_id: str
+    failure_kind: str = ""
+    incoming_digest: str = ""
+    existing_digest: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "inserted": self.inserted,
+            "idempotent": self.idempotent,
+            "conflict": self.conflict,
+            "event_id": self.event_id,
+            "failure_kind": self.failure_kind,
+            "incoming_digest": self.incoming_digest,
+            "existing_digest": self.existing_digest,
+        }
 
 
 class DatabaseService(
@@ -133,9 +156,11 @@ class DatabaseService(
             if isinstance(values, str):
                 try:
                     parsed = json.loads(values)
-                    values = parsed if isinstance(parsed, list) else [values]
+                    if not isinstance(parsed, list):
+                        return values
+                    values = parsed
                 except (TypeError, ValueError, json.JSONDecodeError):
-                    values = [values]
+                    return values
             return json.dumps(
                 [str(item) for item in values if str(item or "").strip()],
                 ensure_ascii=False,
@@ -190,7 +215,33 @@ class DatabaseService(
 
         self._run_with_session(_sync)
 
-    def add_message_log_if_absent(
+    @staticmethod
+    def _message_log_fact_digest(values: dict[str, Any]) -> str:
+        excluded = {"processed", "timestamp", "sender_name"}
+        boolean_fields = {"is_bot", "recalled"}
+        integer_fields = {"event_schema_version", "topic_epoch"}
+        payload = {
+            key: (
+                bool(values.get(key))
+                if key in boolean_fields
+                else int(values.get(key) or 0)
+                if key in integer_fields
+                else values.get(key)
+            )
+            for key in sorted(values)
+            if key not in excluded
+        }
+        return hashlib.sha256(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+
+    def add_message_log_with_diagnostic(
         self,
         group_id: str,
         sender_id: str,
@@ -198,8 +249,8 @@ class DatabaseService(
         content: str,
         *,
         conversation_event: Any,
-    ) -> bool:
-        """Atomically append one canonical event across plugin instances."""
+    ) -> MessageLogWriteResult:
+        """Atomically append one event and distinguish replay from conflict."""
         event_fields = self._conversation_event_log_fields(conversation_event)
         event_id = str(event_fields.get("event_id") or "").strip()
         if not event_id:
@@ -210,7 +261,7 @@ class DatabaseService(
                 content,
                 conversation_event=conversation_event,
             )
-            return True
+            return MessageLogWriteResult(True, False, False, "")
         values: dict[str, Any] = {
             "group_id": str(group_id or ""),
             "sender_id": str(sender_id or ""),
@@ -224,19 +275,57 @@ class DatabaseService(
         column_sql = ", ".join(f'"{name}"' for name in columns)
         with connect_sqlite(self.persistence.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
-            exists = conn.execute(
-                "SELECT 1 FROM messagelog WHERE event_id = ? LIMIT 1",
+            existing = conn.execute(
+                f"SELECT {column_sql} FROM messagelog WHERE event_id = ? LIMIT 1",
                 (event_id,),
             ).fetchone()
-            if exists is not None:
+            if existing is not None:
+                existing_values = {
+                    name: existing[index] for index, name in enumerate(columns)
+                }
+                incoming_digest = self._message_log_fact_digest(values)
+                existing_digest = self._message_log_fact_digest(existing_values)
                 conn.rollback()
-                return False
+                identical = incoming_digest == existing_digest
+                return MessageLogWriteResult(
+                    inserted=False,
+                    idempotent=identical,
+                    conflict=not identical,
+                    event_id=event_id,
+                    failure_kind="" if identical else "duplicate_event_conflict",
+                    incoming_digest=incoming_digest,
+                    existing_digest=existing_digest,
+                )
             conn.execute(
                 f"INSERT INTO messagelog ({column_sql}) VALUES ({placeholders})",
                 tuple(values[name] for name in columns),
             )
             conn.commit()
-        return True
+        return MessageLogWriteResult(
+            inserted=True,
+            idempotent=False,
+            conflict=False,
+            event_id=event_id,
+            incoming_digest=self._message_log_fact_digest(values),
+        )
+
+    def add_message_log_if_absent(
+        self,
+        group_id: str,
+        sender_id: str,
+        sender_name: str,
+        content: str,
+        *,
+        conversation_event: Any,
+    ) -> bool:
+        """Compatibility wrapper retaining the historical boolean contract."""
+        return self.add_message_log_with_diagnostic(
+            group_id,
+            sender_id,
+            sender_name,
+            content,
+            conversation_event=conversation_event,
+        ).inserted
 
     def get_unprocessed_logs(self, group_id: str, limit: int = 50) -> List[MessageLog]:
         def _sync(session: Session) -> List[MessageLog]:
@@ -1560,6 +1649,25 @@ class DatabaseService(
                 conversation_event=conversation_event,
                 with_lock=True,
             )
+        )
+
+    async def add_message_log_with_diagnostic_async(
+        self,
+        group_id: str,
+        sender_id: str,
+        sender_name: str,
+        content: str,
+        *,
+        conversation_event: Any,
+    ) -> MessageLogWriteResult:
+        return await self._run_blocking(
+            self.add_message_log_with_diagnostic,
+            group_id,
+            sender_id,
+            sender_name,
+            content,
+            conversation_event=conversation_event,
+            with_lock=True,
         )
 
     async def message_log_event_exists_async(self, event_id: str) -> bool:

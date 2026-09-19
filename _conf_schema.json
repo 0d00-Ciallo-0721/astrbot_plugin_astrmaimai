@@ -1389,6 +1389,11 @@
         "default": false,
         "hint": "默认关闭。开启后以影子模式写入来源批次、候选与证据；单独开启不会改变旧游标。"
       },
+      "learning_attribution_enabled": {
+        "description": "启用学习证据的结构化来源归因；默认关闭",
+        "type": "bool",
+        "default": false
+      },
       "learning_enrichment_worker_enabled": {
         "description": "启用持久候选增强工作器",
         "type": "bool",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 from dataclasses import replace
 from types import SimpleNamespace
@@ -21,6 +22,7 @@ from astrmai.learning.persistence.candidate_ledger import (
     SourceDisposition,
 )
 from astrmai.learning.runtime.enrichment_worker import LearningEnrichmentWorker
+from astrmai.memory.services.expression_pattern_service import ExpressionPatternService
 
 
 @pytest.fixture
@@ -237,6 +239,70 @@ async def test_worker_marks_provider_at_fence_and_settles_canonical_id(ledger):
             (candidate.candidate_id,),
         ).fetchone()
     assert metrics == (10.0, 1.0, 2.0, 3.0, 4.0, 5.0, 1, 1)
+
+
+@pytest.mark.asyncio
+async def test_worker_passes_attribution_from_candidate_to_canonical_metadata(ledger):
+    candidate = await _discover_expression(ledger)
+    original = await ledger.get_candidate(candidate.candidate_id)
+    with sqlite3.connect(ledger.db_path) as db:
+        payload = dict(original.source_payload)
+        payload.update({
+            "situation": "test",
+            "source_row_ids": [11],
+            "source_attributions": [{"source_row_id": 11, "source_type": "user_said"}],
+            "source_types": ["user_said"],
+            "evidence_qualities": ["high"],
+            "attribution_scope_ids": ["qq:group:42"],
+            "attribution_speaker_scope_ids": ["qq:group:42:user-1"],
+            "personal_attribution_eligible": True,
+        })
+        db.execute(
+            "UPDATE learning_candidate SET source_payload_json = ? WHERE candidate_id = ?",
+            (json.dumps(payload, ensure_ascii=False), candidate.candidate_id),
+        )
+        db.commit()
+
+    class _PassThroughEnricher(_ExpressionEnricher):
+        async def enrich(self, scope_id, candidates, *, provider_call_kwargs=None):
+            result = await super().enrich(
+                scope_id, candidates, provider_call_kwargs=provider_call_kwargs
+            )
+            result.items[0].update(candidates[0])
+            return result
+
+    class _CanonicalStore:
+        async def get_by_dedup_key(self, _key, include_inactive=True):
+            return None
+
+        async def resolve_dedup_key(self, key):
+            return key
+
+    class _CanonicalWriter:
+        request = None
+
+        async def write(self, request):
+            self.request = request
+            return "memory:expression:1"
+
+    canonical_writer = _CanonicalWriter()
+    canonical = ExpressionPatternService(_CanonicalStore(), canonical_writer)
+
+    async def save_patterns(items, **_kwargs):
+        memory_id = await canonical.write_pattern(
+            "qq:group:42", items[0], source="learning_candidate_worker"
+        )
+        return PatternSaveReport(attempted=1, saved=1, memory_ids=[memory_id])
+
+    result = await _worker(
+        ledger, _PassThroughEnricher(), save_patterns=save_patterns
+    ).run_due_once()
+
+    assert result.enriched == 1
+    assert canonical_writer.request.metadata["source_row_ids"] == [11]
+    assert canonical_writer.request.metadata["attribution_speaker_scope_ids"] == [
+        "qq:group:42:user-1"
+    ]
 
 
 @pytest.mark.asyncio

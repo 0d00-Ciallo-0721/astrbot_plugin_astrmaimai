@@ -38,6 +38,7 @@ from .mining.persistence_results import JargonSaveReport, PersistenceFailure
 from .mining.diagnostics import LearningStageDiagnostic, build_learning_diagnostics
 from .mining.jargon_miner import JargonMiner
 from .mining.learning_evidence import merge_evidence_metadata
+from .mining.learning_attribution import LearningAttributionAdapter
 from .mining.learning_input_policy import LearningMessageView
 from .mining.jargon_senses import merge_jargon_senses
 from .persistence.provider_circuit_store import LearningProviderCircuitStore
@@ -293,7 +294,7 @@ class EvolutionManager:
             self._backlog_task.cancel()
 
     def _evolution_config(self):
-        return getattr(self.config, "evolution", None)
+        return getattr(getattr(self, "config", None), "evolution", None)
 
     def _candidate_ledger_enabled(self) -> bool:
         return bool(
@@ -321,6 +322,49 @@ class EvolutionManager:
                 False,
             )
         )
+
+    def _attribution_enabled(self) -> bool:
+        return bool(
+            getattr(
+                self._evolution_config(),
+                "learning_attribution_enabled",
+                False,
+            )
+        )
+
+    @staticmethod
+    def _apply_attribution_evidence_gate(
+        messages: list[Any], adapter: LearningAttributionAdapter
+    ) -> list[Any]:
+        gated: list[Any] = []
+        for message in messages:
+            attribution = adapter.attribute(message)
+            eligible = bool(
+                getattr(message, "learning_evidence_eligible", True)
+                and attribution.evidence_eligible
+            )
+            if eligible == bool(
+                getattr(message, "learning_evidence_eligible", True)
+            ):
+                gated.append(message)
+                continue
+            gated.append(
+                LearningMessageView(
+                    message,
+                    str(getattr(message, "content", "") or ""),
+                    str(
+                        getattr(message, "learning_source_kind", "human_text")
+                        or "human_text"
+                    ),
+                    context_content=str(
+                        getattr(message, "learning_context_content", "")
+                        or getattr(message, "content", "")
+                        or ""
+                    ),
+                    evidence_eligible=eligible,
+                )
+            )
+        return gated
 
     def _enrichment_worker_gate(self) -> tuple[bool, str]:
         requirements = (
@@ -630,6 +674,24 @@ class EvolutionManager:
         content: str,
         conversation_event=None,
     ) -> bool:
+        result = await self._append_message_log_result(
+            group_id=group_id,
+            sender_id=sender_id,
+            sender_name=sender_name,
+            content=content,
+            conversation_event=conversation_event,
+        )
+        return bool(result.get("inserted", False))
+
+    async def _append_message_log_result(
+        self,
+        *,
+        group_id: str,
+        sender_id: str,
+        sender_name: str,
+        content: str,
+        conversation_event=None,
+    ) -> dict[str, Any]:
         kwargs = {
             "group_id": group_id,
             "sender_id": sender_id,
@@ -646,13 +708,30 @@ class EvolutionManager:
             "add_message_log_if_absent_async",
             None,
         )
+        diagnostic_append = getattr(
+            self.db,
+            "add_message_log_with_diagnostic_async",
+            None,
+        )
+        if event_id and callable(diagnostic_append):
+            result = await diagnostic_append(**kwargs)
+            if hasattr(result, "to_dict"):
+                return dict(result.to_dict())
+            if isinstance(result, dict):
+                return dict(result)
         if event_id and callable(conditional_append):
-            return bool(await conditional_append(**kwargs))
+            inserted = bool(await conditional_append(**kwargs))
+            return {
+                "inserted": inserted,
+                "idempotent": not inserted,
+                "conflict": False,
+                "event_id": event_id,
+            }
         if hasattr(self.db, "add_message_log_async"):
             await self.db.add_message_log_async(**kwargs)
-            return True
+            return {"inserted": True, "idempotent": False, "conflict": False}
         await asyncio.to_thread(self.db.add_message_log, **kwargs)
-        return True
+        return {"inserted": True, "idempotent": False, "conflict": False}
 
     async def _publish_learning_event(self, publisher_name: str, payload: dict) -> None:
         if not self.event_bus:
@@ -1575,6 +1654,20 @@ class EvolutionManager:
                         "contributor_count": int(self._field(pattern, "contributor_count", 0) or 0),
                         "model_examples": list(self._field(pattern, "model_examples", []) or []),
                         "evidence_digest": self._field(pattern, "evidence_digest", ""),
+                        **(
+                            {
+                                key: self._field(pattern, key)
+                                for key in (
+                                    "source_row_ids", "source_attributions", "source_types",
+                                    "evidence_qualities", "attribution_unknown_reasons",
+                                    "attribution_scope_ids", "attribution_speaker_ids",
+                                    "attribution_speaker_scope_ids",
+                                    "personal_attribution_eligible",
+                                )
+                            }
+                            if self._field(pattern, "source_attributions", None)
+                            else {}
+                        ),
                         "mining_batch_id": mining_batch_id,
                         "source_ref": f"{source}:{mining_batch_id}:{self._field(pattern, 'candidate_id', '')}",
                     },
@@ -1701,7 +1794,22 @@ class EvolutionManager:
                     "contributor_count",
                     "model_examples",
                     "evidence_digest",
+                    "source_row_ids",
+                    "source_attributions",
+                    "source_types",
+                    "evidence_qualities",
+                    "attribution_unknown_reasons",
+                    "attribution_scope_ids",
+                    "attribution_speaker_ids",
+                    "attribution_speaker_scope_ids",
+                    "personal_attribution_eligible",
                 )
+                if key not in {
+                    "source_row_ids", "source_attributions", "source_types",
+                    "evidence_qualities", "attribution_unknown_reasons",
+                    "attribution_scope_ids", "attribution_speaker_ids",
+                    "attribution_speaker_scope_ids", "personal_attribution_eligible",
+                } or self._field(jargon, "source_attributions", None)
             }
             merged_evidence = merge_evidence_metadata(existing_metadata, incoming_evidence)
             proposed_senses = [
@@ -1919,13 +2027,6 @@ class EvolutionManager:
         envelope = event if isinstance(event, LearningMessageEnvelope) else None
         if envelope is not None:
             event_id = str(envelope.event_id or "").strip()
-            if event_id:
-                exists = False
-                checker = getattr(self.db, "message_log_event_exists_async", None)
-                if callable(checker):
-                    exists = bool(await checker(event_id))
-                if exists:
-                    return {"recorded": False, "reason": "duplicate_event", "event_id": event_id}
             rich_text = envelope.content
             group_id = envelope.chat_id
             sender_id = envelope.sender_id
@@ -1944,7 +2045,7 @@ class EvolutionManager:
             sender_id = event.get_sender_id()
             sender_name = event.get_sender_name()
             conversation_event = event.get_extra("astrmai_conversation_event", None)
-        inserted = await self._append_message_log(
+        append_result = await self._append_message_log_result(
             group_id=group_id,
             sender_id=sender_id,
             sender_name=sender_name,
@@ -1954,8 +2055,27 @@ class EvolutionManager:
                 **({"event_id": event_id} if event_id else {}),
             },
         )
-        if not inserted:
-            return {"recorded": False, "reason": "duplicate_event", "event_id": event_id}
+        if not append_result.get("inserted", False):
+            return {
+                "recorded": False,
+                "reason": (
+                    "duplicate_event_conflict"
+                    if append_result.get("conflict", False)
+                    else "duplicate_event"
+                ),
+                "event_id": event_id,
+                "diagnostics": {
+                    key: append_result.get(key)
+                    for key in (
+                        "idempotent",
+                        "conflict",
+                        "failure_kind",
+                        "incoming_digest",
+                        "existing_digest",
+                    )
+                    if append_result.get(key) not in (None, "")
+                },
+            }
         triggered = self.recorder.record(group_id)
         self._schedule_mining_if_triggered(group_id, triggered)
         payload = UserMessageRecordedEvent(
@@ -2329,8 +2449,14 @@ class EvolutionManager:
         if begun.conflict:
             raise RuntimeError("source_batch_conflict")
 
+        attribution_enabled = self._attribution_enabled()
+        attribution_adapter = LearningAttributionAdapter()
         if pipeline == "expression":
             normalized = self.expression_miner.input_policy.normalize(source_logs)
+            if attribution_enabled:
+                normalized = self._apply_attribution_evidence_gate(
+                    normalized, attribution_adapter
+                )
             existing = await self.expression_miner._existing_patterns(group_id)
             discovered = await self.expression_miner.candidate_extractor.extract(
                 group_id,
@@ -2350,6 +2476,10 @@ class EvolutionManager:
             ]
         else:
             normalized = self.jargon_miner.input_policy.normalize(source_logs)
+            if attribution_enabled:
+                normalized = self._apply_attribution_evidence_gate(
+                    normalized, attribution_adapter
+                )
             blocked = await self.jargon_miner._existing_expression_terms(group_id)
             discovered = await self.jargon_miner.candidate_extractor.extract(
                 group_id,
@@ -2411,8 +2541,14 @@ class EvolutionManager:
                 scope_id=str(group_id),
                 candidate_family=pipeline,
                 candidate_subtype=str(payload.get("candidate_type") or ""),
-                speaker_id=str(payload.get("speaker_id") or ""),
-                speaker_scope_id=str(payload.get("speaker_scope_id") or ""),
+                speaker_id=(
+                    "" if attribution_enabled else str(payload.get("speaker_id") or "")
+                ),
+                speaker_scope_id=(
+                    ""
+                    if attribution_enabled
+                    else str(payload.get("speaker_scope_id") or "")
+                ),
                 fingerprint=f"sha256:{fingerprint}",
                 fingerprint_version=1,
                 extractor_version=f"{pipeline}-extractor-v1",
@@ -2422,49 +2558,261 @@ class EvolutionManager:
                 source_message_end=max(
                     int(self._field(item, "id", 0) or 0) for item in source_logs
                 ),
-                evidence_quality="direct",
+                evidence_quality="unknown" if attribution_enabled else "direct",
                 source_payload=payload,
                 created_at=now,
             )
             evidence: list[CandidateEvidence] = []
+            attribution_views: list[dict[str, Any]] = []
             for source_ref in payload.get("source_message_ids") or ():
                 log = aliases.get(str(source_ref))
                 if log is None:
                     continue
                 row_id = int(self._field(log, "id", 0) or 0)
                 source_key = source_key_by_object[id(log)]
+                attribution = (
+                    attribution_adapter.attribute(log)
+                    if attribution_enabled
+                    else None
+                )
+                if attribution is not None:
+                    attribution_views.append(attribution.to_dict())
                 item = CandidateEvidence.source(
                     candidate_id=candidate.candidate_id,
                     batch_id=batch.batch_id,
                     source_row_id=row_id,
-                    source_message_id=str(
-                        self._field(log, "platform_message_id", "") or source_ref
+                    source_message_id=(
+                        attribution.source_message_id
+                        if attribution is not None
+                        else str(
+                            self._field(log, "platform_message_id", "") or source_ref
+                        )
                     ),
-                    identity_source="messagelog.id",
-                    sender_id=str(self._field(log, "sender_id", "") or ""),
-                    scope_id=str(group_id),
+                    identity_source=(
+                        attribution.identity_source
+                        if attribution is not None
+                        else "messagelog.id"
+                    ),
+                    sender_id=(
+                        str(attribution.speaker_id or "")
+                        if attribution is not None
+                        else str(self._field(log, "sender_id", "") or "")
+                    ),
+                    scope_id=(
+                        str(attribution.scope_id or "")
+                        if attribution is not None
+                        else str(group_id)
+                    ),
                     speaker_scope_id=(
-                        f"{group_id}:{self._field(log, 'sender_id', '')}"
-                        if self._field(log, "sender_id", "")
-                        else ""
+                        str(attribution.speaker_scope_id or "")
+                        if attribution is not None
+                        else (
+                            f"{group_id}:{self._field(log, 'sender_id', '')}"
+                            if self._field(log, "sender_id", "")
+                            else ""
+                        )
                     ),
-                    source_type="user_said",
-                    evidence_quality="direct",
-                    eligible=True,
-                    eligibility_reason="learning_evidence_eligible",
+                    source_type=(
+                        attribution.source_type
+                        if attribution is not None
+                        else "user_said"
+                    ),
+                    evidence_quality=(
+                        attribution.evidence_quality
+                        if attribution is not None
+                        else "direct"
+                    ),
+                    eligible=(
+                        attribution.evidence_eligible
+                        if attribution is not None
+                        else True
+                    ),
+                    eligibility_reason=(
+                        (
+                            "speaker_attribution_eligible"
+                            if attribution.eligible_for_speaker_stats
+                            else "group_shadow_only"
+                            if attribution.eligible_for_group_shadow
+                            else (
+                                attribution.unknown_reasons[0]
+                                if attribution.unknown_reasons
+                                else f"source_type_{attribution.source_type}"
+                            )
+                        )
+                        if attribution is not None
+                        else "learning_evidence_eligible"
+                    ),
                     payload={
                         "event_id": str(self._field(log, "event_id", "") or ""),
                         "candidate_source": pipeline,
+                        **(
+                            {
+                                "platform_id": attribution.platform_id,
+                                "chat_kind": attribution.chat_kind,
+                                "chat_id": attribution.chat_id,
+                                "relation": dict(attribution.relation_payload),
+                                "eligible_for_group_shadow": attribution.eligible_for_group_shadow,
+                                "eligible_for_speaker_stats": attribution.eligible_for_speaker_stats,
+                                "unknown_reasons": list(attribution.unknown_reasons),
+                            }
+                            if attribution is not None
+                            else {}
+                        ),
                     },
                     created_at=float(self._field(log, "timestamp", 0.0) or 0.0),
-                    event_id=str(self._field(log, "event_id", "") or "") or None,
-                    platform_message_id=(
-                        str(self._field(log, "platform_message_id", "") or "") or None
+                    event_id=(
+                        attribution.event_id or None
+                        if attribution is not None
+                        else str(self._field(log, "event_id", "") or "") or None
                     ),
-                    topic_epoch=int(self._field(log, "topic_epoch", 0) or 0),
+                    platform_message_id=(
+                        attribution.platform_message_id or None
+                        if attribution is not None
+                        else str(self._field(log, "platform_message_id", "") or "") or None
+                    ),
+                    pairwise_scope_id=(
+                        attribution.pairwise_id if attribution is not None else None
+                    ),
+                    topic_epoch=(
+                        attribution.topic_epoch
+                        if attribution is not None
+                        else int(self._field(log, "topic_epoch", 0) or 0)
+                    ),
+                    attribution_confidence=(
+                        attribution.attribution_confidence
+                        if attribution is not None
+                        else None
+                    ),
+                    is_generated=(
+                        attribution.is_generated
+                        if attribution is not None
+                        else False
+                    ),
                 )
                 evidence.append(item)
                 candidate_ids_by_source[source_key].append(candidate.candidate_id)
+            if attribution_enabled:
+                eligible_views = [
+                    item for item in attribution_views if item["evidence_eligible"]
+                ]
+                speaker_views = [
+                    item
+                    for item in eligible_views
+                    if item["eligible_for_speaker_stats"]
+                ]
+                speaker_scopes = {
+                    str(item["speaker_scope_id"])
+                    for item in speaker_views
+                    if item["speaker_scope_id"]
+                }
+                personal_eligible = bool(
+                    eligible_views
+                    and len(speaker_views) == len(eligible_views)
+                    and len(speaker_scopes) == 1
+                )
+                quality_rank = {"unknown": 0, "low": 1, "medium": 2, "high": 3}
+                candidate_quality = min(
+                    (
+                        str(item["evidence_quality"])
+                        for item in eligible_views
+                    ),
+                    key=lambda value: quality_rank.get(value, 0),
+                    default="unknown",
+                )
+                payload = {
+                    **payload,
+                    "source_message_ids": sorted(
+                        {
+                            str(item["source_message_id"])
+                            for item in eligible_views
+                            if item["source_message_id"]
+                        }
+                    ),
+                    "support_count": len(
+                        {
+                            (
+                                f"row:{item['source_row_id']}"
+                                if item["source_row_id"] is not None
+                                else f"message:{item['source_message_id']}"
+                            )
+                            for item in eligible_views
+                            if item["source_row_id"] is not None
+                            or item["source_message_id"]
+                        }
+                    ),
+                    "source_attributions": attribution_views,
+                    "source_row_ids": sorted(
+                        {
+                            int(item["source_row_id"])
+                            for item in eligible_views
+                            if item["source_row_id"] is not None
+                        }
+                    ),
+                    "source_types": sorted(
+                        {str(item["source_type"]) for item in attribution_views}
+                    ),
+                    "evidence_qualities": sorted(
+                        {str(item["evidence_quality"]) for item in attribution_views}
+                    ),
+                    "attribution_unknown_reasons": sorted(
+                        {
+                            str(reason)
+                            for item in attribution_views
+                            for reason in item["unknown_reasons"]
+                        }
+                    ),
+                    "personal_attribution_eligible": personal_eligible,
+                    "attribution_scope_ids": sorted(
+                        {
+                            str(item["scope_id"])
+                            for item in eligible_views
+                            if item["scope_id"]
+                        }
+                    ),
+                    "attribution_speaker_ids": sorted(
+                        {
+                            str(item["speaker_id"])
+                            for item in speaker_views
+                            if item["speaker_id"]
+                        }
+                    ),
+                    "attribution_speaker_scope_ids": sorted(speaker_scopes),
+                }
+                personal = speaker_views[0] if personal_eligible else None
+                canonical_scopes = {
+                    str(item["scope_id"])
+                    for item in eligible_views
+                    if item["scope_id"]
+                }
+                candidate = LearningCandidate(
+                    **{
+                        **{
+                            field: getattr(candidate, field)
+                            for field in candidate.__dataclass_fields__
+                            if field
+                            not in {
+                                "scope_id",
+                                "speaker_id",
+                                "speaker_scope_id",
+                                "evidence_quality",
+                                "source_payload",
+                                "evidence",
+                            }
+                        },
+                        "scope_id": (
+                            next(iter(canonical_scopes))
+                            if len(canonical_scopes) == 1
+                            else str(group_id)
+                        ),
+                        "speaker_id": str(personal["speaker_id"] or "") if personal else "",
+                        "speaker_scope_id": (
+                            str(personal["speaker_scope_id"] or "") if personal else ""
+                        ),
+                        "evidence_quality": candidate_quality,
+                        "source_payload": payload,
+                        "evidence": tuple(evidence),
+                    }
+                )
             result = await self.candidate_ledger.upsert_discovered(
                 LearningCandidate(
                     **{

@@ -8,6 +8,10 @@ import pytest
 
 from astrmai.infrastructure.persistence.persistence_schema import _MIGRATIONS, _run_migrations
 from astrmai.learning.evolution_manager import EvolutionManager
+from astrmai.learning.mining.expression_candidate_extractor import (
+    ExpressionCandidateExtractor,
+)
+from astrmai.learning.mining.learning_input_policy import LearningInputPolicy
 from astrmai.learning.persistence.candidate_ledger import CandidateLedger
 
 
@@ -86,8 +90,25 @@ def _logs():
             id=11,
             group_id="qq:group:42",
             sender_id="user-1",
+            sender_name="Alice",
+            content="structured expression",
             event_id="event-11",
+            event_schema_version=1,
             platform_message_id="platform-11",
+            chat_kind="group",
+            role="user",
+            message_kind="text",
+            is_bot=False,
+            reply_target_event_id="event-10",
+            reply_target_actor_id="user-2",
+            reply_target_actor_name="Bob",
+            quote_event_id="",
+            at_actor_ids="[]",
+            causal_parent_event_id="event-10",
+            source_event_ids='["event-11"]',
+            provenance="original",
+            image_refs="[]",
+            recalled=False,
             topic_epoch=1,
             learning_evidence_eligible=True,
         ),
@@ -95,8 +116,25 @@ def _logs():
             id=12,
             group_id="qq:group:42",
             sender_id="user-2",
+            sender_name="Bob",
+            content="context",
             event_id="event-12",
+            event_schema_version=1,
             platform_message_id="platform-12",
+            chat_kind="group",
+            role="user",
+            message_kind="text",
+            is_bot=False,
+            reply_target_event_id="",
+            reply_target_actor_id="",
+            reply_target_actor_name="",
+            quote_event_id="",
+            at_actor_ids="[]",
+            causal_parent_event_id="",
+            source_event_ids='["event-12"]',
+            provenance="original",
+            image_refs="[]",
+            recalled=False,
             topic_epoch=1,
             learning_evidence_eligible=True,
         ),
@@ -118,7 +156,140 @@ async def test_discovery_writes_complete_source_batch_candidate_and_evidence(led
     assert report["source_count"] == 2
     assert report["candidate_count"] == 1
     assert len(due) == 1
-    assert len(await ledger.list_evidence(due[0].candidate_id)) == 1
+    evidence = await ledger.list_evidence(due[0].candidate_id)
+    assert len(evidence) == 1
+    assert due[0].evidence_quality == "direct"
+    assert "source_attributions" not in due[0].source_payload
+    assert evidence[0].evidence_quality == "direct"
+
+
+@pytest.mark.asyncio
+async def test_attribution_flag_writes_structured_ledger_evidence(ledger):
+    manager = _manager(ledger)
+    manager.config = SimpleNamespace(
+        evolution=SimpleNamespace(learning_attribution_enabled=True)
+    )
+
+    await manager._write_candidate_discovery(
+        pipeline="expression",
+        group_id="qq:group:42",
+        logs=_logs(),
+        cursor_before=10,
+    )
+
+    candidate = (await ledger.list_due_enrichment(now=200.0, limit=10))[0]
+    evidence = (await ledger.list_evidence(candidate.candidate_id))[0]
+    assert candidate.scope_id == "qq:group:42"
+    assert candidate.speaker_id == "user-1"
+    assert candidate.speaker_scope_id == "qq:group:42:user-1"
+    assert candidate.evidence_quality == "high"
+    assert evidence.source_row_id == 11
+    assert evidence.source_message_id == "event-11"
+    assert evidence.pairwise_scope_id == (
+        "pair:qq:group:42:user-1:qq:group:42:user-2"
+    )
+    assert evidence.source_type == "user_said"
+    assert evidence.eligible is True
+
+
+@pytest.mark.asyncio
+async def test_attribution_mixed_speakers_stays_group_shadow(ledger):
+    manager = _manager(ledger)
+    manager.config = SimpleNamespace(
+        evolution=SimpleNamespace(learning_attribution_enabled=True)
+    )
+
+    class _MixedExtractor:
+        async def extract(self, group_id, _logs, **_kwargs):
+            return [{
+                "candidate_type": "catchphrase",
+                "normalized_expression": "mixed",
+                "expression": "mixed",
+                "distinct_turn_count": 2,
+                "source_message_ids": ["event-11", "event-12"],
+                "group_id": group_id,
+            }]
+
+    manager.expression_miner.candidate_extractor = _MixedExtractor()
+    await manager._write_candidate_discovery(
+        pipeline="expression", group_id="qq:group:42", logs=_logs(), cursor_before=10
+    )
+
+    candidate = (await ledger.list_due_enrichment(now=200.0, limit=10))[0]
+    assert candidate.speaker_id == ""
+    assert candidate.speaker_scope_id == ""
+    assert candidate.scope_id == "qq:group:42"
+    assert candidate.source_payload["personal_attribution_eligible"] is False
+    assert candidate.source_payload["support_count"] == 2
+
+
+@pytest.mark.parametrize("provenance", ["quoted", "forwarded"])
+@pytest.mark.asyncio
+async def test_attribution_makes_non_source_messages_context_only_before_extraction(
+    ledger, provenance
+):
+    manager = _manager(ledger)
+    manager.config = SimpleNamespace(
+        evolution=SimpleNamespace(learning_attribution_enabled=True)
+    )
+    manager.expression_miner = SimpleNamespace(
+        input_policy=LearningInputPolicy(),
+        candidate_extractor=ExpressionCandidateExtractor(min_count=2),
+        expression_min_distinct_turns=2,
+        _existing_patterns=lambda _group_id: _async_value(set()),
+    )
+    logs = _logs()
+    logs[0].content = "唉嘿嘿呀"
+    logs[1].content = "唉嘿嘿呀"
+    logs[1].provenance = provenance
+
+    report = await manager._write_candidate_discovery(
+        pipeline="expression", group_id="qq:group:42", logs=logs, cursor_before=10
+    )
+
+    assert report["candidate_count"] == 0
+    assert await ledger.list_due_enrichment(now=200.0, limit=10) == ()
+
+
+@pytest.mark.asyncio
+async def test_attribution_excludes_quoted_samples_from_enrichment_payload(ledger):
+    manager = _manager(ledger)
+    manager.config = SimpleNamespace(
+        evolution=SimpleNamespace(learning_attribution_enabled=True)
+    )
+    manager.expression_miner = SimpleNamespace(
+        input_policy=LearningInputPolicy(),
+        candidate_extractor=ExpressionCandidateExtractor(min_count=2),
+        expression_min_distinct_turns=2,
+        _existing_patterns=lambda _group_id: _async_value(set()),
+    )
+    logs = _logs()
+    logs[0].content = "唉 嘿嘿呀"
+    logs[1].content = "唉嘿嘿呀"
+    quoted = SimpleNamespace(**vars(logs[1]))
+    quoted.id = 13
+    quoted.event_id = "event-13"
+    quoted.platform_message_id = "platform-13"
+    quoted.sender_id = "user-3"
+    quoted.content = "唉嘿嘿呀 quoted-contamination"
+    quoted.provenance = "quoted"
+
+    await manager._write_candidate_discovery(
+        pipeline="expression",
+        group_id="qq:group:42",
+        logs=[*logs, quoted],
+        cursor_before=10,
+    )
+
+    candidates = await ledger.list_due_enrichment(now=200.0, limit=20)
+    assert candidates
+    for candidate in candidates:
+        assert candidate.source_payload["count"] == 2
+        assert candidate.source_payload["support_count"] == 2
+        assert all(
+            "quoted-contamination" not in sample
+            for sample in candidate.source_payload["source_examples"]
+        )
 
 
 @pytest.mark.asyncio

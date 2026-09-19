@@ -245,6 +245,7 @@ class CandidateEvidence:
         pairwise_scope_id: str | None = None,
         topic_epoch: int | None = None,
         attribution_confidence: float | None = None,
+        is_generated: bool = False,
     ) -> CandidateEvidence:
         source_key = _source_key(
             source_row_id=source_row_id, source_message_id=source_message_id
@@ -268,7 +269,7 @@ class CandidateEvidence:
             source_type=str(source_type or "unknown"),
             evidence_quality=str(evidence_quality or "unknown"),
             attribution_confidence=attribution_confidence,
-            is_generated=False,
+            is_generated=bool(is_generated),
             eligible=bool(eligible),
             eligibility_reason=str(eligibility_reason or ""),
             identity_source=str(identity_source),

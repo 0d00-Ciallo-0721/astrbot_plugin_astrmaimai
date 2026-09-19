@@ -512,6 +512,15 @@ class ExpressionPatternService:
                 "contributor_count",
                 "model_examples",
                 "evidence_digest",
+                "source_row_ids",
+                "source_attributions",
+                "source_types",
+                "evidence_qualities",
+                "attribution_unknown_reasons",
+                "attribution_scope_ids",
+                "attribution_speaker_ids",
+                "attribution_speaker_scope_ids",
+                "personal_attribution_eligible",
             )
             if payload.get(key) not in (None, "")
         }
