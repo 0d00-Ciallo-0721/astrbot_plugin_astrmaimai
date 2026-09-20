@@ -277,6 +277,11 @@ class ExpressionPatternService:
         if not current:
             return None
         metadata = dict(current.metadata or {})
+        if (
+            str(metadata.get("candidate_id") or "").strip()
+            or metadata.get("candidate_revision") is not None
+        ):
+            raise ValueError("durable_review_contract_required")
         requested_situation = situation
         requested_shared_scope = shared_scope
         expression = str(current.expression or "")

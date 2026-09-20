@@ -127,7 +127,7 @@ class ReplacementPersistedTests(unittest.TestCase):
         call = pattern_service.update_review_calls[0]
         self.assertEqual(call.get("replacement_expression"), "人工修订后的表达")
         self.assertTrue(call.get("apply_replacement"))
-        self.assertEqual(call.get("review_status"), "approved")
+        self.assertEqual(call.get("review_status"), "pending_human")
 
     def test_reject_with_replacement_persists_edit(self):
         service, pattern_service = self._service_with_stub()
@@ -145,13 +145,14 @@ class ReplacementPersistedTests(unittest.TestCase):
         self.assertEqual(call.get("replacement_expression"), "记录驳回理由的修订稿")
         self.assertTrue(call.get("apply_replacement"))
 
-    def test_plain_approve_without_replacement_unchanged(self):
+    def test_plain_approve_without_replacement_stays_maintenance_only(self):
         service, pattern_service = self._service_with_stub()
 
         asyncio.run(service.submit_review("p1", "approved", "webui"))
 
         call = pattern_service.update_review_calls[0]
         self.assertNotIn("replacement_expression", call)
+        self.assertEqual(call.get("review_status"), "pending_human")
 
 
 class PendingHumanQueueTests(unittest.TestCase):

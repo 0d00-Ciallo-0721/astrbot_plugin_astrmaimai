@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from typing import Any, Dict, List, Optional
 
 from ...infrastructure.persistence import DatabaseService
@@ -106,6 +107,28 @@ class ExpressionReviewService:
         reason: str = "",
         weight_delta: float = 0.0,
     ) -> Optional[Dict[str, Any]]:
+        service = self._pattern_service()
+        if service and hasattr(service, "get_pattern"):
+            current = await service.get_pattern(pattern_id)
+        else:
+            legacy_id = int(pattern_id) if str(pattern_id).isdigit() else pattern_id
+            current = await self.db.get_pattern_by_id_async(legacy_id)
+        raw_metadata = getattr(current, "metadata", None) if current else None
+        metadata = dict(raw_metadata) if isinstance(raw_metadata, Mapping) else {}
+        candidate_id = str(metadata.get("candidate_id") or "").strip()
+        candidate_revision = metadata.get("candidate_revision")
+        if candidate_id or candidate_revision is not None:
+            if current is None:
+                return None
+            result = self._serialize_pattern(current)
+            result.update({
+                "maintenance_only": True,
+                "applied": False,
+                "failure_kind": "durable_review_contract_required",
+                "candidate_id": candidate_id,
+                "candidate_revision": candidate_revision,
+            })
+            return result
         normalized = str(decision or "").strip().lower()
         kwargs: Dict[str, Any] = {
             "modified_by": f"human:{reviewer_id}",
@@ -116,10 +139,10 @@ class ExpressionReviewService:
         if normalized == "approved":
             kwargs.update(
                 {
-                    "checked": True,
+                    "checked": False,
                     "rejected": False,
-                    "review_status": "approved",
-                    "review_suggestion": "",
+                    "review_status": "pending_human",
+                    "review_suggestion": "durable_review_required",
                 }
             )
             if replacement_expression:
@@ -144,9 +167,9 @@ class ExpressionReviewService:
         elif normalized in {"revision_needed", "revised", "replace"}:
             kwargs.update(
                 {
-                    "checked": True,
+                    "checked": False,
                     "rejected": False,
-                    "review_status": "approved" if replacement_expression else "pending",
+                    "review_status": "pending_human",
                     "replacement_expression": replacement_expression or None,
                     "apply_replacement": bool(replacement_expression),
                     "review_suggestion": "",
@@ -155,7 +178,6 @@ class ExpressionReviewService:
         else:
             return None
 
-        service = self._pattern_service()
         if service and hasattr(service, "update_review"):
             # ponytail: kwargs forwarding is intentional — caller builds the dict, callee accepts same keys.
             updated = await service.update_review(pattern_id, **kwargs)
@@ -164,4 +186,10 @@ class ExpressionReviewService:
             updated = await self.db.update_pattern_review_async(legacy_id, **kwargs)
         if not updated:
             return None
-        return self._serialize_pattern(updated)
+        result = self._serialize_pattern(updated)
+        result.update({
+            "maintenance_only": True,
+            "admission_eligible": False,
+            "decision_source": "legacy_maintenance",
+        })
+        return result

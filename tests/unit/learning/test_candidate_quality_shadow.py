@@ -447,7 +447,7 @@ async def test_quality_snapshot_round_trip_is_immutable_and_nullable(tmp_path):
     assert restored == features
     assert restored.pmi is None
     with sqlite3.connect(path) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 160
+        assert db.execute("PRAGMA user_version").fetchone()[0] == LATEST_ARCHITECTURE_SCHEMA_VERSION
         assert db.execute("PRAGMA integrity_check").fetchone() == ("ok",)
         assert db.execute("PRAGMA foreign_key_check").fetchall() == []
         columns = {
@@ -513,7 +513,7 @@ def test_quality_migration_from_v129_is_repeatable_and_audited(tmp_path):
         db.commit()
         report = inspect_architecture_migration(db)
 
-    assert LATEST_ARCHITECTURE_SCHEMA_VERSION == 160
+    assert LATEST_ARCHITECTURE_SCHEMA_VERSION == max(version for version, _ddl in _MIGRATIONS)
     assert "learning_candidate_quality" not in report.missing_tables
     assert "ix_learning_quality_candidate" not in report.missing_indexes
 

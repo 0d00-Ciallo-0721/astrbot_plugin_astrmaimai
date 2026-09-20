@@ -10,6 +10,7 @@ from ...infrastructure.gateway import GlobalModelGateway
 from ...infrastructure.runtime.lane_manager import LaneKey
 from ...infrastructure.gateway.json_utils import parse_json_contract
 from ...infrastructure.runtime.background_task_budget import BackgroundTaskBudget
+from .orchestrator import ReviewWorkRequest
 
 
 class ExpressionAutoCheckTask:
@@ -19,25 +20,30 @@ class ExpressionAutoCheckTask:
         "你是表达库治理审核员。"
         "你需要判断某条表达模式是否适合作为长期表达习惯保留。"
         "严格返回 JSON："
-        "{\"decision\":\"approved|rejected|revision_needed\","
-        "\"reason\":\"简短原因\","
+        "{\"decision\":\"approved|rejected|revision_needed|quarantined\","
+        "\"reason\":\"evidence_supported|evidence_conflict|insufficient_evidence|invalid_contract|policy_sensitive|reviewer_disagreement|pair_order_unstable\","
         "\"replacement_expression\":\"可选替代表达\","
         "\"style\":\"可选风格标签\","
         "\"weight_delta\":-0.3}"
     )
 
-    def __init__(self, db_service: DatabaseService, gateway: GlobalModelGateway, tracker=None, config=None, background_task_budget=None):
+    def __init__(self, db_service: DatabaseService, gateway: GlobalModelGateway, tracker=None, config=None, background_task_budget=None, review_orchestrator=None, candidate_ledger=None, maintenance_only: bool = False):
         self.db = db_service
         self.gateway = gateway
         self.tracker = tracker
         self.config = config if config else gateway.config
         self.background_task_budget = background_task_budget or BackgroundTaskBudget()
+        self.review_orchestrator = review_orchestrator
+        self.candidate_ledger = candidate_ledger
+        self.maintenance_only = bool(maintenance_only)
         self._last_run_at: dict[str, float] = {}
 
     def refresh_config(self, config) -> None:
         self.config = config
 
     async def run_once(self, group_id: Optional[str] = None, *, force: bool = False) -> int:
+        if self.maintenance_only:
+            return 0
         now = monotonic()
         scope = str(group_id or "__global__")
         min_interval = float(getattr(self.config.evolution, "review_runner_min_interval_sec", 21600) or 21600)
@@ -65,12 +71,65 @@ class ExpressionAutoCheckTask:
                 continue
             if int(getattr(pattern, "count", 1) or 1) < min_count:
                 continue
+            if self.review_orchestrator is not None:
+                outcome = await self._review_pattern_durable(pattern)
+                if outcome is not None and outcome.status == "completed":
+                    processed += 1
+                continue
             result = await self._review_pattern(pattern)
             if not result:
                 continue
             processed += 1
             await self._apply_review(pattern, result)
         return processed
+
+    @staticmethod
+    def _durable_identity(evidence) -> str:
+        event_id = str(getattr(evidence, "event_id", "") or "").strip()
+        if event_id and not event_id.lower().startswith(("fallback_", "evt_")):
+            return f"event_id:{event_id}"
+        platform_id = str(getattr(evidence, "platform_message_id", "") or "").strip()
+        if platform_id:
+            return f"platform_message_id:{platform_id}"
+        row_id = getattr(evidence, "source_row_id", None)
+        if type(row_id) is int and row_id > 0:
+            return f"row:{row_id}"
+        return ""
+
+    async def _review_pattern_durable(self, pattern):
+        metadata = dict(getattr(pattern, "metadata", {}) or {})
+        candidate_id = str(metadata.get("candidate_id") or "").strip()
+        revision = metadata.get("candidate_revision")
+        if not candidate_id or type(revision) is not int or revision < 0 or self.candidate_ledger is None:
+            return None
+        candidate = await self.candidate_ledger.get_candidate(candidate_id)
+        if candidate is None or candidate.revision != revision:
+            return None
+        evidence = tuple(
+            item for item in await self.candidate_ledger.list_evidence(candidate_id)
+            if item.eligible and not item.is_generated
+        )
+        evidence_ids = tuple(dict.fromkeys(self._durable_identity(item) for item in evidence))
+        if not evidence_ids or any(not value for value in evidence_ids):
+            return None
+        prompt = (
+            f"群聊/会话：{pattern.group_id}\n场景：{pattern.situation}\n"
+            f"表达：{pattern.expression}\n风格：{pattern.style}\n"
+            f"样例：{pattern.content_list}\n出现次数：{pattern.count}\n"
+            "请按审核合同返回 decision/reason/confidence。"
+        )
+        reviewer_ids = tuple(getattr(self.review_orchestrator, "expected_reviewer_ids", ()))
+        reviewer_id = reviewer_ids[0] if reviewer_ids else ""
+        return await self.review_orchestrator.run_configured_quorum(ReviewWorkRequest(
+            candidate_id=candidate_id, candidate_revision=revision,
+            scope_id=str(pattern.group_id or "GLOBAL"), reviewer_id=reviewer_id,
+            reviewer_kind="model", reviewer_attempt_id=f"{candidate_id}:{revision}:{reviewer_id}:ab",
+            owner="expression-auto-check", rubric_version="expression-review-rubric-v1",
+            prompt_version="expression-review-prompt-v1", pair_order="ab",
+            prompt=prompt, system_prompt=self.REVIEW_SYSTEM_PROMPT,
+            source_evidence_ids=evidence_ids, source_example_ids=evidence_ids[:5],
+            reviewer_profile_version="expression-reviewer-profile-v1",
+        ))
 
     async def _review_pattern(self, pattern: ExpressionPattern) -> Optional[dict]:
         prompt = (

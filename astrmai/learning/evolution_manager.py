@@ -61,6 +61,9 @@ from .persistence.candidate_ledger import (
     LearningSourceBatch,
     SourceDisposition,
 )
+from .persistence.review_repository import LearningReviewRepository
+from .review.admission import AdmissionService
+from .review.orchestrator import ReviewOrchestrator
 from .runtime.enrichment_worker import LearningEnrichmentWorker
 from .runtime.learning_lane import LearningLaneBudget, LearningLaneConfig
 from .runtime.provider_adapter import LearningProviderCallAdapter
@@ -165,6 +168,51 @@ class EvolutionManager:
             circuit_store=self.provider_circuit_store,
         )
         self.candidate_ledger = CandidateLedger(db_path) if db_path else None
+        self.review_repository = LearningReviewRepository(db_path) if db_path else None
+        automatic_quorum_enabled = bool(
+            getattr(self._evolution_config(), "learning_automatic_quorum_enabled", False)
+        )
+        review_reviewer_ids = tuple(
+            dict.fromkeys(
+                str(value).strip()
+                for value in getattr(
+                    self._evolution_config(), "learning_review_reviewer_ids", []
+                )
+                if str(value).strip()
+            )
+        )
+        self.review_orchestrator = (
+            ReviewOrchestrator(
+                self.review_repository,
+                self.provider_adapter,
+                automatic_quorum_enabled=automatic_quorum_enabled,
+                expected_reviewer_ids=review_reviewer_ids,
+            )
+            if self.review_repository is not None
+            else None
+        )
+        self.admission_service = (
+            AdmissionService(
+                db_path,
+                evaluation_enabled=bool(
+                    getattr(self._evolution_config(), "learning_admission_evaluation_enabled", False)
+                ),
+                automatic_quorum_enabled=automatic_quorum_enabled,
+                expected_reviewer_ids=review_reviewer_ids,
+                mark_published_enabled=bool(
+                    getattr(self._evolution_config(), "learning_mark_published_enabled", False)
+                ),
+                trusted_publish_owner_ids=frozenset(
+                    str(value).strip()
+                    for value in getattr(
+                        self._evolution_config(), "learning_publish_trusted_owner_ids", []
+                    )
+                    if str(value).strip()
+                ),
+            )
+            if db_path
+            else None
+        )
         self.expression_miner = ExpressionMiner(
             gateway,
             self.config,
@@ -255,6 +303,33 @@ class EvolutionManager:
     def refresh_config(self, config):
         self.config = config
         evolution = getattr(config, "evolution", None)
+        reviewer_ids = tuple(
+            dict.fromkeys(
+                str(value).strip()
+                for value in getattr(evolution, "learning_review_reviewer_ids", [])
+                if str(value).strip()
+            )
+        )
+        automatic_quorum_enabled = bool(
+            getattr(evolution, "learning_automatic_quorum_enabled", False)
+        )
+        if self.review_orchestrator is not None:
+            self.review_orchestrator.automatic_quorum_enabled = automatic_quorum_enabled
+            self.review_orchestrator.expected_reviewer_ids = reviewer_ids
+        if self.admission_service is not None:
+            self.admission_service.evaluation_enabled = bool(
+                getattr(evolution, "learning_admission_evaluation_enabled", False)
+            )
+            self.admission_service.automatic_quorum_enabled = automatic_quorum_enabled
+            self.admission_service.expected_reviewer_ids = reviewer_ids
+            self.admission_service.repository.mark_published_enabled = bool(
+                getattr(evolution, "learning_mark_published_enabled", False)
+            )
+            self.admission_service.repository.trusted_publish_owner_ids = frozenset(
+                str(value).strip()
+                for value in getattr(evolution, "learning_publish_trusted_owner_ids", [])
+                if str(value).strip()
+            )
         self.learning_lane.refresh(self._learning_lane_config())
         if self.provider_circuit_store is not None:
             self.provider_circuit_store.refresh(
@@ -4238,6 +4313,13 @@ class EvolutionManager:
                     )
             except Exception as exc:
                 logger.warning("[Evolution] background lease recovery degraded: %s", exc)
+        if bool(getattr(self._evolution_config(), "learning_review_worker_enabled", False)):
+            if self.review_repository is None or not await self.review_repository.schema_ready():
+                logger.error("[Evolution] review worker blocked: review schema unavailable")
+            else:
+                recovered = await self.review_repository.recover_expired(now=time.time())
+                if recovered:
+                    logger.info("[Evolution] recovered expired review leases count=%s", recovered)
         if self._enrichment_worker_enabled():
             gate_ready, gate_reason = self._enrichment_worker_gate()
             if not gate_ready:
@@ -4311,6 +4393,8 @@ class EvolutionManager:
 
     async def stop_background_tasks(self) -> None:
         self.learning_lane.begin_drain()
+        if self.review_orchestrator is not None:
+            self.review_orchestrator.stop_claiming()
         if self.enrichment_worker is not None:
             self.enrichment_worker.begin_drain()
         self._mining_rerun_requested.clear()
@@ -4323,6 +4407,8 @@ class EvolutionManager:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        if self.review_orchestrator is not None:
+            await self.review_orchestrator.shutdown()
         self._backlog_task = None
         self._enrichment_worker_task = None
         self._ingest_worker = None

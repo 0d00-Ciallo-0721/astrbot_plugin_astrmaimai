@@ -1412,6 +1412,48 @@
         "default": false,
         "hint": "要求候选账本、第二版发现游标、模型服务增强与正式结构就绪检查全部通过；否则按失败关闭原则不启动。"
       },
+      "learning_review_worker_enabled": {
+        "description": "启用持久候选审核工作器",
+        "type": "bool",
+        "default": false,
+        "hint": "默认关闭；要求候选账本、审核结构与共享模型调用适配器同时就绪。"
+      },
+      "learning_review_reviewer_ids": {
+        "description": "自动审核者稳定标识集合",
+        "type": "list",
+        "items": {
+          "type": "string"
+        },
+        "default": [],
+        "hint": "必须明确配置至少两个独立审核者；空列表或缺员时转人工复核。"
+      },
+      "learning_automatic_quorum_enabled": {
+        "description": "启用自动审核共识评估",
+        "type": "bool",
+        "default": false,
+        "hint": "默认关闭；不会激活规范记忆或发布索引。"
+      },
+      "learning_admission_evaluation_enabled": {
+        "description": "启用准入预门禁评估",
+        "type": "bool",
+        "default": false,
+        "hint": "默认关闭；只写主库准入事实。"
+      },
+      "learning_mark_published_enabled": {
+        "description": "允许接收受控索引发布证明",
+        "type": "bool",
+        "default": false,
+        "hint": "默认关闭；本阶段不构建、发布或切换任何索引。"
+      },
+      "learning_publish_trusted_owner_ids": {
+        "description": "受信索引发布证明所有者",
+        "type": "list",
+        "items": {
+          "type": "string"
+        },
+        "default": [],
+        "hint": "默认空列表；仅接受明确列出的后续索引生命周期所有者。"
+      },
       "learning_discovery_cursor_v2_enabled": {
         "description": "启用来源批次发现游标第二版",
         "type": "bool",

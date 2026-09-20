@@ -8,6 +8,7 @@ from astrbot.api import logger
 from ...infrastructure.runtime.lane_manager import LaneKey
 from ...infrastructure.gateway.json_utils import parse_json_contract
 from ...infrastructure.runtime.background_task_budget import BackgroundTaskBudget
+from .orchestrator import ReviewWorkRequest
 
 
 class JargonAutoCheckTask:
@@ -17,19 +18,22 @@ class JargonAutoCheckTask:
         "你是群聊黑话审核员。"
         "你需要判断一个候选黑话是否真实成立、释义是否可信、是否应该进入长期可注入状态。"
         "严格返回 JSON："
-        "{\"decision\":\"approved|rejected|revision_needed\","
-        "\"reason\":\"简短原因\","
+        "{\"decision\":\"approved|rejected|revision_needed|quarantined\","
+        "\"reason\":\"evidence_supported|evidence_conflict|insufficient_evidence|invalid_contract|policy_sensitive|reviewer_disagreement|pair_order_unstable\","
         "\"meaning\":\"可选修正释义\","
         "\"scene\":\"可选适用场景\","
         "\"examples\":[\"可选例句\"],"
         "\"review_suggestion\":\"可选人工复审建议\"}"
     )
 
-    def __init__(self, db_service, gateway, config=None, background_task_budget=None):
+    def __init__(self, db_service, gateway, config=None, background_task_budget=None, review_orchestrator=None, candidate_ledger=None, maintenance_only: bool = False):
         self.db = db_service
         self.gateway = gateway
         self.config = config if config else gateway.config
         self.background_task_budget = background_task_budget or BackgroundTaskBudget()
+        self.review_orchestrator = review_orchestrator
+        self.candidate_ledger = candidate_ledger
+        self.maintenance_only = bool(maintenance_only)
         self._last_run_at: dict[str, float] = {}
 
     def refresh_config(self, config) -> None:
@@ -79,6 +83,8 @@ class JargonAutoCheckTask:
         return list(dict.fromkeys(groups))
 
     async def run_once(self, group_id: Optional[str] = None, *, force: bool = False) -> int:
+        if self.maintenance_only:
+            return 0
         store = self._store()
         if not store or not hasattr(store, "list_candidates"):
             return 0
@@ -119,16 +125,24 @@ class JargonAutoCheckTask:
             metadata = dict(candidate.metadata or {})
             review_status = self._normalized_review_status(metadata.get("review_status") or candidate.status or "review_pending")
             if review_status == "approved" and metadata.get("projection_status") == "pending":
-                if await self._activate_approved_candidate(candidate, metadata):
-                    processed += 1
-                if processed >= limit:
-                    break
+                logger.warning(
+                    "[JargonAutoCheck] legacy approved projection blocked; "
+                    "candidate=%s requires durable admission/publish proof",
+                    getattr(candidate, "id", ""),
+                )
                 continue
             if review_status != "review_pending":
                 continue
             count = int(metadata.get("count") or 0)
             has_evidence = bool(str(metadata.get("meaning") or "").strip()) or bool(metadata.get("examples")) or float(candidate.confidence or 0.0) >= 0.2
             if count < jargon_min_count or not has_evidence:
+                continue
+            if self.review_orchestrator is not None:
+                outcome = await self._review_candidate_durable(candidate)
+                if outcome is not None and outcome.status == "completed":
+                    processed += 1
+                if processed >= limit:
+                    break
                 continue
             result = await self._review_candidate(candidate)
             if not result:
@@ -138,6 +152,55 @@ class JargonAutoCheckTask:
             if processed >= limit:
                 break
         return processed
+
+    @staticmethod
+    def _durable_identity(evidence) -> str:
+        event_id = str(getattr(evidence, "event_id", "") or "").strip()
+        if event_id and not event_id.lower().startswith(("fallback_", "evt_")):
+            return f"event_id:{event_id}"
+        platform_id = str(getattr(evidence, "platform_message_id", "") or "").strip()
+        if platform_id:
+            return f"platform_message_id:{platform_id}"
+        row_id = getattr(evidence, "source_row_id", None)
+        if type(row_id) is int and row_id > 0:
+            return f"row:{row_id}"
+        return ""
+
+    async def _review_candidate_durable(self, candidate):
+        metadata = dict(candidate.metadata or {})
+        candidate_id = str(metadata.get("candidate_id") or "").strip()
+        revision = metadata.get("candidate_revision")
+        if not candidate_id or type(revision) is not int or revision < 0 or self.candidate_ledger is None:
+            return None
+        ledger_candidate = await self.candidate_ledger.get_candidate(candidate_id)
+        if ledger_candidate is None or ledger_candidate.revision != revision:
+            return None
+        evidence = tuple(
+            item for item in await self.candidate_ledger.list_evidence(candidate_id)
+            if item.eligible and not item.is_generated
+        )
+        evidence_ids = tuple(dict.fromkeys(self._durable_identity(item) for item in evidence))
+        if not evidence_ids or any(not value for value in evidence_ids):
+            return None
+        prompt = (
+            f"群聊/会话：{self._scope_id(candidate.session_id)}\n"
+            f"候选黑话：{candidate.content}\n当前释义：{metadata.get('meaning') or candidate.summary}\n"
+            f"场景：{metadata.get('scene') or ''}\n"
+            f"样例：{json.dumps(list(metadata.get('examples') or [])[:5], ensure_ascii=False)}\n"
+            "请按审核合同返回 decision/reason/confidence。"
+        )
+        reviewer_ids = tuple(getattr(self.review_orchestrator, "expected_reviewer_ids", ()))
+        reviewer_id = reviewer_ids[0] if reviewer_ids else ""
+        return await self.review_orchestrator.run_configured_quorum(ReviewWorkRequest(
+            candidate_id=candidate_id, candidate_revision=revision,
+            scope_id=self._scope_id(candidate.session_id), reviewer_id=reviewer_id,
+            reviewer_kind="model", reviewer_attempt_id=f"{candidate_id}:{revision}:{reviewer_id}:ab",
+            owner="jargon-auto-check", rubric_version="jargon-review-rubric-v1",
+            prompt_version="jargon-review-prompt-v1", pair_order="ab",
+            prompt=prompt, system_prompt=self.REVIEW_SYSTEM_PROMPT,
+            source_evidence_ids=evidence_ids, source_example_ids=evidence_ids[:5],
+            reviewer_profile_version="jargon-reviewer-profile-v1",
+        ))
 
     async def _review_candidate(self, candidate) -> Optional[dict]:
         metadata = dict(candidate.metadata or {})

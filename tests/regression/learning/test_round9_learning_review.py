@@ -312,7 +312,7 @@ class Round9LearningReviewTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(sent, ["default:GroupMessage:group-1"])
 
-    async def test_jargon_projection_failure_rolls_back_and_retries_without_llm(self):
+    async def test_legacy_jargon_projection_retry_is_blocked_without_publish_proof(self):
         candidate = SimpleNamespace(
             id="j1",
             kind="jargon",
@@ -340,11 +340,13 @@ class Round9LearningReviewTests(unittest.IsolatedAsyncioTestCase):
         task._last_run_at.clear()
         await task.run_once("group-1")
 
-        self.assertEqual(candidate.status, "active")
-        self.assertEqual(candidate.metadata["projection_status"], "projected")
+        self.assertEqual(candidate.status, "review_pending")
+        self.assertEqual(candidate.visibility, "maintenance_only")
+        self.assertEqual(candidate.metadata["projection_status"], "pending")
         self.assertEqual(gateway.calls, 1)
+        self.assertEqual(projector.projected, ["j1"])
 
-    async def test_active_jargon_with_pending_projection_is_recovered_without_llm(self):
+    async def test_active_legacy_jargon_is_not_projected_without_publish_proof(self):
         candidate = SimpleNamespace(
             id="j-active",
             kind="jargon",
@@ -374,10 +376,11 @@ class Round9LearningReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await task.list_governance_groups(), ["group-1"])
         processed = await task.run_once("group-1")
 
-        self.assertEqual(processed, 1)
-        self.assertEqual(candidate.metadata["projection_status"], "projected")
+        self.assertEqual(processed, 0)
+        self.assertEqual(candidate.metadata["projection_status"], "pending")
         self.assertEqual(gateway.calls, 0)
-        self.assertEqual(await task.list_governance_groups(), [])
+        self.assertEqual(projector.projected, [])
+        self.assertEqual(await task.list_governance_groups(), ["group-1"])
 
     async def test_governance_hot_refresh_updates_interval_and_children(self):
         children = []

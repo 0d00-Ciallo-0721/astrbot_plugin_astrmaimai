@@ -62,7 +62,9 @@ class ReviewServiceMigratedTests(unittest.TestCase):
 
         result = asyncio.run(_run())
         self.assertEqual(result["expression"], "这波节奏挺对")
-        self.assertEqual(result["review_status"], "approved")
+        self.assertEqual(result["review_status"], "pending_human")
+        self.assertTrue(result["maintenance_only"])
+        self.assertFalse(result["admission_eligible"])
         self.assertTrue(db.update_calls[0][1]["apply_replacement"])
 
 

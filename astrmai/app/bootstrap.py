@@ -617,6 +617,13 @@ class PluginBootstrap:
     ) -> tuple[ExpressionAutoCheckTask | None, JargonAutoCheckTask | None]:
         auto_check_task = None
         jargon_auto_check_task = None
+        evolution_config = getattr(runtime.config, "evolution", None)
+        durable_review_enabled = bool(
+            getattr(evolution_config, "learning_review_worker_enabled", False)
+            and getattr(evolution_config, "learning_candidate_ledger_enabled", False)
+            and getattr(evolution_config, "learning_discovery_cursor_v2_enabled", False)
+            and getattr(evolution_config, "learning_enrichment_enabled", False)
+        )
         try:
             auto_check_task = ExpressionAutoCheckTask(
                 db_service=runtime.db_service,
@@ -624,6 +631,13 @@ class PluginBootstrap:
                 tracker=reflect_tracker,
                 config=runtime.config,
                 background_task_budget=getattr(runtime, "background_task_budget", None),
+                review_orchestrator=(
+                    runtime.evolution.review_orchestrator
+                    if durable_review_enabled
+                    else None
+                ),
+                candidate_ledger=getattr(runtime.evolution, "candidate_ledger", None),
+                maintenance_only=not durable_review_enabled,
             )
         except Exception as exc:
             self._record_optional_failure(runtime, "learning.auto_check_task", exc)
@@ -633,6 +647,13 @@ class PluginBootstrap:
                 gateway=runtime.gateway,
                 config=runtime.config,
                 background_task_budget=getattr(runtime, "background_task_budget", None),
+                review_orchestrator=(
+                    runtime.evolution.review_orchestrator
+                    if durable_review_enabled
+                    else None
+                ),
+                candidate_ledger=getattr(runtime.evolution, "candidate_ledger", None),
+                maintenance_only=not durable_review_enabled,
             )
         except Exception as exc:
             self._record_optional_failure(runtime, "learning.jargon_auto_check_task", exc)
