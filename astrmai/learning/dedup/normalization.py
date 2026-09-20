@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import unicodedata
 
@@ -54,6 +55,31 @@ def expression_fingerprint(
     )
 
 
+def expression_fingerprint_v2(
+    *,
+    scope_id: str,
+    speaker_scope_id: str | None,
+    habit_type: str,
+    pattern: str,
+    situation_family: str,
+) -> str:
+    payload = {
+        "habit_type": _normalize(habit_type, compact=True),
+        "pattern": normalize_expression_text(pattern),
+        "scope_id": str(scope_id or "").strip(),
+        "speaker_scope_id": str(speaker_scope_id or "").strip() or "__group__",
+        "situation_family": normalize_situation(situation_family),
+        "version": 2,
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "expression:v2:" + hashlib.sha256(encoded).hexdigest()[:24]
+
+
 def jargon_fingerprint(term: str, meaning: str = "") -> str:
     # A jargon term has one global identity. Meanings can be corrected or
     # enriched later without creating a second canonical record.
@@ -63,6 +89,7 @@ def jargon_fingerprint(term: str, meaning: str = "") -> str:
 __all__ = [
     "GLOBAL_JARGON_SESSION_ID",
     "expression_fingerprint",
+    "expression_fingerprint_v2",
     "jargon_fingerprint",
     "normalize_expression_text",
     "normalize_jargon_meaning",

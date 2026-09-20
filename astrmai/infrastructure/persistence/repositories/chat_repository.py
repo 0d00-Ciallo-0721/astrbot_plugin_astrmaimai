@@ -92,6 +92,24 @@ class ChatRepository:
             include_processed=include_processed,
         )
 
+    def get_quality_window_message_logs(
+        self, group_id: str, *, window_start: float, window_end: float
+    ):
+        return self.db.get_quality_window_message_logs(
+            group_id,
+            window_start=window_start,
+            window_end=window_end,
+        )
+
+    async def get_quality_window_message_logs_async(
+        self, group_id: str, *, window_start: float, window_end: float
+    ):
+        return await self.db.get_quality_window_message_logs_async(
+            group_id,
+            window_start=window_start,
+            window_end=window_end,
+        )
+
     def mark_logs_processed(self, log_ids: list[int]):
         return self.db.mark_logs_processed(log_ids)
 

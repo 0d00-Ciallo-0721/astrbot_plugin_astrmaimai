@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import math
 import re
 import time
 import uuid
@@ -37,9 +38,20 @@ from .mining.expression_results import PatternSaveReport
 from .mining.persistence_results import JargonSaveReport, PersistenceFailure
 from .mining.diagnostics import LearningStageDiagnostic, build_learning_diagnostics
 from .mining.jargon_miner import JargonMiner
-from .mining.learning_evidence import merge_evidence_metadata
+from .mining.learning_evidence import (
+    durable_message_evidence_id,
+    merge_evidence_metadata,
+    message_evidence_id,
+)
 from .mining.learning_attribution import LearningAttributionAdapter
 from .mining.learning_input_policy import LearningMessageView
+from .mining.candidate_quality import (
+    QualitySourceIdentityError,
+    build_expression_quality_snapshots,
+    build_jargon_quality_snapshots,
+    scan_jargon_shadow,
+)
+from .quality.contracts import LearningQualityProfile
 from .mining.jargon_senses import merge_jargon_senses
 from .persistence.provider_circuit_store import LearningProviderCircuitStore
 from .persistence.candidate_ledger import (
@@ -766,6 +778,28 @@ class EvolutionManager:
             max_age_seconds,
             True,
         )
+
+    async def _load_quality_window_logs(
+        self,
+        group_id: str,
+        *,
+        window_start: float,
+        window_end: float,
+    ):
+        if hasattr(self.db, "get_quality_window_message_logs_async"):
+            return await self.db.get_quality_window_message_logs_async(
+                group_id,
+                window_start=window_start,
+                window_end=window_end,
+            )
+        if hasattr(self.db, "get_quality_window_message_logs"):
+            return await asyncio.to_thread(
+                self.db.get_quality_window_message_logs,
+                group_id,
+                window_start=window_start,
+                window_end=window_end,
+            )
+        raise RuntimeError("quality_window_source_unavailable")
 
     async def _list_unprocessed_log_groups(self, *, min_count: int, limit: int) -> list[dict[str, Any]]:
         if hasattr(self.db, "list_unprocessed_log_groups_async"):
@@ -2518,6 +2552,7 @@ class EvolutionManager:
             source_id: [] for source_id in source_ids
         }
         inserted = deduplicated = evidence_count = 0
+        quality_candidates: list[dict[str, Any]] = []
         for raw in discovered:
             payload = dict(raw or {})
             fingerprint = hashlib.sha256(
@@ -2842,6 +2877,232 @@ class EvolutionManager:
             inserted += int(result.inserted)
             deduplicated += int(result.deduplicated)
             evidence_count += result.evidence_inserted
+            quality_candidates.append(
+                {
+                    **payload,
+                    "candidate_id": candidate.candidate_id,
+                    "candidate_revision": result.revision,
+                    "speaker_scope_id": candidate.speaker_scope_id,
+                }
+            )
+
+        quality_report: dict[str, Any] = {
+            "status": "off",
+            "snapshot_count": 0,
+            "inserted": 0,
+            "idempotent": 0,
+            "conflict": 0,
+            "provider_call_count": 0,
+        }
+        quality_enabled = bool(
+            getattr(
+                self._evolution_config(),
+                "learning_quality_shadow_enabled",
+                True,
+            )
+        )
+        if quality_enabled:
+            profile_version = str(
+                getattr(
+                    self._evolution_config(),
+                    "learning_quality_profile_version",
+                    "quality-v1",
+                )
+                or "quality-v1"
+            )
+            if profile_version != "quality-v1":
+                quality_report.update(
+                    status="blocked",
+                    reason="unknown_profile",
+                    profile_version=profile_version,
+                )
+            else:
+                try:
+                    profile = LearningQualityProfile.quality_v1()
+                    valid_timestamps: list[float] = []
+                    for item in normalized:
+                        try:
+                            timestamp = float(self._field(item, "timestamp", 0.0) or 0.0)
+                        except (TypeError, ValueError):
+                            timestamp = float("nan")
+                        if math.isfinite(timestamp) and timestamp > 0:
+                            valid_timestamps.append(timestamp)
+                    if not valid_timestamps:
+                        quality_report.update(
+                            status="insufficient_data",
+                            reason="timestamp_unavailable",
+                            profile_version=profile.version,
+                            profile_hash=profile.parameters_hash,
+                        )
+                    else:
+                        window_end = math.nextafter(max(valid_timestamps), math.inf)
+                        window_days = float(
+                            profile.parameters["expression_window_days"]
+                            if pipeline == "expression"
+                            else 14
+                        )
+                        window_logs = await self._load_quality_window_logs(
+                            group_id,
+                            window_start=window_end - window_days * 86_400.0,
+                            window_end=window_end,
+                        )
+                        quality_normalized = (
+                            self.expression_miner.input_policy.normalize(window_logs)
+                            if pipeline == "expression"
+                            else self.jargon_miner.input_policy.normalize(window_logs)
+                        )
+                        if attribution_enabled:
+                            quality_normalized = self._apply_attribution_evidence_gate(
+                                quality_normalized,
+                                attribution_adapter,
+                            )
+                        quality_facts: list[dict[str, Any]] = []
+                        for item in quality_normalized:
+                            attribution = attribution_adapter.attribute(item)
+                            try:
+                                timestamp = float(
+                                    self._field(item, "timestamp", 0.0) or 0.0
+                                )
+                            except (TypeError, ValueError):
+                                timestamp = float("nan")
+                            if not math.isfinite(timestamp) or timestamp <= 0:
+                                timestamp = None
+                            quality_facts.append(
+                                {
+                                    "source_id": durable_message_evidence_id(item),
+                                    "content": str(
+                                        self._field(item, "content", "") or ""
+                                    ),
+                                    "timestamp": timestamp,
+                                    "eligible": bool(
+                                        self._field(
+                                            item,
+                                            "learning_evidence_eligible",
+                                            True,
+                                        )
+                                        and (
+                                            attribution.evidence_eligible
+                                            if attribution_enabled
+                                            else True
+                                        )
+                                    ),
+                                    "known_scope": bool(
+                                        attribution.scope_id
+                                        if attribution_enabled
+                                        else group_id
+                                    ),
+                                    "eligible_for_speaker_stats": bool(
+                                        attribution.eligible_for_speaker_stats
+                                        if attribution_enabled
+                                        else False
+                                    ),
+                                    "speaker_scope_id": (
+                                        attribution.speaker_scope_id
+                                        if attribution_enabled
+                                        else ""
+                                    ),
+                                }
+                            )
+                        durable_candidates: list[dict[str, Any]] = []
+                        for item in quality_candidates:
+                            evidence = await self.candidate_ledger.list_evidence(
+                                str(item["candidate_id"])
+                            )
+                            source_message_ids = {
+                                durable_message_evidence_id(
+                                    {
+                                        "event_id": entry.event_id,
+                                        "platform_message_id": entry.platform_message_id,
+                                        "id": entry.source_row_id,
+                                    }
+                                )
+                                for entry in evidence
+                                if entry.eligible and not entry.is_generated
+                            }
+                            durable_candidates.append(
+                                {
+                                    **item,
+                                    "source_message_ids": sorted(
+                                        value for value in source_message_ids if value
+                                    ),
+                                }
+                            )
+                        if pipeline == "expression":
+                            snapshots = build_expression_quality_snapshots(
+                                durable_candidates,
+                                quality_facts,
+                                profile=profile,
+                                window_end=window_end,
+                            )
+                        else:
+                            scan = scan_jargon_shadow(
+                                quality_facts,
+                                profile=profile,
+                                window_end=window_end,
+                            )
+                            scan_report = dict(scan.get("report") or {})
+                            if scan_report.get("status") != "completed":
+                                snapshots = ()
+                                quality_report.update(
+                                    status="blocked",
+                                    reason=str(
+                                        scan_report.get("reason")
+                                        or "quality_scan_blocked"
+                                    ),
+                                )
+                            else:
+                                snapshots = build_jargon_quality_snapshots(
+                                    durable_candidates,
+                                    scan,
+                                    profile=profile,
+                                    created_at=window_end,
+                                )
+                        for snapshot in snapshots:
+                            write = await self.candidate_ledger.store_quality_snapshot(
+                                snapshot
+                            )
+                            quality_report["inserted"] += int(write.inserted)
+                            quality_report["idempotent"] += int(write.idempotent)
+                            quality_report["conflict"] += int(write.conflict)
+                        if quality_report["status"] != "blocked":
+                            quality_report.update(
+                                status=(
+                                    "partial"
+                                    if quality_report["conflict"]
+                                    else "completed"
+                                ),
+                                reason=(
+                                    "quality_snapshot_conflict"
+                                    if quality_report["conflict"]
+                                    else "shadow_durable"
+                                ),
+                            )
+                        quality_report.update(
+                            snapshot_count=len(snapshots),
+                            profile_version=profile.version,
+                            profile_hash=profile.parameters_hash,
+                            window_end=window_end,
+                        )
+                except QualitySourceIdentityError as exc:
+                    quality_report.update(
+                        status="blocked",
+                        reason=exc.reason,
+                        snapshot_count=0,
+                        profile_version=profile_version,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        f"[EvolutionManager] quality shadow persistence degraded: {exc}"
+                    )
+                    quality_report.update(
+                        status="partial",
+                        reason=(
+                            "window_source_unavailable"
+                            if str(exc) == "quality_window_source_unavailable"
+                            else "shadow_error"
+                        ),
+                        error_type=type(exc).__name__,
+                    )
 
         dispositions = tuple(
             SourceDisposition.for_row(
@@ -2900,6 +3161,7 @@ class EvolutionManager:
             "source_count": len(source_ids),
             "cursor_semantics": "source_batch_contiguous_v2",
             "pipeline_version": f"{pipeline}-discovery-v2",
+            "quality_shadow": quality_report,
         }
         await self.candidate_ledger.append_stage_diagnostic(
             run_id=str(run_id or batch.batch_id),

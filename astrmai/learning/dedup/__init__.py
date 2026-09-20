@@ -2,6 +2,7 @@ from .candidate_registry import GLOBAL_CANDIDATE_REGISTRY, CandidateRegistry
 from .normalization import (
     GLOBAL_JARGON_SESSION_ID,
     expression_fingerprint,
+    expression_fingerprint_v2,
     jargon_fingerprint,
     normalize_expression_text,
     normalize_jargon_meaning,
@@ -14,6 +15,7 @@ __all__ = [
     "GLOBAL_CANDIDATE_REGISTRY",
     "GLOBAL_JARGON_SESSION_ID",
     "expression_fingerprint",
+    "expression_fingerprint_v2",
     "jargon_fingerprint",
     "normalize_expression_text",
     "normalize_jargon_meaning",

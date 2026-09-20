@@ -11,6 +11,7 @@ from astrmai.learning.evolution_manager import EvolutionManager
 from astrmai.learning.mining.expression_candidate_extractor import (
     ExpressionCandidateExtractor,
 )
+from astrmai.learning.mining.learning_evidence import durable_message_evidence_id
 from astrmai.learning.mining.learning_input_policy import LearningInputPolicy
 from astrmai.learning.persistence.candidate_ledger import CandidateLedger
 
@@ -75,12 +76,29 @@ class _ExpressionMiner:
         return set()
 
 
-def _manager(ledger):
+def _manager(ledger, *, quality_logs=None):
     manager = EvolutionManager.__new__(EvolutionManager)
     manager.candidate_ledger = ledger
     manager.expression_miner = _ExpressionMiner()
     manager.jargon_miner = SimpleNamespace()
     manager._next_pipeline_cursor = lambda logs, _pipeline: (logs[-1].id, 0)
+
+    class _QualityDatabase:
+        async def get_quality_window_message_logs_async(
+            self, group_id, *, window_start, window_end
+        ):
+            corpus = _logs() if quality_logs is None else list(quality_logs)
+            return [
+                item
+                for item in corpus
+                if item.group_id == group_id
+                and (
+                    float(getattr(item, "timestamp", 0) or 0) <= 0
+                    or window_start <= float(item.timestamp) < window_end
+                )
+            ]
+
+    manager.db = _QualityDatabase()
     return manager
 
 
@@ -92,6 +110,7 @@ def _logs():
             sender_id="user-1",
             sender_name="Alice",
             content="structured expression",
+            timestamp=1_700_000_001.0,
             event_id="event-11",
             event_schema_version=1,
             platform_message_id="platform-11",
@@ -118,6 +137,7 @@ def _logs():
             sender_id="user-2",
             sender_name="Bob",
             content="context",
+            timestamp=1_700_000_002.0,
             event_id="event-12",
             event_schema_version=1,
             platform_message_id="platform-12",
@@ -190,6 +210,15 @@ async def test_attribution_flag_writes_structured_ledger_evidence(ledger):
     )
     assert evidence.source_type == "user_said"
     assert evidence.eligible is True
+    quality = await ledger.load_quality_snapshot(
+        candidate.candidate_id,
+        candidate.revision,
+        "quality-v1",
+    )
+    assert quality is not None
+    assert quality.candidate_revision == candidate.revision
+    assert quality.speaker_message_count == 1
+    assert quality.group_message_count == 2
 
 
 @pytest.mark.asyncio
@@ -315,6 +344,225 @@ async def test_discovery_replay_is_idempotent_without_duplicate_candidate_or_evi
     assert replay["evidence_inserted"] == 0
     assert len(due) == 1
     assert len(await ledger.list_evidence(due[0].candidate_id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_quality_snapshot_rebuilds_complete_window_across_discovery_batches(ledger):
+    first_log = _logs()[0]
+    second_log = SimpleNamespace(**vars(first_log))
+    second_log.id = 13
+    second_log.event_id = "event-13"
+    second_log.platform_message_id = "platform-13"
+    second_log.timestamp = first_log.timestamp + 86_400.0
+    expired_log = SimpleNamespace(**vars(first_log))
+    expired_log.id = 3
+    expired_log.event_id = "event-3"
+    expired_log.platform_message_id = "platform-3"
+    expired_log.timestamp = second_log.timestamp - 15 * 86_400.0
+    corpus = [expired_log, first_log, second_log]
+    manager = _manager(ledger, quality_logs=corpus)
+
+    class _BatchExtractor:
+        async def extract(self, group_id, logs, **_kwargs):
+            current = list(logs)[0]
+            return [{
+                "candidate_type": "catchphrase",
+                "normalized_expression": "跨批表达",
+                "expression": "跨批表达",
+                "distinct_turn_count": 99,
+                "distinct_day_count": 99,
+                "distinct_contributor_count": 99,
+                "source_message_ids": [current.event_id],
+                "group_id": group_id,
+            }]
+
+    manager.expression_miner.candidate_extractor = _BatchExtractor()
+    await manager._write_candidate_discovery(
+        pipeline="expression",
+        group_id="qq:group:42",
+        logs=[first_log],
+        cursor_before=10,
+    )
+    await manager._write_candidate_discovery(
+        pipeline="expression",
+        group_id="qq:group:42",
+        logs=[second_log],
+        cursor_before=11,
+    )
+
+    candidate = (await ledger.list_due_enrichment(now=2_000_000_000.0, limit=10))[0]
+    snapshot = await ledger.load_quality_snapshot(
+        candidate.candidate_id, candidate.revision, "quality-v1"
+    )
+    evidence = await ledger.list_evidence(candidate.candidate_id)
+
+    assert len(evidence) == 2
+    assert snapshot is not None
+    assert snapshot.group_message_count == 2
+    assert snapshot.support_count == 2
+    assert snapshot.distinct_turn_count == 2
+    assert snapshot.distinct_day_count == 2
+
+
+@pytest.mark.asyncio
+async def test_quality_snapshot_fails_closed_without_complete_window_source(ledger):
+    manager = _manager(ledger)
+    manager.db = SimpleNamespace()
+
+    report = await manager._write_candidate_discovery(
+        pipeline="expression",
+        group_id="qq:group:42",
+        logs=_logs(),
+        cursor_before=10,
+    )
+    candidate = (await ledger.list_due_enrichment(now=2_000_000_000.0, limit=10))[0]
+
+    assert report["status"] == "completed"
+    assert report["quality_shadow"]["status"] == "partial"
+    assert report["quality_shadow"]["reason"] == "window_source_unavailable"
+    assert await ledger.load_quality_snapshot(
+        candidate.candidate_id, candidate.revision, "quality-v1"
+    ) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("quality_logs", "reason"),
+    [
+        (
+            [
+                SimpleNamespace(
+                    group_id="qq:group:42",
+                    sender_id="user-1",
+                    sender_name="Alice",
+                    content="missing durable identity",
+                    timestamp=1_700_000_001.0,
+                    learning_evidence_eligible=True,
+                )
+            ],
+            "source_identity_unavailable",
+        ),
+        (
+            [
+                SimpleNamespace(
+                    id=None,
+                    group_id="qq:group:42",
+                    sender_id="user-1",
+                    sender_name="Alice",
+                    content="fallback identity is not durable",
+                    timestamp=1_700_000_001.0,
+                    event_id="fallback_deadbeef",
+                    platform_message_id="",
+                    learning_evidence_eligible=True,
+                )
+            ],
+            "source_identity_unavailable",
+        ),
+        (
+            [
+                SimpleNamespace(
+                    group_id="qq:group:42",
+                    sender_id="user-1",
+                    sender_name="Alice",
+                    content="first fact",
+                    timestamp=1_700_000_001.0,
+                    event_id="event-conflict",
+                    learning_evidence_eligible=True,
+                ),
+                SimpleNamespace(
+                    group_id="qq:group:42",
+                    sender_id="user-1",
+                    sender_name="Alice",
+                    content="conflicting fact",
+                    timestamp=1_700_000_001.0,
+                    event_id="event-conflict",
+                    learning_evidence_eligible=True,
+                ),
+            ],
+            "source_identity_conflict",
+        ),
+    ],
+)
+async def test_quality_snapshot_blocks_invalid_durable_source_identity(
+    ledger, quality_logs, reason
+):
+    manager = _manager(ledger, quality_logs=quality_logs)
+
+    report = await manager._write_candidate_discovery(
+        pipeline="expression",
+        group_id="qq:group:42",
+        logs=_logs(),
+        cursor_before=10,
+    )
+    candidate = (await ledger.list_due_enrichment(now=2_000_000_000.0, limit=10))[0]
+
+    assert report["status"] == "completed"
+    assert report["quality_shadow"]["status"] == "blocked"
+    assert report["quality_shadow"]["reason"] == reason
+    assert report["quality_shadow"]["snapshot_count"] == 0
+    assert await ledger.load_quality_snapshot(
+        candidate.candidate_id, candidate.revision, "quality-v1"
+    ) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("platform_message_id", "expected_identity"),
+    [
+        ("platform-authority", "platform_message_id:platform-authority"),
+        ("", "row:11"),
+    ],
+)
+async def test_quality_candidate_evidence_and_window_fact_share_fallback_authority(
+    ledger, platform_message_id, expected_identity
+):
+    source = SimpleNamespace(**vars(_logs()[0]))
+    source.event_id = "fallback_deadbeef"
+    source.platform_message_id = platform_message_id
+
+    class _FallbackExtractor:
+        async def extract(self, group_id, _logs, **_kwargs):
+            return [
+                {
+                    "candidate_type": "catchphrase",
+                    "normalized_expression": "fallback authority",
+                    "expression": "fallback authority",
+                    "distinct_turn_count": 1,
+                    "source_message_ids": ["fallback_deadbeef"],
+                    "group_id": group_id,
+                }
+            ]
+
+    manager = _manager(ledger, quality_logs=[source])
+    manager.expression_miner.candidate_extractor = _FallbackExtractor()
+    manager.config = SimpleNamespace(
+        evolution=SimpleNamespace(learning_attribution_enabled=True)
+    )
+
+    report = await manager._write_candidate_discovery(
+        pipeline="expression",
+        group_id="qq:group:42",
+        logs=[source],
+        cursor_before=10,
+    )
+    candidate = (await ledger.list_due_enrichment(now=2_000_000_000.0, limit=10))[0]
+    snapshot = await ledger.load_quality_snapshot(
+        candidate.candidate_id, candidate.revision, "quality-v1"
+    )
+    evidence = (await ledger.list_evidence(candidate.candidate_id))[0]
+
+    assert report["quality_shadow"]["status"] == "completed"
+    assert snapshot is not None
+    assert snapshot.eligible_message_count == 1
+    assert snapshot.group_message_count == 1
+    assert snapshot.support_count == 1
+    assert durable_message_evidence_id(
+        {
+            "event_id": evidence.event_id,
+            "platform_message_id": evidence.platform_message_id,
+            "id": evidence.source_row_id,
+        }
+    ) == expected_identity
 
 
 @pytest.mark.asyncio

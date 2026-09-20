@@ -1394,6 +1394,18 @@
         "type": "bool",
         "default": false
       },
+      "learning_quality_shadow_enabled": {
+        "description": "启用候选质量影子计算",
+        "type": "bool",
+        "default": true,
+        "hint": "仅增加版本化质量诊断，不改变候选、模型调用、审核、游标或检索排序。"
+      },
+      "learning_decay_enabled": {
+        "description": "启用版本化学习衰减策略",
+        "type": "bool",
+        "default": false,
+        "hint": "默认关闭；仅在后续校准和发布门禁通过后由既有记忆生命周期管理器使用。"
+      },
       "learning_enrichment_worker_enabled": {
         "description": "启用持久候选增强工作器",
         "type": "bool",

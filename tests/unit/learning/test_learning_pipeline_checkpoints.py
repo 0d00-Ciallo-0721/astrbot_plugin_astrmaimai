@@ -71,6 +71,37 @@ def test_expression_replays_bounded_history_while_jargon_resumes_legacy_cursor(t
     assert [item.content for item in jargon] == [f"消息{index}" for index in range(9, 13)]
 
 
+def test_quality_window_query_uses_explicit_bounds_and_preserves_unknowns(tmp_path):
+    service = _database_service(tmp_path)
+    with service.get_session() as session:
+        for timestamp in (0.0, 50.0, 100.0, 199.0, 200.0):
+            session.add(
+                MessageLog(
+                    group_id="quality-scope",
+                    sender_id="user",
+                    sender_name="User",
+                    content=f"message-{timestamp}",
+                    timestamp=timestamp,
+                )
+            )
+        session.add(
+            MessageLog(
+                group_id="other-scope",
+                sender_id="user",
+                sender_name="User",
+                content="other",
+                timestamp=150.0,
+            )
+        )
+        session.commit()
+
+    rows = service.get_quality_window_message_logs(
+        "quality-scope", window_start=100.0, window_end=200.0
+    )
+
+    assert [item.timestamp for item in rows] == [0.0, 100.0, 199.0]
+
+
 def test_pipeline_cursors_advance_independently_and_survive_service_restart(tmp_path):
     service = _database_service(tmp_path)
     _add_logs(service, "ff:GroupMessage:2", 6)

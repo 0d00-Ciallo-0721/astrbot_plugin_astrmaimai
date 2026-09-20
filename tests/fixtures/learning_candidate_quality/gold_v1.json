@@ -1,0 +1,46 @@
+{
+  "fixture_version": "learning-quality-gold-v1",
+  "rubric_version": "candidate-quality-rubric-v1",
+  "synthetic_or_redacted_only": true,
+  "quality_evidence": "pending",
+  "annotation_agreement": null,
+  "split_policy": "duplicate clusters never cross splits",
+  "examples": [
+    {
+      "example_id": "synthetic-train-expression-1",
+      "split": "train",
+      "scope_hash": "scope-train-01",
+      "speaker_hash": "speaker-train-01",
+      "timestamp": 1700000000,
+      "messages": [
+        {"source_id": "train-source-1", "text": "示例短句呀", "source_type": "user_said", "evidence_quality": "high"}
+      ],
+      "labels": {"expression": {"boundary": "呀", "scope": "speaker", "is_style": true}, "jargon": null, "duplicate_cluster": "train-cluster-1"},
+      "annotator_ids": []
+    },
+    {
+      "example_id": "synthetic-validation-jargon-1",
+      "split": "validation",
+      "scope_hash": "scope-validation-01",
+      "speaker_hash": null,
+      "timestamp": 1700000100,
+      "messages": [
+        {"source_id": "validation-source-1", "text": "火箭词示例", "source_type": "user_said", "evidence_quality": "high"}
+      ],
+      "labels": {"expression": null, "jargon": {"term": "火箭词", "is_jargon": true, "definition_supported": "unknown"}, "duplicate_cluster": "validation-cluster-1"},
+      "annotator_ids": []
+    },
+    {
+      "example_id": "synthetic-test-negative-1",
+      "split": "test",
+      "scope_hash": "scope-test-01",
+      "speaker_hash": null,
+      "timestamp": 1700000200,
+      "messages": [
+        {"source_id": "test-source-1", "text": "普通固定文本", "source_type": "user_said", "evidence_quality": "high"}
+      ],
+      "labels": {"expression": {"boundary": null, "scope": "none", "is_style": false}, "jargon": {"term": null, "is_jargon": false, "definition_supported": false}, "duplicate_cluster": "test-cluster-1"},
+      "annotator_ids": []
+    }
+  ]
+}

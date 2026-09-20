@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+import math
 from typing import Any, List
 
 from astrbot.api import logger
 
 from ...infrastructure.persistence import MessageLog
 from ..dedup import GLOBAL_CANDIDATE_REGISTRY, expression_fingerprint
+from ..quality.contracts import LearningQualityProfile
+from .candidate_quality import build_expression_shadow_report
 from .expression_candidate_extractor import ExpressionCandidateExtractor
 from .expression_pattern_enricher import ExpressionPatternEnricher
 from .expression_results import ExpressionEnrichmentResult
 from .learning_input_policy import LearningInputPolicy
+from .learning_attribution import LearningAttributionAdapter
+from .learning_evidence import durable_message_evidence_id, message_evidence_id
 
 
 class ExpressionMiner:
@@ -53,6 +58,95 @@ class ExpressionMiner:
         return list(LearningInputPolicy().normalize(messages))
 
     _normalize_messages = normalize_messages
+
+    def _quality_shadow(
+        self,
+        candidates: list[dict[str, Any]],
+        messages: list[Any],
+    ) -> dict[str, Any] | None:
+        evolution = getattr(self.config, "evolution", None)
+        if not bool(getattr(evolution, "learning_quality_shadow_enabled", True)):
+            return None
+        profile_version = str(
+            getattr(evolution, "learning_quality_profile_version", "quality-v1")
+            or "quality-v1"
+        )
+        if profile_version != "quality-v1":
+            return {
+                "status": "blocked",
+                "reason": "unknown_profile",
+                "profile_version": profile_version,
+                "provider_call_count": 0,
+            }
+        try:
+            profile = LearningQualityProfile.quality_v1()
+            adapter = LearningAttributionAdapter()
+            facts: list[dict[str, Any]] = []
+            identity_aliases: dict[str, str] = {}
+            timestamps: list[float] = []
+            for index, message in enumerate(messages):
+                attribution = adapter.attribute(message)
+                display_id = message_evidence_id(message, fallback_index=index)
+                durable_id = durable_message_evidence_id(message)
+                previous = identity_aliases.get(display_id)
+                if previous is not None and previous != durable_id:
+                    return {
+                        "status": "blocked",
+                        "reason": "source_identity_conflict",
+                        "provider_call_count": 0,
+                    }
+                identity_aliases[display_id] = durable_id
+                try:
+                    timestamp = float(getattr(message, "timestamp", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    timestamp = float("nan")
+                if math.isfinite(timestamp):
+                    timestamps.append(timestamp)
+                facts.append(
+                    {
+                        "source_id": durable_id,
+                        "timestamp": timestamp,
+                        "eligible": bool(
+                            getattr(message, "learning_evidence_eligible", True)
+                            and attribution.evidence_eligible
+                        ),
+                        "known_scope": bool(attribution.scope_id),
+                        "eligible_for_speaker_stats": attribution.eligible_for_speaker_stats,
+                        "speaker_scope_id": attribution.speaker_scope_id,
+                    }
+                )
+            if not timestamps:
+                return {
+                    "status": "insufficient_data",
+                    "reason": "timestamp_unavailable",
+                    "profile_version": profile.version,
+                    "profile_hash": profile.parameters_hash,
+                    "provider_call_count": 0,
+                }
+            typed_candidates = [
+                {
+                    **candidate,
+                    "source_message_ids": [
+                        identity_aliases.get(str(source_id), str(source_id))
+                        for source_id in candidate.get("source_message_ids", ())
+                    ],
+                }
+                for candidate in candidates
+            ]
+            return build_expression_shadow_report(
+                typed_candidates,
+                facts,
+                profile=profile,
+                window_end=math.nextafter(max(timestamps), math.inf),
+            )
+        except Exception as exc:
+            logger.warning(f"[ExpressionMiner] quality shadow degraded: {exc}")
+            return {
+                "status": "partial",
+                "reason": "shadow_error",
+                "error_type": type(exc).__name__,
+                "provider_call_count": 0,
+            }
 
     async def _existing_patterns(self, group_id: str) -> set[str]:
         service = getattr(self.memory_engine, "expression_pattern_service", None) if self.memory_engine else None
@@ -113,6 +207,7 @@ class ExpressionMiner:
             existing_patterns=existing,
         )
         if not candidates:
+            quality_shadow = self._quality_shadow([], normalized)
             self.last_result = ExpressionEnrichmentResult(
                 status="completed",
                 reason="no_candidates",
@@ -128,6 +223,7 @@ class ExpressionMiner:
                 "enriched_count": 0,
                 "discovery_provider_call_count": 0,
                 "pipeline_contains_enrichment": False,
+                **({"quality_shadow": quality_shadow} if quality_shadow is not None else {}),
             }
             return []
         min_distinct_turns = self.expression_min_distinct_turns
@@ -140,6 +236,7 @@ class ExpressionMiner:
             )
             or int(item.get("distinct_turn_count") or len(item.get("evidence_message_ids") or []) or 0) >= min_distinct_turns
         ]
+        quality_shadow = self._quality_shadow(candidates, normalized)
         if not candidates:
             self.last_result = ExpressionEnrichmentResult(
                 status="completed",
@@ -156,6 +253,7 @@ class ExpressionMiner:
                 "discovery_provider_call_count": 0,
                 "pipeline_contains_enrichment": False,
                 "input_policy": dict(self.input_policy.last_report),
+                **({"quality_shadow": quality_shadow} if quality_shadow is not None else {}),
             }
             return []
         candidate_fingerprints = {
@@ -189,6 +287,7 @@ class ExpressionMiner:
                 "discovery_provider_call_count": 0,
                 "pipeline_contains_enrichment": False,
                 "input_policy": dict(self.input_policy.last_report),
+                **({"quality_shadow": quality_shadow} if quality_shadow is not None else {}),
             }
             return []
         try:
@@ -228,6 +327,7 @@ class ExpressionMiner:
                 if getattr(self.enricher, "last_provider_attempt", None) is not None
                 else {"provider_attempt": None, "source": "legacy_gateway_compatibility"}
             ),
+            **({"quality_shadow": quality_shadow} if quality_shadow is not None else {}),
         }
         logger.info(
             f"[ExpressionMiner] 表达习惯挖掘完成: {group_id} -> "

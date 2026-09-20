@@ -676,6 +676,33 @@ class DatabaseService(
 
         return self._run_with_session(_sync)
 
+    def get_quality_window_message_logs(
+        self,
+        group_id: str,
+        *,
+        window_start: float,
+        window_end: float,
+    ) -> List[MessageLog]:
+        if window_end <= window_start:
+            raise ValueError("invalid_quality_window")
+
+        def _sync(session: Session) -> List[MessageLog]:
+            statement = (
+                select(MessageLog)
+                .where(
+                    MessageLog.group_id == group_id,
+                    (MessageLog.timestamp <= 0)
+                    | (
+                        (MessageLog.timestamp >= float(window_start))
+                        & (MessageLog.timestamp < float(window_end))
+                    ),
+                )
+                .order_by(MessageLog.id.asc())
+            )
+            return [self._clone_model(item) for item in session.exec(statement).all()]
+
+        return self._run_with_session(_sync)
+
     def load_learning_snapshot(
         self,
         chat_id: str,
@@ -1935,6 +1962,20 @@ class DatabaseService(
             limit,
             max_age_seconds,
             include_processed,
+        )
+
+    async def get_quality_window_message_logs_async(
+        self,
+        group_id: str,
+        *,
+        window_start: float,
+        window_end: float,
+    ):
+        return await self._run_blocking(
+            self.get_quality_window_message_logs,
+            group_id,
+            window_start=window_start,
+            window_end=window_end,
         )
 
     async def get_chat_state_async(self, chat_id: str):

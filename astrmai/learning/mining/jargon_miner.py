@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import hashlib
+import math
 from astrbot.api import logger
 
 from ..dedup import GLOBAL_CANDIDATE_REGISTRY, jargon_fingerprint, normalize_jargon_term
+from ..quality.contracts import LearningQualityProfile
+from .candidate_quality import scan_jargon_shadow
 from .jargon_candidate_extractor import JargonCandidateExtractor
 from .jargon_enricher import JargonEnricher
 from .jargon_identity import resolve_jargon_identity
 from .learning_input_policy import LearningInputPolicy
+from .learning_attribution import LearningAttributionAdapter
+from .learning_evidence import durable_message_evidence_id
 from typing import Any, Iterable, List, Sequence
 
 
@@ -46,6 +52,105 @@ class JargonMiner:
         return list(LearningInputPolicy().normalize(messages))
 
     _normalize_messages = normalize_messages
+
+    def _quality_shadow(self, messages: list[Any]) -> dict[str, Any] | None:
+        config = getattr(self.expression_miner, "config", None)
+        evolution = getattr(config, "evolution", None)
+        if not bool(getattr(evolution, "learning_quality_shadow_enabled", True)):
+            return None
+        profile_version = str(
+            getattr(evolution, "learning_quality_profile_version", "quality-v1")
+            or "quality-v1"
+        )
+        if profile_version != "quality-v1":
+            return {
+                "status": "blocked",
+                "reason": "unknown_profile",
+                "profile_version": profile_version,
+                "provider_call_count": 0,
+            }
+        try:
+            adapter = LearningAttributionAdapter()
+            facts: list[dict[str, Any]] = []
+            timestamps: list[float] = []
+            for message in messages:
+                attribution = adapter.attribute(message)
+                try:
+                    timestamp = float(getattr(message, "timestamp", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    timestamp = float("nan")
+                if math.isfinite(timestamp):
+                    timestamps.append(timestamp)
+                facts.append(
+                    {
+                        "source_id": durable_message_evidence_id(message),
+                        "content": str(getattr(message, "content", "") or ""),
+                        "timestamp": timestamp,
+                        "eligible": bool(
+                            getattr(message, "learning_evidence_eligible", True)
+                            and attribution.evidence_eligible
+                        ),
+                    }
+                )
+            profile = LearningQualityProfile.quality_v1()
+            if not timestamps:
+                return {
+                    "status": "insufficient_data",
+                    "reason": "timestamp_unavailable",
+                    "profile_version": profile.version,
+                    "profile_hash": profile.parameters_hash,
+                    "provider_call_count": 0,
+                }
+            scan = scan_jargon_shadow(
+                facts,
+                profile=profile,
+                window_end=math.nextafter(max(timestamps), math.inf),
+            )
+            candidates = scan.pop("candidates", {})
+            decision_counts: dict[str, int] = {}
+            ranked: list[dict[str, Any]] = []
+            for term, item in candidates.items():
+                if int(item["support_count"]) < int(profile.parameters["jargon_min_support"]):
+                    decision = "insufficient_data"
+                elif (
+                    item["left_entropy_bits"] is not None
+                    and item["right_entropy_bits"] is not None
+                    and float(item["left_entropy_bits"]) >= float(profile.parameters["jargon_min_left_entropy_bits"])
+                    and float(item["right_entropy_bits"]) >= float(profile.parameters["jargon_min_right_entropy_bits"])
+                ):
+                    decision = "high_confidence_shadow"
+                else:
+                    decision = "low_confidence_shadow"
+                decision_counts[decision] = decision_counts.get(decision, 0) + 1
+                ranked.append(
+                    {
+                        "candidate_key": hashlib.sha256(
+                            term.encode("utf-8")
+                        ).hexdigest()[:16],
+                        "decision": decision,
+                        **item,
+                    }
+                )
+            ranked.sort(
+                key=lambda item: (
+                    -int(item["support_count"]),
+                    -float(item["burst_ratio"] or 0.0),
+                    str(item["candidate_key"]),
+                )
+            )
+            return {
+                **scan["report"],
+                "decision_counts": dict(sorted(decision_counts.items())),
+                "top_candidates": ranked[:20],
+            }
+        except Exception as exc:
+            logger.warning(f"[JargonMiner] quality shadow degraded: {exc}")
+            return {
+                "status": "partial",
+                "reason": "shadow_error",
+                "error_type": type(exc).__name__,
+                "provider_call_count": 0,
+            }
 
     async def _existing_expression_terms(self, group_id: str) -> set[str]:
         service = getattr(self.memory_engine, "expression_pattern_service", None) if self.memory_engine else None
@@ -121,6 +226,7 @@ class JargonMiner:
             existing_terms=existing_terms,
             blocked_terms=expression_terms,
         )
+        quality_shadow = self._quality_shadow(normalized)
         for candidate in candidates:
             observed = str(candidate.get("content") or "")
             canonical, similarity = resolve_jargon_identity(observed, existing_records)
@@ -140,6 +246,7 @@ class JargonMiner:
                 "input_policy": dict(self.input_policy.last_report),
                 "discovery_provider_call_count": 0,
                 "pipeline_contains_enrichment": False,
+                **({"quality_shadow": quality_shadow} if quality_shadow is not None else {}),
             }
             return []
         if not self.enricher:
@@ -155,6 +262,7 @@ class JargonMiner:
                 "discovery_provider_call_count": 0,
                 "pipeline_contains_enrichment": True,
                 "provider_attempt": {"provider_attempt": 0, "reason": "enricher_unavailable"},
+                **({"quality_shadow": quality_shadow} if quality_shadow is not None else {}),
             }
             return candidates
         candidate_fingerprints = {
@@ -177,6 +285,7 @@ class JargonMiner:
                 "input_policy": dict(self.input_policy.last_report),
                 "discovery_provider_call_count": 0,
                 "pipeline_contains_enrichment": False,
+                **({"quality_shadow": quality_shadow} if quality_shadow is not None else {}),
             }
             return []
         try:
@@ -225,5 +334,6 @@ class JargonMiner:
                 if getattr(self.enricher, "last_provider_attempt", None) is not None
                 else {"provider_attempt": None, "source": "legacy_gateway_compatibility"}
             ),
+            **({"quality_shadow": quality_shadow} if quality_shadow is not None else {}),
         }
         return enriched

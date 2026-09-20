@@ -12,6 +12,7 @@ from typing import Any, AsyncIterator, Mapping, Sequence
 
 from ...infrastructure.persistence.sqlite_helpers import connect_aiosqlite
 from ..mining.diagnostics import LearningStageDiagnostic
+from ..quality.contracts import CandidateQualityFeatures
 
 
 _CANDIDATE_FAMILIES = frozenset({"expression", "jargon"})
@@ -610,6 +611,15 @@ class CandidateAttemptRecord:
     output_count: int
 
 
+@dataclass(frozen=True, slots=True)
+class QualitySnapshotWriteResult:
+    quality_id: str
+    inserted: bool = False
+    idempotent: bool = False
+    conflict: bool = False
+    failure_kind: str = ""
+
+
 class CandidateLedger:
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
@@ -621,6 +631,7 @@ class CandidateLedger:
             "learning_candidate_evidence",
             "learning_candidate_attempt",
             "learning_stage_diagnostic",
+            "learning_candidate_quality",
         }
         required_indexes = {
             "ix_learning_candidate_due",
@@ -630,6 +641,7 @@ class CandidateLedger:
             "ix_learning_attempt_due",
             "ix_learning_diagnostic_run",
             "ix_learning_circuit_due",
+            "ix_learning_quality_candidate",
         }
         async with self._db() as db:
             cursor = await db.execute(
@@ -646,6 +658,192 @@ class CandidateLedger:
         async with connect_aiosqlite(self.db_path) as db:
             await db.execute("PRAGMA foreign_keys = ON")
             yield db
+
+    _QUALITY_COLUMNS = """
+        quality_id, candidate_id, candidate_revision, profile_version,
+        profile_hash, window_start, window_end, eligible_message_count,
+        unknown_message_count, support_count, speaker_support,
+        speaker_message_count, group_support, group_message_count,
+        other_support, other_total, distinct_turns, distinct_turn_count,
+        distinct_day_count, context_diversity, g2, log2_effect,
+        signed_log2_lift, p_value, fdr_q, pmi, left_entropy_bits,
+        right_entropy_bits, burst_ratio, first_seen_at, last_seen_at,
+        feature_complete, missing_reasons_json, confidence_tier,
+        reasons_json, created_at
+    """
+
+    @staticmethod
+    def _quality_values(features: CandidateQualityFeatures) -> tuple[Any, ...]:
+        features.__post_init__()
+        return (
+            features.quality_id,
+            features.candidate_id,
+            features.candidate_revision,
+            features.profile_version,
+            features.profile_hash,
+            features.window_start,
+            features.window_end,
+            features.eligible_message_count,
+            features.unknown_message_count,
+            features.support_count,
+            features.speaker_support,
+            features.speaker_message_count,
+            features.group_support,
+            features.group_message_count,
+            features.other_support,
+            features.other_total,
+            features.distinct_turns,
+            features.distinct_turn_count,
+            features.distinct_day_count,
+            features.context_diversity,
+            features.g2,
+            features.log2_effect,
+            features.signed_log2_lift,
+            features.p_value,
+            features.fdr_q,
+            features.pmi,
+            features.left_entropy_bits,
+            features.right_entropy_bits,
+            features.burst_ratio,
+            features.first_seen_at,
+            features.last_seen_at,
+            int(features.feature_complete),
+            _canonical_json(features.missing_reasons),
+            features.confidence_tier,
+            _canonical_json(features.reasons),
+            features.created_at,
+        )
+
+    @staticmethod
+    def _quality_from_row(row: Sequence[Any]) -> CandidateQualityFeatures:
+        try:
+            missing_reasons = json.loads(str(row[32]))
+            reasons = json.loads(str(row[34]))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("invalid_quality_snapshot_json") from exc
+        if not isinstance(missing_reasons, list) or not isinstance(reasons, list):
+            raise ValueError("invalid_quality_snapshot_json")
+        return CandidateQualityFeatures(
+            quality_id=str(row[0]),
+            candidate_id=str(row[1]),
+            candidate_revision=int(row[2]),
+            profile_version=str(row[3]),
+            profile_hash=str(row[4]),
+            window_start=float(row[5]),
+            window_end=float(row[6]),
+            eligible_message_count=int(row[7]),
+            unknown_message_count=int(row[8]),
+            support_count=int(row[9]),
+            speaker_support=None if row[10] is None else int(row[10]),
+            speaker_message_count=None if row[11] is None else int(row[11]),
+            group_support=int(row[12]),
+            group_message_count=int(row[13]),
+            other_support=None if row[14] is None else int(row[14]),
+            other_total=None if row[15] is None else int(row[15]),
+            distinct_turns=int(row[16]),
+            distinct_turn_count=int(row[17]),
+            distinct_day_count=int(row[18]),
+            context_diversity=int(row[19]),
+            g2=None if row[20] is None else float(row[20]),
+            log2_effect=None if row[21] is None else float(row[21]),
+            signed_log2_lift=None if row[22] is None else float(row[22]),
+            p_value=None if row[23] is None else float(row[23]),
+            fdr_q=None if row[24] is None else float(row[24]),
+            pmi=None if row[25] is None else float(row[25]),
+            left_entropy_bits=None if row[26] is None else float(row[26]),
+            right_entropy_bits=None if row[27] is None else float(row[27]),
+            burst_ratio=None if row[28] is None else float(row[28]),
+            first_seen_at=None if row[29] is None else float(row[29]),
+            last_seen_at=None if row[30] is None else float(row[30]),
+            feature_complete=bool(row[31]),
+            missing_reasons=tuple(str(item) for item in missing_reasons),
+            confidence_tier=str(row[33]),
+            reasons=tuple(str(item) for item in reasons),
+            created_at=float(row[35]),
+        )
+
+    async def store_quality_snapshot(
+        self, features: CandidateQualityFeatures
+    ) -> QualitySnapshotWriteResult:
+        async with self._db() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await db.execute(
+                    "SELECT revision FROM learning_candidate WHERE candidate_id = ?",
+                    (features.candidate_id,),
+                )
+                candidate = await cursor.fetchone()
+                await cursor.close()
+                if candidate is None or int(candidate[0]) != features.candidate_revision:
+                    await db.rollback()
+                    return QualitySnapshotWriteResult(
+                        quality_id=features.quality_id,
+                        conflict=True,
+                        failure_kind="candidate_revision_conflict",
+                    )
+                cursor = await db.execute(
+                    f"""SELECT {self._QUALITY_COLUMNS}
+                        FROM learning_candidate_quality
+                        WHERE candidate_id = ? AND candidate_revision = ?
+                          AND profile_version = ?""",
+                    (
+                        features.candidate_id,
+                        features.candidate_revision,
+                        features.profile_version,
+                    ),
+                )
+                existing = await cursor.fetchone()
+                await cursor.close()
+                if existing is not None:
+                    try:
+                        matches = self._quality_from_row(existing) == features
+                    except ValueError:
+                        matches = False
+                    await db.rollback()
+                    return QualitySnapshotWriteResult(
+                        quality_id=features.quality_id,
+                        idempotent=matches,
+                        conflict=not matches,
+                        failure_kind="" if matches else "quality_snapshot_conflict",
+                    )
+                await db.execute(
+                    f"""INSERT INTO learning_candidate_quality({self._QUALITY_COLUMNS})
+                        VALUES ({','.join('?' for _ in range(36))})""",
+                    self._quality_values(features),
+                )
+                await db.commit()
+                return QualitySnapshotWriteResult(
+                    quality_id=features.quality_id,
+                    inserted=True,
+                )
+            except sqlite3.IntegrityError:
+                await db.rollback()
+                return QualitySnapshotWriteResult(
+                    quality_id=features.quality_id,
+                    conflict=True,
+                    failure_kind="quality_identity_conflict",
+                )
+            except BaseException:
+                await db.rollback()
+                raise
+
+    async def load_quality_snapshot(
+        self,
+        candidate_id: str,
+        candidate_revision: int,
+        profile_version: str,
+    ) -> CandidateQualityFeatures | None:
+        async with self._db() as db:
+            cursor = await db.execute(
+                f"""SELECT {self._QUALITY_COLUMNS}
+                    FROM learning_candidate_quality
+                    WHERE candidate_id = ? AND candidate_revision = ?
+                      AND profile_version = ?""",
+                (str(candidate_id), int(candidate_revision), str(profile_version)),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        return None if row is None else self._quality_from_row(row)
 
     @staticmethod
     def _batch_identity(batch: LearningSourceBatch) -> tuple[Any, ...]:
@@ -2040,6 +2238,7 @@ __all__ = [
     "LearningCandidate",
     "LearningSourceBatch",
     "ProviderStartResult",
+    "QualitySnapshotWriteResult",
     "SourceBatchSettlementResult",
     "SourceBatchWriteResult",
     "SourceDisposition",

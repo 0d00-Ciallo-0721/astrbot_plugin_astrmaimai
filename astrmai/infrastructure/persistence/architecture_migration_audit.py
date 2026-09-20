@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 
-LATEST_ARCHITECTURE_SCHEMA_VERSION = 158
+LATEST_ARCHITECTURE_SCHEMA_VERSION = 160
 
 MESSAGELOG_REQUIRED_COLUMNS = (
     "event_id",
@@ -71,6 +71,7 @@ REQUIRED_INDEXES = (
     "ix_learning_attempt_due",
     "ix_learning_diagnostic_run",
     "ix_learning_circuit_due",
+    "ix_learning_quality_candidate",
 )
 
 
@@ -199,6 +200,7 @@ def inspect_architecture_migration(
         "learning_candidate_evidence",
         "learning_candidate_attempt",
         "learning_stage_diagnostic",
+        "learning_candidate_quality",
     )
     missing_tables = tuple(name for name in required_tables if name not in tables)
     table_row_counts = {
@@ -249,6 +251,44 @@ def inspect_architecture_migration(
             "stage",
             "status",
         ),
+        "learning_candidate_quality": (
+            "quality_id",
+            "candidate_id",
+            "candidate_revision",
+            "profile_version",
+            "profile_hash",
+            "window_start",
+            "window_end",
+            "eligible_message_count",
+            "unknown_message_count",
+            "support_count",
+            "speaker_support",
+            "speaker_message_count",
+            "group_support",
+            "group_message_count",
+            "other_support",
+            "other_total",
+            "distinct_turns",
+            "distinct_turn_count",
+            "distinct_day_count",
+            "context_diversity",
+            "g2",
+            "log2_effect",
+            "signed_log2_lift",
+            "p_value",
+            "fdr_q",
+            "pmi",
+            "left_entropy_bits",
+            "right_entropy_bits",
+            "burst_ratio",
+            "first_seen_at",
+            "last_seen_at",
+            "feature_complete",
+            "missing_reasons_json",
+            "confidence_tier",
+            "reasons_json",
+            "created_at",
+        ),
     }
     missing_columns: dict[str, tuple[str, ...]] = {}
     available_columns: dict[str, set[str]] = {}
@@ -278,6 +318,7 @@ def inspect_architecture_migration(
         "ix_learning_attempt_due": "learning_candidate_attempt",
         "ix_learning_diagnostic_run": "learning_stage_diagnostic",
         "ix_learning_circuit_due": "learning_provider_circuit",
+        "ix_learning_quality_candidate": "learning_candidate_quality",
     }
     missing_indexes = tuple(
         name

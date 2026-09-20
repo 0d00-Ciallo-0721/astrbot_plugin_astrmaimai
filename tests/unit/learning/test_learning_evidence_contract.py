@@ -7,6 +7,7 @@ from astrmai.learning.mining.jargon_candidate_extractor import JargonCandidateEx
 from astrmai.learning.mining.jargon_enricher import JargonEnricher
 from astrmai.learning.mining.jargon_identity import resolve_jargon_identity
 from astrmai.learning.mining.jargon_senses import merge_jargon_senses, select_jargon_senses
+from astrmai.learning.mining.learning_evidence import durable_message_evidence_id
 from astrmai.learning.evolution_manager import _jargon_sense_evidence
 
 
@@ -18,6 +19,49 @@ class _Gateway:
 
     async def call_data_process_task(self, **_kwargs):
         return self.result
+
+
+def test_durable_message_identity_separates_domains_with_equal_values():
+    event_identity = durable_message_evidence_id(
+        SimpleNamespace(id=10, event_id="1", platform_message_id="")
+    )
+    row_identity = durable_message_evidence_id(
+        SimpleNamespace(id=1, event_id="", platform_message_id="")
+    )
+
+    assert event_identity == "event_id:1"
+    assert row_identity == "row:1"
+    assert event_identity != row_identity
+
+
+def test_durable_message_identity_requires_strict_positive_integer_row_id():
+    assert durable_message_evidence_id(SimpleNamespace(id=1)) == "row:1"
+    for invalid in (True, 1.5, "1", 0, -1, None):
+        assert durable_message_evidence_id(SimpleNamespace(id=invalid)) == ""
+
+
+def test_durable_message_identity_rejects_fallback_event_without_authority():
+    for event_id in ("fallback_deadbeef", "evt_deadbeef"):
+        assert durable_message_evidence_id(
+            SimpleNamespace(id=None, event_id=event_id, platform_message_id="")
+        ) == ""
+
+
+def test_durable_message_identity_falls_through_fallback_event_to_authority():
+    assert durable_message_evidence_id(
+        SimpleNamespace(
+            id=7,
+            event_id="fallback_deadbeef",
+            platform_message_id="platform-7",
+        )
+    ) == "platform_message_id:platform-7"
+    assert durable_message_evidence_id(
+        SimpleNamespace(
+            id=7,
+            event_id="evt_deadbeef",
+            platform_message_id="",
+        )
+    ) == "row:7"
 
 
 def test_jargon_evidence_bundle_contains_real_context_and_no_model_evidence():

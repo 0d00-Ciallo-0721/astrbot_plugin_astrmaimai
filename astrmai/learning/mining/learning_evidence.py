@@ -10,6 +10,21 @@ from .learning_attribution import LearningAttributionAdapter
 EVIDENCE_VERSION = 3
 
 
+def durable_message_evidence_id(message: Any) -> str:
+    event_id = str(_value(message, "event_id", "") or "").strip()
+    if event_id and not event_id.lower().startswith(("fallback_", "evt_")):
+        return f"event_id:{event_id}"
+    platform_message_id = str(
+        _value(message, "platform_message_id", "") or ""
+    ).strip()
+    if platform_message_id:
+        return f"platform_message_id:{platform_message_id}"
+    source_row_id = _value(message, "id", None)
+    if type(source_row_id) is int and source_row_id > 0:
+        return f"row:{source_row_id}"
+    return ""
+
+
 def message_evidence_id(message: Any, *, fallback_index: int) -> str:
     for field in ("event_id", "platform_message_id", "id"):
         value = str(_value(message, field, "") or "").strip()
