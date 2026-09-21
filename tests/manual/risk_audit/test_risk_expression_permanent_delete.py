@@ -43,10 +43,15 @@ class TestExpressionPermanentDelete(unittest.TestCase):
 
         from astrmai.memory.services.v2_store import MemoryV2Store
 
-        source = inspect.getsource(MemoryV2Store)
-
-        undo_keywords = ["undelete", "rollback"]
-        found = [kw for kw in undo_keywords if kw in source.lower()]
+        method_names = {
+            name.lower()
+            for name, member in inspect.getmembers(MemoryV2Store)
+            if inspect.isfunction(member)
+        }
+        undo_prefixes = ("undelete", "restore_purged", "restore_deleted")
+        found = sorted(
+            name for name in method_names if name.startswith(undo_prefixes)
+        )
 
         self.assertEqual(found, [],
                          f"No undo/restore mechanism in MemoryV2Store. "

@@ -12,7 +12,9 @@ from ...infrastructure.runtime.lane_manager import LaneKey
 from ...infrastructure.runtime.turn_call_ledger import clamp_timeout_to_turn_budget
 from ...infrastructure.gateway.json_utils import parse_json_payload
 from ..contracts.memory_query import MemoryQuery
+from ..contracts.learning_retrieval import LearningFocusContext, LearningTurnCorrelation
 from ..contracts.retrieval_trace import RetrievalTrace
+from .learning_retrieval_events import LearningRetrievalEventWriter
 
 
 class ReActRetriever:
@@ -51,7 +53,15 @@ class ReActRetriever:
         chat_context: str = "",
         sender_name: str = "",
         retrieve_keys: list | None = None,
+        event=None,
+        prompt_revision: str = "",
     ) -> str:
+        await self._record_learning_shadow(
+            event=event,
+            query=query,
+            chat_id=chat_id,
+            prompt_revision=prompt_revision,
+        )
         if not self.gateway:
             return ""
 
@@ -139,6 +149,114 @@ class ReActRetriever:
             final_answer=final_answer,
         )
         return final_answer
+
+    async def _record_learning_shadow(
+        self,
+        *,
+        event,
+        query: str,
+        chat_id: str,
+        prompt_revision: str,
+    ) -> None:
+        engine = self.memory_engine
+        writer = getattr(engine, "learning_retrieval_event_writer", None) if engine else None
+        evolution = getattr(getattr(engine, "config", None), "evolution", None) if engine else None
+        if (
+            event is None
+            or writer is None
+            or not bool(getattr(evolution, "learning_retrieval_shadow_enabled", False))
+        ):
+            return
+        focus_context = (
+            event.get_extra("astrmai_learning_focus_context", None)
+            if hasattr(event, "get_extra")
+            else None
+        )
+        proactive = bool(
+            event.get_extra("astrmai_is_proactive_event", False)
+            if hasattr(event, "get_extra")
+            else False
+        )
+        focus_eligible = bool(
+            isinstance(focus_context, LearningFocusContext)
+            and focus_context.attribution_eligible
+        )
+        correlation = LearningTurnCorrelation.from_event(
+            event,
+            prompt_revision=prompt_revision,
+            query_text=query,
+            scope_id=(focus_context.scope_id if isinstance(focus_context, LearningFocusContext) else chat_id),
+            sender_id=(focus_context.speaker_id if focus_eligible else ""),
+            allow_event_sender=not proactive,
+        )
+        try:
+            selection = await engine.select_learning_retrieval_assets(
+                scope_id=correlation.scope_id,
+                speaker_id=correlation.sender_id,
+                current_generation=int(getattr(engine, "_vector_generation", 0) or 0),
+            )
+            asset_revision_ids = tuple(
+                f"{item.asset_id}:{item.asset_revision}" for item in selection.selected
+            )
+            observed_at = time.time()
+            candidate_revision, review_revision, admission_revision = (
+                LearningRetrievalEventWriter.revision_facts(selection.selected)
+            )
+            asset_provenance = LearningRetrievalEventWriter.asset_provenance(
+                selection.selected,
+                generation=int(getattr(engine, "_vector_generation", 0) or 0),
+            )
+            events = LearningRetrievalEventWriter.selection_events(
+                correlation=correlation,
+                source_layer="react_retriever",
+                asset_revision_ids=asset_revision_ids,
+                selected_ids=selection.selected_ids,
+                accepted_ids=(
+                    selection.selected_ids
+                    if selection.accepted_for_prompt and (not proactive or focus_eligible)
+                    else ()
+                ),
+                generation=int(getattr(engine, "_vector_generation", 0) or 0),
+                policy_version=selection.profile_version,
+                created_at=observed_at,
+                accepted=bool(selection.accepted_for_prompt and (not proactive or focus_eligible)),
+                include_accepted=False,
+                reason_code=("" if selection.selected else "no_eligible_learning_asset"),
+                candidate_revision=candidate_revision,
+                review_revision=review_revision,
+                admission_revision=admission_revision,
+                asset_provenance=asset_provenance,
+            )
+            mutations = [await writer.append(item) for item in events]
+            if hasattr(event, "set_extra"):
+                LearningRetrievalEventWriter.merge_shadow(
+                    event,
+                    {
+                        "correlation": correlation,
+                        "asset_revision_ids": asset_revision_ids,
+                        "asset_provenance": asset_provenance,
+                        "selected_ids": selection.selected_ids,
+                        "accepted_ids": (
+                            selection.selected_ids
+                            if selection.accepted_for_prompt and (not proactive or focus_eligible)
+                            else ()
+                        ),
+                        "generation": int(getattr(engine, "_vector_generation", 0) or 0),
+                        "policy_version": selection.profile_version,
+                        "created_at": observed_at,
+                        "selected": tuple(selection.selected),
+                        "candidate_revision": candidate_revision,
+                        "review_revision": review_revision,
+                        "admission_revision": admission_revision,
+                        "event_mutations": tuple(mutations),
+                    },
+                    source_layer="react_retriever",
+                )
+        except Exception as exc:
+            logger.debug(
+                "[ReAct] learning retrieval shadow degraded: %s",
+                type(exc).__name__,
+            )
 
     async def _generate_question(
         self,

@@ -36,9 +36,10 @@ def _database(path: Path) -> None:
     with sqlite3.connect(path) as db:
         db.execute("PRAGMA foreign_keys = ON")
         for version, ddl in _MIGRATIONS:
-            if version >= 145:
+            if 145 <= version < LATEST_ARCHITECTURE_SCHEMA_VERSION:
                 db.execute(ddl)
-        db.execute(f"PRAGMA user_version = {LATEST_ARCHITECTURE_SCHEMA_VERSION}")
+        db.execute(f"PRAGMA user_version = {LATEST_ARCHITECTURE_SCHEMA_VERSION - 1}")
+        _run_migrations(db)
         db.commit()
 
 
@@ -755,7 +756,7 @@ def test_stage07_migration_is_ready_and_has_no_cross_database_foreign_keys(tmp_p
     _candidate(path)
     with sqlite3.connect(path) as db:
         report = inspect_architecture_migration(db)
-        assert report.schema_version == 169
+        assert report.schema_version == LATEST_ARCHITECTURE_SCHEMA_VERSION
         assert not {"learning_review_attempt", "learning_review_decision", "learning_admission"} & set(report.missing_tables)
         assert db.execute("PRAGMA integrity_check").fetchone() == ("ok",)
         assert db.execute("PRAGMA foreign_key_check").fetchall() == []
@@ -797,7 +798,9 @@ def test_stage07_v168_database_upgrades_order_invariant_additively(tmp_path: Pat
             row[1] for row in db.execute("PRAGMA table_info(learning_review_decision)")
         }
         assert "order_invariant" in columns_after
-        assert db.execute("PRAGMA user_version").fetchone() == (169,)
+        assert db.execute("PRAGMA user_version").fetchone() == (
+            LATEST_ARCHITECTURE_SCHEMA_VERSION,
+        )
         assert db.execute(
             "SELECT order_invariant FROM learning_review_decision "
             "WHERE decision_id = 'legacy-decision'"

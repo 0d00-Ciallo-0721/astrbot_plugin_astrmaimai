@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+import time
 from typing import Any
 
 from astrbot.api.event import AstrMessageEvent
@@ -12,6 +13,8 @@ import json
 from astrbot.api import logger
 
 from ..contracts.memory_query import MemoryInjectionBundle, MemoryInjectionTrace
+from ..contracts.learning_retrieval import LearningFocusContext, LearningTurnCorrelation
+from ..retrieval.learning_retrieval_events import LearningRetrievalEventWriter
 from ..contracts.retrieval_trace import RetrievalTrace
 from ...infrastructure.runtime.turn_call_ledger import begin_stage, finish_stage
 from .memory_context_builder import MemoryContextBuilder
@@ -184,6 +187,126 @@ class MemoryInjectionService:
         except Exception:
             logger.warning("[MemoryInjection] failed to persist retrieval trace", exc_info=True)
 
+    async def _record_learning_shadow(
+        self,
+        *,
+        event,
+        current_query: str,
+        prompt_envelope: PromptEnvelope | None,
+        allow_prompt: bool,
+    ) -> None:
+        engine = getattr(self.retrieval_service, "engine", None)
+        writer = getattr(engine, "learning_retrieval_event_writer", None) if engine else None
+        evolution = getattr(getattr(engine, "config", None), "evolution", None) if engine else None
+        if (
+            engine is None
+            or writer is None
+            or not bool(getattr(evolution, "learning_retrieval_shadow_enabled", False))
+        ):
+            return
+        prompt_revision = str(
+            getattr(prompt_envelope, "prompt_revision", "")
+            or (
+                event.get_extra("astrmai_prompt_revision", "")
+                if hasattr(event, "get_extra")
+                else ""
+            )
+            or ""
+        ).strip()
+        focus_context = (
+            event.get_extra("astrmai_learning_focus_context", None)
+            if hasattr(event, "get_extra")
+            else None
+        )
+        proactive = bool(
+            event.get_extra("astrmai_is_proactive_event", False)
+            if hasattr(event, "get_extra")
+            else False
+        )
+        focus_eligible = bool(
+            isinstance(focus_context, LearningFocusContext)
+            and focus_context.attribution_eligible
+        )
+        correlation = LearningTurnCorrelation.from_event(
+            event,
+            prompt_revision=prompt_revision,
+            query_text=current_query,
+            scope_id=(focus_context.scope_id if isinstance(focus_context, LearningFocusContext) else ""),
+            sender_id=(focus_context.speaker_id if focus_eligible else ""),
+            allow_event_sender=not proactive,
+        )
+        try:
+            selection = await engine.select_learning_retrieval_assets(
+                scope_id=correlation.scope_id,
+                speaker_id=correlation.sender_id,
+                current_generation=int(getattr(engine, "_vector_generation", 0) or 0),
+            )
+            asset_revision_ids = tuple(
+                f"{item.asset_id}:{item.asset_revision}" for item in selection.selected
+            )
+            accepted = bool(
+                selection.accepted_for_prompt
+                and allow_prompt
+                and (not proactive or focus_eligible)
+            )
+            accepted_ids = selection.selected_ids if accepted else ()
+            observed_at = time.time()
+            candidate_revision, review_revision, admission_revision = (
+                LearningRetrievalEventWriter.revision_facts(selection.selected)
+            )
+            asset_provenance = LearningRetrievalEventWriter.asset_provenance(
+                selection.selected,
+                generation=int(getattr(engine, "_vector_generation", 0) or 0),
+            )
+            events = LearningRetrievalEventWriter.selection_events(
+                correlation=correlation,
+                source_layer="memory_injection",
+                asset_revision_ids=asset_revision_ids,
+                selected_ids=selection.selected_ids,
+                accepted_ids=accepted_ids,
+                generation=int(getattr(engine, "_vector_generation", 0) or 0),
+                policy_version=selection.profile_version,
+                created_at=observed_at,
+                accepted=accepted,
+                include_accepted=False,
+                reason_code=(
+                    "" if accepted else
+                    "proactive_focus_unavailable" if proactive and not focus_eligible else
+                    "prompt_policy_blocked" if selection.selected else
+                    "no_eligible_learning_asset"
+                ),
+                candidate_revision=candidate_revision,
+                review_revision=review_revision,
+                admission_revision=admission_revision,
+                asset_provenance=asset_provenance,
+            )
+            mutations = [await writer.append(item) for item in events]
+            if hasattr(event, "set_extra"):
+                LearningRetrievalEventWriter.merge_shadow(
+                    event,
+                    {
+                        "correlation": correlation,
+                        "asset_revision_ids": asset_revision_ids,
+                        "asset_provenance": asset_provenance,
+                        "selected_ids": selection.selected_ids,
+                        "accepted_ids": accepted_ids,
+                        "generation": int(getattr(engine, "_vector_generation", 0) or 0),
+                        "policy_version": selection.profile_version,
+                        "created_at": observed_at,
+                        "selected": tuple(selection.selected),
+                        "candidate_revision": candidate_revision,
+                        "review_revision": review_revision,
+                        "admission_revision": admission_revision,
+                        "event_mutations": tuple(mutations),
+                    },
+                    source_layer="memory_injection",
+                )
+        except Exception as exc:
+            logger.warning(
+                "[MemoryInjection] learning retrieval shadow degraded: %s",
+                type(exc).__name__,
+            )
+
     @classmethod
     def has_memory_intent(cls, text: str) -> bool:
         lowered = str(text or "").lower()
@@ -328,16 +451,27 @@ class MemoryInjectionService:
             )
             return MemoryInjectionBundle(trace=trace, skip_reason=reason)
 
-        if hasattr(event, "get_extra") and event.get_extra("astrmai_lightweight_event", False):
-            return skipped("lightweight_event")
-        if isinstance(prompt_envelope, PromptEnvelope) and prompt_envelope.near_context_priority:
-            return skipped("near_context_priority")
-        if hasattr(event, "get_extra") and event.get_extra("astrmai_near_context_priority", False):
-            return skipped("near_context_priority")
-
         current_query = self._current_query(event, prompt, prompt_envelope)
         if not current_query:
             return skipped("empty_query")
+        near_context = bool(
+            isinstance(prompt_envelope, PromptEnvelope)
+            and prompt_envelope.near_context_priority
+        ) or bool(
+            hasattr(event, "get_extra")
+            and event.get_extra("astrmai_near_context_priority", False)
+        )
+        await self._record_learning_shadow(
+            event=event,
+            current_query=current_query,
+            prompt_envelope=prompt_envelope,
+            allow_prompt=not (disable_rag or is_fast_mode or near_context),
+        )
+
+        if hasattr(event, "get_extra") and event.get_extra("astrmai_lightweight_event", False):
+            return skipped("lightweight_event")
+        if near_context:
+            return skipped("near_context_priority")
 
         think_level = self._think_level(event)
         if think_level is not None and think_level <= 0:

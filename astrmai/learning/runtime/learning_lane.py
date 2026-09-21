@@ -19,6 +19,7 @@ LEARNING_TASK_NAMES = frozenset(
     {
         "learning.expression_enrichment",
         "learning.jargon_enrichment",
+        "learning.retrieval_regeneration",
     }
 )
 

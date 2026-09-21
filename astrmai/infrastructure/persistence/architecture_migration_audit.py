@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 
-LATEST_ARCHITECTURE_SCHEMA_VERSION = 169
+LATEST_ARCHITECTURE_SCHEMA_VERSION = 171
 
 MESSAGELOG_REQUIRED_COLUMNS = (
     "event_id",
@@ -75,11 +75,15 @@ REQUIRED_INDEXES = (
     "ux_learning_review_active_claim",
     "ix_learning_review_decision_candidate",
     "ix_learning_admission_blocked",
+    "ix_learning_retrieval_turn",
+    "ix_learning_retrieval_generation",
 )
 
 REQUIRED_TRIGGERS = (
     "trg_learning_review_decision_no_update",
     "trg_learning_review_decision_no_delete",
+    "trg_learning_retrieval_event_no_update",
+    "trg_learning_retrieval_event_no_delete",
 )
 
 
@@ -93,6 +97,7 @@ class ArchitectureMigrationAuditReport:
     missing_columns: dict[str, tuple[str, ...]] = field(default_factory=dict)
     missing_indexes: tuple[str, ...] = ()
     missing_triggers: tuple[str, ...] = ()
+    invalid_constraints: tuple[str, ...] = ()
     canonical_event_rows: int = 0
     duplicate_event_id_groups: int = 0
     conflicting_event_id_groups: int = 0
@@ -222,6 +227,7 @@ def inspect_architecture_migration(
         "learning_review_attempt",
         "learning_review_decision",
         "learning_admission",
+        "learning_retrieval_event",
     )
     missing_tables = tuple(name for name in required_tables if name not in tables)
     table_row_counts = {
@@ -328,6 +334,15 @@ def inspect_architecture_migration(
             "admission_revision", "pre_index_eligible", "post_publish_eligible",
             "index_blocked", "provenance_digest", "revision",
         ),
+        "learning_retrieval_event": (
+            "event_id", "idempotency_key", "turn_id", "correlation_id",
+            "source_layer", "stage", "event_status", "scope_id", "sender_id",
+            "query_fingerprint", "candidate_revision", "review_revision",
+            "admission_revision", "asset_revision_ids_json", "asset_provenance_json", "selected_ids_json",
+            "accepted_ids_json", "visible_ids_json", "generation", "policy_version",
+            "prompt_revision", "reason_code", "trimmed_reason", "budget_chars",
+            "budget_tokens", "outcome", "reply_id", "diagnostics_json", "created_at",
+        ),
     }
     missing_columns: dict[str, tuple[str, ...]] = {}
     available_columns: dict[str, set[str]] = {}
@@ -361,6 +376,8 @@ def inspect_architecture_migration(
         "ux_learning_review_active_claim": "learning_review_attempt",
         "ix_learning_review_decision_candidate": "learning_review_decision",
         "ix_learning_admission_blocked": "learning_admission",
+        "ix_learning_retrieval_turn": "learning_retrieval_event",
+        "ix_learning_retrieval_generation": "learning_retrieval_event",
     }
     missing_indexes = tuple(
         name
@@ -369,6 +386,28 @@ def inspect_architecture_migration(
     )
     triggers = _trigger_names(db)
     missing_triggers = tuple(name for name in REQUIRED_TRIGGERS if name not in triggers)
+    invalid_constraints: list[str] = []
+    retrieval_sql = str(
+        (
+            db.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='learning_retrieval_event'"
+            ).fetchone()
+            or ("",)
+        )[0]
+        or ""
+    )
+    for value in (
+        "memory_injection", "react_retriever", "prompt_refiner", "reply_commit",
+        "eligible", "selected", "accepted_for_prompt", "prompt_visible", "reply_outcome",
+        "observed", "blocked", "unknown", "failed", "budget_zero", "fast_mode",
+        "near_context", "priority_eviction", "policy", "error", "reply_sent",
+        "reply_failed", "cancelled", "no_reply",
+    ):
+        if retrieval_sql and f"'{value}'" not in retrieval_sql:
+            invalid_constraints.append(f"learning_retrieval_event:{value}")
+    normalized_retrieval_sql = "".join(retrieval_sql.lower().split())
+    if retrieval_sql and "json_valid(asset_provenance_json)" not in normalized_retrieval_sql:
+        invalid_constraints.append("learning_retrieval_event:asset_provenance_json_valid")
 
     canonical_event_rows = 0
     duplicate_event_id_groups = 0
@@ -430,6 +469,7 @@ def inspect_architecture_migration(
             missing_columns,
             missing_indexes,
             missing_triggers,
+            invalid_constraints,
             conflicting_event_id_groups,
             invalid_json_fields,
         )
@@ -443,6 +483,7 @@ def inspect_architecture_migration(
         missing_columns=missing_columns,
         missing_indexes=missing_indexes,
         missing_triggers=missing_triggers,
+        invalid_constraints=tuple(invalid_constraints),
         canonical_event_rows=canonical_event_rows,
         duplicate_event_id_groups=duplicate_event_id_groups,
         conflicting_event_id_groups=conflicting_event_id_groups,

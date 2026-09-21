@@ -167,6 +167,7 @@ class EvolutionManager:
             gateway=self.gateway,
             circuit_store=self.provider_circuit_store,
         )
+        self.last_prompt_regeneration_attempt = None
         self.candidate_ledger = CandidateLedger(db_path) if db_path else None
         self.review_repository = LearningReviewRepository(db_path) if db_path else None
         automatic_quorum_enabled = bool(
@@ -495,6 +496,112 @@ class EvolutionManager:
                 ),
             ),
         )
+
+    async def regenerate_learning_prompt_asset(
+        self,
+        *,
+        candidate,
+        source_examples: tuple[str, ...],
+        attempt: int,
+        profile_version: str,
+        turn_id: str = "",
+        correlation_id: str = "",
+    ) -> str:
+        turn_id = str(turn_id or "").strip()
+        correlation_id = str(correlation_id or "").strip()
+        if not turn_id or not correlation_id:
+            self.last_prompt_regeneration_attempt = {
+                "status": "blocked",
+                "failure_stage": "regeneration_identity",
+                "failure_kind": "turn_identity_unavailable",
+                "provider_request_started": False,
+            }
+            return ""
+        evolution = self._evolution_config()
+        if (
+            not bool(getattr(evolution, "learning_enrichment_enabled", False))
+            or attempt != 1
+            or str(profile_version or "") != "retrieval-v1"
+        ):
+            return ""
+        asset_id = str(getattr(candidate, "asset_id", "") or "").strip()
+        scope_id = str(getattr(candidate, "scope_id", "") or "").strip()
+        current_prompt = str(getattr(candidate, "prompt_text", "") or "").strip()
+        examples = tuple(
+            str(value).strip()[:400]
+            for value in tuple(source_examples or ())[:4]
+            if str(value).strip()
+        )
+        if not asset_id or not scope_id or not current_prompt or not examples:
+            return ""
+        identity = {
+            "schema": "learning-retrieval-regeneration-v1",
+            "asset_id": asset_id,
+            "asset_revision": getattr(candidate, "asset_revision", None),
+            "candidate_revision": getattr(candidate, "candidate_revision", None),
+            "admission_revision": getattr(candidate, "admission_revision", None),
+            "model_example_id": str(
+                getattr(candidate, "model_example_id", "") or ""
+            ),
+            "source_example_ids": sorted(
+                str(value).strip()
+                for value in tuple(
+                    getattr(candidate, "source_example_ids", ()) or ()
+                )
+                if str(value).strip()
+            ),
+            "attempt": attempt,
+            "profile_version": profile_version,
+            "turn_id": turn_id,
+            "correlation_id": correlation_id,
+        }
+        attempt_digest = hashlib.sha256(
+            json.dumps(
+                identity,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        prompt = (
+            "Rewrite the model-generated learning hint so it preserves the same useful "
+            "intent without copying wording from the source examples. Do not add facts, "
+            "names, or unsupported claims. Return JSON only as "
+            "{\"prompt_text\":\"...\"}.\n"
+            f"Current hint: {current_prompt[:400]}\n"
+            f"Source examples: {json.dumps(examples, ensure_ascii=False)}"
+        )
+        lane = self._learning_lane_config()
+        provider_result = await self.provider_adapter.call(
+            task_name="learning.retrieval_regeneration",
+            scope_id=scope_id,
+            prompt=prompt,
+            system_prompt="Return one concise rewritten hint as strict JSON.",
+            is_json=True,
+            hard_timeout_sec=(
+                lane.execution_timeout_sec + (2 * lane.admission_timeout_sec)
+            ),
+            logical_wait_timeout_sec=lane.admission_timeout_sec,
+            runtime_wait_timeout_sec=lane.admission_timeout_sec,
+            provider_timeout_sec=lane.execution_timeout_sec,
+            run_id=f"learning-retrieval-regeneration-{attempt_digest[:16]}",
+            work_attempt_id=f"learning-retrieval-regeneration:{attempt_digest}",
+            candidate_work_attempt=attempt,
+            candidate_id=asset_id,
+        )
+        self.last_prompt_regeneration_attempt = provider_result
+        if not provider_result.ok:
+            return ""
+        parsed = parse_json_contract(
+            provider_result.value,
+            required_keys=("prompt_text",),
+            field_types={"prompt_text": str},
+            allow_extra_keys=False,
+            allow_naked_members=False,
+        )
+        if not parsed.schema_valid or not isinstance(parsed.value, dict):
+            return ""
+        return str(parsed.value.get("prompt_text") or "").strip()[:240]
 
     def _learning_pipeline_concurrency(self) -> int:
         evolution = self._evolution_config()

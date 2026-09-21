@@ -8,6 +8,7 @@ from typing import Any, Awaitable, Callable, Iterable, Mapping
 from astrbot.api import logger
 
 from ..contracts.committed_reply import CommittedBotTurn
+from ...memory.retrieval.learning_retrieval_events import LearningRetrievalEventWriter
 from ..runtime.architecture_rollout import (
     ArchitectureTimer,
     record_architecture_observation,
@@ -27,11 +28,12 @@ class ReplyCommitResult:
 class ReplyCommitService:
     """Coordinates post-send consumers without ever resending the reply."""
 
-    def __init__(self, outbox_store=None, *, owner_registry=None) -> None:
+    def __init__(self, outbox_store=None, *, owner_registry=None, learning_event_writer=None) -> None:
         self._lock = asyncio.Lock()
         self._consumer_status: dict[str, dict[str, str]] = {}
         self._outbox_store = outbox_store
         self._owner_registry = owner_registry
+        self._learning_event_writer = learning_event_writer
         self._detached_tasks: set[asyncio.Task[Any]] = set()
 
     def _register_owner_task(self, task: asyncio.Task[Any], *, run_id: str) -> None:
@@ -52,6 +54,58 @@ class ReplyCommitService:
         except Exception as exc:
             logger.debug("[ReplyCommit] owner registry registration degraded: %s", exc)
 
+    async def _record_learning_reply_outcome(
+        self,
+        event: Any,
+        committed_turn: CommittedBotTurn,
+    ) -> None:
+        writer = self._learning_event_writer
+        shadow = (
+            event.get_extra("astrmai_learning_retrieval_shadow", None)
+            if writer is not None and hasattr(event, "get_extra")
+            else None
+        )
+        if not isinstance(shadow, dict):
+            return
+        raw_status = str(getattr(getattr(committed_turn, "send_status", None), "value", "") or "")
+        outcome = {
+            "sent": "reply_sent",
+            "partial": "reply_sent",
+            "failed": "reply_failed",
+            "cancelled": "cancelled",
+            "stale": "no_reply",
+        }.get(raw_status, "unknown")
+        terminal = LearningRetrievalEventWriter.reply_outcome_event(
+            correlation=shadow.get("correlation"),
+            asset_revision_ids=tuple(shadow.get("asset_revision_ids") or ()),
+            generation=shadow.get("generation"),
+            policy_version=str(shadow.get("policy_version") or "retrieval-v1"),
+            outcome=outcome,
+            reply_id=(
+                str(getattr(committed_turn, "commit_id", "") or "")
+                if outcome in {"reply_sent", "reply_failed"}
+                else ""
+            ),
+            created_at=float(getattr(committed_turn, "sent_at", 0.0) or 0.0),
+            candidate_revision=shadow.get("candidate_revision"),
+            review_revision=shadow.get("review_revision"),
+            admission_revision=shadow.get("admission_revision"),
+            asset_provenance=tuple(shadow.get("asset_provenance") or ()),
+        )
+        try:
+            mutation = await writer.append(terminal)
+        except Exception as exc:
+            logger.warning(
+                "[ReplyCommit] learning retrieval outcome degraded: %s",
+                type(exc).__name__,
+            )
+            return
+        if mutation.conflict:
+            logger.warning(
+                "[ReplyCommit] learning retrieval outcome not persisted: %s",
+                mutation.failure_kind,
+            )
+
     async def enqueue(
         self,
         event: Any,
@@ -68,6 +122,7 @@ class ReplyCommitService:
         recovered by ``repair_pending`` after reloads.
         """
         context = dict(repair_context or {})
+        await self._record_learning_reply_outcome(event, committed_turn)
         statuses = {str(name): "pending" for name in consumers}
         inline_names = {
             str(name) for name in inline_consumer_names if str(name) in consumers

@@ -8,25 +8,69 @@ stable classification suitable for diagnostics and tests.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from pathlib import Path
+import re
 from typing import Any
 
 
 def validate_vector_identity(descriptor: Mapping[str, Any] | None) -> dict[str, Any]:
-    """Validate the minimum identity required before publishing an index."""
+    """Validate the complete durable identity required before publishing an index."""
     descriptor = descriptor if isinstance(descriptor, Mapping) else {}
-    required = ("embedding_model", "provider_source", "physical_dimension", "vector_count", "generation", "revision")
+    required = (
+        "asset_revision_digest", "index_file", "embedding_model", "provider_source",
+        "api_base_fingerprint", "physical_dimension", "configured_dimension",
+        "document_count", "vector_count", "mapping_hash", "index_hash",
+        "generation", "revision",
+    )
     missing = [name for name in required if descriptor.get(name) in (None, "")]
     errors: list[str] = []
-    for field in ("physical_dimension", "vector_count", "generation", "revision"):
+    for field in ("generation", "revision", "document_count", "vector_count"):
         value = descriptor.get(field)
-        if value not in (None, ""):
-            try:
-                if int(value) < 0:
-                    errors.append(f"{field}:negative")
-            except (TypeError, ValueError):
-                errors.append(f"{field}:invalid")
+        if value not in (None, "") and (type(value) is not int or value < 0):
+            errors.append(f"{field}:invalid")
+    for field in ("physical_dimension", "configured_dimension"):
+        value = descriptor.get(field)
+        if value not in (None, "") and (type(value) is not int or value <= 0):
+            errors.append(f"{field}:invalid")
+    index_file = descriptor.get("index_file")
+    if isinstance(index_file, str) and index_file and Path(index_file).name != index_file:
+        errors.append("index_file:not_basename")
+    physical = descriptor.get("physical_dimension")
+    configured = descriptor.get("configured_dimension")
+    if type(physical) is int and type(configured) is int and physical != configured:
+        errors.append("dimension:mismatch")
+    documents = descriptor.get("document_count")
+    vectors = descriptor.get("vector_count")
+    if type(documents) is int and type(vectors) is int and documents != vectors:
+        errors.append("count:mismatch")
+    for field in ("asset_revision_digest", "api_base_fingerprint", "mapping_hash", "index_hash"):
+        value = descriptor.get(field)
+        if value not in (None, "") and re.fullmatch(r"sha256:v1:[0-9a-f]{64}", str(value)) is None:
+            errors.append(f"{field}:invalid")
     status = "valid" if not missing and not errors else "blocked"
-    return {"status": status, "missing": missing, "errors": errors, "publish_allowed": status == "valid"}
+    failure_kind = ""
+    if missing:
+        failure_kind = "identity_missing"
+    elif errors:
+        failure_kind = errors[0].replace(":", "_")
+    return {
+        "status": status,
+        "missing": missing,
+        "errors": errors,
+        "publish_allowed": status == "valid",
+        "failure_stage": "" if status == "valid" else "vector_identity",
+        "failure_kind": failure_kind,
+        "retryable": False,
+        "expected": {
+            "dimension": configured,
+            "document_count": documents,
+        },
+        "actual": {
+            "dimension": physical,
+            "vector_count": vectors,
+        },
+        "diagnostics": {"missing": list(missing), "errors": list(errors)},
+    }
 
 
 def reconcile_memory_vector(

@@ -1445,6 +1445,30 @@
         "default": false,
         "hint": "默认关闭；本阶段不构建、发布或切换任何索引。"
       },
+      "learning_vector_build_enabled": {
+        "description": "启用本地学习向量候选构建",
+        "type": "bool",
+        "default": false,
+        "hint": "默认关闭；仅允许受控本地数据构建候选资产。"
+      },
+      "learning_vector_publish_enabled": {
+        "description": "启用学习向量代际发布",
+        "type": "bool",
+        "default": false,
+        "hint": "默认关闭；必须与构建开关及完整发布门禁同时成立。"
+      },
+      "learning_retrieval_shadow_enabled": {
+        "description": "启用学习资产影子检索",
+        "type": "bool",
+        "default": false,
+        "hint": "默认关闭；只记录选择事实，不改变用户可见回复。"
+      },
+      "learning_prompt_injection_enabled": {
+        "description": "允许学习资产进入最终提示词",
+        "type": "bool",
+        "default": false,
+        "hint": "默认关闭；还必须同时启用影子检索并通过提示词门禁。"
+      },
       "learning_publish_trusted_owner_ids": {
         "description": "受信索引发布证明所有者",
         "type": "list",

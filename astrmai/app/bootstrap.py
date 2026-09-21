@@ -17,6 +17,7 @@ from ..conversation.attention.private_turn_coordinator import PrivateTurnCoordin
 from ..conversation.decision.judge import Judge
 from ..conversation.execution.reply_service import ReplyService
 from ..conversation.execution.reply_commit_service import ReplyCommitService
+from ..memory.retrieval.learning_retrieval_events import LearningRetrievalEventWriter
 from ..conversation.execution.post_reply_feedback_coordinator import PostReplyFeedbackCoordinator
 from ..conversation.execution.reread_action_dispatcher import RereadActionDispatcher
 from ..conversation.execution.system2_runner import System2Runner
@@ -252,6 +253,12 @@ class PluginBootstrap:
         memory_engine: MemoryEngine,
     ) -> None:
         memory_engine.db_service = db_service
+        database_path = getattr(db_service, "db_path", None)
+        memory_engine.learning_retrieval_event_writer = (
+            LearningRetrievalEventWriter(database_path)
+            if database_path
+            else None
+        )
         db_service.memory_engine = memory_engine
         # ponytail: trace_cache_dir default path guess. Verify actual cache dir on disk
         # if turn_trace_store / raw_trace_store produce file-not-found at runtime.
@@ -401,6 +408,15 @@ class PluginBootstrap:
             background_task_budget=getattr(runtime, "background_task_budget", None),
             owner_registry=getattr(runtime, "owner_registry", None),
         )
+        admission_service = getattr(evolution, "admission_service", None)
+        admission_repository = getattr(admission_service, "repository", None)
+        bind_publish_repository = getattr(
+            runtime.memory_engine,
+            "bind_learning_admission_repository",
+            None,
+        )
+        if callable(bind_publish_repository) and admission_repository is not None:
+            bind_publish_repository(admission_repository)
         reply_engine = ReplyService(
             runtime.state_engine,
             runtime.state_engine.mood_manager,
@@ -411,6 +427,11 @@ class PluginBootstrap:
             reply_commit_service=ReplyCommitService(
                 ReplyCommitOutboxStore(runtime.db_service.db_path),
                 owner_registry=getattr(runtime, "owner_registry", None),
+                learning_event_writer=getattr(
+                    runtime.memory_engine,
+                    "learning_retrieval_event_writer",
+                    None,
+                ),
             ),
             qq_action_store=QQActionLedgerStore(runtime.db_service.db_path),
             owner_registry=getattr(runtime, "owner_registry", None),
@@ -434,6 +455,11 @@ class PluginBootstrap:
             runtime.db_service,
             runtime.config,
             react_retriever=react_retriever,
+            learning_prompt_regenerator=getattr(
+                evolution,
+                "regenerate_learning_prompt_asset",
+                None,
+            ),
         )
         system2_planner = Planner(
             self.context,

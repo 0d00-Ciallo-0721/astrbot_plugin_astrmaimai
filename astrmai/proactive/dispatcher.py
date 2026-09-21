@@ -10,6 +10,7 @@ from typing import Any, Awaitable, Callable
 
 from astrbot.api import logger
 
+from ..memory.contracts.learning_retrieval import LearningFocusContext
 from .history_store import ProactiveHistoryStore
 from .rhythm import evaluate_proactive_rhythm
 
@@ -330,6 +331,27 @@ class ProactiveDispatcher:
             return intent.intent_id
         seed = abs(hash((intent.chat_id, intent.source, intent.reason, intent.guidance, now)))
         return f"{intent.source}-{int(now * 1000)}-{seed % 1000000:06d}"
+
+    @staticmethod
+    def _learning_focus_context(intent: ProactiveMessageIntent) -> LearningFocusContext:
+        raw = intent.metadata.get("learning_focus_context")
+        if isinstance(raw, LearningFocusContext) and raw.scope_id == intent.chat_id:
+            return raw
+        source_event_id = str(intent.metadata.get("source_event_id") or "").strip()
+        speaker_id = str(intent.metadata.get("focus_speaker_id") or "").strip()
+        fingerprint = str(intent.metadata.get("focus_message_fingerprint") or "").strip()
+        revision = intent.metadata.get("focus_context_revision", 0)
+        if type(revision) is not int or revision < 0:
+            revision = 0
+        real_focus = bool(source_event_id and fingerprint)
+        return LearningFocusContext(
+            source_event_id=source_event_id if real_focus else "",
+            scope_id=intent.chat_id,
+            speaker_id=speaker_id if real_focus else "",
+            focus_message_fingerprint=fingerprint if real_focus else "",
+            synthetic=not real_focus,
+            context_revision=revision,
+        )
 
     async def _state_energy(self, chat_id: str) -> float | None:
         if not self.state_engine or not hasattr(self.state_engine, "get_state"):
@@ -1092,6 +1114,7 @@ class ProactiveDispatcher:
             "如果当前语境不适合，请等待或忽略。\n"
             f"候选指引：{intent.guidance}"
         )
+        learning_focus_context = self._learning_focus_context(intent)
         event_data = {
             "message_str": candidate_text,
             "timestamp": now,
@@ -1111,6 +1134,7 @@ class ProactiveDispatcher:
                 "astrmai_proactive_time_bucket": checks.get("time_bucket", ""),
                 "astrmai_social_intent": intent.suggested_social_intent,
                 "astrmai_action_tier": intent.suggested_action_tier,
+                "astrmai_learning_focus_context": learning_focus_context,
                 "astrmai_loop_source": "proactive_dispatcher",
                 "astrmai_proactive_dispatch_decision": decision,
                 "astrmai_proactive_completion_callback": _completion,

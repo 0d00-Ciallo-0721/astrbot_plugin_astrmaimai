@@ -1,5 +1,10 @@
 import json
+import hashlib
+import asyncio
+import inspect
 import re
+import time
+from dataclasses import replace
 from datetime import datetime
 
 from astrbot.api import logger
@@ -7,6 +12,8 @@ from astrbot.api.event import AstrMessageEvent
 from ...infrastructure.compat.legacy_compat import read_legacy_prompt_envelope
 from ..contracts.prompt_envelope import PromptEnvelope, ReplyMode
 from ..contracts.turn_context import MemoryInjectionDecision, ensure_turn_context, get_turn_context
+from ...memory.retrieval.learning_retrieval_events import LearningRetrievalEventWriter
+from ...memory.retrieval.learning_retrieval_selector import LearningRetrievalSelector
 
 
 class PromptRefiner:
@@ -45,14 +52,82 @@ class PromptRefiner:
         "cold_summary",
     )
 
-    def __init__(self, memory_engine, db_service=None, config=None, react_retriever=None):
+    def __init__(
+        self,
+        memory_engine,
+        db_service=None,
+        config=None,
+        react_retriever=None,
+        learning_prompt_regenerator=None,
+    ):
         self.memory_engine = memory_engine
         self.db_service = db_service
         self.config = config
         self.react_retriever = react_retriever
+        self.learning_prompt_regenerator = learning_prompt_regenerator
 
     def refresh_config(self, config) -> None:
         self.config = config
+
+    @staticmethod
+    def _correlation_for_prompt_visibility(correlation, *, prompt_revision: str):
+        revision = str(prompt_revision or "").strip()
+        if correlation is None or not revision:
+            return correlation
+        if str(getattr(correlation, "prompt_revision", "") or "").strip() == revision:
+            return correlation
+        try:
+            return replace(correlation, prompt_revision=revision)
+        except (TypeError, ValueError):
+            return correlation
+
+    async def _record_learning_visibility_failure(
+        self,
+        event,
+        *,
+        cancelled: bool,
+    ) -> None:
+        learning_shadow = (
+            event.get_extra("astrmai_learning_retrieval_shadow", None)
+            if hasattr(event, "get_extra")
+            else None
+        )
+        writer = getattr(self.memory_engine, "learning_retrieval_event_writer", None)
+        if not isinstance(learning_shadow, dict) or writer is None:
+            return
+        correlation = learning_shadow.get("correlation")
+        if correlation is None:
+            return
+        visibility_event = LearningRetrievalEventWriter.prompt_visibility_event(
+            correlation=correlation,
+            asset_revision_ids=tuple(learning_shadow.get("asset_revision_ids") or ()),
+            accepted_ids=tuple(learning_shadow.get("accepted_ids") or ()),
+            visible_ids=(),
+            generation=learning_shadow.get("generation"),
+            policy_version=str(learning_shadow.get("policy_version") or "retrieval-v1"),
+            created_at=float(learning_shadow.get("created_at", 0.0) or 0.0),
+            trimmed_reason="error",
+            render_failed=True,
+            candidate_revision=learning_shadow.get("candidate_revision"),
+            review_revision=learning_shadow.get("review_revision"),
+            admission_revision=learning_shadow.get("admission_revision"),
+            asset_provenance=tuple(learning_shadow.get("asset_provenance") or ()),
+            diagnostics={
+                "repetition_attempts": tuple(learning_shadow.get("repetition_diagnostics") or ()),
+            },
+        )
+        if cancelled:
+            visibility_event = replace(
+                visibility_event,
+                event_status="unknown",
+                reason_code="render_cancelled",
+            )
+        mutation = await writer.append(visibility_event)
+        if mutation.conflict:
+            logger.warning(
+                "[PromptRefiner] learning visibility failure not persisted: %s",
+                mutation.failure_kind,
+            )
 
     @staticmethod
     def _format_memory_block(memory_text: str) -> str:
@@ -81,6 +156,43 @@ class PromptRefiner:
         if len(text) <= limit:
             return text
         return text[:limit].rstrip()
+
+    async def _regenerate_learning_prompt_text(
+        self,
+        *,
+        candidate,
+        source_examples: tuple[str, ...],
+        attempt: int,
+        turn_id: str = "",
+        correlation_id: str = "",
+    ) -> str:
+        if not str(turn_id or "").strip() or not str(correlation_id or "").strip():
+            return ""
+        regenerator = self.learning_prompt_regenerator
+        if regenerator is None:
+            regenerator = getattr(self.memory_engine, "learning_prompt_regenerator", None)
+        if not callable(regenerator):
+            return ""
+        try:
+            result = regenerator(
+                candidate=candidate,
+                source_examples=source_examples,
+                attempt=attempt,
+                profile_version="retrieval-v1",
+                turn_id=turn_id,
+                correlation_id=correlation_id,
+            )
+            if inspect.isawaitable(result):
+                result = await result
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "[PromptRefiner] learning repetition regeneration failed: %s",
+                type(exc).__name__,
+            )
+            return ""
+        return self._sanitize_prompt_fragment(result, limit=240)
 
     @staticmethod
     def _truncate_soft_background_text(text: str, budget_chars: int) -> str:
@@ -302,7 +414,11 @@ class PromptRefiner:
         raw_sections = dict(getattr(prompt_envelope, "learning_context_sections", {}) or {})
         jargon = str(raw_sections.get("jargon", "") or "").strip()
         expression = str(raw_sections.get("expression", "") or "").strip()
-        if not jargon and not expression:
+        learning_assets = str(raw_sections.get("learning_assets", "") or "").strip()
+        asset_sections = dict(getattr(prompt_envelope, "learning_asset_sections", {}) or {})
+        if not asset_sections and learning_assets:
+            asset_sections = {"__legacy__": learning_assets}
+        if not jargon and not expression and not asset_sections:
             fallback = str(getattr(prompt_envelope, "learning_context_block", "") or "").strip()
             if not fallback:
                 return "", {
@@ -314,25 +430,48 @@ class PromptRefiner:
                     "model_visible_expression": False,
                     "selected_jargon_chars": 0,
                     "selected_expression_chars": 0,
+                    "visible_learning_asset_ids": (),
                 }
             jargon = fallback
 
         trimmed: list[str] = []
+        rendered_parts: list[str] = []
+        visible_asset_ids: list[str] = []
+
+        def remaining() -> int:
+            used = len("\n\n".join(rendered_parts))
+            return max(0, budget - used - (2 if rendered_parts else 0))
+
         kept_jargon = jargon
-        kept_expression = expression
-        separator = 2 if kept_jargon and kept_expression else 0
-        if len(kept_jargon) + separator + len(kept_expression) > budget and kept_expression:
-            remaining = max(0, budget - len(kept_jargon) - separator)
-            if remaining > 0:
-                kept_expression = self._truncate_soft_background_text(kept_expression, remaining)
-                trimmed.append("expression:truncated")
+        if kept_jargon:
+            if len(kept_jargon) > budget:
+                kept_jargon = self._truncate_soft_background_text(kept_jargon, budget)
+                trimmed.append("jargon:truncated")
+            if kept_jargon:
+                rendered_parts.append(kept_jargon)
+        for asset_id, raw_text in asset_sections.items():
+            asset_text = str(raw_text or "").strip()
+            if not asset_text:
+                continue
+            if len(asset_text) <= remaining():
+                rendered_parts.append(asset_text)
+                if asset_id != "__legacy__":
+                    visible_asset_ids.append(str(asset_id))
             else:
-                kept_expression = ""
-                trimmed.append("expression")
-        rendered = "\n\n".join(part for part in (kept_jargon, kept_expression) if part)
-        if len(rendered) > budget:
-            rendered = self._truncate_soft_background_text(rendered, budget)
-            trimmed.append("jargon:truncated")
+                trimmed.append(f"learning_asset:{asset_id}")
+        kept_expression = expression
+        if kept_expression:
+            available = remaining()
+            if len(kept_expression) > available:
+                if available > 0:
+                    kept_expression = self._truncate_soft_background_text(kept_expression, available)
+                    trimmed.append("expression:truncated")
+                else:
+                    kept_expression = ""
+                    trimmed.append("expression")
+            if kept_expression:
+                rendered_parts.append(kept_expression)
+        rendered = "\n\n".join(rendered_parts)
         return rendered, {
             "budget_chars": budget,
             "trimmed_sections": trimmed,
@@ -340,6 +479,8 @@ class PromptRefiner:
             "skipped_reason": "" if rendered else "trimmed_to_empty",
             "model_visible_jargon": bool(kept_jargon and rendered),
             "model_visible_expression": bool(kept_expression and kept_expression in rendered),
+            "model_visible_learning_assets": bool(visible_asset_ids),
+            "visible_learning_asset_ids": tuple(visible_asset_ids),
             "selected_jargon_chars": len(jargon),
             "selected_expression_chars": len(expression),
         }
@@ -955,6 +1096,48 @@ class PromptRefiner:
         style_variant: str = "",
         proactive_recall: str = "",
     ) -> tuple[str, str]:
+        try:
+            return await self._refine_prompt_impl(
+                event=event,
+                system_prompt=system_prompt,
+                prompt=prompt,
+                context=context,
+                prompt_envelope=prompt_envelope,
+                style_variant=style_variant,
+                proactive_recall=proactive_recall,
+            )
+        except asyncio.CancelledError:
+            try:
+                await asyncio.shield(
+                    self._record_learning_visibility_failure(event, cancelled=True)
+                )
+            except Exception:
+                logger.warning(
+                    "[PromptRefiner] cancelled visibility event degraded",
+                    exc_info=True,
+                )
+            raise
+        except Exception:
+            try:
+                await self._record_learning_visibility_failure(event, cancelled=False)
+            except Exception:
+                logger.warning(
+                    "[PromptRefiner] failed visibility event degraded",
+                    exc_info=True,
+                )
+            raise
+
+    async def _refine_prompt_impl(
+        self,
+        event: AstrMessageEvent,
+        system_prompt: str,
+        prompt: str = "",
+        context=None,
+        *,
+        prompt_envelope: PromptEnvelope | None = None,
+        style_variant: str = "",
+        proactive_recall: str = "",
+    ) -> tuple[str, str]:
         disable_rag = False
         if hasattr(context, "get"):
             disable_rag = context.get("disable_rag_injection")
@@ -966,6 +1149,33 @@ class PromptRefiner:
             prompt_envelope = event.get_extra("astrmai_prompt_envelope", None)
         if not isinstance(prompt_envelope, PromptEnvelope):
             prompt_envelope = read_legacy_prompt_envelope(event, prompt=prompt)
+        if not str(getattr(prompt_envelope, "prompt_revision", "") or "").strip():
+            turn = event.get_extra("astrmai_turn_identity", None) if hasattr(event, "get_extra") else None
+            turn_id = str(getattr(turn, "turn_id", "") or "").strip()
+            if turn_id:
+                prompt_revision_material = {
+                    "schema": "prompt-revision-v1",
+                    "turn_id": turn_id,
+                    "focus_message_identity": str(
+                        getattr(prompt_envelope, "focus_message_identity", "") or ""
+                    ),
+                    "thread_signature": str(
+                        getattr(prompt_envelope, "thread_signature", "") or ""
+                    ),
+                }
+                prompt_envelope.prompt_revision = "sha256:v1:" + hashlib.sha256(
+                    json.dumps(
+                        prompt_revision_material,
+                        ensure_ascii=True,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                if hasattr(event, "set_extra"):
+                    event.set_extra(
+                        "astrmai_prompt_revision",
+                        prompt_envelope.prompt_revision,
+                    )
 
         recent_transcript = prompt_envelope.recent_transcript.strip()
         recent_transcript_source = getattr(prompt_envelope, "recent_transcript_source", "").strip()
@@ -1012,6 +1222,140 @@ class PromptRefiner:
         cognitive_drive_block = str(getattr(prompt_envelope, "cognitive_drive_block", "") or "").strip()
         situational_context_block = str(getattr(prompt_envelope, "situational_context_block", "") or "").strip()
         planner_runtime_instruction_block = str(getattr(prompt_envelope, "planner_runtime_instruction_block", "") or "").strip()
+        learning_shadow = (
+            event.get_extra("astrmai_learning_retrieval_shadow", None)
+            if hasattr(event, "get_extra")
+            else None
+        )
+        if (
+            isinstance(learning_shadow, dict)
+            and learning_shadow.get("accepted_ids")
+            and not is_fast_mode
+            and not near_context_priority
+            and self.LEARNING_CONTEXT_BUDGET_CHARS > 0
+        ):
+            selected_assets = tuple(learning_shadow.get("selected") or ())
+            accepted_asset_ids = set(learning_shadow.get("accepted_ids") or ())
+            learning_asset_sections: dict[str, str] = {}
+            repetition_results: dict[str, object] = {}
+            repetition_diagnostics: list[dict[str, object]] = []
+            turn_identity = event.get_extra("astrmai_turn_identity", None)
+            regeneration_turn_id = str(
+                getattr(turn_identity, "turn_id", "") or ""
+            ).strip()
+            regeneration_correlation_id = str(
+                event.get_extra("astrmai_trace_id", "") or ""
+            ).strip()
+            shadow_correlation = learning_shadow.get("correlation")
+            if not regeneration_correlation_id and shadow_correlation is not None:
+                regeneration_correlation_id = str(
+                    getattr(shadow_correlation, "correlation_id", "") or ""
+                ).strip()
+            for item in selected_assets:
+                asset_id = str(getattr(item, "asset_id", "") or "").strip()
+                prompt_text = str(getattr(item, "prompt_text", "") or "").strip()
+                if not asset_id or asset_id not in accepted_asset_ids or not prompt_text:
+                    continue
+                prompt_text_provenance = str(
+                    getattr(item, "prompt_text_provenance", "") or ""
+                ).strip()
+                source_examples = tuple(getattr(item, "source_examples", ()) or ())
+                source_example_ids = tuple(getattr(item, "source_example_ids", ()) or ())
+                model_example_id = str(getattr(item, "model_example_id", "") or "").strip()
+                provenance_valid = bool(
+                    prompt_text_provenance == "model_generated"
+                    and source_examples
+                    and len(source_examples) == len(source_example_ids)
+                    and all(source_example_ids)
+                    and model_example_id
+                    and model_example_id not in set(source_example_ids)
+                )
+                if not provenance_valid:
+                    repetition_results[asset_id] = "source_model_provenance_invalid"
+                    repetition_diagnostics.append({
+                        "asset_id": asset_id,
+                        "profile_version": "retrieval-v1",
+                        "outcome": "blocked",
+                        "attempt_count": 0,
+                        "reason_code": "source_model_provenance_invalid",
+                    })
+                    continue
+                first_guard = LearningRetrievalSelector.repetition_guard(
+                    source_examples=source_examples,
+                    model_output=prompt_text,
+                    attempt=int(getattr(item, "repetition_attempt", 0) or 0),
+                )
+                guard = first_guard
+                regenerated_text = ""
+                if first_guard.regenerate:
+                    if not regeneration_turn_id or not regeneration_correlation_id:
+                        repetition_results[asset_id] = "turn_identity_unavailable"
+                        repetition_diagnostics.append({
+                            "asset_id": asset_id,
+                            "profile_version": first_guard.profile_version,
+                            "outcome": "blocked",
+                            "attempt_count": 0,
+                            "first_cosine_similarity": first_guard.cosine_similarity,
+                            "first_trigram_overlap": first_guard.trigram_overlap,
+                            "reason_code": "turn_identity_unavailable",
+                        })
+                        continue
+                    regenerated_text = await self._regenerate_learning_prompt_text(
+                        candidate=item,
+                        source_examples=source_examples,
+                        attempt=1,
+                        turn_id=regeneration_turn_id,
+                        correlation_id=regeneration_correlation_id,
+                    )
+                    if regenerated_text:
+                        guard = LearningRetrievalSelector.repetition_guard(
+                            source_examples=source_examples,
+                            model_output=regenerated_text,
+                            attempt=1,
+                        )
+                    else:
+                        repetition_results[asset_id] = "repetition_regenerator_unavailable"
+                        repetition_diagnostics.append({
+                            "asset_id": asset_id,
+                            "profile_version": first_guard.profile_version,
+                            "outcome": "blocked",
+                            "attempt_count": 1,
+                            "first_cosine_similarity": first_guard.cosine_similarity,
+                            "first_trigram_overlap": first_guard.trigram_overlap,
+                            "reason_code": "repetition_regenerator_unavailable",
+                        })
+                        continue
+                repetition_results[asset_id] = guard
+                repetition_diagnostics.append({
+                    "asset_id": asset_id,
+                    "profile_version": guard.profile_version,
+                    "outcome": "blocked" if guard.blocked else "accepted",
+                    "attempt_count": 2 if first_guard.regenerate else 1,
+                    "first_cosine_similarity": first_guard.cosine_similarity,
+                    "first_trigram_overlap": first_guard.trigram_overlap,
+                    "second_cosine_similarity": guard.cosine_similarity if first_guard.regenerate else 0.0,
+                    "second_trigram_overlap": guard.trigram_overlap if first_guard.regenerate else 0.0,
+                    "reason_code": guard.reason_code,
+                })
+                if guard.regenerate or guard.blocked:
+                    continue
+                if regenerated_text:
+                    prompt_text = regenerated_text
+                learning_asset_sections[asset_id] = f"- {prompt_text[:240]}"
+            learning_shadow["repetition_results"] = repetition_results
+            learning_shadow["repetition_diagnostics"] = tuple(repetition_diagnostics)
+            learning_shadow["accepted_ids"] = tuple(
+                asset_id
+                for asset_id in tuple(learning_shadow.get("accepted_ids") or ())
+                if asset_id in learning_asset_sections
+            )
+            if learning_asset_sections:
+                sections = dict(prompt_envelope.learning_context_sections or {})
+                sections["learning_assets"] = "\n".join(learning_asset_sections.values())
+                prompt_envelope.learning_context_sections = sections
+                prompt_envelope.learning_asset_sections = dict(
+                    list(learning_asset_sections.items())[:3]
+                )
         soft_background_block, soft_background_meta = self._render_soft_background_sections(
             prompt_envelope,
             is_fast_mode=is_fast_mode,
@@ -1330,6 +1674,93 @@ class PromptRefiner:
             sections.append(final_speaker_lock)
 
         final_prompt = "\n\n".join(section for section in sections if section).strip()
+
+        if isinstance(learning_shadow, dict):
+            writer = getattr(self.memory_engine, "learning_retrieval_event_writer", None)
+            correlation = self._correlation_for_prompt_visibility(
+                learning_shadow.get("correlation"),
+                prompt_revision=str(getattr(prompt_envelope, "prompt_revision", "") or ""),
+            )
+            learning_shadow["correlation"] = correlation
+            accepted_ids = tuple(learning_shadow.get("accepted_ids") or ())
+            budget_chars = int(learning_context_meta.get("budget_chars", 0) or 0)
+            accepted_for_prompt = bool(accepted_ids and budget_chars > 0)
+            effective_accepted_ids = accepted_ids if accepted_for_prompt else ()
+            visible_ids = tuple(
+                asset_id
+                for asset_id in learning_context_meta.get("visible_learning_asset_ids", ())
+                if asset_id in set(effective_accepted_ids)
+            )
+            visible = bool(visible_ids and not is_fast_mode and not near_context_priority)
+            if writer is not None and correlation is not None:
+                accepted_event = LearningRetrievalEventWriter.accepted_for_prompt_event(
+                    correlation=correlation,
+                    source_layer="prompt_refiner",
+                    asset_revision_ids=tuple(learning_shadow.get("asset_revision_ids") or ()),
+                    selected_ids=tuple(learning_shadow.get("selected_ids") or ()),
+                    accepted_ids=effective_accepted_ids,
+                    generation=learning_shadow.get("generation"),
+                    policy_version=str(learning_shadow.get("policy_version") or "retrieval-v1"),
+                    created_at=float(learning_shadow.get("created_at", 0.0) or time.time()),
+                    accepted=accepted_for_prompt,
+                    reason_code="" if accepted_for_prompt else "budget_zero" if budget_chars <= 0 else "policy",
+                    candidate_revision=learning_shadow.get("candidate_revision"),
+                    review_revision=learning_shadow.get("review_revision"),
+                    admission_revision=learning_shadow.get("admission_revision"),
+                    asset_provenance=tuple(learning_shadow.get("asset_provenance") or ()),
+                    diagnostics={
+                        "repetition_attempts": tuple(learning_shadow.get("repetition_diagnostics") or ()),
+                    },
+                )
+                try:
+                    accepted_mutation = await writer.append(accepted_event)
+                    if accepted_mutation.conflict:
+                        logger.warning(
+                            "[PromptRefiner] learning acceptance not persisted: %s",
+                            accepted_mutation.failure_kind,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "[PromptRefiner] learning acceptance event degraded: %s",
+                        type(exc).__name__,
+                    )
+                trimmed_reason = ""
+                if not visible:
+                    if is_fast_mode:
+                        trimmed_reason = "fast_mode"
+                    elif near_context_priority:
+                        trimmed_reason = "near_context"
+                    elif budget_chars <= 0:
+                        trimmed_reason = "budget_zero"
+                    elif accepted_ids:
+                        trimmed_reason = "priority_eviction"
+                    else:
+                        trimmed_reason = "policy"
+                visibility_event = LearningRetrievalEventWriter.prompt_visibility_event(
+                    correlation=correlation,
+                    asset_revision_ids=tuple(learning_shadow.get("asset_revision_ids") or ()),
+                    accepted_ids=effective_accepted_ids,
+                    visible_ids=visible_ids if visible else (),
+                    generation=learning_shadow.get("generation"),
+                    policy_version=str(learning_shadow.get("policy_version") or "retrieval-v1"),
+                    created_at=float(learning_shadow.get("created_at", 0.0) or time.time()),
+                    budget_chars=budget_chars,
+                    trimmed_reason=trimmed_reason,
+                    candidate_revision=learning_shadow.get("candidate_revision"),
+                    review_revision=learning_shadow.get("review_revision"),
+                    admission_revision=learning_shadow.get("admission_revision"),
+                    asset_provenance=tuple(learning_shadow.get("asset_provenance") or ()),
+                    diagnostics={
+                        "repetition_attempts": tuple(learning_shadow.get("repetition_diagnostics") or ()),
+                    },
+                )
+                try:
+                    await writer.append(visibility_event)
+                except Exception as exc:
+                    logger.warning(
+                        "[PromptRefiner] learning visibility event degraded: %s",
+                        type(exc).__name__,
+                    )
 
         if getattr(getattr(self.config, "global_settings", None), "debug_mode", False):
             # Security: truncate user-facing text to 80 chars in debug logs

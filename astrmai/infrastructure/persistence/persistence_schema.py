@@ -770,7 +770,61 @@ _MIGRATIONS: list[tuple[int, str]] = [
     (169, """ALTER TABLE learning_review_decision
         ADD COLUMN order_invariant INTEGER NOT NULL DEFAULT 0
         CHECK(order_invariant IN (0,1))"""),
+    (170, """CREATE TABLE IF NOT EXISTS learning_retrieval_event (
+        event_id TEXT PRIMARY KEY,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        turn_id TEXT NOT NULL,
+        correlation_id TEXT NOT NULL,
+        source_layer TEXT NOT NULL CHECK(source_layer IN ('memory_injection','react_retriever','prompt_refiner','reply_commit')),
+        stage TEXT NOT NULL CHECK(stage IN ('eligible','selected','accepted_for_prompt','prompt_visible','reply_outcome')),
+        event_status TEXT NOT NULL CHECK(event_status IN ('observed','blocked','unknown','failed')),
+        scope_id TEXT NOT NULL,
+        sender_id TEXT NOT NULL DEFAULT '',
+        query_fingerprint TEXT NOT NULL DEFAULT '',
+        candidate_revision INTEGER,
+        review_revision INTEGER,
+        admission_revision INTEGER,
+        asset_revision_ids_json TEXT NOT NULL DEFAULT '[]',
+        selected_ids_json TEXT NOT NULL DEFAULT '[]',
+        accepted_ids_json TEXT NOT NULL DEFAULT '[]',
+        visible_ids_json TEXT NOT NULL DEFAULT '[]',
+        generation INTEGER,
+        policy_version TEXT NOT NULL,
+        prompt_revision TEXT NOT NULL DEFAULT '',
+        reason_code TEXT NOT NULL DEFAULT '',
+        trimmed_reason TEXT NOT NULL DEFAULT '' CHECK(trimmed_reason IN ('','budget_zero','fast_mode','near_context','priority_eviction','policy','error')),
+        budget_chars INTEGER,
+        budget_tokens INTEGER,
+        outcome TEXT NOT NULL DEFAULT 'unknown' CHECK(outcome IN ('unknown','reply_sent','reply_failed','cancelled','no_reply')),
+        reply_id TEXT NOT NULL DEFAULT '',
+        diagnostics_json TEXT NOT NULL DEFAULT '{}',
+        created_at REAL NOT NULL
+    )"""),
+    (171, """ALTER TABLE learning_retrieval_event
+        ADD COLUMN asset_provenance_json TEXT NOT NULL DEFAULT '[]'
+        CHECK(json_valid(asset_provenance_json))"""),
 ]
+
+
+def _ensure_learning_retrieval_event_objects(db: sqlite3.Connection) -> None:
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS ix_learning_retrieval_turn "
+        "ON learning_retrieval_event(turn_id, correlation_id, stage, created_at)"
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS ix_learning_retrieval_generation "
+        "ON learning_retrieval_event(generation, stage, event_status, created_at)"
+    )
+    db.execute(
+        """CREATE TRIGGER IF NOT EXISTS trg_learning_retrieval_event_no_update
+        BEFORE UPDATE ON learning_retrieval_event
+        BEGIN SELECT RAISE(ABORT, 'learning_retrieval_event is immutable'); END"""
+    )
+    db.execute(
+        """CREATE TRIGGER IF NOT EXISTS trg_learning_retrieval_event_no_delete
+        BEFORE DELETE ON learning_retrieval_event
+        BEGIN SELECT RAISE(ABORT, 'learning_retrieval_event is immutable'); END"""
+    )
 
 
 def _run_migrations(db: sqlite3.Connection) -> None:
@@ -890,6 +944,8 @@ def _run_migrations(db: sqlite3.Connection) -> None:
                 continue
         try:
             db.execute(ddl)
+            if version == 170:
+                _ensure_learning_retrieval_event_objects(db)
             db.execute(f"PRAGMA user_version = {version}")
         except sqlite3.OperationalError as exc:
             if "duplicate column name" in str(exc).lower():
@@ -1037,6 +1093,25 @@ async def _run_migrations_async(db: aiosqlite.Connection) -> None:
                 continue
         try:
             await db.execute(ddl)
+            if version == 170:
+                await db.execute(
+                    "CREATE INDEX IF NOT EXISTS ix_learning_retrieval_turn "
+                    "ON learning_retrieval_event(turn_id, correlation_id, stage, created_at)"
+                )
+                await db.execute(
+                    "CREATE INDEX IF NOT EXISTS ix_learning_retrieval_generation "
+                    "ON learning_retrieval_event(generation, stage, event_status, created_at)"
+                )
+                await db.execute(
+                    """CREATE TRIGGER IF NOT EXISTS trg_learning_retrieval_event_no_update
+                    BEFORE UPDATE ON learning_retrieval_event
+                    BEGIN SELECT RAISE(ABORT, 'learning_retrieval_event is immutable'); END"""
+                )
+                await db.execute(
+                    """CREATE TRIGGER IF NOT EXISTS trg_learning_retrieval_event_no_delete
+                    BEFORE DELETE ON learning_retrieval_event
+                    BEGIN SELECT RAISE(ABORT, 'learning_retrieval_event is immutable'); END"""
+                )
             await db.execute(f"PRAGMA user_version = {version}")
         except sqlite3.OperationalError as exc:
             if "duplicate column name" in str(exc).lower():

@@ -225,10 +225,18 @@ class ContextRuntimeWiringTests(unittest.TestCase):
     def test_cognition_stack_wires_qq_action_ledger_from_runtime_database(self):
         bootstrap_mod = importlib.import_module("astrmai.app.bootstrap")
         captured = {}
+        prompt_refiner_kwargs = {}
+
+        async def regenerate_learning_prompt_asset(**_request):
+            return "regenerated"
 
         class DummyReplyService:
             def __init__(self, *_args, **kwargs):
                 captured.update(kwargs)
+
+        def build_prompt_refiner(*_args, **kwargs):
+            prompt_refiner_kwargs.update(kwargs)
+            return SimpleNamespace()
 
         runtime = SimpleNamespace(
             db_service=SimpleNamespace(db_path="C:/runtime/astrmai.db"),
@@ -254,14 +262,20 @@ class ContextRuntimeWiringTests(unittest.TestCase):
             raw_config={},
         )
 
-        with patch.object(bootstrap_mod, "EvolutionManager", lambda *_args, **_kwargs: SimpleNamespace()), \
+        with patch.object(
+            bootstrap_mod,
+            "EvolutionManager",
+            lambda *_args, **_kwargs: SimpleNamespace(
+                regenerate_learning_prompt_asset=regenerate_learning_prompt_asset,
+            ),
+        ), \
              patch.object(bootstrap_mod, "ReplyService", DummyReplyService), \
              patch.object(bootstrap_mod, "ReplyCommitService", lambda *_args, **_kwargs: SimpleNamespace()), \
              patch.object(bootstrap_mod, "ReplyCommitOutboxStore", lambda *_args, **_kwargs: SimpleNamespace()), \
              patch.object(bootstrap_mod, "PersonaSummarizer", lambda *_args, **_kwargs: SimpleNamespace()), \
              patch.object(bootstrap_mod, "ContextEngine", lambda *_args, **_kwargs: SimpleNamespace()), \
              patch.object(bootstrap_mod, "ReActRetriever", lambda *_args, **_kwargs: SimpleNamespace()), \
-             patch.object(bootstrap_mod, "PromptRefiner", lambda *_args, **_kwargs: SimpleNamespace()), \
+             patch.object(bootstrap_mod, "PromptRefiner", build_prompt_refiner), \
              patch.object(bootstrap_mod, "Planner", lambda *_args, **_kwargs: SimpleNamespace()), \
              patch.object(bootstrap_mod, "System2Runner", lambda *_args, **_kwargs: SimpleNamespace()):
             bootstrap._build_cognition_stack(runtime)
@@ -269,6 +283,10 @@ class ContextRuntimeWiringTests(unittest.TestCase):
         self.assertEqual(
             captured["qq_action_store"].db_path,
             runtime.db_service.db_path,
+        )
+        self.assertIs(
+            prompt_refiner_kwargs["learning_prompt_regenerator"],
+            regenerate_learning_prompt_asset,
         )
 
     def test_runtime_exports_context_compaction_and_prefix_cache_can_be_disabled(self):

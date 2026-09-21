@@ -13,6 +13,12 @@ from typing import Any
 from astrbot.api import logger
 
 from ..contracts.memory_query import MemoryCandidate, MemoryWriteRequest
+from ..contracts.learning_retrieval import (
+    LearningAssetVersion,
+    LearningIndexMembership,
+    LearningPublishMutation,
+    LearningRetrievalCandidate,
+)
 from ...infrastructure.persistence.sqlite_helpers import connect_aiosqlite
 from .memory_scoring import DEFAULT_MEMORY_SCORING
 
@@ -408,9 +414,6 @@ class MemoryV2Store:
                 """
             )
             await db.execute(
-                "INSERT OR REPLACE INTO memory_v2_meta(key, value) VALUES ('schema_version', '3')"
-            )
-            await db.execute(
                 """
                 INSERT OR REPLACE INTO memory_v2_migrations(version, backup_dir, status, detail, applied_at)
                 VALUES ('3', ?, 'applied', 'candidate revision fence ready', ?)
@@ -493,6 +496,7 @@ class MemoryV2Store:
                 "CREATE INDEX IF NOT EXISTS ix_vector_resource_descriptors_role "
                 "ON vector_resource_descriptors(role, generation)"
             )
+            await self._ensure_learning_schema_v4(db)
             await db.execute(
                 """CREATE TABLE IF NOT EXISTS memory_consistency_repairs (
                     repair_id TEXT PRIMARY KEY,
@@ -556,6 +560,1120 @@ class MemoryV2Store:
             await self._ensure_fts_projection(db)
             await db.commit()
         self._initialized = True
+
+    async def _ensure_learning_schema_v4(self, db) -> None:
+        cursor = await db.execute("PRAGMA table_info(vector_resource_descriptors)")
+        descriptor_columns = {str(row[1]) for row in await cursor.fetchall()}
+        await cursor.close()
+        descriptor_migrations = {
+            "asset_revision_digest": "ALTER TABLE vector_resource_descriptors ADD COLUMN asset_revision_digest TEXT NOT NULL DEFAULT ''",
+            "index_file": "ALTER TABLE vector_resource_descriptors ADD COLUMN index_file TEXT NOT NULL DEFAULT ''",
+            "configured_dimension": "ALTER TABLE vector_resource_descriptors ADD COLUMN configured_dimension INTEGER",
+            "mapping_hash": "ALTER TABLE vector_resource_descriptors ADD COLUMN mapping_hash TEXT NOT NULL DEFAULT ''",
+            "index_hash": "ALTER TABLE vector_resource_descriptors ADD COLUMN index_hash TEXT NOT NULL DEFAULT ''",
+            "published_at": "ALTER TABLE vector_resource_descriptors ADD COLUMN published_at REAL NOT NULL DEFAULT 0",
+            "rollback_parent_generation": "ALTER TABLE vector_resource_descriptors ADD COLUMN rollback_parent_generation INTEGER",
+        }
+        for column, statement in descriptor_migrations.items():
+            if column not in descriptor_columns:
+                await db.execute(statement)
+        await db.execute(
+            """CREATE TABLE IF NOT EXISTS learning_asset_version (
+                asset_id TEXT NOT NULL,
+                asset_revision INTEGER NOT NULL,
+                canonical_memory_id TEXT NOT NULL,
+                candidate_id TEXT NOT NULL,
+                candidate_revision INTEGER NOT NULL,
+                admission_revision INTEGER NOT NULL,
+                scope_id TEXT NOT NULL,
+                speaker_scope_id TEXT NOT NULL DEFAULT '',
+                fingerprint TEXT NOT NULL,
+                fingerprint_version INTEGER NOT NULL,
+                lifecycle_status TEXT NOT NULL CHECK(lifecycle_status IN ('candidate','active','stale','superseded','blocked','retired')),
+                valid_at REAL,
+                invalid_at REAL,
+                provenance_hash TEXT NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY(asset_id, asset_revision),
+                UNIQUE(candidate_id, candidate_revision),
+                FOREIGN KEY(canonical_memory_id) REFERENCES canonical_memories(id)
+            )"""
+        )
+        await db.execute(
+            """CREATE TABLE IF NOT EXISTS learning_index_membership (
+                asset_id TEXT NOT NULL,
+                asset_revision INTEGER NOT NULL,
+                generation INTEGER NOT NULL,
+                resource_id TEXT NOT NULL,
+                mapping_ordinal INTEGER NOT NULL,
+                vector_id TEXT NOT NULL,
+                mapping_hash TEXT NOT NULL,
+                index_hash TEXT NOT NULL,
+                membership_status TEXT NOT NULL CHECK(membership_status IN ('candidate','current','stale','orphan','blocked','retired')),
+                revision INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY(asset_id, asset_revision, generation),
+                UNIQUE(generation, vector_id),
+                FOREIGN KEY(asset_id, asset_revision)
+                    REFERENCES learning_asset_version(asset_id, asset_revision)
+            )"""
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS ix_learning_asset_scope "
+            "ON learning_asset_version(scope_id, speaker_scope_id, lifecycle_status)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS ix_learning_membership_generation "
+            "ON learning_index_membership(generation, membership_status, mapping_ordinal)"
+        )
+        await db.execute(
+            "INSERT OR REPLACE INTO memory_v2_meta(key, value) VALUES ('schema_version', '4')"
+        )
+        await db.execute(
+            "INSERT OR IGNORE INTO memory_v2_meta(key, value) VALUES ('learning_current_generation', '0')"
+        )
+        await db.execute(
+            "INSERT OR IGNORE INTO memory_v2_meta(key, value) VALUES ('learning_pending_generation', '')"
+        )
+        await db.execute(
+            "INSERT OR IGNORE INTO memory_v2_meta(key, value) VALUES ('learning_pending_resource_id', '')"
+        )
+        await db.execute(
+            "INSERT OR IGNORE INTO memory_v2_meta(key, value) VALUES ('learning_pending_publish_json', '')"
+        )
+        await db.execute(
+            """INSERT OR REPLACE INTO memory_v2_migrations(version, backup_dir, status, detail, applied_at)
+            VALUES ('4', '', 'applied', 'learning asset and index membership ready', ?)""",
+            (self._now(),),
+        )
+
+    async def learning_schema_readiness(self) -> dict[str, Any]:
+        await self.initialize()
+        required = {
+            "learning_asset_version": {
+                "asset_id", "asset_revision", "canonical_memory_id", "candidate_id",
+                "candidate_revision", "admission_revision", "scope_id", "speaker_scope_id",
+                "fingerprint", "fingerprint_version", "lifecycle_status", "valid_at",
+                "invalid_at", "provenance_hash", "revision", "created_at", "updated_at",
+            },
+            "learning_index_membership": {
+                "asset_id", "asset_revision", "generation", "resource_id", "mapping_ordinal",
+                "vector_id", "mapping_hash", "index_hash", "membership_status", "revision",
+                "created_at", "updated_at",
+            },
+            "vector_resource_descriptors": {
+                "asset_revision_digest", "index_file", "configured_dimension", "mapping_hash",
+                "index_hash", "published_at", "rollback_parent_generation",
+            },
+        }
+        async with connect_aiosqlite(self.db_path) as db:
+            cursor = await db.execute("SELECT name, sql FROM sqlite_master WHERE type='table'")
+            table_rows = await cursor.fetchall()
+            await cursor.close()
+            table_sql = {str(row[0]): str(row[1] or "") for row in table_rows}
+            cursor = await db.execute("SELECT name FROM sqlite_master WHERE type='index'")
+            indexes = {str(row[0]) for row in await cursor.fetchall()}
+            await cursor.close()
+            cursor = await db.execute("SELECT value FROM memory_v2_meta WHERE key='schema_version'")
+            row = await cursor.fetchone()
+            await cursor.close()
+            version = int(row[0]) if row and str(row[0]).isdigit() else 0
+            missing_tables = sorted(set(required) - set(table_sql))
+            missing_columns: dict[str, list[str]] = {}
+            for table, columns in required.items():
+                if table not in table_sql:
+                    continue
+                cursor = await db.execute(f'PRAGMA table_info("{table}")')
+                available = {str(item[1]) for item in await cursor.fetchall()}
+                await cursor.close()
+                missing = sorted(columns - available)
+                if missing:
+                    missing_columns[table] = missing
+        invalid_checks: list[str] = []
+        asset_sql = table_sql.get("learning_asset_version", "")
+        membership_sql = table_sql.get("learning_index_membership", "")
+        for value in ("candidate", "active", "stale", "superseded", "blocked", "retired"):
+            if f"'{value}'" not in asset_sql:
+                invalid_checks.append(f"learning_asset_version:{value}")
+        for value in ("candidate", "current", "stale", "orphan", "blocked", "retired"):
+            if f"'{value}'" not in membership_sql:
+                invalid_checks.append(f"learning_index_membership:{value}")
+        missing_indexes = sorted(
+            {"ix_learning_asset_scope", "ix_learning_membership_generation"} - indexes
+        )
+        return {
+            "ready": bool(
+                version == 4
+                and not missing_tables
+                and not missing_columns
+                and not missing_indexes
+                and not invalid_checks
+            ),
+            "schema_version": version,
+            "missing_tables": missing_tables,
+            "missing_columns": missing_columns,
+            "missing_indexes": missing_indexes,
+            "invalid_checks": invalid_checks,
+        }
+
+    @staticmethod
+    def _strict_non_negative_int(value: object) -> bool:
+        return type(value) is int and value >= 0
+
+    async def save_learning_candidate_asset(
+        self,
+        asset: LearningAssetVersion,
+        membership: LearningIndexMembership,
+    ) -> LearningPublishMutation:
+        return await self.save_learning_generation_candidates((asset,), (membership,))
+
+    async def save_learning_generation_candidates(
+        self,
+        assets: tuple[LearningAssetVersion, ...],
+        memberships: tuple[LearningIndexMembership, ...],
+    ) -> LearningPublishMutation:
+        await self.initialize()
+        asset_by_key = {
+            (asset.asset_id, asset.asset_revision): asset
+            for asset in assets
+        }
+        membership_keys = {
+            (membership.asset_id, membership.asset_revision)
+            for membership in memberships
+        }
+        generations = {membership.generation for membership in memberships}
+        resource_ids = {membership.resource_id for membership in memberships}
+        mapping_hashes = {membership.mapping_hash for membership in memberships}
+        index_hashes = {membership.index_hash for membership in memberships}
+        if (
+            not assets
+            or len(asset_by_key) != len(assets)
+            or len(membership_keys) != len(memberships)
+            or membership_keys != set(asset_by_key)
+            or len(generations) != 1
+            or len(resource_ids) != 1
+            or len(mapping_hashes) != 1
+            or len(index_hashes) != 1
+            or len({membership.mapping_ordinal for membership in memberships}) != len(memberships)
+            or len({membership.vector_id for membership in memberships}) != len(memberships)
+            or not all(
+                asset.lifecycle_status in {"candidate", "active"}
+                and all(
+                    self._strict_non_negative_int(value)
+                    for value in (
+                        asset.asset_revision, asset.candidate_revision,
+                        asset.admission_revision, asset.fingerprint_version, asset.revision,
+                    )
+                )
+                and all(
+                    str(value or "").strip()
+                    for value in (
+                        asset.asset_id, asset.canonical_memory_id, asset.candidate_id,
+                        asset.scope_id, asset.fingerprint, asset.provenance_hash,
+                    )
+                )
+                for asset in assets
+            )
+            or not all(
+                membership.membership_status == "candidate"
+                and all(
+                    self._strict_non_negative_int(value)
+                    for value in (
+                        membership.asset_revision, membership.generation,
+                        membership.mapping_ordinal, membership.revision,
+                    )
+                )
+                and all(
+                    str(value or "").strip()
+                    for value in (
+                        membership.asset_id, membership.resource_id, membership.vector_id,
+                        membership.mapping_hash, membership.index_hash,
+                    )
+                )
+                for membership in memberships
+            )
+        ):
+            return LearningPublishMutation(
+                False, True, failure_stage="candidate_asset", failure_kind="invalid_candidate_contract",
+            )
+        async with connect_aiosqlite(self.db_path) as db:
+            await db.execute("PRAGMA foreign_keys = ON")
+            await db.execute("BEGIN IMMEDIATE")
+            inserted = False
+            for membership in memberships:
+                asset = asset_by_key[(membership.asset_id, membership.asset_revision)]
+                cursor = await db.execute(
+                    "SELECT canonical_memory_id,candidate_id,candidate_revision,admission_revision,"
+                    "scope_id,speaker_scope_id,fingerprint,fingerprint_version,lifecycle_status,"
+                    "provenance_hash,revision FROM learning_asset_version "
+                    "WHERE asset_id=? AND asset_revision=?",
+                    (asset.asset_id, asset.asset_revision),
+                )
+                current_asset = await cursor.fetchone()
+                await cursor.close()
+                expected_asset = (
+                    asset.canonical_memory_id, asset.candidate_id, asset.candidate_revision,
+                    asset.admission_revision, asset.scope_id, asset.speaker_scope_id,
+                    asset.fingerprint, asset.fingerprint_version, asset.lifecycle_status,
+                    asset.provenance_hash, asset.revision,
+                )
+                if current_asset is not None:
+                    current_values = tuple(current_asset)
+                    same_identity = (
+                        current_values[:8] == expected_asset[:8]
+                        and current_values[9] == expected_asset[9]
+                    )
+                    compatible_status = bool(
+                        current_values[8] == expected_asset[8]
+                        and int(current_values[10]) == int(expected_asset[10])
+                    ) or bool(
+                        current_values[8] == "active"
+                        and expected_asset[8] == "candidate"
+                        and int(current_values[10]) == int(expected_asset[10]) + 1
+                    )
+                    if not same_identity or not compatible_status:
+                        await db.rollback()
+                        return LearningPublishMutation(
+                            False, True, failure_stage="candidate_asset",
+                            failure_kind="candidate_identity_conflict",
+                        )
+                else:
+                    if asset.lifecycle_status != "candidate":
+                        await db.rollback()
+                        return LearningPublishMutation(
+                            False, True, failure_stage="candidate_asset",
+                            failure_kind="active_asset_missing",
+                        )
+                    cursor = await db.execute(
+                        "SELECT 1 FROM canonical_memories WHERE id=?",
+                        (asset.canonical_memory_id,),
+                    )
+                    canonical = await cursor.fetchone()
+                    await cursor.close()
+                    if canonical is None:
+                        await db.rollback()
+                        return LearningPublishMutation(
+                            False, True, failure_stage="candidate_asset",
+                            failure_kind="canonical_memory_missing",
+                        )
+                    try:
+                        await db.execute(
+                            """INSERT INTO learning_asset_version(
+                               asset_id,asset_revision,canonical_memory_id,candidate_id,candidate_revision,
+                               admission_revision,scope_id,speaker_scope_id,fingerprint,fingerprint_version,
+                               lifecycle_status,valid_at,invalid_at,provenance_hash,revision,created_at,updated_at
+                            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            (
+                                asset.asset_id, asset.asset_revision, asset.canonical_memory_id,
+                                asset.candidate_id, asset.candidate_revision, asset.admission_revision,
+                                asset.scope_id, asset.speaker_scope_id, asset.fingerprint,
+                                asset.fingerprint_version, asset.lifecycle_status, asset.valid_at,
+                                asset.invalid_at, asset.provenance_hash, asset.revision,
+                                asset.created_at, asset.updated_at,
+                            ),
+                        )
+                    except Exception:
+                        await db.rollback()
+                        return LearningPublishMutation(
+                            False, True, failure_stage="candidate_asset",
+                            failure_kind="candidate_uniqueness_conflict",
+                        )
+                    inserted = True
+                cursor = await db.execute(
+                    "SELECT membership_status,resource_id,mapping_ordinal,vector_id,mapping_hash,"
+                    "index_hash,revision FROM learning_index_membership "
+                    "WHERE asset_id=? AND asset_revision=? AND generation=?",
+                    (membership.asset_id, membership.asset_revision, membership.generation),
+                )
+                current_membership = await cursor.fetchone()
+                await cursor.close()
+                expected_membership = (
+                    "candidate", membership.resource_id, membership.mapping_ordinal,
+                    membership.vector_id, membership.mapping_hash, membership.index_hash,
+                    membership.revision,
+                )
+                if current_membership is not None:
+                    current_values = tuple(current_membership)
+                    completed_identity = bool(
+                        current_values[0] == "current"
+                        and current_values[1:6] == expected_membership[1:6]
+                        and int(current_values[6]) == int(expected_membership[6]) + 1
+                    )
+                    if current_values != expected_membership and not completed_identity:
+                        await db.rollback()
+                        return LearningPublishMutation(
+                            False, True, failure_stage="candidate_asset",
+                            failure_kind="candidate_identity_conflict",
+                        )
+                    continue
+                try:
+                    await db.execute(
+                        """INSERT INTO learning_index_membership(
+                           asset_id,asset_revision,generation,resource_id,mapping_ordinal,vector_id,
+                           mapping_hash,index_hash,membership_status,revision,created_at,updated_at
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            membership.asset_id, membership.asset_revision, membership.generation,
+                            membership.resource_id, membership.mapping_ordinal, membership.vector_id,
+                            membership.mapping_hash, membership.index_hash, membership.membership_status,
+                            membership.revision, membership.created_at, membership.updated_at,
+                        ),
+                    )
+                except Exception:
+                    await db.rollback()
+                    return LearningPublishMutation(
+                        False, True, failure_stage="candidate_asset",
+                        failure_kind="candidate_uniqueness_conflict",
+                    )
+                inserted = True
+            await db.commit()
+        first_asset = assets[0]
+        first_membership = memberships[0]
+        return LearningPublishMutation(
+            inserted, False, idempotent=not inserted,
+            asset_revision=first_asset.revision,
+            membership_revision=first_membership.revision,
+        )
+
+    async def activate_learning_generation(
+        self,
+        *,
+        asset_id: str,
+        asset_revision: int,
+        generation: int,
+        expected_current_generation: int,
+        expected_asset_revision: int,
+        expected_membership_revision: int,
+        mapping_hash: str,
+        index_hash: str,
+        now: float,
+        asset_revision_set: tuple[tuple[str, int, int, int], ...] | None = None,
+    ) -> LearningPublishMutation:
+        await self.initialize()
+        requested = asset_revision_set or (
+            (asset_id, asset_revision, expected_asset_revision, expected_membership_revision),
+        )
+        if (
+            not requested
+            or any(len(item) != 4 for item in requested)
+            or not all(
+                str(item[0] or "").strip()
+                and all(self._strict_non_negative_int(value) for value in item[1:])
+                for item in requested
+            )
+        ):
+            return LearningPublishMutation(
+                False, True, failure_stage="asset_set_cas",
+                failure_kind="generation_asset_set_invalid",
+            )
+        requested = tuple(
+            sorted(
+                (
+                    str(item[0]), int(item[1]), int(item[2]), int(item[3])
+                )
+                for item in requested
+            )
+        )
+        requested_keys = {(item[0], item[1]) for item in requested}
+        if len(requested_keys) != len(requested):
+            return LearningPublishMutation(
+                False, True, failure_stage="asset_set_cas",
+                failure_kind="generation_asset_set_invalid",
+            )
+        if not all(
+            self._strict_non_negative_int(value)
+            for value in (
+                asset_revision, generation, expected_current_generation,
+                expected_asset_revision, expected_membership_revision,
+            )
+        ) or generation <= expected_current_generation:
+            return LearningPublishMutation(
+                False, True, failure_stage="pointer_cas", failure_kind="generation_invalid",
+            )
+        async with connect_aiosqlite(self.db_path) as db:
+            await db.execute("PRAGMA foreign_keys = ON")
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT value FROM memory_v2_meta WHERE key='learning_current_generation'"
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            current_generation = int(row[0]) if row and str(row[0]).isdigit() else 0
+            cursor = await db.execute(
+                "SELECT key,value FROM memory_v2_meta "
+                "WHERE key IN ('learning_pending_generation','learning_pending_resource_id',"
+                "'learning_pending_publish_json')"
+            )
+            pending = {str(item[0]): str(item[1] or "") for item in await cursor.fetchall()}
+            await cursor.close()
+            cursor = await db.execute(
+                "SELECT asset_id,asset_revision FROM learning_asset_version "
+                "WHERE lifecycle_status='active'"
+            )
+            active_keys = {(str(row[0]), int(row[1])) for row in await cursor.fetchall()}
+            await cursor.close()
+            if not active_keys.issubset(requested_keys):
+                await db.rollback()
+                return LearningPublishMutation(
+                    False, True, failure_stage="asset_set_cas",
+                    failure_kind="generation_asset_set_incomplete",
+                    current_generation=current_generation,
+                )
+            cursor = await db.execute(
+                "SELECT asset_id,asset_revision FROM learning_index_membership "
+                "WHERE generation=? AND membership_status IN ('candidate','current')",
+                (generation,),
+            )
+            target_keys = {(str(row[0]), int(row[1])) for row in await cursor.fetchall()}
+            await cursor.close()
+            if target_keys != requested_keys:
+                await db.rollback()
+                return LearningPublishMutation(
+                    False, True, failure_stage="asset_set_cas",
+                    failure_kind="generation_asset_set_conflict",
+                    current_generation=current_generation,
+                )
+            states: list[tuple[tuple[str, int, int, int], tuple, tuple]] = []
+            for entry in requested:
+                entry_asset_id, entry_asset_revision, entry_expected_asset, entry_expected_membership = entry
+                cursor = await db.execute(
+                    "SELECT lifecycle_status,revision FROM learning_asset_version "
+                    "WHERE asset_id=? AND asset_revision=?",
+                    (entry_asset_id, entry_asset_revision),
+                )
+                asset_state = await cursor.fetchone()
+                await cursor.close()
+                cursor = await db.execute(
+                    "SELECT membership_status,revision,mapping_hash,index_hash,resource_id "
+                    "FROM learning_index_membership "
+                    "WHERE asset_id=? AND asset_revision=? AND generation=?",
+                    (entry_asset_id, entry_asset_revision, generation),
+                )
+                membership_state = await cursor.fetchone()
+                await cursor.close()
+                if asset_state is None or membership_state is None:
+                    await db.rollback()
+                    return LearningPublishMutation(
+                        False, True, failure_stage="asset_set_cas",
+                        failure_kind="generation_asset_set_missing",
+                        current_generation=current_generation,
+                    )
+                states.append((entry, asset_state, membership_state))
+            if (
+                current_generation == generation
+                and all(
+                    asset_state[0] == "active"
+                    and membership_state[0] == "current"
+                    and str(membership_state[2]) == mapping_hash
+                    and str(membership_state[3]) == index_hash
+                    for _entry, asset_state, membership_state in states
+                )
+            ):
+                await db.rollback()
+                return LearningPublishMutation(
+                    False, False, idempotent=True, current_generation=current_generation,
+                    asset_revision=int(states[0][1][1]),
+                    membership_revision=int(states[0][2][1]),
+                )
+            if current_generation != expected_current_generation:
+                await db.rollback()
+                return LearningPublishMutation(
+                    False, True, failure_stage="pointer_cas", failure_kind="current_generation_conflict",
+                    current_generation=current_generation,
+                )
+            if (
+                pending.get("learning_pending_generation") != str(generation)
+                or not states
+                or any(
+                    pending.get("learning_pending_resource_id") != str(state[2][4])
+                    for state in states
+                )
+            ):
+                await db.rollback()
+                return LearningPublishMutation(
+                    False, True, failure_stage="pointer_cas", failure_kind="publish_reservation_missing",
+                    current_generation=current_generation,
+                )
+            for entry, asset_state, membership_state in states:
+                _entry_id, _entry_revision, entry_expected_asset, entry_expected_membership = entry
+                if asset_state[0] not in {"candidate", "active"} or int(asset_state[1]) != entry_expected_asset:
+                    await db.rollback()
+                    return LearningPublishMutation(
+                        False, True, failure_stage="asset_cas", failure_kind="asset_revision_conflict",
+                        current_generation=current_generation,
+                    )
+                if (
+                    membership_state[0] != "candidate"
+                    or int(membership_state[1]) != entry_expected_membership
+                    or str(membership_state[2]) != mapping_hash
+                    or str(membership_state[3]) != index_hash
+                ):
+                    await db.rollback()
+                    return LearningPublishMutation(
+                        False, True, failure_stage="membership_cas",
+                        failure_kind="membership_revision_conflict",
+                        current_generation=current_generation,
+                    )
+            await db.execute(
+                "UPDATE learning_index_membership SET membership_status='stale',revision=revision+1,updated_at=? "
+                "WHERE membership_status='current' AND generation=?",
+                (now, current_generation),
+            )
+            for entry, asset_state, _membership_state in states:
+                entry_asset_id, entry_asset_revision, entry_expected_asset, entry_expected_membership = entry
+                if asset_state[0] == "candidate":
+                    asset_cursor = await db.execute(
+                        "UPDATE learning_asset_version SET lifecycle_status='active',valid_at=?,revision=revision+1,updated_at=? "
+                        "WHERE asset_id=? AND asset_revision=? AND lifecycle_status='candidate' AND revision=?",
+                        (now, now, entry_asset_id, entry_asset_revision, entry_expected_asset),
+                    )
+                    if asset_cursor.rowcount != 1:
+                        await asset_cursor.close()
+                        await db.rollback()
+                        return LearningPublishMutation(
+                            False, True, failure_stage="asset_cas", failure_kind="publish_cas_conflict",
+                            current_generation=current_generation,
+                        )
+                    await asset_cursor.close()
+                membership_cursor = await db.execute(
+                    "UPDATE learning_index_membership SET membership_status='current',revision=revision+1,updated_at=? "
+                    "WHERE asset_id=? AND asset_revision=? AND generation=? "
+                    "AND membership_status='candidate' AND revision=?",
+                    (now, entry_asset_id, entry_asset_revision, generation, entry_expected_membership),
+                )
+                if membership_cursor.rowcount != 1:
+                    await membership_cursor.close()
+                    await db.rollback()
+                    return LearningPublishMutation(
+                        False, True, failure_stage="membership_cas", failure_kind="publish_cas_conflict",
+                        current_generation=current_generation,
+                    )
+                await membership_cursor.close()
+            pointer_cursor = await db.execute(
+                "UPDATE memory_v2_meta SET value=? WHERE key='learning_current_generation' AND value=?",
+                (str(generation), str(expected_current_generation)),
+            )
+            if not pending.get("learning_pending_publish_json"):
+                await db.execute(
+                    "UPDATE memory_v2_meta SET value='' WHERE key IN "
+                    "('learning_pending_generation','learning_pending_resource_id')"
+                )
+            if pointer_cursor.rowcount != 1:
+                await pointer_cursor.close()
+                await db.rollback()
+                return LearningPublishMutation(
+                    False, True, failure_stage="pointer_cas", failure_kind="publish_cas_conflict",
+                    current_generation=current_generation,
+                )
+            await pointer_cursor.close()
+            await db.commit()
+        return LearningPublishMutation(
+            True, False, current_generation=generation,
+            asset_revision=expected_asset_revision + 1,
+            membership_revision=expected_membership_revision + 1,
+        )
+
+    async def complete_learning_generation_settlement(
+        self,
+        *,
+        generation: int,
+        resource_id: str,
+        asset_revision_set: tuple[tuple[str, int, int, int], ...],
+    ) -> LearningPublishMutation:
+        await self.initialize()
+        try:
+            requested = tuple(
+                sorted(
+                    (str(item[0]), int(item[1]), int(item[2]), int(item[3]))
+                    for item in asset_revision_set
+                )
+            )
+        except (TypeError, ValueError, IndexError):
+            requested = ()
+        if (
+            not requested
+            or type(generation) is not int
+            or generation < 0
+            or not str(resource_id or "").strip()
+        ):
+            return LearningPublishMutation(
+                False, True, failure_stage="settlement_completion",
+                failure_kind="generation_asset_set_invalid",
+            )
+        requested_keys = {(item[0], item[1]) for item in requested}
+        async with connect_aiosqlite(self.db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT key,value FROM memory_v2_meta WHERE key IN "
+                "('learning_current_generation','learning_pending_generation',"
+                "'learning_pending_resource_id','learning_pending_publish_json')"
+            )
+            values = {str(row[0]): str(row[1] or "") for row in await cursor.fetchall()}
+            await cursor.close()
+            if (
+                values.get("learning_current_generation") != str(generation)
+                or values.get("learning_pending_generation") != str(generation)
+                or values.get("learning_pending_resource_id") != resource_id
+            ):
+                await db.rollback()
+                cleared = bool(
+                    values.get("learning_current_generation") == str(generation)
+                    and not values.get("learning_pending_generation")
+                    and not values.get("learning_pending_resource_id")
+                    and not values.get("learning_pending_publish_json")
+                )
+                return LearningPublishMutation(
+                    False, not cleared, idempotent=cleared,
+                    failure_stage="settlement_completion",
+                    failure_kind="" if cleared else "pending_publish_identity_conflict",
+                    current_generation=generation,
+                )
+            try:
+                pending = json.loads(values.get("learning_pending_publish_json") or "{}")
+                stored = {
+                    (str(item[0]), int(item[1]))
+                    for item in pending.get("asset_revision_set", ())
+                }
+            except (TypeError, ValueError, KeyError, IndexError, json.JSONDecodeError):
+                stored = set()
+            cursor = await db.execute(
+                "SELECT asset_id,asset_revision FROM learning_index_membership "
+                "WHERE generation=? AND membership_status='current'",
+                (generation,),
+            )
+            current_keys = {(str(row[0]), int(row[1])) for row in await cursor.fetchall()}
+            await cursor.close()
+            if stored != requested_keys or current_keys != requested_keys:
+                await db.rollback()
+                return LearningPublishMutation(
+                    False, True, failure_stage="settlement_completion",
+                    failure_kind="generation_asset_set_conflict",
+                    current_generation=generation,
+                )
+            cursors = [
+                await db.execute(
+                    "UPDATE memory_v2_meta SET value='' WHERE key=? AND value=?",
+                    (key, expected),
+                )
+                for key, expected in (
+                    ("learning_pending_generation", str(generation)),
+                    ("learning_pending_resource_id", resource_id),
+                    ("learning_pending_publish_json", values["learning_pending_publish_json"]),
+                )
+            ]
+            if any(cursor.rowcount != 1 for cursor in cursors):
+                for cursor in cursors:
+                    await cursor.close()
+                await db.rollback()
+                return LearningPublishMutation(
+                    False, True, failure_stage="settlement_completion",
+                    failure_kind="settlement_completion_cas_conflict",
+                    current_generation=generation,
+                )
+            for cursor in cursors:
+                await cursor.close()
+            await db.commit()
+        return LearningPublishMutation(
+            True, False, current_generation=generation,
+        )
+
+    @staticmethod
+    async def _membership_resource_id(
+        db,
+        *,
+        asset_id: str,
+        asset_revision: int,
+        generation: int,
+    ) -> str:
+        cursor = await db.execute(
+            "SELECT resource_id FROM learning_index_membership "
+            "WHERE asset_id=? AND asset_revision=? AND generation=?",
+            (asset_id, asset_revision, generation),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        return str(row[0] or "") if row else ""
+
+    async def reserve_learning_generation(
+        self,
+        *,
+        asset_id: str,
+        asset_revision: int,
+        generation: int,
+        resource_id: str,
+        expected_current_generation: int,
+        settlement_payload: dict[str, Any] | None = None,
+        asset_revision_set: tuple[tuple[str, int, int, int], ...] | None = None,
+    ) -> LearningPublishMutation:
+        await self.initialize()
+        requested = asset_revision_set or ((asset_id, asset_revision, 0, 0),)
+        if (
+            not requested
+            or any(len(item) != 4 for item in requested)
+            or not all(
+                str(item[0] or "").strip()
+                and all(self._strict_non_negative_int(value) for value in item[1:])
+                for item in requested
+            )
+        ):
+            return LearningPublishMutation(
+                False, True, failure_stage="pointer_reservation",
+                failure_kind="generation_asset_set_invalid",
+            )
+        requested = tuple(
+            sorted(
+                (str(item[0]), int(item[1]), int(item[2]), int(item[3]))
+                for item in requested
+            )
+        )
+        requested_keys = {(item[0], item[1]) for item in requested}
+        if len(requested_keys) != len(requested):
+            return LearningPublishMutation(
+                False, True, failure_stage="pointer_reservation",
+                failure_kind="generation_asset_set_invalid",
+            )
+        if settlement_payload is not None:
+            settlement_payload = dict(settlement_payload)
+            settlement_payload["asset_revision_set"] = [list(item) for item in requested]
+        try:
+            settlement_json = (
+                json.dumps(
+                    settlement_payload,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                if settlement_payload is not None
+                else ""
+            )
+        except (TypeError, ValueError):
+            return LearningPublishMutation(
+                False, True, failure_stage="pointer_reservation",
+                failure_kind="settlement_payload_invalid",
+            )
+        if settlement_payload is not None and not isinstance(settlement_payload, dict):
+            return LearningPublishMutation(
+                False, True, failure_stage="pointer_reservation",
+                failure_kind="settlement_payload_invalid",
+            )
+        if (
+            not asset_id.strip()
+            or not resource_id.strip()
+            or not self._strict_non_negative_int(asset_revision)
+            or not self._strict_non_negative_int(generation)
+            or not self._strict_non_negative_int(expected_current_generation)
+            or generation <= expected_current_generation
+        ):
+            return LearningPublishMutation(
+                False, True, failure_stage="pointer_reservation", failure_kind="reservation_contract_invalid",
+            )
+        async with connect_aiosqlite(self.db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT key,value FROM memory_v2_meta WHERE key IN "
+                "('learning_current_generation','learning_pending_generation',"
+                "'learning_pending_resource_id','learning_pending_publish_json')"
+            )
+            values = {str(row[0]): str(row[1] or "") for row in await cursor.fetchall()}
+            await cursor.close()
+            current = int(values.get("learning_current_generation") or 0)
+            pending_generation = values.get("learning_pending_generation", "")
+            pending_resource = values.get("learning_pending_resource_id", "")
+            if pending_generation == str(generation) and pending_resource == resource_id:
+                stored_settlement = values.get("learning_pending_publish_json", "")
+                await db.rollback()
+                if settlement_json and stored_settlement != settlement_json:
+                    return LearningPublishMutation(
+                        False, True, failure_stage="pointer_reservation",
+                        failure_kind="publish_settlement_identity_conflict",
+                        current_generation=current,
+                    )
+                return LearningPublishMutation(
+                    False, False, idempotent=True, current_generation=current,
+                )
+            if current != expected_current_generation or pending_generation or pending_resource:
+                await db.rollback()
+                return LearningPublishMutation(
+                    False, True, failure_stage="pointer_reservation",
+                    failure_kind="publish_reservation_conflict", current_generation=current,
+                )
+            cursor = await db.execute(
+                "SELECT asset_id,asset_revision FROM learning_asset_version "
+                "WHERE lifecycle_status='active'"
+            )
+            active_keys = {(str(row[0]), int(row[1])) for row in await cursor.fetchall()}
+            await cursor.close()
+            if not active_keys.issubset(requested_keys):
+                await db.rollback()
+                return LearningPublishMutation(
+                    False, True, failure_stage="pointer_reservation",
+                    failure_kind="generation_asset_set_incomplete", current_generation=current,
+                )
+            cursor = await db.execute(
+                """SELECT asset_id,asset_revision,revision FROM learning_index_membership
+                   WHERE generation=? AND resource_id=? AND membership_status='candidate'""",
+                (generation, resource_id),
+            )
+            candidate_rows = await cursor.fetchall()
+            await cursor.close()
+            candidate_keys = {(str(row[0]), int(row[1])) for row in candidate_rows}
+            candidate_revisions = {
+                (str(row[0]), int(row[1])): int(row[2]) for row in candidate_rows
+            }
+            if candidate_keys != requested_keys or any(
+                candidate_revisions[(item[0], item[1])] != item[3]
+                for item in requested
+            ):
+                await db.rollback()
+                return LearningPublishMutation(
+                    False, True, failure_stage="pointer_reservation",
+                    failure_kind="generation_asset_set_conflict", current_generation=current,
+                )
+            generation_cursor = await db.execute(
+                "UPDATE memory_v2_meta SET value=? "
+                "WHERE key='learning_pending_generation' AND value=''",
+                (str(generation),),
+            )
+            resource_cursor = await db.execute(
+                "UPDATE memory_v2_meta SET value=? "
+                "WHERE key='learning_pending_resource_id' AND value=''",
+                (resource_id,),
+            )
+            settlement_cursor = await db.execute(
+                "UPDATE memory_v2_meta SET value=? "
+                "WHERE key='learning_pending_publish_json' AND value=''",
+                (settlement_json,),
+            )
+            if (
+                generation_cursor.rowcount != 1
+                or resource_cursor.rowcount != 1
+                or settlement_cursor.rowcount != 1
+            ):
+                await generation_cursor.close()
+                await resource_cursor.close()
+                await settlement_cursor.close()
+                await db.rollback()
+                return LearningPublishMutation(
+                    False, True, failure_stage="pointer_reservation",
+                    failure_kind="publish_reservation_conflict", current_generation=current,
+                )
+            await generation_cursor.close()
+            await resource_cursor.close()
+            await settlement_cursor.close()
+            await db.commit()
+        return LearningPublishMutation(True, False, current_generation=current)
+
+    async def get_pending_learning_publish(self) -> dict[str, Any] | None:
+        await self.initialize()
+        async with connect_aiosqlite(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT key,value FROM memory_v2_meta WHERE key IN "
+                "('learning_pending_generation','learning_pending_resource_id',"
+                "'learning_pending_publish_json')"
+            )
+            values = {str(row[0]): str(row[1] or "") for row in await cursor.fetchall()}
+            await cursor.close()
+        pending_generation = values.get("learning_pending_generation", "")
+        pending_resource = values.get("learning_pending_resource_id", "")
+        raw = values.get("learning_pending_publish_json", "")
+        if not raw:
+            if pending_generation or pending_resource:
+                return {
+                    "_failure_kind": "pending_publish_identity_incomplete",
+                    "generation": pending_generation,
+                    "resource_id": pending_resource,
+                }
+            return None
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {
+                "_failure_kind": "pending_publish_payload_invalid",
+                "generation": pending_generation,
+                "resource_id": pending_resource,
+            }
+        if not isinstance(payload, dict):
+            return {
+                "_failure_kind": "pending_publish_payload_invalid",
+                "generation": pending_generation,
+                "resource_id": pending_resource,
+            }
+        if (
+            str(payload.get("generation")) != pending_generation
+            or str(payload.get("resource_id") or "") != pending_resource
+        ):
+            return {
+                "_failure_kind": "pending_publish_identity_conflict",
+                "generation": pending_generation,
+                "resource_id": pending_resource,
+            }
+        return payload
+
+    async def get_learning_publish_facts(
+        self,
+        *,
+        asset_id: str,
+        asset_revision: int,
+        generation: int,
+    ) -> dict[str, Any] | None:
+        await self.initialize()
+        if (
+            not str(asset_id or "").strip()
+            or not self._strict_non_negative_int(asset_revision)
+            or not self._strict_non_negative_int(generation)
+        ):
+            return None
+        async with connect_aiosqlite(self.db_path) as db:
+            cursor = await db.execute(
+                """SELECT a.candidate_id,a.candidate_revision,a.admission_revision,
+                          a.canonical_memory_id,a.provenance_hash,a.lifecycle_status,a.revision,
+                          m.resource_id,m.vector_id,m.mapping_hash,m.index_hash,
+                          m.membership_status,m.revision
+                   FROM learning_asset_version a
+                   JOIN learning_index_membership m
+                     ON m.asset_id=a.asset_id AND m.asset_revision=a.asset_revision
+                   WHERE a.asset_id=? AND a.asset_revision=? AND m.generation=?""",
+                (asset_id, asset_revision, generation),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        if row is None:
+            return None
+        return {
+            "asset_id": str(asset_id),
+            "asset_revision": int(asset_revision),
+            "generation": int(generation),
+            "candidate_id": str(row[0]),
+            "candidate_revision": int(row[1]),
+            "admission_revision": int(row[2]),
+            "canonical_memory_id": str(row[3]),
+            "provenance_hash": str(row[4]),
+            "lifecycle_status": str(row[5]),
+            "asset_row_revision": int(row[6]),
+            "resource_id": str(row[7]),
+            "vector_id": str(row[8]),
+            "mapping_hash": str(row[9]),
+            "index_hash": str(row[10]),
+            "membership_status": str(row[11]),
+            "membership_row_revision": int(row[12]),
+        }
+
+    async def get_learning_generation_state(self) -> dict[str, Any]:
+        await self.initialize()
+        async with connect_aiosqlite(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT key,value FROM memory_v2_meta WHERE key IN "
+                "('learning_current_generation','learning_pending_generation',"
+                "'learning_pending_resource_id')"
+            )
+            values = {str(row[0]): str(row[1] or "") for row in await cursor.fetchall()}
+            await cursor.close()
+        raw_current = values.get("learning_current_generation", "")
+        raw_pending = values.get("learning_pending_generation", "")
+        current_valid = raw_current.isdigit()
+        pending_valid = not raw_pending or raw_pending.isdigit()
+        return {
+            "ready": current_valid and pending_valid,
+            "current_generation": int(raw_current) if current_valid else None,
+            "pending_generation": int(raw_pending) if raw_pending.isdigit() else None,
+            "pending_resource_id": values.get("learning_pending_resource_id", ""),
+            "failure_kind": "" if current_valid and pending_valid else "generation_state_invalid",
+        }
+
+    async def list_learning_retrieval_candidates(self) -> list[LearningRetrievalCandidate]:
+        await self.initialize()
+        async with connect_aiosqlite(self.db_path) as db:
+            cursor = await db.execute(
+                """SELECT a.asset_id,a.asset_revision,a.candidate_revision,a.admission_revision,
+                   a.canonical_memory_id,a.scope_id,a.speaker_scope_id,a.fingerprint,
+                   a.lifecycle_status,a.provenance_hash,m.membership_status,m.generation,
+                   c.importance,c.confidence,c.decay_score,c.metadata,c.summary,c.content
+                   FROM learning_asset_version a
+                   JOIN learning_index_membership m
+                     ON m.asset_id=a.asset_id AND m.asset_revision=a.asset_revision
+                   JOIN canonical_memories c ON c.id=a.canonical_memory_id
+                   JOIN memory_v2_meta current_generation
+                     ON current_generation.key='learning_current_generation'
+                   JOIN memory_v2_meta pending_generation
+                     ON pending_generation.key='learning_pending_generation'
+                   WHERE c.status='active'
+                     AND a.lifecycle_status='active'
+                     AND m.membership_status='current'
+                     AND m.generation=CAST(current_generation.value AS INTEGER)
+                     AND (
+                         pending_generation.value=''
+                         OR m.generation<>CAST(pending_generation.value AS INTEGER)
+                     )
+                   ORDER BY a.asset_id,m.generation"""
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+        candidates: list[LearningRetrievalCandidate] = []
+        for row in rows:
+            try:
+                metadata = json.loads(str(row[15] or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                metadata = {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+
+            def score(name: str, fallback: Any = -1.0) -> float:
+                value = metadata.get(name, fallback)
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    return -1.0
+                return float(value)
+
+            review_revision = metadata.get("review_revision", row[2])
+            if type(review_revision) is not int or review_revision < 0:
+                review_revision = None
+            raw_source_examples = metadata.get("source_examples") or ()
+            source_examples = tuple(
+                str(item).strip()[:400]
+                for item in raw_source_examples
+                if isinstance(item, str) and str(item).strip()
+            ) if isinstance(raw_source_examples, (list, tuple)) else ()
+            raw_source_ids = metadata.get("source_example_ids") or ()
+            source_example_ids = tuple(
+                str(item).strip()
+                for item in raw_source_ids
+                if str(item).strip()
+            ) if isinstance(raw_source_ids, (list, tuple)) else ()
+
+            candidates.append(
+                LearningRetrievalCandidate(
+                    asset_id=str(row[0]), asset_revision=int(row[1]),
+                    candidate_revision=int(row[2]), admission_revision=int(row[3]),
+                    canonical_memory_id=str(row[4]), scope_id=str(row[5]),
+                    speaker_scope_id=str(row[6]),
+                    topic_scope_id=str(metadata.get("topic_scope_id") or ""),
+                    fingerprint=str(row[7]), lifecycle_status=str(row[8]),
+                    membership_status=str(row[10]), generation=int(row[11]),
+                    relevance=score("retrieval_relevance"),
+                    asset_weight=score("asset_weight", row[12]),
+                    support=score("support_score"),
+                    decay=score("decay_score", row[14]),
+                    evidence_quality=score("evidence_quality_score", row[13]),
+                    provenance_hash=str(row[9]),
+                    prompt_text=str(row[16] or row[17] or "")[:400],
+                    review_revision=review_revision,
+                    prompt_text_provenance=str(
+                        metadata.get("prompt_text_provenance") or ""
+                    ).strip(),
+                    source_examples=source_examples,
+                    source_example_ids=source_example_ids,
+                    model_example_id=str(metadata.get("model_example_id") or "").strip(),
+                    repetition_attempt=(
+                        int(metadata.get("repetition_attempt"))
+                        if type(metadata.get("repetition_attempt")) is int
+                        and int(metadata.get("repetition_attempt")) >= 0
+                        else 0
+                    ),
+                )
+            )
+        return candidates
 
     async def enqueue_consistency_repair(self, mismatch_kind: str, *, memory_id: str = "", document_id: str = "", faiss_id: str = "", generation: int | None = None, expected_revision: int | None = None, max_attempts: int = 3) -> str:
         """Persist one idempotent consistency repair descriptor."""

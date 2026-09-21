@@ -36,6 +36,7 @@ except ImportError:
 from ..retrieval.bm25 import BM25Retriever
 from ..retrieval.hybrid_retriever import HybridRetriever
 from ..retrieval.vector_store import VectorRetriever
+from ..retrieval.learning_retrieval_selector import LearningRetrievalSelector
 from ..retrieval.embedding import invoke_embedding
 from ..contracts.memory_query import MemoryQuery, MemoryWriteRequest
 from ..contracts.vector_resource_state import (
@@ -57,6 +58,7 @@ from .memory_index_projector import MemoryIndexProjector
 from .memory_injection_service import MemoryInjectionService
 from .memory_maintenance_service import MemoryMaintenanceService
 from .memory_migration_service import MemoryMigrationService
+from .memory_vector_reconciliation import validate_vector_identity
 from .memory_observer import MemoryObserver
 from .memory_retrieval_service import MemoryRetrievalService
 from .memory_turn_pipeline import MemoryTurnPipeline
@@ -96,6 +98,14 @@ class VectorIndexDescriptor:
     vector_count: int | None = None
     created_at: float = 0.0
     status: str = "published"
+    asset_revision_digest: str = ""
+    configured_dimension: int | None = None
+    mapping_hash: str = ""
+    index_hash: str = ""
+    published_at: float = 0.0
+    resource_id: str = ""
+    resource_role: str = "active"
+    rollback_parent_generation: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -103,15 +113,26 @@ class VectorIndexDescriptor:
             "file_name": self.index_file,
             "index_file": self.index_file,
             "embedding_models": list(self.embedding_models),
+            "embedding_model": self.embedding_models[0] if self.embedding_models else "",
             "provider_source_id": self.provider_source_id,
+            "provider_source": self.provider_source_id,
             "api_base_fingerprint": self.api_base_fingerprint,
             "dimension": self.dimension,
+            "physical_dimension": self.dimension,
             "metric": self.metric,
             "document_count": self.document_count,
             "vector_count": self.vector_count,
             "created_at": self.created_at,
             "published_at": self.created_at,
             "status": self.status,
+            "asset_revision_digest": self.asset_revision_digest,
+            "configured_dimension": self.configured_dimension,
+            "mapping_hash": self.mapping_hash,
+            "index_hash": self.index_hash,
+            "published_at": self.published_at or self.created_at,
+            "resource_id": self.resource_id,
+            "resource_role": self.resource_role,
+            "rollback_parent_generation": self.rollback_parent_generation,
         }
 
 
@@ -136,6 +157,15 @@ class MemoryEngine:
         self.config = config if config else gateway.config
         self.owner_registry = owner_registry
         self.db_service = None
+        self.learning_retrieval_selector = LearningRetrievalSelector()
+        self.learning_retrieval_event_writer = None
+        self.learning_admission_repository = None
+        self._learning_publish_queue: asyncio.Queue | None = None
+        self._learning_publish_worker_task: asyncio.Task | None = None
+        self._learning_publish_recovery_result: dict[str, Any] = {
+            "status": "not_started",
+            "recovered": False,
+        }
         if hasattr(self.config, "provider") and getattr(self.config.provider, "embedding_models", None):
             self.embedding_models = self.config.provider.embedding_models
         else:
@@ -302,6 +332,11 @@ class MemoryEngine:
         except Exception as exc:
             logger.debug("[MemoryEngine] owner registry registration degraded: %s", exc)
 
+    def bind_learning_admission_repository(self, repository: Any) -> None:
+        self.learning_admission_repository = repository
+        if repository is not None:
+            repository.publish_proof_verifier = self
+
     @staticmethod
     def _configured_embedding_models(config, fallback: list | None = None) -> list:
         configured = []
@@ -437,6 +472,10 @@ class MemoryEngine:
     def _vector_manifest_path(self) -> Path:
         return self.data_path / "vector_index_manifest.json"
 
+    @property
+    def _learning_vector_candidate_manifest_path(self) -> Path:
+        return self.data_path / "learning_vector_candidate_manifest.json"
+
     @staticmethod
     def _vector_resource_descriptor_columns() -> tuple[str, ...]:
         return (
@@ -444,6 +483,8 @@ class MemoryEngine:
             "provider_source", "api_base_fingerprint", "physical_dimension",
             "document_count", "vector_count", "resource_status", "created_at",
             "updated_at", "last_close_status", "last_repair_status", "revision",
+            "asset_revision_digest", "index_file", "configured_dimension",
+            "mapping_hash", "index_hash", "published_at", "rollback_parent_generation",
         )
 
     def _vector_resource_id(self, index_path: str | Path) -> str:
@@ -481,6 +522,21 @@ class MemoryEngine:
                 "CREATE INDEX IF NOT EXISTS ix_vector_resource_descriptors_role "
                 "ON vector_resource_descriptors(role, generation)"
             )
+            existing_columns = {
+                str(row[1]) for row in db.execute("PRAGMA table_info(vector_resource_descriptors)")
+            }
+            migrations = {
+                "asset_revision_digest": "ALTER TABLE vector_resource_descriptors ADD COLUMN asset_revision_digest TEXT NOT NULL DEFAULT ''",
+                "index_file": "ALTER TABLE vector_resource_descriptors ADD COLUMN index_file TEXT NOT NULL DEFAULT ''",
+                "configured_dimension": "ALTER TABLE vector_resource_descriptors ADD COLUMN configured_dimension INTEGER",
+                "mapping_hash": "ALTER TABLE vector_resource_descriptors ADD COLUMN mapping_hash TEXT NOT NULL DEFAULT ''",
+                "index_hash": "ALTER TABLE vector_resource_descriptors ADD COLUMN index_hash TEXT NOT NULL DEFAULT ''",
+                "published_at": "ALTER TABLE vector_resource_descriptors ADD COLUMN published_at REAL NOT NULL DEFAULT 0",
+                "rollback_parent_generation": "ALTER TABLE vector_resource_descriptors ADD COLUMN rollback_parent_generation INTEGER",
+            }
+            for column, statement in migrations.items():
+                if column not in existing_columns:
+                    db.execute(statement)
             db.commit()
 
     def _persist_vector_resource_descriptor_sync(self, snapshot: dict[str, Any]) -> bool:
@@ -578,6 +634,12 @@ class MemoryEngine:
         physical_dimension: int | None = None,
         document_count: int | None = None,
         vector_count: int | None = None,
+        asset_revision_digest: str = "",
+        configured_dimension: int | None = None,
+        mapping_hash: str = "",
+        index_hash: str = "",
+        published_at: float = 0.0,
+        rollback_parent_generation: int | None = None,
         last_close_status: str = "",
         last_repair_status: str = "",
     ) -> dict[str, Any]:
@@ -608,6 +670,13 @@ class MemoryEngine:
                 "last_close_status": str(last_close_status or (current or {}).get("last_close_status") or ""),
                 "last_repair_status": str(last_repair_status or (current or {}).get("last_repair_status") or ""),
                 "revision": int((current or {}).get("revision", -1) or 0) + 1,
+                "asset_revision_digest": str(asset_revision_digest or ""),
+                "index_file": Path(path).name,
+                "configured_dimension": configured_dimension,
+                "mapping_hash": str(mapping_hash or ""),
+                "index_hash": str(index_hash or ""),
+                "published_at": float(published_at or 0.0),
+                "rollback_parent_generation": rollback_parent_generation,
             }
             self._vector_resource_descriptors[resource_id] = descriptor
         self._queue_vector_resource_descriptor_persist(descriptor)
@@ -1167,6 +1236,11 @@ class MemoryEngine:
         vector_count: int | None = None,
         generation: int | None = None,
         status: str = "published",
+        asset_revision_digest: str = "",
+        configured_dimension: int | None = None,
+        mapping_hash: str = "",
+        index_hash: str = "",
+        rollback_parent_generation: int | None = None,
     ) -> None:
         created_at = time.time()
         payload = VectorIndexDescriptor(
@@ -1180,6 +1254,14 @@ class MemoryEngine:
             vector_count=vector_count,
             created_at=created_at,
             status=status,
+            asset_revision_digest=str(asset_revision_digest or ""),
+            configured_dimension=configured_dimension,
+            mapping_hash=str(mapping_hash or ""),
+            index_hash=str(index_hash or ""),
+            published_at=created_at,
+            resource_id=self._vector_resource_id(index_path),
+            resource_role="active",
+            rollback_parent_generation=rollback_parent_generation,
         ).to_dict()
         payload["resource_id"] = self._vector_resource_id(index_path)
         payload["role"] = "active"
@@ -1205,9 +1287,1206 @@ class MemoryEngine:
             physical_dimension=dimension,
             document_count=document_count,
             vector_count=vector_count,
+            asset_revision_digest=asset_revision_digest,
+            configured_dimension=configured_dimension,
+            mapping_hash=mapping_hash,
+            index_hash=index_hash,
+            published_at=created_at,
+            rollback_parent_generation=rollback_parent_generation,
             resource_status="active",
             last_close_status="open",
         )
+
+    def _write_learning_vector_candidate_manifest(
+        self,
+        index_path: Path,
+        payload: dict[str, Any],
+        *,
+        rollback_parent_generation: int,
+    ) -> dict[str, Any]:
+        created_at = time.time()
+        candidate = VectorIndexDescriptor(
+            generation=int(payload["generation"]),
+            index_file=index_path.name,
+            embedding_models=(str(payload["embedding_model"]),),
+            provider_source_id=str(payload["provider_source"]),
+            api_base_fingerprint=str(payload["api_base_fingerprint"]),
+            dimension=int(payload["physical_dimension"]),
+            document_count=int(payload["document_count"]),
+            vector_count=int(payload["vector_count"]),
+            created_at=created_at,
+            status="candidate",
+            asset_revision_digest=str(payload["asset_revision_digest"]),
+            configured_dimension=int(payload["configured_dimension"]),
+            mapping_hash=str(payload["mapping_hash"]),
+            index_hash=str(payload["index_hash"]),
+            published_at=0.0,
+            resource_id=self._vector_resource_id(index_path),
+            resource_role="candidate",
+            rollback_parent_generation=rollback_parent_generation,
+        ).to_dict()
+        candidate["role"] = "candidate"
+        candidate["resource_status"] = "candidate"
+        manifest_path = self._learning_vector_candidate_manifest_path
+        temporary_path = manifest_path.with_name(
+            f"{manifest_path.name}.{uuid.uuid4().hex}.tmp"
+        )
+        temporary_path.write_text(
+            json.dumps(candidate, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        os.replace(temporary_path, manifest_path)
+        self._record_vector_resource_descriptor(
+            index_path,
+            role="candidate",
+            generation=candidate["generation"],
+            resource_id=candidate["resource_id"],
+            embedding_model=str(payload["embedding_model"]),
+            provider_source=str(payload["provider_source"]),
+            api_base_fingerprint=str(payload["api_base_fingerprint"]),
+            physical_dimension=int(payload["physical_dimension"]),
+            document_count=int(payload["document_count"]),
+            vector_count=int(payload["vector_count"]),
+            asset_revision_digest=str(payload["asset_revision_digest"]),
+            configured_dimension=int(payload["configured_dimension"]),
+            mapping_hash=str(payload["mapping_hash"]),
+            index_hash=str(payload["index_hash"]),
+            published_at=0.0,
+            rollback_parent_generation=rollback_parent_generation,
+            resource_status="candidate",
+            last_close_status="open",
+        )
+        return candidate
+
+    def _promote_learning_vector_candidate_manifest(
+        self,
+        *,
+        expected_current_generation: int,
+        expected_target_generation: int,
+        expected_resource_id: str,
+        expected_mapping_hash: str,
+        expected_index_hash: str,
+        expected_asset_revision_digest: str,
+    ) -> dict[str, Any]:
+        try:
+            candidate = json.loads(
+                self._learning_vector_candidate_manifest_path.read_text(encoding="utf-8")
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            return {
+                "applied": False,
+                "conflict": True,
+                "failure_stage": "manifest_promotion",
+                "failure_kind": f"candidate_manifest_read_error:{type(exc).__name__}",
+            }
+        index_file = str(candidate.get("index_file") or "").strip()
+        if (
+            not index_file
+            or Path(index_file).name != index_file
+            or int(candidate.get("generation", -1)) != expected_target_generation
+            or str(candidate.get("resource_id") or "") != expected_resource_id
+            or str(candidate.get("mapping_hash") or "").removeprefix("sha256:v1:")
+            != str(expected_mapping_hash).removeprefix("sha256:v1:")
+            or str(candidate.get("index_hash") or "").removeprefix("sha256:v1:")
+            != str(expected_index_hash).removeprefix("sha256:v1:")
+            or str(candidate.get("asset_revision_digest") or "")
+            != expected_asset_revision_digest
+            or str(candidate.get("role") or "") != "candidate"
+        ):
+            return {
+                "applied": False,
+                "conflict": True,
+                "failure_stage": "manifest_promotion",
+                "failure_kind": "candidate_manifest_identity_mismatch",
+            }
+        index_path = self.data_path / index_file
+        try:
+            actual_index_hash = hashlib.sha256(index_path.read_bytes()).hexdigest()
+        except OSError as exc:
+            return {
+                "applied": False,
+                "conflict": True,
+                "failure_stage": "manifest_promotion",
+                "failure_kind": f"index_read_error:{type(exc).__name__}",
+            }
+        if actual_index_hash != str(expected_index_hash).removeprefix("sha256:v1:"):
+            return {
+                "applied": False,
+                "conflict": True,
+                "failure_stage": "manifest_promotion",
+                "failure_kind": "index_hash_mismatch",
+            }
+        with self._vector_registry_lock:
+            current_generation = int(getattr(self, "_vector_generation", 0) or 0)
+            if current_generation == expected_target_generation:
+                try:
+                    current = json.loads(
+                        self._vector_manifest_path.read_text(encoding="utf-8")
+                    )
+                except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                    current = {}
+                idempotent = bool(
+                    int(current.get("generation", -1)) == expected_target_generation
+                    and str(current.get("resource_id") or "") == expected_resource_id
+                    and str(current.get("asset_revision_digest") or "")
+                    == expected_asset_revision_digest
+                    and str(current.get("mapping_hash") or "").removeprefix("sha256:v1:")
+                    == str(expected_mapping_hash).removeprefix("sha256:v1:")
+                    and str(current.get("index_hash") or "").removeprefix("sha256:v1:")
+                    == str(expected_index_hash).removeprefix("sha256:v1:")
+                )
+                return {
+                    "applied": False,
+                    "conflict": not idempotent,
+                    "idempotent": idempotent,
+                    "failure_stage": "" if idempotent else "manifest_promotion",
+                    "failure_kind": "" if idempotent else "current_manifest_identity_conflict",
+                }
+            if current_generation != expected_current_generation:
+                return {
+                    "applied": False,
+                    "conflict": True,
+                    "failure_stage": "manifest_promotion",
+                    "failure_kind": "current_generation_conflict",
+                }
+            self._publish_vector_index_manifest(
+                index_path,
+                list(candidate.get("embedding_models") or ()),
+                dimension=int(candidate["physical_dimension"]),
+                provider_source_id=str(candidate["provider_source_id"]),
+                api_base_fingerprint=str(candidate["api_base_fingerprint"]),
+                document_count=int(candidate["document_count"]),
+                vector_count=int(candidate["vector_count"]),
+                generation=expected_target_generation,
+                asset_revision_digest=expected_asset_revision_digest,
+                configured_dimension=int(candidate["configured_dimension"]),
+                mapping_hash=str(candidate["mapping_hash"]),
+                index_hash=str(candidate["index_hash"]),
+                rollback_parent_generation=expected_current_generation,
+            )
+            self._vector_generation = expected_target_generation
+        return {
+            "applied": True,
+            "conflict": False,
+            "generation": expected_target_generation,
+            "resource_id": expected_resource_id,
+            "manifest": dict(self._vector_index_descriptor or {}),
+        }
+
+    def publish_learning_vector_index_manifest(
+        self,
+        index_path: Path,
+        descriptor: dict[str, Any],
+        *,
+        expected_current_generation: int,
+    ) -> dict[str, Any]:
+        evolution = getattr(self.config, "evolution", None)
+        if not bool(getattr(evolution, "learning_vector_build_enabled", False)):
+            return {"applied": False, "conflict": True, "failure_kind": "vector_build_disabled"}
+        if not bool(getattr(evolution, "learning_vector_publish_enabled", False)):
+            return {"applied": False, "conflict": True, "failure_kind": "vector_publish_disabled"}
+        payload = dict(descriptor or {})
+        payload["index_file"] = index_path.name
+        validation = validate_vector_identity(payload)
+        if not validation["publish_allowed"]:
+            return {
+                "applied": False,
+                "conflict": True,
+                "failure_stage": validation["failure_stage"],
+                "failure_kind": validation["failure_kind"],
+                "validation": validation,
+            }
+        try:
+            actual_index_hash = hashlib.sha256(index_path.read_bytes()).hexdigest()
+        except OSError as exc:
+            return {
+                "applied": False,
+                "conflict": True,
+                "failure_stage": "index_verification",
+                "failure_kind": f"index_read_error:{type(exc).__name__}",
+            }
+        declared_hash = str(payload.get("index_hash") or "")
+        if declared_hash.startswith("sha256:v1:"):
+            declared_hash = declared_hash.split(":", 2)[2]
+        if actual_index_hash != declared_hash:
+            return {
+                "applied": False,
+                "conflict": True,
+                "failure_stage": "index_verification",
+                "failure_kind": "index_hash_mismatch",
+                "expected": declared_hash,
+                "actual": actual_index_hash,
+            }
+        target_generation = int(payload["generation"])
+        try:
+            with sqlite3.connect(self.v2_db_path, timeout=5.0) as db:
+                pending = {
+                    str(row[0]): str(row[1] or "")
+                    for row in db.execute(
+                        "SELECT key,value FROM memory_v2_meta WHERE key IN "
+                        "('learning_pending_generation','learning_pending_resource_id')"
+                    ).fetchall()
+                }
+        except (OSError, sqlite3.Error) as exc:
+            return {
+                "applied": False,
+                "conflict": True,
+                "failure_stage": "pointer_reservation",
+                "failure_kind": f"reservation_read_error:{type(exc).__name__}",
+            }
+        if (
+            pending.get("learning_pending_generation") != str(target_generation)
+            or pending.get("learning_pending_resource_id") != self._vector_resource_id(index_path)
+        ):
+            return {
+                "applied": False,
+                "conflict": True,
+                "failure_stage": "pointer_reservation",
+                "failure_kind": "publish_reservation_missing",
+            }
+        with self._vector_registry_lock:
+            current_generation = int(getattr(self, "_vector_generation", 0) or 0)
+            if current_generation != expected_current_generation:
+                return {
+                    "applied": False,
+                    "conflict": True,
+                    "failure_stage": "pointer_cas",
+                    "failure_kind": "current_generation_conflict",
+                    "expected": expected_current_generation,
+                    "actual": current_generation,
+                }
+            if target_generation <= current_generation:
+                return {
+                    "applied": False,
+                    "conflict": True,
+                    "failure_stage": "pointer_cas",
+                    "failure_kind": "generation_not_monotonic",
+                }
+            candidate_manifest = self._write_learning_vector_candidate_manifest(
+                index_path,
+                payload,
+                rollback_parent_generation=current_generation,
+            )
+        return {
+            "applied": True,
+            "conflict": False,
+            "generation": target_generation,
+            "resource_id": self._vector_resource_id(index_path),
+            "manifest": candidate_manifest,
+        }
+
+    async def select_learning_retrieval_assets(
+        self,
+        *,
+        scope_id: str,
+        speaker_id: str,
+        current_generation: int,
+    ):
+        evolution = getattr(self.config, "evolution", None)
+        shadow_enabled = bool(
+            getattr(evolution, "learning_retrieval_shadow_enabled", False)
+        )
+        prompt_enabled = bool(
+            shadow_enabled
+            and getattr(evolution, "learning_prompt_injection_enabled", False)
+        )
+        generation_state = await self.v2_store.get_learning_generation_state()
+        pending_generation = generation_state.get("pending_generation")
+        if (
+            not generation_state.get("ready")
+            or (
+                pending_generation is not None
+                and (
+                    type(current_generation) is not int
+                    or pending_generation <= current_generation
+                )
+            )
+            or generation_state.get("current_generation") != current_generation
+        ):
+            return self.learning_retrieval_selector.select(
+                (),
+                scope_id=scope_id,
+                speaker_id=speaker_id,
+                current_generation=current_generation,
+                shadow_enabled=shadow_enabled,
+                prompt_injection_enabled=prompt_enabled,
+            )
+        candidates = (
+            await self.v2_store.list_learning_retrieval_candidates()
+            if shadow_enabled
+            else ()
+        )
+        return self.learning_retrieval_selector.select(
+            candidates,
+            scope_id=scope_id,
+            speaker_id=speaker_id,
+            current_generation=current_generation,
+            shadow_enabled=shadow_enabled,
+            prompt_injection_enabled=prompt_enabled,
+        )
+
+    async def publish_learning_vector_candidate(
+        self,
+        *,
+        index_path: Path,
+        descriptor: dict[str, Any],
+        asset,
+        membership,
+        proof,
+        admission_repository,
+        submitting_owner_id: str,
+        expected_admission_record_revision: int,
+        expected_current_generation: int,
+        now: float,
+    ) -> dict[str, Any]:
+        return await self.publish_learning_vector_generation(
+            index_path=index_path,
+            descriptor=descriptor,
+            assets=(asset,),
+            memberships=(membership,),
+            proofs=(proof,),
+            admission_repository=admission_repository,
+            submitting_owner_id=submitting_owner_id,
+            expected_admission_record_revisions={
+                str(getattr(proof, "candidate_id", "")): expected_admission_record_revision,
+            },
+            expected_current_generation=expected_current_generation,
+            now=now,
+        )
+
+    @staticmethod
+    def _learning_asset_revision_digest(assets: tuple[Any, ...]) -> str:
+        payload = [
+            {
+                "asset_id": str(getattr(asset, "asset_id", "") or ""),
+                "asset_revision": getattr(asset, "asset_revision", None),
+            }
+            for asset in sorted(
+                assets,
+                key=lambda item: (
+                    str(getattr(item, "asset_id", "") or ""),
+                    getattr(item, "asset_revision", -1),
+                ),
+            )
+        ]
+        return "sha256:v1:" + hashlib.sha256(
+            json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    @staticmethod
+    def _publish_proof_payload(proof: Any) -> dict[str, Any]:
+        payload = (
+            dict(proof.proof_payload())
+            if callable(getattr(proof, "proof_payload", None))
+            else {}
+        )
+        payload["publish_proof"] = str(getattr(proof, "publish_proof", "") or "")
+        return payload
+
+    async def verify(
+        self,
+        proof: Any,
+        *,
+        submitting_owner_id: str,
+    ):
+        from ...learning.review.admission import PublishProofVerification
+
+        pending = await self.v2_store.get_pending_learning_publish()
+        if not pending or pending.get("_failure_kind"):
+            return PublishProofVerification(False, "publish_reservation_missing")
+        if (
+            str(submitting_owner_id or "") != str(pending.get("submitting_owner_id") or "")
+            or str(getattr(proof, "owner_id", "") or "") != str(submitting_owner_id or "")
+        ):
+            return PublishProofVerification(False, "publish_owner_mismatch")
+        raw_items = pending.get("items")
+        if not isinstance(raw_items, list):
+            raw_items = [{"proof": pending.get("proof")}]
+        proof_payload = self._publish_proof_payload(proof)
+        canonical_proof = json.dumps(
+            proof_payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        matched = [
+            item for item in raw_items
+            if json.dumps(
+                item.get("proof"),
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ) == canonical_proof
+        ]
+        if len(matched) != 1:
+            return PublishProofVerification(False, "publish_proof_not_reserved")
+        try:
+            generation = int(pending["generation"])
+        except (TypeError, ValueError, KeyError):
+            return PublishProofVerification(False, "pending_publish_identity_incomplete")
+        facts = await self.v2_store.get_learning_publish_facts(
+            asset_id=str(getattr(proof, "asset_id", "") or ""),
+            asset_revision=getattr(proof, "asset_revision", None),
+            generation=generation,
+        )
+        if facts is None:
+            return PublishProofVerification(False, "publish_membership_missing")
+        try:
+            manifest = json.loads(
+                self._learning_vector_candidate_manifest_path.read_text(
+                    encoding="utf-8"
+                )
+            )
+            index_file = str(manifest.get("index_file") or manifest.get("file_name") or "")
+            if Path(index_file).name != index_file or not index_file:
+                raise ValueError("invalid index basename")
+            index_path = self.data_path / index_file
+            actual_index_hash = hashlib.sha256(index_path.read_bytes()).hexdigest()
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return PublishProofVerification(False, "authoritative_vector_resource_unavailable")
+        mapping_hash = str(manifest.get("mapping_hash") or "").removeprefix("sha256:v1:")
+        index_hash = str(manifest.get("index_hash") or "").removeprefix("sha256:v1:")
+        proof_matches = bool(
+            str(facts["candidate_id"]) == str(getattr(proof, "candidate_id", ""))
+            and int(facts["candidate_revision"]) == getattr(proof, "candidate_revision", None)
+            and int(facts["admission_revision"]) == getattr(proof, "admission_revision", None)
+            and str(facts["provenance_hash"]) == str(getattr(proof, "provenance_digest", ""))
+            and facts["lifecycle_status"] in {"candidate", "active"}
+            and facts["membership_status"] in {"candidate", "current"}
+            and str(facts["resource_id"]) == str(pending.get("resource_id") or "")
+            and str(facts["mapping_hash"]) == mapping_hash == str(getattr(proof, "mapping_digest", ""))
+            and str(facts["index_hash"]) == index_hash == actual_index_hash
+            and str(getattr(proof, "index_generation", "")) == str(generation)
+            and getattr(proof, "vector_dimension", None) == manifest.get("physical_dimension")
+            and getattr(proof, "vector_count", None) == manifest.get("vector_count")
+            and int(manifest.get("generation", -1)) == generation
+            and str(manifest.get("resource_id") or "") == str(facts["resource_id"])
+            and str(manifest.get("role") or "") == "candidate"
+            and str(manifest.get("asset_revision_digest") or "")
+            == str(pending.get("asset_revision_digest") or manifest.get("asset_revision_digest") or "")
+        )
+        if not proof_matches:
+            return PublishProofVerification(False, "authoritative_publish_identity_mismatch")
+        verification_payload = {
+            "proof": proof_payload,
+            "facts": facts,
+            "manifest": {
+                "generation": generation,
+                "resource_id": facts["resource_id"],
+                "asset_revision_digest": manifest.get("asset_revision_digest"),
+                "mapping_hash": mapping_hash,
+                "index_hash": index_hash,
+                "physical_dimension": manifest.get("physical_dimension"),
+                "vector_count": manifest.get("vector_count"),
+            },
+        }
+        digest = hashlib.sha256(
+            json.dumps(
+                verification_payload,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        return PublishProofVerification(True, verification_digest=digest)
+
+    async def publish_learning_vector_generation(
+        self,
+        *,
+        index_path: Path,
+        descriptor: dict[str, Any],
+        assets: tuple[Any, ...],
+        memberships: tuple[Any, ...],
+        proofs: tuple[Any, ...],
+        admission_repository,
+        submitting_owner_id: str,
+        expected_admission_record_revisions: dict[str, int],
+        expected_current_generation: int,
+        now: float,
+    ) -> dict[str, Any]:
+        evolution = getattr(self.config, "evolution", None)
+        if not bool(getattr(evolution, "learning_vector_build_enabled", False)):
+            return {"status": "blocked", "failure_stage": "build", "failure_kind": "vector_build_disabled"}
+        if not bool(getattr(evolution, "learning_vector_publish_enabled", False)):
+            return {"status": "blocked", "failure_stage": "publish", "failure_kind": "vector_publish_disabled"}
+        if not getattr(self, "_accepting_vector_work", True):
+            return {"status": "blocked", "failure_stage": "publish", "failure_kind": "shutdown_fenced"}
+        assets = tuple(assets or ())
+        memberships = tuple(memberships or ())
+        proofs = tuple(proofs or ())
+        asset_by_key = {
+            (str(getattr(item, "asset_id", "") or ""), getattr(item, "asset_revision", None)): item
+            for item in assets
+        }
+        membership_by_key = {
+            (str(getattr(item, "asset_id", "") or ""), getattr(item, "asset_revision", None)): item
+            for item in memberships
+        }
+        proof_by_key = {
+            (str(getattr(item, "asset_id", "") or ""), getattr(item, "asset_revision", None)): item
+            for item in proofs
+        }
+        generations = {getattr(item, "generation", None) for item in memberships}
+        resource_ids = {str(getattr(item, "resource_id", "") or "") for item in memberships}
+        mapping_hashes = {str(getattr(item, "mapping_hash", "") or "") for item in memberships}
+        index_hashes = {str(getattr(item, "index_hash", "") or "") for item in memberships}
+        if (
+            not assets
+            or len(asset_by_key) != len(assets)
+            or len(membership_by_key) != len(memberships)
+            or set(asset_by_key) != set(membership_by_key)
+            or len(generations) != 1
+            or len(resource_ids) != 1
+            or len(mapping_hashes) != 1
+            or len(index_hashes) != 1
+            or any(not key[0] or type(key[1]) is not int or key[1] < 0 for key in asset_by_key)
+        ):
+            return {
+                "status": "blocked",
+                "failure_stage": "publish_preflight",
+                "failure_kind": "generation_asset_set_invalid",
+            }
+        target_generation = next(iter(generations))
+        if type(target_generation) is not int or target_generation < 0:
+            return {
+                "status": "blocked",
+                "failure_stage": "publish_preflight",
+                "failure_kind": "generation_asset_set_invalid",
+            }
+        resource_id = self._vector_resource_id(index_path)
+        declared_index_hash = str(descriptor.get("index_hash") or "")
+        plain_index_hash = (
+            declared_index_hash.split(":", 2)[2]
+            if declared_index_hash.startswith("sha256:v1:")
+            else declared_index_hash
+        )
+        declared_mapping_hash = str(descriptor.get("mapping_hash") or "")
+        plain_mapping_hash = (
+            declared_mapping_hash.split(":", 2)[2]
+            if declared_mapping_hash.startswith("sha256:v1:")
+            else declared_mapping_hash
+        )
+        asset_digest = self._learning_asset_revision_digest(assets)
+        if (
+            str(descriptor.get("asset_revision_digest") or "") != asset_digest
+            or type(descriptor.get("document_count")) is not int
+            or type(descriptor.get("vector_count")) is not int
+            or int(descriptor["document_count"]) != len(assets)
+            or int(descriptor["vector_count"]) != len(assets)
+            or resource_ids != {resource_id}
+            or mapping_hashes != {plain_mapping_hash}
+            or index_hashes != {plain_index_hash}
+        ):
+            return {
+                "status": "blocked",
+                "failure_stage": "publish_preflight",
+                "failure_kind": "publish_identity_mismatch",
+            }
+        candidate_keys = {
+            key for key, asset in asset_by_key.items()
+            if str(getattr(asset, "lifecycle_status", "")) == "candidate"
+        }
+        if set(proof_by_key) != candidate_keys:
+            return {
+                "status": "blocked",
+                "failure_stage": "publish_preflight",
+                "failure_kind": "publish_proof_set_mismatch",
+            }
+        for key, proof in proof_by_key.items():
+            asset = asset_by_key[key]
+            membership = membership_by_key[key]
+            expected_record_revision = expected_admission_record_revisions.get(
+                str(getattr(proof, "candidate_id", ""))
+            )
+            if (
+                not (
+                    getattr(asset, "asset_id", "")
+                    == getattr(membership, "asset_id", "")
+                    == getattr(proof, "asset_id", "")
+                )
+                or getattr(asset, "asset_revision", None) != getattr(membership, "asset_revision", None)
+                or getattr(asset, "asset_revision", None) != getattr(proof, "asset_revision", None)
+                or getattr(asset, "candidate_id", "") != getattr(proof, "candidate_id", "")
+                or getattr(asset, "candidate_revision", None) != getattr(proof, "candidate_revision", None)
+                or getattr(asset, "admission_revision", None) != getattr(proof, "admission_revision", None)
+                or str(target_generation) != str(getattr(proof, "index_generation", ""))
+                or getattr(membership, "mapping_hash", "") != getattr(proof, "mapping_digest", "")
+                or getattr(membership, "index_hash", "") != getattr(proof, "index_hash", "")
+                or getattr(asset, "provenance_hash", "") != getattr(proof, "provenance_digest", "")
+                or type(expected_record_revision) is not int
+                or expected_record_revision <= 0
+                or getattr(proof, "vector_dimension", None) != descriptor.get("physical_dimension")
+                or getattr(proof, "vector_count", None) != descriptor.get("vector_count")
+            ):
+                return {
+                    "status": "blocked",
+                    "failure_stage": "publish_preflight",
+                    "failure_kind": "publish_identity_mismatch",
+                }
+        staged = await self.v2_store.save_learning_generation_candidates(assets, memberships)
+        if not (staged.applied or staged.idempotent):
+            return {
+                "status": "blocked",
+                "failure_stage": staged.failure_stage,
+                "failure_kind": staged.failure_kind,
+            }
+        generation_state = await self.v2_store.get_learning_generation_state()
+        if generation_state.get("current_generation") == target_generation:
+            try:
+                completed_manifest = json.loads(
+                    self._vector_manifest_path.read_text(encoding="utf-8")
+                )
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                completed_manifest = {}
+            completed_facts = [
+                await self.v2_store.get_learning_publish_facts(
+                    asset_id=key[0],
+                    asset_revision=key[1],
+                    generation=target_generation,
+                )
+                for key in sorted(asset_by_key)
+            ]
+            completed = bool(
+                completed_facts
+                and all(
+                    facts is not None
+                    and facts["lifecycle_status"] == "active"
+                    and facts["membership_status"] == "current"
+                    and facts["resource_id"] == resource_id
+                    and facts["mapping_hash"] == plain_mapping_hash
+                    and facts["index_hash"] == plain_index_hash
+                    for facts in completed_facts
+                )
+                and int(completed_manifest.get("generation", -1)) == target_generation
+                and completed_manifest.get("rollback_parent_generation") == expected_current_generation
+                and str(completed_manifest.get("resource_id") or "") == resource_id
+                and str(completed_manifest.get("asset_revision_digest") or "") == asset_digest
+                and str(completed_manifest.get("mapping_hash") or "").removeprefix("sha256:v1:")
+                == plain_mapping_hash
+                and str(completed_manifest.get("index_hash") or "").removeprefix("sha256:v1:")
+                == plain_index_hash
+            )
+            if completed:
+                return {
+                    "status": "published",
+                    "idempotent": True,
+                    "generation": target_generation,
+                    "resource_id": resource_id,
+                    "asset_revision_digest": asset_digest,
+                    "asset_count": len(assets),
+                }
+            return {
+                "status": "blocked",
+                "failure_stage": "publish_replay",
+                "failure_kind": "published_generation_identity_conflict",
+            }
+        asset_revision_set = tuple(
+            sorted(
+                (
+                    key[0], key[1], int(getattr(asset_by_key[key], "revision", 0)),
+                    int(getattr(membership_by_key[key], "revision", 0)),
+                )
+                for key in asset_by_key
+            )
+        )
+        items = []
+        for key in sorted(asset_by_key):
+            asset = asset_by_key[key]
+            membership = membership_by_key[key]
+            proof = proof_by_key.get(key)
+            items.append({
+                "asset_id": key[0],
+                "asset_revision": key[1],
+                "candidate_id": str(getattr(asset, "candidate_id", "") or ""),
+                "candidate_revision": getattr(asset, "candidate_revision", None),
+                "admission_revision": getattr(asset, "admission_revision", None),
+                "expected_asset_revision": getattr(asset, "revision", None),
+                "expected_membership_revision": getattr(membership, "revision", None),
+                "expected_admission_record_revision": (
+                    expected_admission_record_revisions.get(str(getattr(asset, "candidate_id", "")))
+                    if proof is not None else None
+                ),
+                "proof": self._publish_proof_payload(proof) if proof is not None else None,
+            })
+        settlement_payload = {
+            "generation": target_generation,
+            "resource_id": resource_id,
+            "asset_revision_digest": asset_digest,
+            "mapping_hash": plain_mapping_hash,
+            "index_hash": plain_index_hash,
+            "expected_current_generation": expected_current_generation,
+            "submitting_owner_id": str(submitting_owner_id or ""),
+            "items": items,
+        }
+        reserved = await self.v2_store.reserve_learning_generation(
+            asset_id=asset_revision_set[0][0],
+            asset_revision=asset_revision_set[0][1],
+            generation=target_generation,
+            resource_id=resource_id,
+            expected_current_generation=expected_current_generation,
+            settlement_payload=settlement_payload,
+            asset_revision_set=asset_revision_set,
+        )
+        if not (reserved.applied or reserved.idempotent):
+            return {
+                "status": "retry_wait",
+                "failure_stage": reserved.failure_stage,
+                "failure_kind": reserved.failure_kind,
+            }
+        manifest_result = self.publish_learning_vector_index_manifest(
+            index_path,
+            descriptor,
+            expected_current_generation=expected_current_generation,
+        )
+        if not manifest_result.get("applied"):
+            return {
+                "status": "settlement_pending",
+                "failure_stage": manifest_result.get("failure_stage", "manifest_publish"),
+                "failure_kind": manifest_result.get("failure_kind", "manifest_publish_failed"),
+            }
+        try:
+            persisted_manifest = json.loads(
+                self._learning_vector_candidate_manifest_path.read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            return {
+                "status": "settlement_pending",
+                "failure_stage": "authoritative_verification",
+                "failure_kind": f"manifest_read_error:{type(exc).__name__}",
+            }
+        if not (
+            int(persisted_manifest.get("generation", -1)) == target_generation
+            and str(persisted_manifest.get("mapping_hash") or "") == str(descriptor.get("mapping_hash") or "")
+            and str(persisted_manifest.get("index_hash") or "") == declared_index_hash
+            and str(persisted_manifest.get("resource_id") or "") == resource_id
+            and str(persisted_manifest.get("asset_revision_digest") or "") == asset_digest
+            and str(persisted_manifest.get("role") or "") == "candidate"
+        ):
+            return {
+                "status": "settlement_pending",
+                "failure_stage": "authoritative_verification",
+                "failure_kind": "manifest_verification_mismatch",
+            }
+        admissions = []
+        for key in sorted(proof_by_key):
+            proof = proof_by_key[key]
+            admission = await admission_repository.mark_published(
+                proof,
+                submitting_owner_id=submitting_owner_id,
+                expected_record_revision=expected_admission_record_revisions[proof.candidate_id],
+                now=now,
+            )
+            if not (admission.applied or admission.idempotent):
+                return {
+                    "status": "settlement_pending",
+                    "failure_stage": "admission_settlement",
+                    "failure_kind": admission.failure_kind or "admission_settlement_failed",
+                    "generation": target_generation,
+                }
+            admissions.append(admission)
+        activated = await self.v2_store.activate_learning_generation(
+            asset_id=asset_revision_set[0][0],
+            asset_revision=asset_revision_set[0][1],
+            generation=target_generation,
+            expected_current_generation=expected_current_generation,
+            expected_asset_revision=asset_revision_set[0][2],
+            expected_membership_revision=asset_revision_set[0][3],
+            mapping_hash=plain_mapping_hash,
+            index_hash=plain_index_hash,
+            now=now,
+            asset_revision_set=asset_revision_set,
+        )
+        if not (activated.applied or activated.idempotent):
+            return {
+                "status": "settlement_pending",
+                "failure_stage": activated.failure_stage,
+                "failure_kind": activated.failure_kind,
+                "generation": target_generation,
+            }
+        promoted = self._promote_learning_vector_candidate_manifest(
+            expected_current_generation=expected_current_generation,
+            expected_target_generation=target_generation,
+            expected_resource_id=resource_id,
+            expected_mapping_hash=plain_mapping_hash,
+            expected_index_hash=plain_index_hash,
+            expected_asset_revision_digest=asset_digest,
+        )
+        if not (promoted.get("applied") or promoted.get("idempotent")):
+            return {
+                "status": "settlement_pending",
+                "failure_stage": promoted.get("failure_stage", "manifest_promotion"),
+                "failure_kind": promoted.get(
+                    "failure_kind", "manifest_promotion_failed"
+                ),
+                "generation": target_generation,
+            }
+        completed = await self.v2_store.complete_learning_generation_settlement(
+            generation=target_generation,
+            resource_id=resource_id,
+            asset_revision_set=asset_revision_set,
+        )
+        if not (completed.applied or completed.idempotent):
+            return {
+                "status": "settlement_pending",
+                "failure_stage": completed.failure_stage,
+                "failure_kind": completed.failure_kind,
+                "generation": target_generation,
+            }
+        return {
+            "status": "published",
+            "generation": target_generation,
+            "resource_id": resource_id,
+            "asset_revision_digest": asset_digest,
+            "asset_count": len(assets),
+            "admission_revisions": tuple(
+                getattr(result.admission, "revision", None) for result in admissions
+            ),
+            "asset_revision": activated.asset_revision,
+            "membership_revision": activated.membership_revision,
+        }
+
+    async def submit_learning_vector_generation(self, **request: Any) -> dict[str, Any]:
+        if not getattr(self, "_accepting_vector_work", True):
+            return {"status": "blocked", "failure_stage": "publish", "failure_kind": "shutdown_fenced"}
+        await self._start_learning_publish_runtime(recover=False)
+        queue = self._learning_publish_queue
+        worker = self._learning_publish_worker_task
+        if queue is None or worker is None or worker.done():
+            return {
+                "status": "blocked",
+                "failure_stage": "publish_worker",
+                "failure_kind": "publish_worker_unavailable",
+            }
+        loop = asyncio.get_running_loop()
+        completion = loop.create_future()
+        work_id = "learning-publish-" + hashlib.sha256(
+            repr(
+                (
+                    request.get("expected_current_generation"),
+                    tuple(
+                        sorted(
+                            (
+                                str(getattr(asset, "asset_id", "")),
+                                getattr(asset, "asset_revision", None),
+                            )
+                            for asset in tuple(request.get("assets") or ())
+                        )
+                    ),
+                )
+            ).encode("utf-8")
+        ).hexdigest()[:20]
+        try:
+            queue.put_nowait((work_id, dict(request), completion))
+        except asyncio.QueueFull:
+            return {
+                "status": "retry_wait",
+                "failure_stage": "publish_worker",
+                "failure_kind": "publish_queue_full",
+            }
+        try:
+            return await asyncio.shield(completion)
+        except asyncio.CancelledError:
+            if not completion.done():
+                completion.cancel()
+            raise
+
+    async def _learning_publish_worker(self) -> None:
+        queue = self._learning_publish_queue
+        if queue is None:
+            return
+        while getattr(self, "_accepting_vector_work", True):
+            try:
+                work_id, request, completion = await asyncio.wait_for(
+                    queue.get(), timeout=0.5
+                )
+            except asyncio.TimeoutError:
+                repository = self.learning_admission_repository
+                if repository is None:
+                    continue
+                try:
+                    pending = await self.v2_store.get_pending_learning_publish()
+                    if pending:
+                        self._learning_publish_recovery_result = (
+                            await self.recover_learning_vector_publish(
+                                admission_repository=repository,
+                                now=time.time(),
+                            )
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self._learning_publish_recovery_result = {
+                        "status": "retry_wait",
+                        "recovered": False,
+                        "failure_stage": "publish_recovery",
+                        "failure_kind": f"recovery_error:{type(exc).__name__}",
+                    }
+                continue
+            try:
+                if completion.cancelled():
+                    continue
+                result = await self.publish_learning_vector_generation(
+                    **request,
+                    admission_repository=self.learning_admission_repository,
+                )
+                if not completion.done():
+                    completion.set_result(result)
+            except asyncio.CancelledError:
+                if not completion.done():
+                    completion.set_result({
+                        "status": "settlement_pending",
+                        "failure_stage": "publish_worker",
+                        "failure_kind": "worker_cancelled",
+                        "work_id": work_id,
+                    })
+                raise
+            except Exception as exc:
+                if not completion.done():
+                    completion.set_result({
+                        "status": "retry_wait",
+                        "failure_stage": "publish_worker",
+                        "failure_kind": f"worker_error:{type(exc).__name__}",
+                        "work_id": work_id,
+                    })
+            finally:
+                queue.task_done()
+
+    async def _start_learning_publish_runtime(self, *, recover: bool) -> None:
+        repository = self.learning_admission_repository
+        if repository is None:
+            if recover:
+                self._learning_publish_recovery_result = {
+                    "status": "blocked",
+                    "recovered": False,
+                    "failure_kind": "admission_repository_unavailable",
+                }
+            return
+        if recover:
+            self._learning_publish_recovery_result = await self.recover_learning_vector_publish(
+                admission_repository=repository,
+                now=time.time(),
+            )
+        evolution = getattr(self.config, "evolution", None)
+        if not (
+            bool(getattr(evolution, "learning_vector_build_enabled", False))
+            and bool(getattr(evolution, "learning_vector_publish_enabled", False))
+        ):
+            return
+        existing = self._learning_publish_worker_task
+        if existing is not None and not existing.done():
+            return
+        self._learning_publish_queue = asyncio.Queue(maxsize=8)
+        self._learning_publish_worker_task = asyncio.create_task(
+            self._learning_publish_worker(),
+            name="astrmai-learning-vector-publish-worker",
+        )
+        self._register_owner_task(
+            self._learning_publish_worker_task,
+            task_family="memory.learning_vector.publish",
+            scope_id="GLOBAL",
+            run_id="learning-vector-publish-worker",
+        )
+
+    async def recover_learning_vector_publish(
+        self,
+        *,
+        admission_repository,
+        now: float,
+    ) -> dict[str, Any]:
+        pending = await self.v2_store.get_pending_learning_publish()
+        if not pending:
+            return {"status": "completed", "recovered": False, "reason": "no_pending_publish"}
+        if pending.get("_failure_kind"):
+            return {
+                "status": "blocked",
+                "failure_stage": "publish_recovery",
+                "failure_kind": str(pending["_failure_kind"]),
+            }
+        if "items" not in pending and isinstance(pending.get("proof"), dict):
+            pending = dict(pending)
+            pending["items"] = [{
+                "asset_id": pending.get("asset_id"),
+                "asset_revision": pending.get("asset_revision"),
+                "candidate_id": pending.get("candidate_id"),
+                "candidate_revision": pending.get("candidate_revision"),
+                "admission_revision": pending.get("admission_revision"),
+                "expected_asset_revision": pending.get("expected_asset_revision"),
+                "expected_membership_revision": pending.get("expected_membership_revision"),
+                "expected_admission_record_revision": pending.get("expected_admission_record_revision"),
+                "proof": pending.get("proof"),
+            }]
+            pending["asset_revision_set"] = [[
+                pending.get("asset_id"), pending.get("asset_revision"),
+                pending.get("expected_asset_revision"), pending.get("expected_membership_revision"),
+            ]]
+        required = (
+            "generation", "resource_id", "mapping_hash", "index_hash",
+            "expected_current_generation", "submitting_owner_id", "items",
+            "asset_revision_set",
+        )
+        if (
+            any(name not in pending for name in required)
+            or not isinstance(pending.get("items"), list)
+            or not pending["items"]
+            or not isinstance(pending.get("asset_revision_set"), list)
+        ):
+            return {
+                "status": "blocked",
+                "failure_stage": "publish_recovery",
+                "failure_kind": "pending_publish_identity_incomplete",
+            }
+        if any(
+            not isinstance(item, dict) or not isinstance(item.get("proof"), dict)
+            for item in pending["items"]
+        ):
+            return {
+                "status": "blocked",
+                "failure_stage": "publish_recovery",
+                "failure_kind": "pending_publish_proof_invalid",
+            }
+        try:
+            asset_revision_set = tuple(
+                sorted(
+                    (
+                        str(item[0]), int(item[1]), int(item[2]), int(item[3])
+                    )
+                    for item in pending["asset_revision_set"]
+                )
+            )
+            item_keys = {
+                (str(item["asset_id"]), int(item["asset_revision"]))
+                for item in pending["items"]
+            }
+        except (TypeError, ValueError, KeyError, IndexError):
+            return {
+                "status": "blocked",
+                "failure_stage": "publish_recovery",
+                "failure_kind": "pending_publish_identity_incomplete",
+            }
+        if not asset_revision_set or item_keys != {(item[0], item[1]) for item in asset_revision_set}:
+            return {
+                "status": "blocked",
+                "failure_stage": "publish_recovery",
+                "failure_kind": "pending_publish_asset_set_conflict",
+            }
+        try:
+            persisted_manifest = json.loads(
+                self._learning_vector_candidate_manifest_path.read_text(encoding="utf-8")
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            return {
+                "status": "retry_wait",
+                "failure_stage": "publish_recovery",
+                "failure_kind": f"manifest_read_error:{type(exc).__name__}",
+            }
+        if not (
+            int(persisted_manifest.get("generation", -1)) == int(pending["generation"])
+            and str(persisted_manifest.get("resource_id") or "") == str(pending["resource_id"])
+            and str(persisted_manifest.get("mapping_hash") or "").removeprefix("sha256:v1:")
+            == str(pending["mapping_hash"]).removeprefix("sha256:v1:")
+            and str(persisted_manifest.get("index_hash") or "").removeprefix("sha256:v1:")
+            == str(pending["index_hash"]).removeprefix("sha256:v1:")
+            and (
+                not str(pending.get("asset_revision_digest") or "")
+                or str(persisted_manifest.get("asset_revision_digest") or "")
+                == str(pending["asset_revision_digest"])
+            )
+            and str(persisted_manifest.get("role") or "") == "candidate"
+        ):
+            return {
+                "status": "blocked",
+                "failure_stage": "publish_recovery",
+                "failure_kind": "pending_manifest_identity_mismatch",
+            }
+        for item in pending["items"]:
+            try:
+                from ...learning.review.admission import VectorPublishProof
+
+                raw_proof = dict(item["proof"])
+                raw_proof.pop("proof_version", None)
+                raw_proof["review_decision_ids"] = tuple(raw_proof.get("review_decision_ids") or ())
+                proof = VectorPublishProof(**raw_proof)
+                expected_record_revision = int(item["expected_admission_record_revision"])
+            except (TypeError, ValueError, KeyError):
+                return {
+                    "status": "blocked",
+                    "failure_stage": "publish_recovery",
+                    "failure_kind": "pending_publish_proof_invalid",
+                }
+            admission = await admission_repository.mark_published(
+                proof,
+                submitting_owner_id=str(pending["submitting_owner_id"]),
+                expected_record_revision=expected_record_revision,
+                now=now,
+            )
+            if not (admission.applied or admission.idempotent):
+                return {
+                    "status": "settlement_pending",
+                    "failure_stage": "admission_settlement",
+                    "failure_kind": admission.failure_kind or "admission_settlement_failed",
+                    "generation": int(pending["generation"]),
+                }
+        activated = await self.v2_store.activate_learning_generation(
+            asset_id=asset_revision_set[0][0],
+            asset_revision=asset_revision_set[0][1],
+            generation=int(pending["generation"]),
+            expected_current_generation=int(pending["expected_current_generation"]),
+            expected_asset_revision=asset_revision_set[0][2],
+            expected_membership_revision=asset_revision_set[0][3],
+            mapping_hash=str(pending["mapping_hash"]),
+            index_hash=str(pending["index_hash"]),
+            now=now,
+            asset_revision_set=asset_revision_set,
+        )
+        if not (activated.applied or activated.idempotent):
+            return {
+                "status": "settlement_pending",
+                "failure_stage": activated.failure_stage,
+                "failure_kind": activated.failure_kind,
+                "generation": int(pending["generation"]),
+            }
+        promoted = self._promote_learning_vector_candidate_manifest(
+            expected_current_generation=int(pending["expected_current_generation"]),
+            expected_target_generation=int(pending["generation"]),
+            expected_resource_id=str(pending["resource_id"]),
+            expected_mapping_hash=str(pending["mapping_hash"]),
+            expected_index_hash=str(pending["index_hash"]),
+            expected_asset_revision_digest=str(
+                pending.get("asset_revision_digest")
+                or persisted_manifest.get("asset_revision_digest")
+                or ""
+            ),
+        )
+        if not (promoted.get("applied") or promoted.get("idempotent")):
+            return {
+                "status": "settlement_pending",
+                "failure_stage": promoted.get("failure_stage", "manifest_promotion"),
+                "failure_kind": promoted.get(
+                    "failure_kind", "manifest_promotion_failed"
+                ),
+                "generation": int(pending["generation"]),
+            }
+        completed = await self.v2_store.complete_learning_generation_settlement(
+            generation=int(pending["generation"]),
+            resource_id=str(pending["resource_id"]),
+            asset_revision_set=asset_revision_set,
+        )
+        if not (completed.applied or completed.idempotent):
+            return {
+                "status": "settlement_pending",
+                "failure_stage": completed.failure_stage,
+                "failure_kind": completed.failure_kind,
+                "generation": int(pending["generation"]),
+            }
+        return {
+            "status": "published",
+            "recovered": True,
+            "generation": int(pending["generation"]),
+            "resource_id": str(pending["resource_id"]),
+            "asset_count": len(asset_revision_set),
+            "asset_revision": activated.asset_revision,
+            "membership_revision": activated.membership_revision,
+        }
 
     def _cleanup_stale_vector_indexes(
         self,
@@ -1358,10 +2637,20 @@ class MemoryEngine:
         self._startup_last_yield = time.monotonic()
         self._startup_yield_count = 0
         await self.v2_store.initialize()
+        get_learning_generation = getattr(
+            self.v2_store, "get_learning_generation_state", None
+        )
+        if callable(get_learning_generation):
+            learning_generation = await get_learning_generation()
+            if learning_generation.get("ready"):
+                self._vector_generation = int(
+                    learning_generation.get("current_generation", 0) or 0
+                )
         await self._load_vector_resource_descriptors()
         await self._load_index_delete_repairs()
         await self._flush_index_delete_repair_persistence()
         await self._scan_vector_resources_on_startup()
+        await self._start_learning_publish_runtime(recover=True)
         await self._startup_checkpoint(force=True)
         self.index_projector = MemoryIndexProjector(self)
         self.v2_store.index_projector = self.index_projector
@@ -5518,6 +6807,29 @@ class MemoryEngine:
 
     async def stop_background_producers(self):
         self.begin_shutdown()
+        publish_worker = self._learning_publish_worker_task
+        await self._cancel_background_task_safely(
+            publish_worker,
+            "learning vector publish worker",
+        )
+        if self._learning_publish_worker_task is publish_worker:
+            self._learning_publish_worker_task = None
+        queue = self._learning_publish_queue
+        if queue is not None:
+            while True:
+                try:
+                    work_id, _request, completion = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if not completion.done():
+                    completion.set_result({
+                        "status": "blocked",
+                        "failure_stage": "publish_worker",
+                        "failure_kind": "shutdown_fenced",
+                        "work_id": work_id,
+                    })
+                queue.task_done()
+        self._learning_publish_queue = None
         pipeline = getattr(self, "memory_pipeline", None)
         begin_pipeline_shutdown = getattr(pipeline, "begin_shutdown", None)
         if callable(begin_pipeline_shutdown):
@@ -5567,6 +6879,9 @@ class MemoryEngine:
         if not getattr(self, "_accepting_vector_work", True):
             return
         self._accepting_vector_work = False
+        publish_worker = self._learning_publish_worker_task
+        if publish_worker is not None and not publish_worker.done():
+            publish_worker.cancel()
         self._accepting_dimension_probe = False
         probe_task = getattr(self, "_vector_dimension_probe_task", None)
         if probe_task is not None and not probe_task.done():

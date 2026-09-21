@@ -31,7 +31,21 @@ def test_mismatch_sets_are_explicit_and_history_is_classified():
 
 
 def test_identity_validation_is_fail_closed():
-    assert validate_vector_identity({"embedding_model": "m", "provider_source": "p", "physical_dimension": 1024, "vector_count": 2, "generation": 1, "revision": 1})["publish_allowed"]
+    assert validate_vector_identity({
+        "asset_revision_digest": "sha256:v1:" + "a" * 64,
+        "index_file": "vectors.g1.index",
+        "embedding_model": "m",
+        "provider_source": "p",
+        "api_base_fingerprint": "sha256:v1:" + "b" * 64,
+        "physical_dimension": 1024,
+        "configured_dimension": 1024,
+        "document_count": 2,
+        "vector_count": 2,
+        "mapping_hash": "sha256:v1:" + "c" * 64,
+        "index_hash": "sha256:v1:" + "d" * 64,
+        "generation": 1,
+        "revision": 1,
+    })["publish_allowed"]
     invalid = validate_vector_identity({"embedding_model": "", "provider_source": None, "physical_dimension": "bad"})
     assert invalid["status"] == "blocked"
     assert invalid["publish_allowed"] is False

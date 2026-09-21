@@ -60,6 +60,7 @@ class PromptEnvelope:
         return f"<retrieved_memory>\n{safe}\n</retrieved_memory>"
 
     raw_user_text: str = ""
+    prompt_revision: str = ""
     recent_transcript: str = ""
     recent_transcript_source: str = ""
     recent_transcript_reason: str = ""
@@ -102,6 +103,8 @@ class PromptEnvelope:
     soft_background_skipped_reason: str = ""
     learning_context_block: str = ""
     learning_context_sections: dict[str, str] = field(default_factory=dict)
+    learning_asset_sections: dict[str, str] = field(default_factory=dict)
+    learning_focus_context: Any = None
     learning_context_budget_chars: int = 0
     learning_context_trimmed_sections: list[str] = field(default_factory=list)
     learning_context_rendered_chars: int = 0

@@ -10,6 +10,7 @@ from astrbot.api import logger
 
 from ..contracts.prompt_envelope import PromptEnvelope
 from ..contracts.turn_context import ensure_turn_context
+from ...memory.contracts.learning_retrieval import LearningFocusContext
 from ...infrastructure.runtime.trace_runtime import debug_trace
 
 
@@ -155,6 +156,15 @@ class PlanningInputLoader:
         user_id=None,
     ) -> dict[str, Any]:
         level = int(think_level or 0)
+        learning_focus_context = (
+            event.get_extra("astrmai_learning_focus_context", None)
+            if hasattr(event, "get_extra")
+            else None
+        )
+        if not isinstance(learning_focus_context, LearningFocusContext):
+            learning_focus_context = None
+        if prompt_envelope is not None:
+            prompt_envelope.learning_focus_context = learning_focus_context
         result: dict[str, Any] = {
             # Deprecated compatibility mirrors for legacy readers outside the main reply chain.
             "slang_context": "",
@@ -167,6 +177,7 @@ class PlanningInputLoader:
             "planner_reasoning": "",
             "goals_context": "",
             "tool_state": ToolStateInputs(),
+            "learning_focus_context": learning_focus_context,
         }
         tasks = [
             self._run_timed(
@@ -239,6 +250,9 @@ class PlanningInputLoader:
         if actor_id:
             return actor_id
         if hasattr(event, "get_extra"):
+            learning_focus = event.get_extra("astrmai_learning_focus_context", None)
+            if isinstance(learning_focus, LearningFocusContext):
+                return learning_focus.speaker_id if learning_focus.attribution_eligible else ""
             focus_context = event.get_extra("astrmai_focus_thread_context", None)
             actor_set = getattr(focus_context, "actor_set", None)
             actor_id = str(getattr(actor_set, "current_actor_id", "") or "").strip()
