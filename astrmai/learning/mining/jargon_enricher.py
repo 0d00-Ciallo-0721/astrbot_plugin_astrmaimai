@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from ..release.flags import ReleaseCheckpoint
+from ..release.runtime_gate import runtime_gate_check
+
 from astrbot.api import logger
 
 from ...infrastructure.gateway.json_utils import parse_json_contract
@@ -99,7 +102,7 @@ class JargonEnricher:
                 self.gateway, "call_data_process_task_result"
             ):
                 evolution = getattr(self.config, "evolution", None)
-                if not bool(getattr(evolution, "learning_enrichment_enabled", False)):
+                if not runtime_gate_check(evolution, ReleaseCheckpoint.CLAIM).allowed:
                     return self._failed_result(
                         group_id,
                         candidates,

@@ -1343,6 +1343,12 @@
         "default": false,
         "hint": "默认关闭。仅在受控的模拟或录制服务环境显式开启；关闭时停止新的外部模型服务请求。"
       },
+      "learning_discovery_enabled": {
+        "description": "启用学习发现影子扫描",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后不再扫描新的学习输入，但不影响对话主链路。"
+      },
       "learning_enrichment_concurrency": {
         "description": "学习增强逻辑通道最大并发数",
         "type": "int",
@@ -1462,6 +1468,30 @@
         "type": "bool",
         "default": false,
         "hint": "默认关闭；只记录选择事实，不改变用户可见回复。"
+      },
+      "learning_injection_enabled": {
+        "description": "允许学习资产进入最终提示词",
+        "type": "bool",
+        "default": false,
+        "hint": "默认关闭；Stage 10 本地 shadow 不允许用户可见注入。"
+      },
+      "learning_release_kill_switch": {
+        "description": "学习灰度持久硬停止",
+        "type": "bool",
+        "default": false,
+        "hint": "触发后阻断 discovery、claim、admission、retrieval 和 send 检查点。"
+      },
+      "learning_release_id": {
+        "description": "当前学习灰度 release 标识",
+        "type": "string",
+        "default": "runtime",
+        "hint": "进入 staging 前必须与 release manifest 一致。"
+      },
+      "learning_release_kill_switch_path": {
+        "description": "持久化学习硬停止状态文件",
+        "type": "string",
+        "default": "",
+        "hint": "必须位于仓库外；为空时仅使用持久配置和环境变量。"
       },
       "learning_prompt_injection_enabled": {
         "description": "允许学习资产进入最终提示词",

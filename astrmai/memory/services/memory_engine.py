@@ -24,6 +24,8 @@ from ...learning.dedup import (
     expression_fingerprint,
     jargon_fingerprint,
 )
+from ...learning.release.flags import ReleaseCheckpoint
+from ...learning.release.runtime_gate import runtime_gate_check
 
 try:
     from astrbot.core.db.vec_db.faiss_impl.vec_db import FaissVecDB
@@ -1583,12 +1585,12 @@ class MemoryEngine:
         current_generation: int,
     ):
         evolution = getattr(self.config, "evolution", None)
-        shadow_enabled = bool(
-            getattr(evolution, "learning_retrieval_shadow_enabled", False)
-        )
+        shadow_enabled = runtime_gate_check(
+            evolution, ReleaseCheckpoint.RETRIEVAL
+        ).allowed
         prompt_enabled = bool(
             shadow_enabled
-            and getattr(evolution, "learning_prompt_injection_enabled", False)
+            and runtime_gate_check(evolution, ReleaseCheckpoint.SEND).allowed
         )
         generation_state = await self.v2_store.get_learning_generation_state()
         pending_generation = generation_state.get("pending_generation")

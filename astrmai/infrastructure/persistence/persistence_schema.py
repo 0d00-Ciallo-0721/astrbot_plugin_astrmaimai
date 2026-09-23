@@ -803,6 +803,32 @@ _MIGRATIONS: list[tuple[int, str]] = [
     (171, """ALTER TABLE learning_retrieval_event
         ADD COLUMN asset_provenance_json TEXT NOT NULL DEFAULT '[]'
         CHECK(json_valid(asset_provenance_json))"""),
+    (172, """CREATE TABLE IF NOT EXISTS learning_human_admission (
+        admission_id TEXT PRIMARY KEY,
+        candidate_id TEXT NOT NULL,
+        candidate_revision INTEGER NOT NULL,
+        admission_revision INTEGER NOT NULL,
+        reviewer_identity TEXT NOT NULL,
+        decision TEXT NOT NULL CHECK(decision IN ('approved','rejected','blocked')),
+        reason TEXT NOT NULL,
+        provenance_digest TEXT NOT NULL,
+        publish_proof_digest TEXT NOT NULL DEFAULT '',
+        created_at REAL NOT NULL,
+        FOREIGN KEY(candidate_id) REFERENCES learning_candidate(candidate_id),
+        CHECK(candidate_revision >= 0),
+        CHECK(admission_revision > 0),
+        CHECK(TRIM(admission_id) <> ''),
+        CHECK(TRIM(reviewer_identity) <> ''),
+        CHECK(TRIM(reason) <> ''),
+        CHECK(json_valid(json_object('reviewer_identity', reviewer_identity)))
+    )"""),
+    (173, "CREATE INDEX IF NOT EXISTS ix_learning_human_admission_candidate ON learning_human_admission(candidate_id, candidate_revision, admission_revision)"),
+    (174, """CREATE TRIGGER IF NOT EXISTS trg_learning_human_admission_no_update
+        BEFORE UPDATE ON learning_human_admission
+        BEGIN SELECT RAISE(ABORT, 'learning_human_admission is immutable'); END"""),
+    (175, """CREATE TRIGGER IF NOT EXISTS trg_learning_human_admission_no_delete
+        BEFORE DELETE ON learning_human_admission
+        BEGIN SELECT RAISE(ABORT, 'learning_human_admission is immutable'); END"""),
 ]
 
 

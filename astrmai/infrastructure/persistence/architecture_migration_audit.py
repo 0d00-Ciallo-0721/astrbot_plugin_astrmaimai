@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 
-LATEST_ARCHITECTURE_SCHEMA_VERSION = 171
+LATEST_ARCHITECTURE_SCHEMA_VERSION = 175
 
 MESSAGELOG_REQUIRED_COLUMNS = (
     "event_id",
@@ -77,6 +77,7 @@ REQUIRED_INDEXES = (
     "ix_learning_admission_blocked",
     "ix_learning_retrieval_turn",
     "ix_learning_retrieval_generation",
+    "ix_learning_human_admission_candidate",
 )
 
 REQUIRED_TRIGGERS = (
@@ -84,6 +85,8 @@ REQUIRED_TRIGGERS = (
     "trg_learning_review_decision_no_delete",
     "trg_learning_retrieval_event_no_update",
     "trg_learning_retrieval_event_no_delete",
+    "trg_learning_human_admission_no_update",
+    "trg_learning_human_admission_no_delete",
 )
 
 
@@ -227,6 +230,7 @@ def inspect_architecture_migration(
         "learning_review_attempt",
         "learning_review_decision",
         "learning_admission",
+        "learning_human_admission",
         "learning_retrieval_event",
     )
     missing_tables = tuple(name for name in required_tables if name not in tables)
@@ -334,6 +338,11 @@ def inspect_architecture_migration(
             "admission_revision", "pre_index_eligible", "post_publish_eligible",
             "index_blocked", "provenance_digest", "revision",
         ),
+        "learning_human_admission": (
+            "admission_id", "candidate_id", "candidate_revision", "admission_revision",
+            "reviewer_identity", "decision", "reason", "provenance_digest",
+            "publish_proof_digest", "created_at",
+        ),
         "learning_retrieval_event": (
             "event_id", "idempotency_key", "turn_id", "correlation_id",
             "source_layer", "stage", "event_status", "scope_id", "sender_id",
@@ -378,6 +387,7 @@ def inspect_architecture_migration(
         "ix_learning_admission_blocked": "learning_admission",
         "ix_learning_retrieval_turn": "learning_retrieval_event",
         "ix_learning_retrieval_generation": "learning_retrieval_event",
+        "ix_learning_human_admission_candidate": "learning_human_admission",
     }
     missing_indexes = tuple(
         name

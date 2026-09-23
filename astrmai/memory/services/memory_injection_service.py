@@ -17,6 +17,8 @@ from ..contracts.learning_retrieval import LearningFocusContext, LearningTurnCor
 from ..retrieval.learning_retrieval_events import LearningRetrievalEventWriter
 from ..contracts.retrieval_trace import RetrievalTrace
 from ...infrastructure.runtime.turn_call_ledger import begin_stage, finish_stage
+from ...learning.release.flags import ReleaseCheckpoint
+from ...learning.release.runtime_gate import runtime_gate_check
 from .memory_context_builder import MemoryContextBuilder
 from .memory_query_builder import MemoryQueryBuilder
 from .memory_retrieval_service import MemoryRetrievalService
@@ -201,7 +203,9 @@ class MemoryInjectionService:
         if (
             engine is None
             or writer is None
-            or not bool(getattr(evolution, "learning_retrieval_shadow_enabled", False))
+            or not runtime_gate_check(
+                evolution, ReleaseCheckpoint.RETRIEVAL
+            ).allowed
         ):
             return
         prompt_revision = str(

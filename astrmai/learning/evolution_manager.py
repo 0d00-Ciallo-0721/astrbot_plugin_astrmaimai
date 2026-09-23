@@ -67,6 +67,8 @@ from .review.orchestrator import ReviewOrchestrator
 from .runtime.enrichment_worker import LearningEnrichmentWorker
 from .runtime.learning_lane import LearningLaneBudget, LearningLaneConfig
 from .runtime.provider_adapter import LearningProviderCallAdapter
+from .release.flags import ReleaseCheckpoint
+from .release.runtime_gate import runtime_gate_check
 
 
 def _jargon_sense_evidence(evidence: dict[str, Any], sense: dict[str, Any]) -> dict[str, Any]:
@@ -210,6 +212,9 @@ class EvolutionManager:
                     )
                     if str(value).strip()
                 ),
+                release_kill_switch=lambda: not runtime_gate_check(
+                    self._evolution_config(), ReleaseCheckpoint.ADMISSION
+                ).allowed,
             )
             if db_path
             else None
@@ -455,7 +460,14 @@ class EvolutionManager:
         return gated
 
     def _enrichment_worker_gate(self) -> tuple[bool, str]:
+        release_gate = runtime_gate_check(
+            self._evolution_config(), ReleaseCheckpoint.CLAIM
+        )
         requirements = (
+            (
+                release_gate.allowed,
+                release_gate.reason,
+            ),
             (self._candidate_ledger_enabled(), "candidate_ledger_disabled"),
             (self._discovery_cursor_v2_enabled(), "discovery_cursor_v2_disabled"),
             (
@@ -518,8 +530,9 @@ class EvolutionManager:
             }
             return ""
         evolution = self._evolution_config()
+        release_gate = runtime_gate_check(evolution, ReleaseCheckpoint.CLAIM)
         if (
-            not bool(getattr(evolution, "learning_enrichment_enabled", False))
+            not release_gate.allowed
             or attempt != 1
             or str(profile_version or "") != "retrieval-v1"
         ):
@@ -1328,6 +1341,9 @@ class EvolutionManager:
             "details": report,
         }
         if not isinstance(run_payload["details"].get("schema_version"), str):
+            enrichment_status = str(
+                run_payload["details"].get("enrichment_status") or ""
+            ).strip().lower()
             run_payload["details"] = {
                 **run_payload["details"],
                 **build_learning_diagnostics(
@@ -1354,7 +1370,10 @@ class EvolutionManager:
                         ),
                     ],
                     input_scan_complete=True,
-                    enrichment_complete=status in {"completed", "skipped"},
+                    enrichment_complete=(
+                        status in {"completed", "skipped"}
+                        and enrichment_status not in {"pending", "blocked", "waiting"}
+                    ),
                     persistence_complete=status in {"completed", "skipped"},
                     cursor_commit_complete=status in {"completed", "skipped"},
                 ),
@@ -2471,10 +2490,16 @@ class EvolutionManager:
                     batch_id_hash=LearningStageDiagnostic.hash_batch(batch_id),
                 ),
             ]
+            enrichment_status = str(
+                report.get("enrichment_status") or ""
+            ).strip().lower()
             report.update(build_learning_diagnostics(
                 stages,
                 input_scan_complete=True,
-                enrichment_complete=status in {"completed", "skipped"},
+                enrichment_complete=(
+                    status in {"completed", "skipped"}
+                    and enrichment_status not in {"pending", "blocked", "waiting"}
+                ),
                 persistence_complete=status in {"completed", "skipped"} and not bool(report.get("persistence", {}).get("failed", 0)),
                 cursor_commit_complete=status in {"completed", "skipped"},
             ))
@@ -3491,7 +3516,11 @@ class EvolutionManager:
                         retained_count=int(
                             discovery_report.get("retained_count", 0) or 0
                         ),
-                        report=discovery_report,
+                        report={
+                            **discovery_report,
+                            "enrichment_status": "pending",
+                            "source_cursor_owner": "learning_source_batch",
+                        },
                         duration_ms=(time.perf_counter() - started) * 1000,
                         persist_run=False,
                     )
@@ -3837,6 +3866,15 @@ class EvolutionManager:
     ):
         if not logs:
             return {}
+        release_gate = runtime_gate_check(
+            self._evolution_config(), ReleaseCheckpoint.DISCOVERY
+        )
+        if not release_gate.allowed:
+            return {
+                "status": "blocked",
+                "reason": release_gate.reason,
+                "outcomes": {},
+            }
         run_id = str(run_id or self._mining_run_id(group_id, logs))
         group_lock = await self._get_mining_lock(group_id)
         async with group_lock:

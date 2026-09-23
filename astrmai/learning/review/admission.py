@@ -3,14 +3,16 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, Protocol
+from typing import Any, AsyncIterator, Callable, Protocol
 
 from ...infrastructure.persistence.sqlite_helpers import connect_aiosqlite
 from ..persistence.review_repository import LearningReviewRepository
+from ..release.flags import runtime_kill_switch_active
 
 
 def _json(value: Any) -> str:
@@ -208,6 +210,101 @@ class AdmissionRepository:
             await cursor.close()
         return self._record(row)
 
+    async def record_human_admission(
+        self, *, admission_id: str, candidate_id: str, candidate_revision: int,
+        admission_revision: int, reviewer_identity: str, decision: str,
+        reason: str, provenance_digest: str, publish_proof_digest: str = "",
+        now: float,
+    ) -> bool:
+        """Append an auditable human admission fact after durable CAS success."""
+        reviewer_identity = str(reviewer_identity or "").strip()
+        admission_id = str(admission_id or "").strip()
+        candidate_id = str(candidate_id or "").strip()
+        reason = str(reason or "").strip()
+        provenance_digest = str(provenance_digest or "").lower()
+        publish_proof_digest = str(publish_proof_digest or "").lower()
+        if (
+            not admission_id or not candidate_id
+            or not reviewer_identity.lower().startswith("human:")
+            or len(reviewer_identity) <= len("human:")
+            or decision not in {"approved", "rejected", "blocked"}
+            or not reason
+            or not re.fullmatch(r"[0-9a-f]{64}", provenance_digest)
+            or (publish_proof_digest and not re.fullmatch(r"[0-9a-f]{64}", publish_proof_digest))
+            or type(candidate_revision) is not int or candidate_revision < 0
+            or type(admission_revision) is not int or admission_revision <= 0
+            or type(now) not in {int, float} or isinstance(now, bool) or not math.isfinite(float(now)) or float(now) < 0
+        ):
+            return False
+        async with self._db() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT revision FROM learning_candidate WHERE candidate_id = ?",
+                (candidate_id,),
+            )
+            candidate = await cursor.fetchone()
+            await cursor.close()
+            if candidate is None or int(candidate[0]) != candidate_revision:
+                await db.rollback()
+                return False
+            try:
+                cursor = await db.execute(
+                    f"SELECT {self._COLUMNS} FROM learning_admission "
+                    "WHERE candidate_id = ? AND candidate_revision = ?",
+                    (candidate_id, candidate_revision),
+                )
+                durable = self._record(await cursor.fetchone())
+                await cursor.close()
+            except Exception:
+                await db.rollback()
+                return False
+            if durable is None or durable.admission_revision != admission_revision:
+                await db.rollback()
+                return False
+            if durable.provenance_digest.lower() != provenance_digest:
+                await db.rollback()
+                return False
+            if durable.publish_proof_digest:
+                if publish_proof_digest != durable.publish_proof_digest.lower():
+                    await db.rollback()
+                    return False
+            elif publish_proof_digest:
+                await db.rollback()
+                return False
+            try:
+                cursor = await db.execute(
+                    "SELECT 1 FROM learning_human_admission "
+                    "WHERE admission_id = ? OR "
+                    "(candidate_id = ? AND candidate_revision = ? AND admission_revision = ?)",
+                    (admission_id, candidate_id, candidate_revision, admission_revision),
+                )
+                duplicate = await cursor.fetchone()
+                await cursor.close()
+            except Exception:
+                await db.rollback()
+                return False
+            if duplicate is not None:
+                await db.rollback()
+                return False
+            try:
+                await db.execute(
+                    """INSERT INTO learning_human_admission(
+                       admission_id,candidate_id,candidate_revision,admission_revision,
+                       reviewer_identity,decision,reason,provenance_digest,
+                       publish_proof_digest,created_at
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        admission_id, candidate_id, candidate_revision, admission_revision,
+                        reviewer_identity, decision, reason, provenance_digest,
+                        publish_proof_digest, float(now),
+                    ),
+                )
+            except Exception:
+                await db.rollback()
+                return False
+            await db.commit()
+        return True
+
     async def save_evaluation(
         self, *, candidate_id: str, candidate_revision: int,
         review_decision_ids: tuple[str, ...], pre_index_eligible: bool,
@@ -384,6 +481,7 @@ class AdmissionService:
         trusted_publish_owner_ids: frozenset[str] = frozenset(),
         expected_reviewer_ids: tuple[str, ...] = (),
         publish_proof_verifier: PublishProofVerifier | None = None,
+        release_kill_switch: Callable[[], bool] | None = None,
     ) -> None:
         self.db_path = Path(db_path)
         self.evaluation_enabled = bool(evaluation_enabled)
@@ -396,6 +494,9 @@ class AdmissionService:
             publish_proof_verifier=publish_proof_verifier,
         )
         self.reviews = LearningReviewRepository(db_path)
+        self.release_kill_switch = release_kill_switch or (
+            lambda: runtime_kill_switch_active(None)
+        )
 
     @asynccontextmanager
     async def _db(self) -> AsyncIterator[Any]:
@@ -404,6 +505,13 @@ class AdmissionService:
             yield db
 
     async def evaluate(self, candidate_id: str, expected_revision: int, *, now: float) -> AdmissionMutation:
+        if self.release_kill_switch():
+            return AdmissionMutation(
+                False,
+                True,
+                failure_kind="learning_release_kill_switch",
+                admission=await self.repository.get(candidate_id, expected_revision),
+            )
         if not self.evaluation_enabled:
             return AdmissionMutation(
                 False, True, failure_kind="admission_evaluation_disabled",

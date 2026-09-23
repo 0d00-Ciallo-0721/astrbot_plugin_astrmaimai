@@ -14,6 +14,8 @@ from ..contracts.prompt_envelope import PromptEnvelope, ReplyMode
 from ..contracts.turn_context import MemoryInjectionDecision, ensure_turn_context, get_turn_context
 from ...memory.retrieval.learning_retrieval_events import LearningRetrievalEventWriter
 from ...memory.retrieval.learning_retrieval_selector import LearningRetrievalSelector
+from ...learning.release.flags import ReleaseCheckpoint, runtime_kill_switch_active
+from ...learning.release.runtime_gate import runtime_gate_check
 
 
 class PromptRefiner:
@@ -411,11 +413,30 @@ class PromptRefiner:
             budget = self.LEARNING_CONTEXT_FAST_MODE_BUDGET
         elif near_context_priority:
             budget = self.LEARNING_CONTEXT_NEAR_CONTEXT_BUDGET
+        if runtime_kill_switch_active(self.config):
+            return "", {
+                "budget_chars": budget,
+                "trimmed_sections": [],
+                "rendered_chars": 0,
+                "skipped_reason": "learning_release_kill_switch",
+                "model_visible_jargon": False,
+                "model_visible_expression": False,
+                "selected_jargon_chars": 0,
+                "selected_expression_chars": 0,
+                "visible_learning_asset_ids": (),
+            }
         raw_sections = dict(getattr(prompt_envelope, "learning_context_sections", {}) or {})
+        release_send_allowed = runtime_gate_check(
+            self.config, ReleaseCheckpoint.SEND
+        ).allowed
+        if not release_send_allowed:
+            raw_sections.pop("learning_assets", None)
         jargon = str(raw_sections.get("jargon", "") or "").strip()
         expression = str(raw_sections.get("expression", "") or "").strip()
         learning_assets = str(raw_sections.get("learning_assets", "") or "").strip()
         asset_sections = dict(getattr(prompt_envelope, "learning_asset_sections", {}) or {})
+        if not release_send_allowed:
+            asset_sections = {}
         if not asset_sections and learning_assets:
             asset_sections = {"__legacy__": learning_assets}
         if not jargon and not expression and not asset_sections:

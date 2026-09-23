@@ -1387,3 +1387,64 @@ def test_publish_requires_authoritative_verifier_not_owner_checksum(tmp_path: Pa
         assert rejected.failure_kind == "publish_asset_not_verified"
 
     asyncio.run(run())
+
+
+def test_human_admission_is_append_only_and_bound_to_durable_admission(tmp_path: Path):
+    async def run() -> None:
+        path = tmp_path / "human-admission-append-only.db"
+        _database(path)
+        _candidate(path)
+        repository = AdmissionRepository(path)
+        saved = await repository.save_evaluation(
+            candidate_id="candidate-1", candidate_revision=7,
+            review_decision_ids=("review-quorum:fixture",), pre_index_eligible=True,
+            blocked_reason="vector_identity_unverified", blocked_stage="index_identity",
+            blocked_kind="vector_identity_unverified", provenance_digest="a" * 64, now=10.0,
+        )
+        assert saved.admission is not None
+        assert await repository.record_human_admission(
+            admission_id="human-admission-1", candidate_id="candidate-1",
+            candidate_revision=7, admission_revision=saved.admission.admission_revision,
+            reviewer_identity="human:reviewer-1", decision="approved", reason="fixture",
+            provenance_digest="a" * 64, now=11.0,
+        )
+        assert not await repository.record_human_admission(
+            admission_id="human-admission-2", candidate_id="candidate-1",
+            candidate_revision=7, admission_revision=saved.admission.admission_revision,
+            reviewer_identity="human:reviewer-2", decision="approved", reason="duplicate",
+            provenance_digest="a" * 64, now=12.0,
+        )
+        with sqlite3.connect(path) as db:
+            with pytest.raises(sqlite3.IntegrityError):
+                db.execute("UPDATE learning_human_admission SET reason='tampered'")
+            with pytest.raises(sqlite3.IntegrityError):
+                db.execute("DELETE FROM learning_human_admission")
+            db.rollback()
+
+    asyncio.run(run())
+
+
+def test_human_admission_rejects_revision_and_provenance_drift(tmp_path: Path):
+    async def run() -> None:
+        path = tmp_path / "human-admission-contract.db"
+        _database(path)
+        _candidate(path)
+        repository = AdmissionRepository(path)
+        saved = await repository.save_evaluation(
+            candidate_id="candidate-1", candidate_revision=7,
+            review_decision_ids=("review-quorum:fixture",), pre_index_eligible=True,
+            blocked_reason="vector_identity_unverified", blocked_stage="index_identity",
+            blocked_kind="vector_identity_unverified", provenance_digest="b" * 64, now=10.0,
+        )
+        assert saved.admission is not None
+        kwargs = dict(
+            admission_id="human-admission-1", candidate_id="candidate-1",
+            candidate_revision=7, admission_revision=saved.admission.admission_revision,
+            reviewer_identity="human:reviewer-1", decision="approved", reason="fixture",
+            provenance_digest="b" * 64, now=11.0,
+        )
+        assert await repository.record_human_admission(**{**kwargs, "admission_revision": 99}) is False
+        assert await repository.record_human_admission(**{**kwargs, "provenance_digest": "c" * 64}) is False
+        assert await repository.record_human_admission(**{**kwargs, "reviewer_identity": "model:reviewer"}) is False
+
+    asyncio.run(run())

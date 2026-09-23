@@ -995,7 +995,11 @@ class LearningReviewRepository:
                 expected_revision=candidate_revision,
                 pair_order="quorum",
                 order_invariant=True,
-                diagnostics={"source_decision_count": len(quorum.decision_ids), "order_invariant": True},
+                diagnostics={
+                    "source_decision_count": len(quorum.decision_ids),
+                    "reviewer_ids": list(quorum.reviewer_ids),
+                    "order_invariant": True,
+                },
                 created_at=created_at,
             )
             try:

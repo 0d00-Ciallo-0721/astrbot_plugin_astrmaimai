@@ -15,6 +15,8 @@ from ..contracts.memory_query import MemoryQuery
 from ..contracts.learning_retrieval import LearningFocusContext, LearningTurnCorrelation
 from ..contracts.retrieval_trace import RetrievalTrace
 from .learning_retrieval_events import LearningRetrievalEventWriter
+from ...learning.release.flags import ReleaseCheckpoint
+from ...learning.release.runtime_gate import runtime_gate_check
 
 
 class ReActRetriever:
@@ -164,7 +166,9 @@ class ReActRetriever:
         if (
             event is None
             or writer is None
-            or not bool(getattr(evolution, "learning_retrieval_shadow_enabled", False))
+            or not runtime_gate_check(
+                evolution, ReleaseCheckpoint.RETRIEVAL
+            ).allowed
         ):
             return
         focus_context = (

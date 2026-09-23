@@ -4,6 +4,9 @@ import json
 import re
 from typing import Any
 
+from ..release.flags import ReleaseCheckpoint
+from ..release.runtime_gate import runtime_gate_check
+
 from astrbot.api import logger
 
 from ...infrastructure.gateway.json_utils import parse_json_payload
@@ -129,7 +132,7 @@ class ExpressionPatternEnricher:
             self.gateway, "call_data_process_task_result"
         ):
             evolution = getattr(self.config, "evolution", None)
-            if not bool(getattr(evolution, "learning_enrichment_enabled", False)):
+            if not runtime_gate_check(evolution, ReleaseCheckpoint.CLAIM).allowed:
                 raise RuntimeError("learning_enrichment_disabled")
             attempt = await self.provider_adapter.call(
                 task_name="learning.expression_enrichment",
@@ -236,7 +239,9 @@ class ExpressionPatternEnricher:
         if (
             self.provider_adapter is not None
             and hasattr(self.gateway, "call_data_process_task_result")
-            and not bool(getattr(evolution, "learning_enrichment_enabled", False))
+            and (
+                not runtime_gate_check(evolution, ReleaseCheckpoint.CLAIM).allowed
+            )
         ):
             self.last_result = ExpressionEnrichmentResult(
                 status="blocked",

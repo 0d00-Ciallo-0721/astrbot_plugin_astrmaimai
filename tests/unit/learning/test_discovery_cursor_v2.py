@@ -668,6 +668,44 @@ async def test_cursor_v2_branch_commits_discovery_and_never_runs_legacy_miner():
     assert commits[0]["reason"] == "discovery_durable_enrichment_pending"
 
 
+@pytest.mark.asyncio
+async def test_discovery_only_diagnostics_do_not_claim_enrichment_completed():
+    manager = EvolutionManager.__new__(EvolutionManager)
+    manager.config = SimpleNamespace(
+        evolution=SimpleNamespace(
+            expression_min_count=2,
+            learning_pipeline_timeout_sec=60.0,
+        )
+    )
+    manager.db = SimpleNamespace(memory_engine=None)
+    manager._last_mining_outcomes = {}
+    manager._mining_batch_id = lambda *_args, **_kwargs: "batch:diagnostic"
+    manager._pipeline_threshold = lambda _pipeline: 2
+
+    outcome = await manager._record_pipeline_state(
+        run_id="run:diagnostic",
+        pipeline="expression",
+        group_id="qq:group:42",
+        logs=_logs(),
+        batch_id="batch:diagnostic",
+        status="completed",
+        reason="discovery_durable_enrichment_pending",
+        cursor_before=10,
+        cursor_after=12,
+        retained_count=1,
+        report={
+            "candidate_count": 1,
+            "enrichment_status": "pending",
+        },
+        persist_run=False,
+    )
+
+    proof = outcome["report"]["terminal_proof"]
+    assert proof["persistence_complete"] is True
+    assert proof["cursor_commit_complete"] is True
+    assert proof["enrichment_complete"] is False
+
+
 @pytest.mark.parametrize(
     ("ledger_enabled", "cursor_v2_enabled", "worker_enabled", "provider_enabled", "ready"),
     [
