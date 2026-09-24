@@ -1473,19 +1473,19 @@
         "description": "允许学习资产进入最终提示词",
         "type": "bool",
         "default": false,
-        "hint": "默认关闭；Stage 10 本地 shadow 不允许用户可见注入。"
+        "hint": "默认关闭；第十阶段本地影子计算不允许注入用户可见内容。"
       },
       "learning_release_kill_switch": {
         "description": "学习灰度持久硬停止",
         "type": "bool",
         "default": false,
-        "hint": "触发后阻断 discovery、claim、admission、retrieval 和 send 检查点。"
+        "hint": "触发后阻断发现、声明、准入、检索和发送检查点。"
       },
       "learning_release_id": {
-        "description": "当前学习灰度 release 标识",
+        "description": "当前学习灰度发布标识",
         "type": "string",
         "default": "runtime",
-        "hint": "进入 staging 前必须与 release manifest 一致。"
+        "hint": "进入暂存阶段前必须与发布清单一致。"
       },
       "learning_release_kill_switch_path": {
         "description": "持久化学习硬停止状态文件",

@@ -34,12 +34,30 @@ def _frontend_paths() -> set[str]:
     return paths
 
 
+def _frontend_routes() -> set[tuple[str, str]]:
+    source = APP_JS.read_text(encoding="utf-8")
+    routes: set[tuple[str, str]] = set()
+    for match in re.finditer(r"api\.(get|post|put|delete)\(\s*([`\"'])(.*?)\2", source):
+        raw = match.group(3)
+        if raw.startswith("/"):
+            routes.add((match.group(1).upper(), _normalize(raw)))
+    return routes
+
+
 def _backend_paths() -> set[str]:
     source = PLUGIN_PAGES.read_text(encoding="utf-8")
     paths: set[str] = set()
     for match in re.finditer(r"\(\s*\"(GET|POST|PUT|DELETE)\"\s*,\s*\"(/[^\"]+)\"", source):
         paths.add(_normalize(match.group(2)))
     return paths
+
+
+def _backend_routes() -> set[tuple[str, str]]:
+    source = PLUGIN_PAGES.read_text(encoding="utf-8")
+    return {
+        (match.group(1), _normalize(match.group(2)))
+        for match in re.finditer(r"\(\s*\"(GET|POST|PUT|PATCH|DELETE)\"\s*,\s*\"(/[^\"]+)\"", source)
+    }
 
 
 class FrontendBackendContractTests(unittest.TestCase):
@@ -56,6 +74,16 @@ class FrontendBackendContractTests(unittest.TestCase):
             [],
             f"前端调用了未注册的后端路径（FE/BE 漂移）：{missing}",
         )
+
+    def test_every_frontend_call_uses_a_registered_http_method(self):
+        missing = sorted(_frontend_routes() - _backend_routes())
+        self.assertEqual(missing, [], f"前端 HTTP 方法与后端注册不一致：{missing}")
+
+    def test_plugin_page_backend_only_registers_bridge_methods(self):
+        unsupported = sorted(
+            route for route in _backend_routes() if route[0] not in {"GET", "POST"}
+        )
+        self.assertEqual(unsupported, [])
 
     def test_normalization_examples(self):
         self.assertEqual(_normalize("/memories/canonical/${segment(id)}"), "/memories/canonical/{p}")

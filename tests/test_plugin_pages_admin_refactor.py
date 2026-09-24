@@ -2,6 +2,7 @@
 from types import SimpleNamespace
 import asyncio
 import unittest
+from unittest.mock import patch
 
 
 class PluginPagesAdminRefactorTests(unittest.TestCase):
@@ -32,23 +33,22 @@ class PluginPagesAdminRefactorTests(unittest.TestCase):
         self.assertIn(f"{PLUGIN_API_PREFIX}/tools/policy", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/cognition/recent-decisions", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/cognition/recent-turns", paths)
-        self.assertIn(f"{PLUGIN_API_PREFIX}/cognition/chats/{{chat_id}}/turns", paths)
-        self.assertIn(f"{PLUGIN_API_PREFIX}/cognition/chats/{{chat_id}}/trace-events", paths)
+        self.assertIn(f"{PLUGIN_API_PREFIX}/cognition/chats/<chat_id>/turns", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/cognition/chats/<chat_id>/trace-events", paths)
-        self.assertIn(f"{PLUGIN_API_PREFIX}/cognition/chats/{{chat_id}}/unified-timeline", paths)
+        self.assertIn(f"{PLUGIN_API_PREFIX}/cognition/chats/<chat_id>/unified-timeline", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/cognition/observability/overview", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/cognition/observability/timeline", paths)
-        self.assertIn(f"{PLUGIN_API_PREFIX}/cognition/observability/chats/{{chat_id}}", paths)
+        self.assertIn(f"{PLUGIN_API_PREFIX}/cognition/observability/chats/<chat_id>", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/cognition/observability/errors", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/cognition/observability/search", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/cognition/scheduler/status", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/cognition/scheduler/due-selection", paths)
-        self.assertIn(f"{PLUGIN_API_PREFIX}/cognition/scheduler/chats/{{chat_id}}", paths)
+        self.assertIn(f"{PLUGIN_API_PREFIX}/cognition/scheduler/chats/<chat_id>", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/heartflow/chats", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/heartflow/impulses", paths)
-        self.assertIn(f"{PLUGIN_API_PREFIX}/heartflow/chats/{{chat_id}}/impulses", paths)
+        self.assertIn(f"{PLUGIN_API_PREFIX}/heartflow/chats/<chat_id>/impulses", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/heartflow/timeline", paths)
-        self.assertIn(f"{PLUGIN_API_PREFIX}/heartflow/chats/{{chat_id}}/timeline", paths)
+        self.assertIn(f"{PLUGIN_API_PREFIX}/heartflow/chats/<chat_id>/timeline", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/heartflow/topic-digests", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/proactive/intents", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/learning/status", paths)
@@ -57,11 +57,8 @@ class PluginPagesAdminRefactorTests(unittest.TestCase):
         self.assertIn(f"{PLUGIN_API_PREFIX}/tools/executions", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/tools/catalog", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/memories/jargon/cleanup/preview", paths)
-        self.assertIn(f"{PLUGIN_API_PREFIX}/reviews/{{id}}/submit", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/reviews/<id>/submit", paths)
-        self.assertIn(f"{PLUGIN_API_PREFIX}/memories/events/{{id}}", paths)
-        self.assertIn(f"{PLUGIN_API_PREFIX}/memories/events/<id>", paths)
-        self.assertIn(f"{PLUGIN_API_PREFIX}/users/{{user_id}}/slices/{{index}}", paths)
+        self.assertIn(f"{PLUGIN_API_PREFIX}/memories/events/<id>/delete", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/users/<user_id>/slices/<index>", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/persona/slices", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/persona/slices/update", paths)
@@ -72,24 +69,81 @@ class PluginPagesAdminRefactorTests(unittest.TestCase):
         self.assertFalse(any(path.startswith(f"{PLUGIN_API_PREFIX}/config") for path in paths))
 
         mutating = {(path, methods) for path, _, methods, _ in registered if methods != ("GET",)}
-        self.assertIn((f"{PLUGIN_API_PREFIX}/reviews/{{id}}/submit", ("POST",)), mutating)
         self.assertIn((f"{PLUGIN_API_PREFIX}/reviews/<id>/submit", ("POST",)), mutating)
-        self.assertIn((f"{PLUGIN_API_PREFIX}/reviews/{{id}}/delete", ("POST",)), mutating)
-        self.assertIn((f"{PLUGIN_API_PREFIX}/memories/events/{{id}}/delete", ("POST",)), mutating)
+        self.assertIn((f"{PLUGIN_API_PREFIX}/reviews/<id>/delete", ("POST",)), mutating)
         self.assertIn((f"{PLUGIN_API_PREFIX}/memories/events/<id>/delete", ("POST",)), mutating)
-        self.assertIn((f"{PLUGIN_API_PREFIX}/memories/reflections/{{date}}/delete", ("POST",)), mutating)
-        self.assertIn((f"{PLUGIN_API_PREFIX}/memories/nodes/{{id}}/delete", ("POST",)), mutating)
-        self.assertIn((f"{PLUGIN_API_PREFIX}/memories/jargon/{{id}}/delete", ("POST",)), mutating)
+        self.assertIn((f"{PLUGIN_API_PREFIX}/memories/reflections/<date>/delete", ("POST",)), mutating)
+        self.assertIn((f"{PLUGIN_API_PREFIX}/memories/nodes/<id>/delete", ("POST",)), mutating)
+        self.assertIn((f"{PLUGIN_API_PREFIX}/memories/jargon/<id>/delete", ("POST",)), mutating)
         self.assertIn((f"{PLUGIN_API_PREFIX}/memories/jargon/cleanup/apply", ("POST",)), mutating)
-        self.assertIn((f"{PLUGIN_API_PREFIX}/users/{{user_id}}", ("POST",)), mutating)
-        self.assertIn((f"{PLUGIN_API_PREFIX}/users/{{user_id}}/delete", ("POST",)), mutating)
-        self.assertIn((f"{PLUGIN_API_PREFIX}/users/{{user_id}}/slices/{{index}}/delete", ("POST",)), mutating)
+        self.assertIn((f"{PLUGIN_API_PREFIX}/users/<user_id>", ("POST",)), mutating)
+        self.assertIn((f"{PLUGIN_API_PREFIX}/users/<user_id>/delete", ("POST",)), mutating)
         self.assertIn((f"{PLUGIN_API_PREFIX}/users/<user_id>/slices/<index>/delete", ("POST",)), mutating)
         self.assertIn((f"{PLUGIN_API_PREFIX}/persona/slices/update", ("POST",)), mutating)
         self.assertIn((f"{PLUGIN_API_PREFIX}/persona/slices/restore", ("POST",)), mutating)
         self.assertIn((f"{PLUGIN_API_PREFIX}/persona/slices/regenerate", ("POST",)), mutating)
         self.assertIn((f"{PLUGIN_API_PREFIX}/learning/expression-backfill", ("POST",)), mutating)
         self.assertNotIn((f"{PLUGIN_API_PREFIX}/persona/save", ("POST",)), mutating)
+        self.assertTrue(
+            all(methods[0] in {"GET", "POST"} for _, _, methods, _ in registered),
+            "AstrBot Plugin Page bridge only supports GET/POST",
+        )
+
+    def test_plugin_request_proxy_forwards_query_path_and_json(self):
+        from astrmai.webui import plugin_pages
+
+        class _Query:
+            def items(self):
+                return [("limit", "25"), ("cursor", "abc")]
+
+        class _Request:
+            query = _Query()
+            path_params = {"item_id": "item-7"}
+
+            async def body(self):
+                return b'{"enabled": true}'
+
+            async def json(self, default=None):
+                return {"enabled": True}
+
+        with patch.object(plugin_pages, "astrbot_request", _Request()):
+            request = plugin_pages._make_page_request({"item_id": "item-7"})
+            self.assertEqual(request.query_params, {"limit": "25", "cursor": "abc"})
+            self.assertEqual(request.path_params, {"item_id": "item-7"})
+            self.assertEqual(asyncio.run(plugin_pages.AstrMaiAdminPageApi._body(request)), {"enabled": True})
+
+    def test_invalid_plugin_json_returns_error_instead_of_empty_body(self):
+        from astrmai.webui import plugin_pages
+
+        class _Request:
+            query = {}
+            path_params = {}
+
+            async def body(self):
+                return b"not-json"
+
+            async def json(self, default=None):
+                return default
+
+        async def _handler(request):
+            await plugin_pages.AstrMaiAdminPageApi._body(request)
+            return {"status": "ok"}
+
+        with patch.object(plugin_pages, "astrbot_request", _Request()):
+            response = asyncio.run(plugin_pages._page_handler(_handler)())
+        self.assertEqual(response["status"], "error")
+        self.assertIn("合法 JSON", response["message"])
+
+    def test_empty_plugin_body_returns_explicit_error(self):
+        from astrmai.webui import plugin_pages
+
+        request = SimpleNamespace(
+            body=lambda: b"",
+            json=lambda default=None: default,
+        )
+
+        with self.assertRaisesRegex(ValueError, "不能为空"):
+            asyncio.run(plugin_pages.AstrMaiAdminPageApi._body(request))
 
     def test_registered_plugin_page_handlers_accept_astrbot_path_kwargs(self):
         from astrmai.webui.plugin_pages import PLUGIN_API_PREFIX, register_astrmai_admin_pages

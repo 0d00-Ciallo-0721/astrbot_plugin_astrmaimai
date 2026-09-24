@@ -338,9 +338,6 @@ async function readyBridge(bridge) {
   if (typeof bridge.ready === "function") {
     return bridge.ready();
   }
-  if (typeof bridge.initialize === "function") {
-    return bridge.initialize();
-  }
   return bridge.getContext ? bridge.getContext() : {};
 }
 

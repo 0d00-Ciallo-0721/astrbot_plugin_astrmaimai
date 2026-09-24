@@ -135,6 +135,35 @@ class MessageEntryGapCoverageTests(unittest.TestCase):
         ), patch.object(self.entry_mod, "is_direct_call_event", return_value=False):
             return asyncio.run(_run())
 
+    def _collect_then_run_downstream(self, facade, event):
+        result = self._collect(facade, event)
+        downstream_calls = []
+        if not event.stopped:
+            downstream_calls.append("other_plugin")
+        return result, downstream_calls
+
+    def test_two_handler_fixture_only_blocks_after_astrmai_handles_event(self):
+        not_ready_facade = _Facade()
+        not_ready_facade.is_runtime_ready = lambda: False
+        group_event = _Event(group_id="group-1")
+
+        result, downstream = self._collect_then_run_downstream(not_ready_facade, group_event)
+
+        self.assertEqual(result, [])
+        self.assertEqual(downstream, ["other_plugin"])
+
+        poke_facade = _Facade()
+        poke_facade.handle_poke = lambda _event: asyncio.sleep(
+            0,
+            result=self.entry_mod.IngressDecision.stop("poke_event"),
+        )
+        poke_event = _Event()
+
+        result, downstream = self._collect_then_run_downstream(poke_facade, poke_event)
+
+        self.assertEqual(result, [])
+        self.assertEqual(downstream, [])
+
     def test_group_reread_stops_before_attention(self):
         facade = _Facade()
 
@@ -189,7 +218,7 @@ class MessageEntryGapCoverageTests(unittest.TestCase):
 
         self.assertEqual(recorded, [])
 
-    def test_duplicate_message_stops_event_before_facade_guards(self):
+    def test_duplicate_message_skips_astrmai_without_stopping_other_plugins(self):
         facade = _Facade()
         event = _Event()
 
@@ -205,15 +234,15 @@ class MessageEntryGapCoverageTests(unittest.TestCase):
                 ]
 
         self.assertEqual(asyncio.run(_run()), [])
-        self.assertTrue(event.stopped)
+        self.assertFalse(event.stopped)
         self.assertEqual(facade.calls, [])
 
-    def test_self_message_stops_before_poke_handling(self):
+    def test_self_message_skips_astrmai_without_stopping_other_plugins(self):
         facade = _Facade()
         event = _Event(sender_id="bot-1", self_id="bot-1")
 
         self.assertEqual(self._collect(facade, event), [])
-        self.assertTrue(event.stopped)
+        self.assertFalse(event.stopped)
         self.assertEqual(facade.calls, [])
 
     def test_runtime_persona_gate_blocks_private_message_before_attention(self):
@@ -228,7 +257,7 @@ class MessageEntryGapCoverageTests(unittest.TestCase):
         self.assertTrue(event.stopped)
         self.assertNotIn("attention", facade.calls)
 
-    def test_runtime_persona_gate_silently_blocks_ordinary_group_message(self):
+    def test_runtime_persona_gate_leaves_ordinary_group_message_available(self):
         facade = _Facade()
         facade.is_runtime_ready = lambda: False
         event = _Event(group_id="group-1")
@@ -236,7 +265,7 @@ class MessageEntryGapCoverageTests(unittest.TestCase):
         result = self._collect(facade, event)
 
         self.assertEqual(result, [])
-        self.assertTrue(event.stopped)
+        self.assertFalse(event.stopped)
         self.assertNotIn("attention", facade.calls)
 
     def test_framework_command_exception_is_caught_and_processing_continues(self):
@@ -334,14 +363,14 @@ class MessageEntryGapCoverageTests(unittest.TestCase):
         self.assertTrue(event.get_extra("prepared_by_facade", False))
         self.assertIsNone(event.get_extra("astrmai_turn_identity"))
 
-    def test_non_conversational_message_stops_before_group_wait(self):
+    def test_non_conversational_message_skips_astrmai_without_stopping_other_plugins(self):
         facade = _Facade()
         event = _Event(text="[AMTEST] status")
         event.set_extra("astrmai_non_conversational", True)
 
         self.assertEqual(self._collect(facade, event), [])
 
-        self.assertTrue(event.stopped)
+        self.assertFalse(event.stopped)
         self.assertIsNone(event.get_extra("astrmai_turn_identity"))
         self.assertNotIn("group_wait", facade.calls)
         self.assertNotIn("attention", facade.calls)
@@ -456,7 +485,7 @@ class MessageEntryGapCoverageTests(unittest.TestCase):
         facade.check_message_scope_access = _raise
 
         self.assertEqual(self._collect(facade, event), [])
-        self.assertTrue(event.stopped)
+        self.assertFalse(event.stopped)
         self.assertNotIn("group_wait", facade.calls)
 
     def test_group_wait_exception_yields_error_and_stops_event(self):

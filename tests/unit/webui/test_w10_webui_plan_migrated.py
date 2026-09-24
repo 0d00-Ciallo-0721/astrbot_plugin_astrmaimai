@@ -165,8 +165,8 @@ class W10WebuiPlanMigratedTests(unittest.TestCase):
                 registered.append((path, tuple(methods)))
 
         plugin_pages_mod.register_astrmai_admin_pages(_Context(), SimpleNamespace(runtime=None))
-        self.assertIn((f"{plugin_pages_mod.PLUGIN_API_PREFIX}/memory-feedback/{{feedback_id}}/disable", ("POST",)), registered)
-        self.assertNotIn((f"{plugin_pages_mod.PLUGIN_API_PREFIX}/memory-feedback/{{feedback_id}}", ("DELETE",)), registered)
+        self.assertIn((f"{plugin_pages_mod.PLUGIN_API_PREFIX}/memory-feedback/<feedback_id>/disable", ("POST",)), registered)
+        self.assertNotIn((f"{plugin_pages_mod.PLUGIN_API_PREFIX}/memory-feedback/<feedback_id>", ("DELETE",)), registered)
 
     def test_chat_runtime_service_no_longer_delegates_to_admin_ui_service(self):
         repo_root = Path(__file__).resolve().parents[3]

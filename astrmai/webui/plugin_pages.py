@@ -8,10 +8,12 @@ from typing import Any, Awaitable, Callable
 
 from astrbot.api import logger
 
-try:  # pragma: no cover - Quart is supplied by AstrBot at runtime.
-    from quart import request as quart_request
-except Exception:  # pragma: no cover
-    quart_request = None
+try:  # AstrBot >= 4.26.4 Plugin Page request proxy.
+    from astrbot.api.web import error_response as astrbot_error_response
+    from astrbot.api.web import request as astrbot_request
+except Exception:  # pragma: no cover - permits tests on older development hosts.
+    astrbot_error_response = None
+    astrbot_request = None
 
 from .backend.adapters.plugin_api import PluginApiAdapter, set_active_facade
 from .backend.db import get_db
@@ -24,6 +26,11 @@ from .backend.services.user_ui_service import UserUiService
 
 
 PLUGIN_API_PREFIX = "/astrmai/admin"
+_MISSING_JSON = object()
+
+
+class _InvalidPageRequest(ValueError):
+    """Raised when a Page request contains malformed JSON."""
 
 
 def _maybe_await(value: Any) -> Awaitable[Any]:
@@ -36,20 +43,37 @@ def _maybe_await(value: Any) -> Awaitable[Any]:
     return _wrap()
 
 
+def _mapping_to_dict(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    try:
+        return dict(value)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return {str(key): item for key, item in value.items()}
+    except (AttributeError, TypeError, ValueError):
+        return {}
+
+
 def _make_page_request(path_params: dict[str, Any] | None = None) -> Any:
     query_params: dict[str, Any] = {}
     request_obj = None
-    if quart_request is not None:
+    if astrbot_request is not None:
         try:
-            query_params = dict(getattr(quart_request, "args", {}) or {})
-            request_obj = quart_request
+            request_obj = astrbot_request
+            query_params = _mapping_to_dict(getattr(astrbot_request, "query", None))
         except Exception:
-            query_params = {}
             request_obj = None
+            query_params = {}
     return SimpleNamespace(
-        path_params=dict(path_params or {}),
+        path_params=dict(path_params or getattr(request_obj, "path_params", {}) or {}),
         query_params=query_params,
-        json=(request_obj.get_json if request_obj is not None and hasattr(request_obj, "get_json") else None),
+        json=(
+            getattr(request_obj, "json", None)
+            if request_obj is not None and hasattr(request_obj, "json") else None
+        ),
+        body=(getattr(request_obj, "body", None) if request_obj is not None else None),
     )
 
 
@@ -65,7 +89,13 @@ def _json_safe(value: Any) -> Any:
 
 def _page_handler(handler: Callable[[Any], Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
     async def _wrapped(*_args: Any, **path_values: Any) -> Any:
-        return _json_safe(await handler(_make_page_request(path_values)))
+        try:
+            result = await handler(_make_page_request(path_values))
+        except _InvalidPageRequest as exc:
+            if astrbot_error_response is not None:
+                return astrbot_error_response(str(exc), status_code=400)
+            return {"status": "error", "message": str(exc), "data": {}}
+        return _json_safe(result)
 
     return _wrapped
 
@@ -100,12 +130,28 @@ class AstrMaiAdminPageApi:
             return dict(request)
         json_method = getattr(request, "json", None)
         if callable(json_method):
+            body_method = getattr(request, "body", None)
             try:
-                data = await _maybe_await(json_method())
-                return data if isinstance(data, dict) else {}
+                if callable(body_method):
+                    raw_body = await _maybe_await(body_method())
+                    if isinstance(raw_body, (bytes, bytearray)) and not raw_body.strip():
+                        raise _InvalidPageRequest("请求体不能为空")
+                try:
+                    data = await _maybe_await(json_method(_MISSING_JSON))
+                except TypeError:
+                    data = await _maybe_await(json_method())
+                if data is _MISSING_JSON:
+                    raise _InvalidPageRequest("请求体必须是合法 JSON 对象")
+                if data is None:
+                    raise _InvalidPageRequest("请求体必须是 JSON 对象")
+                if not isinstance(data, dict):
+                    raise _InvalidPageRequest("请求体必须是 JSON 对象")
+                return data
+            except _InvalidPageRequest:
+                raise
             except Exception as exc:
                 logger.warning(f"[AstrMai] _body parse failed: {exc}")
-                return {}
+                raise _InvalidPageRequest("请求体必须是合法 JSON 对象") from exc
         return {}
 
     @staticmethod
@@ -708,7 +754,6 @@ def register_astrmai_admin_pages(context: Any, facade: Any) -> None:
         ("POST", "/memories/canonical/{memory_id}/stale", api.stale_canonical_memory, "AstrMai mark canonical memory stale"),
         ("POST", "/memories/canonical/{memory_id}/merge", api.merge_canonical_memory, "AstrMai merge canonical memory"),
         ("POST", "/memories/canonical/{memory_id}/delete", api.delete_canonical_memory, "AstrMai soft delete canonical memory"),
-        ("DELETE", "/memories/canonical/{memory_id}", api.delete_canonical_memory, "AstrMai soft delete canonical memory"),
         ("GET", "/memories/diagnostics/migrations", api.memory_migration_report, "AstrMai memory migration report"),
         ("POST", "/memories/migration/dry-run", api.memory_migration_dry_run, "AstrMai memory migration dry run"),
         ("POST", "/memories/migration/execute", api.memory_migration_execute, "AstrMai memory migration execute"),
@@ -784,23 +829,18 @@ def register_astrmai_admin_pages(context: Any, facade: Any) -> None:
         ("POST", "/reviews/batch", api.batch_review, "AstrMai batch review"),
         ("POST", "/reviews", api.create_review, "AstrMai create review"),
         ("POST", "/reviews/{id}", api.update_review, "AstrMai update review"),
-        ("PUT", "/reviews/{id}", api.update_review, "AstrMai update review"),
         ("POST", "/reviews/{id}/delete", api.delete_review, "AstrMai delete review"),
-        ("DELETE", "/reviews/{id}", api.delete_review, "AstrMai delete review"),
         ("GET", "/memories/events", api.list_memory_events, "AstrMai memory events"),
         ("POST", "/memories/events", api.create_memory_event, "AstrMai create memory event"),
         ("POST", "/memories/events/{id}/delete", api.delete_memory_event, "AstrMai delete memory event"),
-        ("DELETE", "/memories/events/{id}", api.delete_memory_event, "AstrMai delete memory event"),
         ("GET", "/memories/reflections", api.list_reflections, "AstrMai memory reflections"),
         ("POST", "/memories/reflections", api.create_reflection, "AstrMai create reflection"),
-        ("PUT", "/memories/reflections/{date}", api.update_reflection, "AstrMai update reflection"),
+        ("POST", "/memories/reflections/{date}", api.update_reflection, "AstrMai update reflection"),
         ("POST", "/memories/reflections/{date}/delete", api.delete_reflection, "AstrMai delete reflection"),
-        ("DELETE", "/memories/reflections/{date}", api.delete_reflection, "AstrMai delete reflection"),
         ("GET", "/memories/nodes", api.list_nodes, "AstrMai memory nodes"),
         ("POST", "/memories/nodes", api.create_node, "AstrMai create memory node"),
-        ("PUT", "/memories/nodes/{id}", api.update_node, "AstrMai update memory node"),
+        ("POST", "/memories/nodes/{id}", api.update_node, "AstrMai update memory node"),
         ("POST", "/memories/nodes/{id}/delete", api.delete_node, "AstrMai delete memory node"),
-        ("DELETE", "/memories/nodes/{id}", api.delete_node, "AstrMai delete memory node"),
         ("GET", "/memories/jargon", api.list_jargon, "AstrMai jargon list"),
         ("GET", "/memories/jargon/cleanup/preview", api.jargon_cleanup_preview, "AstrMai jargon cleanup preview"),
         ("POST", "/memories/jargon/cleanup/apply", api.apply_jargon_cleanup, "AstrMai apply jargon cleanup"),
@@ -808,18 +848,13 @@ def register_astrmai_admin_pages(context: Any, facade: Any) -> None:
         ("POST", "/memories/jargon/{id}/approve", api.approve_jargon, "AstrMai approve jargon"),
         ("POST", "/memories/jargon/{id}/reject", api.reject_jargon, "AstrMai reject jargon"),
         ("POST", "/memories/jargon/{id}", api.update_jargon, "AstrMai update jargon"),
-        ("PUT", "/memories/jargon/{id}", api.update_jargon, "AstrMai update jargon"),
         ("POST", "/memories/jargon/{id}/delete", api.delete_jargon, "AstrMai delete jargon"),
-        ("DELETE", "/memories/jargon/{id}", api.delete_jargon, "AstrMai delete jargon"),
         ("GET", "/users", api.users, "AstrMai users"),
         ("GET", "/users/{user_id}", api.user, "AstrMai user detail"),
         ("POST", "/users/{user_id}", api.update_user, "AstrMai update user"),
-        ("PATCH", "/users/{user_id}", api.update_user, "AstrMai update user"),
         ("POST", "/users/{user_id}/delete", api.delete_user, "AstrMai delete user"),
-        ("DELETE", "/users/{user_id}", api.delete_user, "AstrMai delete user"),
         ("POST", "/users/{user_id}/slices", api.add_user_slice, "AstrMai add user slice"),
-        ("PUT", "/users/{user_id}/slices/{index}", api.update_user_slice, "AstrMai update user slice"),
-        ("DELETE", "/users/{user_id}/slices/{index}", api.delete_user_slice, "AstrMai delete user slice"),
+        ("POST", "/users/{user_id}/slices/{index}", api.update_user_slice, "AstrMai update user slice"),
         ("POST", "/users/{user_id}/slices/{index}/delete", api.delete_user_slice_post, "AstrMai delete user slice"),
         ("GET", "/persona/slices", api.persona_slices, "AstrMai persona slices"),
         ("POST", "/persona/slices/update", api.update_persona_slices, "AstrMai update derived persona slices"),
@@ -830,13 +865,13 @@ def register_astrmai_admin_pages(context: Any, facade: Any) -> None:
 
     registered: set[tuple[str, str]] = set()
     for method, path, handler, description in routes:
-        for route_path in dict.fromkeys((path, _werkzeug_path_alias(path))):
-            full_path = f"{PLUGIN_API_PREFIX}{route_path}"
-            key = (method, full_path)
-            if key in registered:
-                continue
-            registered.add(key)
-            context.register_web_api(full_path, _page_handler(handler), [method], description)
+        route_path = _werkzeug_path_alias(path)
+        full_path = f"{PLUGIN_API_PREFIX}{route_path}"
+        key = (method, full_path)
+        if key in registered:
+            continue
+        registered.add(key)
+        context.register_web_api(full_path, _page_handler(handler), [method], description)
 
 
 __all__ = ["AstrMaiAdminPageApi", "PLUGIN_API_PREFIX", "register_astrmai_admin_pages"]

@@ -72,9 +72,52 @@ class BackgroundTaskOwnerRegistry:
         }
     )
 
-    def __init__(self, *, generation: int = 0) -> None:
+    def __init__(
+        self,
+        *,
+        generation: int = 0,
+        max_terminal_records: int = 256,
+        terminal_ttl_sec: float | None = 3600.0,
+        clock: Any = time.time,
+    ) -> None:
         self.generation = int(generation or 0)
+        self.max_terminal_records = max(0, int(max_terminal_records))
+        self.terminal_ttl_sec = (
+            None
+            if terminal_ttl_sec is None
+            else max(0.0, float(terminal_ttl_sec))
+        )
+        self._clock = clock if callable(clock) else time.time
         self._records: dict[str, TaskOwnerRecord] = {}
+
+    def _now(self) -> float:
+        try:
+            return float(self._clock())
+        except (TypeError, ValueError):
+            return time.time()
+
+    def _prune_terminal_history(self) -> None:
+        terminal = [
+            record
+            for record in self._records.values()
+            if record.status in self.TERMINAL_STATUSES
+        ]
+        if self.terminal_ttl_sec is not None:
+            cutoff = self._now() - self.terminal_ttl_sec
+            for record in terminal:
+                finished_at = record.finished_at or record.created_at
+                if finished_at <= cutoff:
+                    self._records.pop(record.task_id, None)
+            terminal = [
+                record
+                for record in terminal
+                if record.task_id in self._records
+            ]
+        if len(terminal) <= self.max_terminal_records:
+            return
+        terminal.sort(key=lambda record: (record.finished_at or record.created_at, record.task_id))
+        for record in terminal[: len(terminal) - self.max_terminal_records]:
+            self._records.pop(record.task_id, None)
 
     def set_generation(self, generation: int) -> None:
         """Update the generation used for subsequently registered tasks."""
@@ -185,6 +228,7 @@ class BackgroundTaskOwnerRegistry:
             generation=self.generation if generation is None else int(generation),
             cancel_status=self._normalize(cancel_status, "cancelled"),
             status=self._normalize(status, "queued"),
+            created_at=self._now(),
             task=task,
         )
         self._records[task_id] = record
@@ -210,7 +254,7 @@ class BackgroundTaskOwnerRegistry:
         error: str = "",
     ) -> str:
         task_id = f"owner_{uuid.uuid4().hex[:20]}"
-        now = time.time()
+        now = self._now()
         record = TaskOwnerRecord(
             task_id=task_id,
             task_family=self._normalize(task_family, "unknown"),
@@ -225,6 +269,7 @@ class BackgroundTaskOwnerRegistry:
             error=error,
         )
         self._records[task_id] = record
+        self._prune_terminal_history()
         return task_id
 
     def mark_started(self, task_id: str) -> bool:
@@ -255,7 +300,8 @@ class BackgroundTaskOwnerRegistry:
         if error_type:
             record.error_type = str(error_type)[:120]
         if normalized in self.TERMINAL_STATUSES and not record.finished_at:
-            record.finished_at = time.time()
+            record.finished_at = self._now()
+            self._prune_terminal_history()
         return True
 
     def _settle(self, task_id: str, task: asyncio.Task[Any]) -> None:
@@ -278,13 +324,15 @@ class BackgroundTaskOwnerRegistry:
                 record.status = "succeeded"
         if not record.started_at:
             record.started_at = record.created_at
-        record.finished_at = record.finished_at or time.time()
+        record.finished_at = record.finished_at or self._now()
         record.task = task
+        self._prune_terminal_history()
 
     def forget(self, task_id: str) -> bool:
         return self._records.pop(str(task_id or ""), None) is not None
 
     def records(self, *, include_terminal: bool = True) -> list[TaskOwnerRecord]:
+        self._prune_terminal_history()
         values = list(self._records.values())
         if include_terminal:
             return values
@@ -300,6 +348,11 @@ class BackgroundTaskOwnerRegistry:
         return {
             "total": len(records),
             "active": sum(1 for record in records if record.status not in self.TERMINAL_STATUSES),
+            "terminal_count": sum(1 for record in records if record.status in self.TERMINAL_STATUSES),
+            "retention": {
+                "max_terminal_records": self.max_terminal_records,
+                "terminal_ttl_sec": self.terminal_ttl_sec,
+            },
             "by_status": by_status,
             "by_task_family": by_family,
             "tasks": [record.as_dict() for record in records],

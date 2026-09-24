@@ -45,6 +45,45 @@ def _optional_filter_hook(name: str):
     return _identity
 
 
+def _llm_response_diagnostics(event: Any, response: Any) -> dict[str, Any]:
+    """Return stable, non-content identifiers for an LLM response log line."""
+    completion = str(getattr(response, "completion_text", "") or "")
+    trace: dict[str, Any] = {}
+    getter = getattr(event, "get_extra", None)
+    if callable(getter):
+        try:
+            raw_trace = getter("astrmai_request_trace")
+            if isinstance(raw_trace, dict):
+                trace = raw_trace
+        except Exception:
+            trace = {}
+    provider_id = (
+        getattr(response, "provider_id", None)
+        or getattr(response, "chat_provider_id", None)
+        or trace.get("provider_id")
+        or trace.get("chat_provider_id")
+        or ""
+    )
+    turn_id = (
+        getattr(response, "turn_id", None)
+        or getattr(response, "request_id", None)
+        or trace.get("turn_id")
+        or trace.get("request_id")
+        or ""
+    )
+    generation = getattr(response, "generation", None)
+    if generation is None:
+        generation = trace.get("generation")
+    return {
+        "chat_id": str(getattr(event, "unified_msg_origin", "") or ""),
+        "provider_id": str(provider_id or ""),
+        "turn_id": str(turn_id or ""),
+        "generation": generation,
+        "completion_length": len(completion),
+        "completion_sha256": hashlib.sha256(completion.encode("utf-8")).hexdigest()[:16],
+    }
+
+
 @register(
     "astrmai",
     "Gemini Antigravity",
@@ -234,9 +273,8 @@ class AstrMaiPlugin(Star):
     @_optional_filter_hook("on_llm_response")
     async def on_llm_response(self, event: AstrMessageEvent, response: LLMResponse):
         try:
-            chat_id = event.unified_msg_origin
-            text_preview = str(response.completion_text or "")[:200]
-            logger.debug(f"[AstrMai] LLM response for {chat_id}: {text_preview}")
+            diagnostics = _llm_response_diagnostics(event, response)
+            logger.debug("[AstrMai] LLM response diagnostics: %s", diagnostics)
         except Exception:
             logger.debug("[AstrMai] on_llm_response hook failed", exc_info=True)
 

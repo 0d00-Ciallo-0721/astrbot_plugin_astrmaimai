@@ -258,14 +258,11 @@ async def handle_global_message(facade: RuntimeFacadeProtocol, event):
         concurrency_flags = resolve_conversation_concurrency_flags(None)
 
     if check_message_dedup(event).should_stop:
-        debug_trace(event, "ingress.stop", reason="duplicate_message")
-        event.stop_event()
+        debug_trace(event, "ingress.skip", reason="duplicate_message")
         return
 
     if scope.sender_id == scope.self_id:
-        debug_trace(event, "ingress.stop", reason="self_message")
-        if hasattr(event, "stop_event"):
-            event.stop_event()
+        debug_trace(event, "ingress.skip", reason="self_message")
         return
 
     try:
@@ -284,7 +281,6 @@ async def handle_global_message(facade: RuntimeFacadeProtocol, event):
             return
     except Exception:
         logger.exception("[AstrMai] check_message_scope_access failed — denying by default")
-        event.stop_event()
         return
 
     readiness_check = getattr(facade, "is_runtime_ready", None)
@@ -297,8 +293,9 @@ async def handle_global_message(facade: RuntimeFacadeProtocol, event):
             message_getter = getattr(facade, "get_runtime_startup_message", None)
             message = message_getter() if callable(message_getter) else "人格正在初始化，请稍后再试。"
             yield event.plain_result(message)
-        debug_trace(event, "ingress.stop", reason="runtime_not_ready")
-        event.stop_event()
+        debug_trace(event, "ingress.skip", reason="runtime_not_ready")
+        if direct_call:
+            event.stop_event()
         return
 
     if (
@@ -319,8 +316,7 @@ async def handle_global_message(facade: RuntimeFacadeProtocol, event):
                 await coordinator.record_concurrency_event("non_conversational_blocked")
         except Exception:
             logger.debug("[AstrMai] non-conversational metric degraded", exc_info=True)
-        debug_trace(event, "ingress.stop", reason="non_conversational")
-        event.stop_event()
+        debug_trace(event, "ingress.skip", reason="non_conversational")
         return
 
     debug_trace(event, "ingress.enter", chat_id=scope.chat_id, sender_id=scope.sender_id, preview=preview_text(msg_str, 80))
