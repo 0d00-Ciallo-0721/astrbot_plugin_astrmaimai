@@ -1,5 +1,6 @@
 import json
 from datetime import datetime
+from importlib import import_module
 from typing import Any
 
 from pydantic.dataclasses import dataclass
@@ -11,17 +12,54 @@ from astrbot.core.astr_agent_context import AstrAgentContext
 
 from .base_agent import AstrMaiBaseSubAgent
 
-try:
-    from astrbot.core.tools.cron_tools import (
-        CREATE_CRON_JOB_TOOL,
-        DELETE_CRON_JOB_TOOL,
-        LIST_CRON_JOBS_TOOL,
+_CRON_TOOLS_CACHE: tuple[Any, ...] | None = None
+
+
+def _load_cron_tools() -> tuple[tuple[Any, ...], str | None]:
+    global _CRON_TOOLS_CACHE
+    if _CRON_TOOLS_CACHE is not None:
+        return _CRON_TOOLS_CACHE, None
+
+    try:
+        cron_tools = import_module("astrbot.core.tools.cron_tools")
+    except Exception as exc:
+        reason = f"当前宿主未提供可识别的 Cron 工具接口：无法加载 cron_tools（{exc}）"
+        logger.warning(f"[Sys3/CronAgent] {reason}")
+        return (), reason
+
+    future_task_tool = getattr(cron_tools, "FutureTaskTool", None)
+    future_task_error = None
+    if future_task_tool is not None:
+        try:
+            tool = future_task_tool()
+        except Exception as exc:
+            future_task_error = f"FutureTaskTool 初始化失败：{exc}"
+            logger.warning(f"[Sys3/CronAgent] {future_task_error}，尝试旧版 CronTools")
+        else:
+            logger.info("[Sys3/CronAgent] 框架内置 FutureTaskTool 加载成功")
+            _CRON_TOOLS_CACHE = (tool,)
+            return _CRON_TOOLS_CACHE, None
+
+    legacy_names = (
+        "CREATE_CRON_JOB_TOOL",
+        "DELETE_CRON_JOB_TOOL",
+        "LIST_CRON_JOBS_TOOL",
     )
-    _CRON_TOOLS_AVAILABLE = True
-    logger.info("[Sys3/CronAgent] 框架内置 CronTools 加载成功")
-except ImportError:
-    _CRON_TOOLS_AVAILABLE = False
-    logger.warning("[Sys3/CronAgent] 框架内置 CronTools 不可用，Cron 功能降级")
+    legacy_tools = tuple(getattr(cron_tools, name, None) for name in legacy_names)
+    if all(tool is not None for tool in legacy_tools):
+        logger.info("[Sys3/CronAgent] 框架内置旧版 CronTools 加载成功")
+        _CRON_TOOLS_CACHE = legacy_tools
+        return _CRON_TOOLS_CACHE, None
+
+    missing = [name for name, tool in zip(legacy_names, legacy_tools) if tool is None]
+    details = ["当前宿主未提供可识别的 Cron 工具接口"]
+    if future_task_error:
+        details.append(future_task_error)
+    if missing:
+        details.append(f"旧版 CronTools 缺少导出：{', '.join(missing)}")
+    reason = "；".join(details)
+    logger.warning(f"[Sys3/CronAgent] {reason}")
+    return (), reason
 
 
 @dataclass
@@ -46,21 +84,19 @@ class CronAgent(AstrMaiBaseSubAgent):
             "1. 创建任务时，cron_expression 使用标准 5 段格式（分 时 日 月 周），如 '0 8 * * *' 表示每天 8 点\n"
             "2. 一次性任务使用 run_at 参数（ISO 8601 格式，含时区）并设 run_once=true\n"
             "3. note 字段必填，用自然语言描述任务内容\n"
-            "4. 任务创建成功后，用自然语言确认：时间、频率、具体内容三要素\n"
-            "5. 如果用户说的时间模糊（如‘等会儿’），礼貌地请求明确时间"
+            "4. 如果工具 schema 提供 action，必须选择 create/edit/delete/list 之一并按该 action 提供参数；"
+            "旧版独立工具则按工具名调用\n"
+            "5. 任务创建成功后，用自然语言确认：时间、频率、具体内容三要素\n"
+            "6. 如果用户说的时间模糊（如‘等会儿’），礼貌地请求明确时间"
         )
 
     async def get_tool_set(self, ctx, event) -> ToolSet:
-        if not _CRON_TOOLS_AVAILABLE:
-            return ToolSet([])
-        return ToolSet([
-            CREATE_CRON_JOB_TOOL,
-            DELETE_CRON_JOB_TOOL,
-            LIST_CRON_JOBS_TOOL,
-        ])
+        tools, _error = _load_cron_tools()
+        return ToolSet(list(tools))
 
     async def _get_decline_reason(self) -> str:
-        return "框架定时任务工具 (cron_tools) 未能成功加载，请检查 AstrBot 版本是否 >= v4.14.0"
+        _tools, error = _load_cron_tools()
+        return error or "当前宿主未提供可识别的 Cron 工具接口"
 
     @staticmethod
     def _parse_run_at(value: Any) -> datetime | None:
