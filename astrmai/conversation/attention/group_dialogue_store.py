@@ -137,6 +137,7 @@ class SocialFeedbackAggregate:
     last_updated_at: float
     response_count: int = 0
     unanswered_count: int = 0
+    consecutive_unanswered_count: int = 0
     followup_count: int = 0
     reaction_count: int = 0
     positive_count: int = 0
@@ -160,16 +161,23 @@ class SocialFeedbackAggregate:
         kind = str(record.feedback_kind or "").strip().lower()
         if kind in {"direct_quote", "direct_mention", "target_followup", "semantic_followup", "followup", "echo"}:
             self.response_count = min(self.MAX_COUNT, self.response_count + 1)
+            self.consecutive_unanswered_count = 0
             if kind != "echo":
                 self.followup_count = min(self.MAX_COUNT, self.followup_count + 1)
         elif kind == "reaction":
             self.response_count = min(self.MAX_COUNT, self.response_count + 1)
+            self.consecutive_unanswered_count = 0
             self.reaction_count = min(self.MAX_COUNT, self.reaction_count + 1)
         elif kind in {"explicit_positive", "direct_wakeup", "force_engage"}:
             self.response_count = min(self.MAX_COUNT, self.response_count + 1)
+            self.consecutive_unanswered_count = 0
             self.positive_count = min(self.MAX_COUNT, self.positive_count + 1)
         elif kind == "proactive_unanswered":
             self.unanswered_count = min(self.MAX_COUNT, self.unanswered_count + 1)
+            self.consecutive_unanswered_count = min(
+                self.MAX_COUNT,
+                self.consecutive_unanswered_count + 1,
+            )
         elif kind == "explicit_negative":
             self.negative_count = min(self.MAX_COUNT, self.negative_count + 1)
             self.suppression_until = max(
@@ -196,7 +204,10 @@ class SocialFeedbackAggregate:
         return {
             "actor_id": self.actor_id,
             "proactive_response_rate": round(self.response_count / max(1, total), 3),
-            "consecutive_unanswered_count": min(self.MAX_COUNT, self.unanswered_count),
+            "consecutive_unanswered_count": min(
+                self.MAX_COUNT,
+                self.consecutive_unanswered_count,
+            ),
             "recent_followup_strength": round(min(1.0, self.followup_count / self.MAX_COUNT) * decay, 3),
             "recent_reaction_strength": round(min(1.0, self.reaction_count / self.MAX_COUNT) * decay, 3),
             "explicit_negative_suppression": bool(self.suppression_until > now),

@@ -71,6 +71,28 @@ def test_observation_closed_is_neutral_after_reaction_or_followup():
     assert summary["recent_followup_strength"] > 0
 
 
+def test_unanswered_tail_resets_after_positive_feedback():
+    async def run(kinds):
+        store = GroupDialogueStore()
+        for index, kind in enumerate(kinds, start=1):
+            await store.record_bot_turn_feedback(
+                "chat-g",
+                observation_id=f"observation-{index}",
+                bot_turn_id=f"turn-{index}",
+                feedback_kind=kind,
+                status="impacted",
+                actor_id="user-a",
+                evidence_event_id=f"event-{index}",
+                feedback_at=float(index),
+            )
+        return await store.get_feedback_summary("chat-g", actor_id="user-a", now=4.0)
+
+    for positive_kind in ("followup", "reaction", "explicit_positive"):
+        summary = asyncio.run(run(("proactive_unanswered", positive_kind, "proactive_unanswered")))
+        assert summary["consecutive_unanswered_count"] == 1
+        assert summary["proactive_response_rate"] > 0
+
+
 def test_explicit_negative_is_local_and_expires():
     async def run():
         store = GroupDialogueStore()
@@ -313,20 +335,25 @@ def test_feedback_aggregate_rebuilds_after_snapshot_restore():
     async def run():
         with tempfile.TemporaryDirectory() as tmp:
             first = GroupDialogueStore(snapshot_dir=Path(tmp))
-            await first.record_bot_turn_feedback(
-                "chat-g",
-                observation_id="observation-1",
-                bot_turn_id="turn-1",
-                feedback_kind="followup",
-                status="impacted",
-                actor_id="user-a",
-                evidence_event_id="event-1",
-                feedback_at=time.time(),
-            )
+            for index, kind in enumerate(
+                ("proactive_unanswered", "followup", "proactive_unanswered"),
+                start=1,
+            ):
+                await first.record_bot_turn_feedback(
+                    "chat-g",
+                    observation_id=f"observation-{index}",
+                    bot_turn_id=f"turn-{index}",
+                    feedback_kind=kind,
+                    status="impacted",
+                    actor_id="user-a",
+                    evidence_event_id=f"event-{index}",
+                    feedback_at=time.time() + index,
+                )
             assert await first.persist_snapshot() is True
             second = GroupDialogueStore(snapshot_dir=Path(tmp))
             assert await second.restore_snapshot() == 1
             return await second.get_feedback_summary("chat-g", actor_id="user-a")
 
     summary = asyncio.run(run())
+    assert summary["consecutive_unanswered_count"] == 1
     assert summary["recent_followup_strength"] > 0
