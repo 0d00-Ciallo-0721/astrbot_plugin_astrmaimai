@@ -17,7 +17,10 @@ class VisibleReplyArtifact:
 
     @property
     def blocked(self) -> bool:
-        return not self.visible_text or bool(self.blocked_reason)
+        return (
+            not self.visible_text
+            and not bool(self.metadata.get("reply_form_action_only", False))
+        ) or bool(self.blocked_reason)
 
 
 @dataclass

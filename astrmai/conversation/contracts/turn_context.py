@@ -75,6 +75,9 @@ class CognitiveSnapshot:
     readonly_tools_allowed: bool = False
     readonly_tools_skip_reason: str = ""
     reply_need: str = ""
+    form: str = "answer"
+    social_admission: str = ""
+    social_signals: list[str] = field(default_factory=list)
     social_intent: str = ""
     action_tier: str = ""
     allowed_action_families: list[str] = field(default_factory=list)
@@ -239,6 +242,7 @@ class SideInputSnapshot:
 class ProactiveSnapshot:
     is_proactive: bool = False
     source: str = ""
+    intent: str = ""
     intent_id: str = ""
     reason: str = ""
     guidance_preview: str = ""
@@ -504,6 +508,9 @@ def build_turn_trace_summary(
             "readonly_tools_allowed": bool(cognitive.readonly_tools_allowed),
             "readonly_tools_skip_reason": cognitive.readonly_tools_skip_reason,
             "reply_need": cognitive.reply_need,
+            "form": cognitive.form,
+            "social_admission": cognitive.social_admission,
+            "social_signals": list(cognitive.social_signals or []),
             "social_intent": cognitive.social_intent,
             "action_tier": cognitive.action_tier,
             "allowed_action_families": list(cognitive.allowed_action_families or []),
@@ -696,6 +703,7 @@ def build_turn_trace_summary(
         "proactive": {
             "is_proactive": bool(turn_context.proactive.is_proactive),
             "source": turn_context.proactive.source,
+            "intent": turn_context.proactive.intent,
             "intent_id": turn_context.proactive.intent_id,
             "reason": _preview_text(turn_context.proactive.reason, 160),
             "guidance_preview": _preview_text(turn_context.proactive.guidance_preview, 160),

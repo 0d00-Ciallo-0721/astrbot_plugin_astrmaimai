@@ -203,6 +203,8 @@ class ProactiveTask:
             config=self.config,
             semaphore=self._bg_semaphore,
             dream_visible=False,
+            dispatcher=self.proactive_dispatcher,
+            state_engine=state_engine,
         )
         self.review_dispatcher = ReviewDispatcher(context, None)
         self.heartflow_manager = HeartflowManager(

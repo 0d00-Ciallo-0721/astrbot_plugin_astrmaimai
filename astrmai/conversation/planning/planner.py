@@ -13,6 +13,7 @@ from astrbot.api.event import AstrMessageEvent
 
 from ..contracts.dialog_history_policy import DialogHistoryPolicy
 from ..contracts.turn_context import build_turn_trace_summary, ensure_turn_context
+from ..contracts.turn_target import TurnTarget
 from ..contracts.turn_outcome import claim_completion_callback, settle_completion_callback
 from ..contracts.vision_candidate import VisionCandidate, load_vision_candidates
 from ..vision_state import (
@@ -1994,6 +1995,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         decision = event.get_extra("astrmai_proactive_dispatch_decision", None)
         proactive.is_proactive = True
         proactive.source = str(event.get_extra("astrmai_proactive_source", "") or "")
+        proactive.intent = str(event.get_extra("astrmai_proactive_intent", "") or "")
         proactive.intent_id = str(event.get_extra("astrmai_proactive_intent_id", "") or "")
         proactive.reason = str(event.get_extra("astrmai_proactive_reason", "") or "")
         proactive.guidance_preview = str(event.get_extra("astrmai_proactive_guidance", "") or "")[:240]
@@ -2042,6 +2044,10 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             proactive.cooldown_seconds = float(event.get_extra("astrmai_proactive_cooldown", 0.0) or 0.0)
         except (TypeError, ValueError):
             proactive.cooldown_seconds = 0.0
+        # An absent or rejected target remains an explicit empty target.
+        turn_context.attention.turn_target = TurnTarget.from_value(
+            event.get_extra("astrmai_proactive_target", None)
+        )
 
     @classmethod
     def _extract_group_social_candidates(cls, reply_text: str) -> list[tuple[str, str]]:
@@ -2615,7 +2621,23 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         think_decision = prepared["think_decision"]
         memory_feedback_summary = prepared["memory_feedback_summary"]
         cognitive_gate = prepared["cognitive_gate"]
-        if think_decision.level <= 0 and "group_non_direct" in think_decision.signals:
+        if not event.get_extra("astrmai_reply_form", ""):
+            default_form = "comfort" if str(event.get_extra("astrmai_social_intent", "") or "") == "comfort" else "answer"
+            event.set_extra("astrmai_reply_form", default_form)
+        turn_context.cognitive.social_admission = str(event.get_extra("astrmai_social_admission", "") or "")
+        turn_context.cognitive.social_signals = list(event.get_extra("astrmai_social_signals", []) or [])
+        turn_context.cognitive.form = str(event.get_extra("astrmai_reply_form", "answer") or "answer")
+        # Think level controls reasoning depth and tool budget only.  Social
+        # admission is recorded by the attention router and must not be
+        # rewritten into wait merely because this turn has a zero budget.
+        social_admission = str(event.get_extra("astrmai_social_admission", "") or "").strip().lower()
+        if (
+            think_decision.level <= 0
+            and "group_non_direct" in think_decision.signals
+            and not social_admission
+        ):
+            # Legacy callers without an attention trace retain their previous
+            # conservative fallback; traced turns are governed by admission.
             event.set_extra("astrmai_wait_reason", "group_ambient_short_wait")
             event.set_extra("astrmai_cognitive_action", "wait")
             event.set_extra("astrmai_reply_need", "wait")
@@ -2627,14 +2649,13 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             turn_context.cognitive.social_intent = "observe"
             turn_context.cognitive.action_tier = "none"
             turn_context.cognitive.risk_flags = ["group_non_direct_budget_wait", "group_ambient_short_wait"]
-            await self._settle_no_send_relationship_event(
-                event,
-                chat_id,
-                skipped_reason="wait",
-            )
+            await self._settle_no_send_relationship_event(event, chat_id, skipped_reason="wait")
             await self._finalize_proactive_event(event, None)
             await self._remember_turn_trace(chat_id, event, status="skipped_wait")
             return ""
+        if think_decision.level <= 0 and "group_non_direct" in think_decision.signals:
+            event.set_extra("astrmai_think_budget_limited", True)
+            event.set_extra("astrmai_think_budget_limit_reason", "group_non_direct")
 
         cognitive_decision = None
         should_run_cognitive_loop = (
@@ -2664,6 +2685,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                 event.set_extra("astrmai_cognitive_intent", cognitive_decision.intent)
                 event.set_extra("astrmai_cognitive_memory_policy", cognitive_decision.memory_policy)
                 event.set_extra("astrmai_reply_need", cognitive_decision.reply_need)
+                event.set_extra("astrmai_reply_form", cognitive_decision.form)
                 event.set_extra("astrmai_social_intent", cognitive_decision.social_intent)
                 event.set_extra("astrmai_action_tier", cognitive_decision.action_tier)
                 event.set_extra("astrmai_allowed_action_families", list(cognitive_decision.allowed_action_families))
@@ -2686,6 +2708,9 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                 turn_context.cognitive.intent = cognitive_decision.intent
                 turn_context.cognitive.memory_policy = cognitive_decision.memory_policy
                 turn_context.cognitive.reply_need = cognitive_decision.reply_need
+                turn_context.cognitive.form = cognitive_decision.form
+                turn_context.cognitive.social_admission = str(event.get_extra("astrmai_social_admission", "") or "")
+                turn_context.cognitive.social_signals = list(event.get_extra("astrmai_social_signals", []) or [])
                 turn_context.cognitive.social_intent = cognitive_decision.social_intent
                 turn_context.cognitive.action_tier = cognitive_decision.action_tier
                 turn_context.cognitive.allowed_action_families = list(cognitive_decision.allowed_action_families)
@@ -2707,6 +2732,21 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                     self._merge_inner_monologue(event.get_extra("sys1_thought", ""), cognitive_decision.inner_monologue),
                 )
                 self._apply_cognitive_guidance(prompt_envelope, cognitive_decision)
+                if cognitive_decision.form == "silence":
+                    event.set_extra("astrmai_cognitive_action", "wait")
+                    event.set_extra("astrmai_reply_need", "ignore")
+                    event.set_extra("astrmai_wait_reason", "form_silence")
+                    event.set_extra("astrmai_reply_form_terminal", True)
+                    turn_context.cognitive.action = "wait"
+                    turn_context.cognitive.reply_need = "ignore"
+                    await self._settle_no_send_relationship_event(
+                        event,
+                        chat_id,
+                        skipped_reason="form_silence",
+                    )
+                    await self._finalize_proactive_event(event, None)
+                    await self._remember_turn_trace(chat_id, event, status="skipped_silence")
+                    return ""
                 if cognitive_decision.reply_need in {"wait", "ignore"} or cognitive_decision.action in {"wait", "ignore"}:
                     logger.info(
                         f"[{chat_id}] CognitiveLoop decision={cognitive_decision.reply_need}; planner execution skipped."

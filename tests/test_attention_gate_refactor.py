@@ -407,7 +407,7 @@ class RefactoredAttentionGateTests(unittest.TestCase):
         self.assertEqual(event.get_extra("astrmai_topic_activity_reason"), "command")
         self.assertEqual(traced[0][1], "skipped_sensor_filter")
 
-    def test_topic_activity_rejects_mixed_and_image_messages(self):
+    def test_topic_activity_marks_mixed_and_image_messages_as_semantic_media(self):
         image = SimpleNamespace(type="image")
         plain = SimpleNamespace(type="plain")
         mixed = _FakeEvent("user-1", "Alice", "图片里写了周末", components=[plain, image])
@@ -420,10 +420,14 @@ class RefactoredAttentionGateTests(unittest.TestCase):
             image_only.unified_msg_origin, image_only, "user-2", is_private=False
         )
 
-        self.assertFalse(mixed_result["valid"])
-        self.assertFalse(image_result["valid"])
-        self.assertEqual(mixed_result["reason"], "non_plain_text")
-        self.assertEqual(image_result["reason"], "non_plain_text")
+        self.assertTrue(mixed_result["valid"])
+        self.assertTrue(image_result["valid"])
+        self.assertEqual(mixed_result["kind"], "media")
+        self.assertEqual(image_result["kind"], "media")
+        self.assertEqual(mixed_result["reason"], "semantic_media:image")
+        self.assertEqual(image_result["reason"], "semantic_media:image")
+        self.assertEqual(mixed_result["preview"], "[media:image]")
+        self.assertEqual(image_result["preview"], "[media:image]")
 
     def test_repeated_identical_ignored_message_uses_short_cache(self):
         router_mod = importlib.import_module("astrmai.conversation.attention.decision_router")

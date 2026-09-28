@@ -753,6 +753,19 @@ class AttentionDecisionRouter:
             "astrmai_observation_invalidated_reason",
             result.invalidated_reason,
         )
+        event.set_extra("astrmai_social_signals", list(result.social_signals))
+        event.set_extra("astrmai_social_admission", result.social_admission)
+        event.set_extra("astrmai_social_evidence", dict(result.social_evidence))
+        event.set_extra("astrmai_social_window_seconds", result.social_window_seconds)
+        event.set_extra("astrmai_social_ttl_seconds", result.social_ttl_seconds)
+        event.set_extra("astrmai_feedback_effect", result.feedback_effect)
+        event.set_extra("astrmai_feedback_evidence", dict(result.feedback_evidence))
+        event.set_extra(
+            "astrmai_feedback_consumer",
+            "participation" if result.feedback_effect != "none" else "none",
+        )
+        for signal in ("human_dyad_active", "open_question_waiting", "bot_recently_spoke", "direct_wakeup"):
+            event.set_extra(f"astrmai_{signal}", signal in result.social_signals)
 
     @staticmethod
     def _record_judge_agreement(
@@ -968,6 +981,18 @@ class AttentionDecisionRouter:
         )
         if focus_event is not None and hasattr(focus_event, "set_extra"):
             focus_event.set_extra("astrmai_attention_eligible", attention_eligible)
+            direct_wakeup = bool(
+                is_strong_wakeup
+                or self._is_direct_event(focus_event)
+                or focus_event.get_extra("astrmai_group_direct_wakeup", False)
+            )
+            focus_event.set_extra("astrmai_direct_wakeup", direct_wakeup)
+            if direct_wakeup:
+                focus_event.set_extra("astrmai_social_admission", "admit")
+                existing_signals = list(focus_event.get_extra("astrmai_social_signals", []) or [])
+                if "direct_wakeup" not in existing_signals:
+                    existing_signals.append("direct_wakeup")
+                focus_event.set_extra("astrmai_social_signals", existing_signals)
         if attention_eligible:
             self._count("attention_eligible")
         if participation_enabled and not is_private:
@@ -999,6 +1024,19 @@ class AttentionDecisionRouter:
             recent_committed_turn = (
                 shadow_committed_turn if committed_history_enabled else None
             )
+            feedback_summary: dict[str, Any] = {}
+            feedback_store = getattr(self.gate, "dialogue_store", None)
+            feedback_reader = getattr(feedback_store, "get_feedback_summary", None)
+            if callable(feedback_reader):
+                try:
+                    feedback_summary = await feedback_reader(
+                        chat_id,
+                        actor_id=str(getattr(focus_event, "get_sender_id", lambda: "")() or ""),
+                    )
+                except Exception as exc:
+                    feedback_summary = {}
+                    self._count("feedback_read_degraded")
+                    logger.debug("[AttentionRouter] feedback summary read degraded: %s", type(exc).__name__)
             record_architecture_observation(
                 focus_event,
                 "committed_history",
@@ -1019,6 +1057,7 @@ class AttentionDecisionRouter:
                 batch_events=events,
                 strong_wakeup_event_ids=strong_event_ids,
                 recent_committed_turn=recent_committed_turn,
+                feedback_summary=feedback_summary,
                 previous_state=self._participation_states.get(chat_id),
                 topic_identity=self._attention_topic(focus_event, focus_thread),
                 ttl_seconds=ttl_seconds,
@@ -1045,6 +1084,10 @@ class AttentionDecisionRouter:
                     "FORCE_PASS",
                     "active_bot_continuation",
                 )
+            elif "direct_wakeup" in participation_result.social_signals:
+                prefilter = AttentionPrefilterDecision("FORCE_PASS", "direct_wakeup")
+            elif participation_result.social_admission == "wait":
+                prefilter = AttentionPrefilterDecision("WAIT", "human_dyad_active")
             elif participation_result.action == "FORCE_PASS" and (
                 force_pass_enabled or bool(strong_event_ids)
             ):
@@ -1100,6 +1143,12 @@ class AttentionDecisionRouter:
                 raw_action="IGNORE",
                 reason=f"prefilter:{prefilter.reason}",
             )
+        if prefilter.action == "WAIT":
+            self._count("judge_avoided_wait")
+            if focus_event is not None and hasattr(focus_event, "set_extra"):
+                focus_event.set_extra("astrmai_judge_avoided", True)
+                focus_event.set_extra("astrmai_wait_reason", prefilter.reason)
+            return AttentionDecision(action="WAIT", raw_action="WAIT", reason=f"prefilter:{prefilter.reason}")
         if self._cached_judge_ignore(chat_id, focus_event, focus_thread):
             self._count("judge_avoided_exact_cache")
             await self._sample_avoided_decision(

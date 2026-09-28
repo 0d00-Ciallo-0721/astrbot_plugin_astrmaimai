@@ -144,6 +144,23 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
             except Exception:
                 logger.debug("[ReplyService] group reread seed degraded", exc_info=True)
 
+    @staticmethod
+    def _late_reconnect_eligible(event: AstrMessageEvent, stale_reason: str) -> bool:
+        reason = str(stale_reason or "").strip()
+        if reason.startswith("same_actor_direct_update") or reason.startswith("superseded_by_newer_activity_same_thread"):
+            return True
+        target = event.get_extra(
+            "astrmai_turn_target",
+            event.get_extra("astrmai_proactive_target", None),
+        )
+        target_event_id = str((target.get("target_event_id", "") if isinstance(target, dict) else getattr(target, "target_event_id", "")) or "").strip()
+        target_thread_id = str((target.get("target_thread_id", "") if isinstance(target, dict) else getattr(target, "target_thread_id", "")) or "").strip()
+        try:
+            confidence = float((target.get("confidence", 0.0) if isinstance(target, dict) else getattr(target, "confidence", 0.0)) or 0.0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        return bool((target_event_id or target_thread_id) and confidence >= 0.5)
+
     async def handle_reply(
         self,
         event: AstrMessageEvent,
@@ -156,7 +173,10 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
         outcome_kind: str = "reply",
     ):
         debug_trace(event, "execution.reply.enter", chat_id=chat_id, raw_preview=preview_text(str(raw_text or ""), 120))
-        if not raw_text:
+        requested_form = str(
+            event.get_extra("astrmai_reply_form", "") if hasattr(event, "get_extra") else ""
+        ).strip().lower()
+        if not raw_text and requested_form != "reaction":
             return VisibleReplyArtifact("", [], "", blocked_reason="empty_reply")
 
         normalized_outcome_kind = (
@@ -190,6 +210,21 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
         with observe_stage(event, "reply.prepare") as prepare_stage:
             reply_mode = self._resolve_reply_mode(event)
             freshness_state, stale_reason = await self._check_reply_freshness(event, chat_id)
+            if freshness_state == FreshnessState.FRESH and reply_mode == ReplyMode.LATE_RECONNECT:
+                reply_mode = ReplyMode.CASUAL_FOLLOWUP
+                event.set_extra("astrmai_reply_mode", reply_mode.value)
+                event.set_extra("astrmai_late_reconnect_eligible", False)
+            if freshness_state == FreshnessState.STALE_BUT_SALVAGEABLE:
+                late_reconnect_eligible = self._late_reconnect_eligible(event, stale_reason)
+                event.set_extra("astrmai_late_reconnect_eligible", late_reconnect_eligible)
+                event.set_extra("astrmai_late_reconnect_reason", str(stale_reason or "stale_salvage"))
+                if late_reconnect_eligible and reply_mode != ReplyMode.AMBIENT_IGNORE:
+                    reply_mode = ReplyMode.LATE_RECONNECT
+                    event.set_extra("astrmai_reply_mode", reply_mode.value)
+                elif not late_reconnect_eligible:
+                    freshness_state = FreshnessState.EXPIRED
+                    stale_reason = "late_reconnect_unassociated"
+                    event.set_extra("astrmai_reply_stale_reason", stale_reason)
             artifact = self._build_visible_reply_artifact(
                 raw_text,
                 event=event,
@@ -251,13 +286,51 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
         formatted_user_text = f"{sender_name}: {rich_text}"
         reply_plan = self._build_reply_plan(event, chat_id, artifact)
         at_targets = self._merge_wait_targets(event, pending_actions)
+        action_only = bool(
+            artifact.metadata.get("reply_form") == "reaction"
+            and artifact.metadata.get("reply_form_action_only", False)
+            and not artifact.segments
+        )
+        action_commit_done = False
         with observe_stage(
             event,
             "reply.send",
             metadata={"planned_segment_count": len(artifact.segments or [])},
         ) as send_stage:
             try:
-                sent = await self._send_segments(event, chat_id, artifact, at_targets)
+                if action_only:
+                    action_results = await self.qq_action_dispatcher.commit(
+                        event,
+                        chat_id,
+                        send_key=str(event.get_extra("astrmai_reply_send_key", "") or ""),
+                    )
+                    action_commit_done = True
+                    reaction_result = next(
+                        (
+                            result
+                            for result in reversed(action_results or [])
+                            if str(result.get("action", "") or "")
+                            in {"message_emoji_reaction", "message_emoji_like", "message_reaction"}
+                        ),
+                        None,
+                    )
+                    sent = bool(reaction_result and reaction_result.get("status") == "sent")
+                    artifact.metadata["reaction_action_status"] = str(
+                        reaction_result.get("status", "failed") if reaction_result else "failed"
+                    )
+                    artifact.metadata["reaction_action_detail"] = str(
+                        reaction_result.get("detail", "reaction_action_not_committed")
+                        if reaction_result
+                        else "reaction_action_not_committed"
+                    )
+                    artifact.metadata["send_status"] = "sent" if sent else "failed"
+                    artifact.metadata["sent_segment_count"] = 0
+                    artifact.sent = sent
+                    if not sent:
+                        artifact.metadata["send_failure_reason"] = artifact.metadata["reaction_action_detail"]
+                        artifact.blocked_reason = "reaction_action_failed"
+                else:
+                    sent = await self._send_segments(event, chat_id, artifact, at_targets)
             except asyncio.CancelledError:
                 if track_turn_outcome:
                     release_text_output(event, normalized_outcome_kind)
@@ -307,6 +380,16 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
                 anchor_event=anchor_event,
             )
             return artifact
+        if action_only:
+            if track_turn_outcome:
+                release_text_output(event, normalized_outcome_kind)
+            event.set_extra("astrmai_reply_delivery_status", "sent")
+            event.set_extra("astrmai_reply_sent_segment_count", 0)
+            event.set_extra("astrmai_reply_outbound_message_ids", [])
+            artifact.metadata["send_status"] = "sent"
+            artifact.metadata["sent_segment_count"] = 0
+            artifact.metadata["reply_action_only"] = True
+            return artifact
         record_reply_stats(
             event,
             segment_count=len(artifact.segments or []),
@@ -327,14 +410,15 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
                 ),
                 kind=normalized_outcome_kind,
             )
-        try:
-            await self.qq_action_dispatcher.commit(
-                event,
-                chat_id,
-                send_key=str(event.get_extra("astrmai_reply_send_key", "") or ""),
-            )
-        except Exception as exc:
-            logger.warning(f"[ReplyService] optional QQ action commit degraded: {exc}")
+        if not action_commit_done:
+            try:
+                await self.qq_action_dispatcher.commit(
+                    event,
+                    chat_id,
+                    send_key=str(event.get_extra("astrmai_reply_send_key", "") or ""),
+                )
+            except Exception as exc:
+                logger.warning(f"[ReplyService] optional QQ action commit degraded: {exc}")
         send_receipt = self._build_send_receipt(artifact)
         event.set_extra("astrmai_reply_delivery_status", send_receipt.status.value)
         event.set_extra(

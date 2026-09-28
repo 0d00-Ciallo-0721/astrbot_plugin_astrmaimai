@@ -8,14 +8,13 @@ import uuid
 from pathlib import Path
 
 from astrbot.api import logger
-from astrbot.api.event import MessageChain
-from ..infrastructure.runtime.outbound_send_guard import outbound_send_allowed
 from ..infrastructure.runtime.background_task_ledger import (
     BackgroundTaskLedger,
     TaskLease,
     settle_task_lease,
 )
 from ..infrastructure.persistence.dream_completion_outbox import DreamCompletionOutboxStore
+from .dispatcher import ProactiveMessageIntent
 
 
 class DreamScheduler:
@@ -23,12 +22,24 @@ class DreamScheduler:
     FAILURE_RETRY_BASE_SECONDS = 300.0
     FAILURE_RETRY_MAX_SECONDS = 3600.0
 
-    def __init__(self, context, memory_engine, config, semaphore, dream_visible: bool = False):
+    def __init__(
+        self,
+        context,
+        memory_engine,
+        config,
+        semaphore,
+        dream_visible: bool = False,
+        *,
+        dispatcher=None,
+        state_engine=None,
+    ):
         self.context = context
         self.memory_engine = memory_engine
         self.config = config
         self._bg_semaphore = semaphore
         self.dream_visible = dream_visible
+        self.dispatcher = dispatcher
+        self.state_engine = state_engine
         self.dream_agent = None
         self.dream_generator = None
         self.promotion_engine = None
@@ -52,6 +63,65 @@ class DreamScheduler:
         life = getattr(config, "life", None)
         self._dream_interval = max(int(getattr(life, "dream_interval_min", 30) or 30), 1) * 60
         self.dream_visible = bool(getattr(life, "dream_visible", self.dream_visible))
+
+    async def _captured_generation(self, chat_id: str) -> int:
+        state_loader = getattr(self.state_engine, "get_state", None)
+        if not callable(state_loader):
+            return 0
+        state = state_loader(chat_id)
+        if asyncio.iscoroutine(state):
+            state = await state
+        return int(getattr(state, "proactive_generation", 0) or 0)
+
+    def _visible_cooldown_seconds(self) -> float:
+        return max(300.0, min(float(self._dream_interval or 0.0), 3600.0))
+
+    async def _dispatch_visible_dream(
+        self,
+        chat_id: str,
+        dream_text: str,
+        pending: dict,
+    ) -> tuple[bool, bool, str]:
+        dispatcher = self.dispatcher
+        if dispatcher is None or not hasattr(dispatcher, "dispatch"):
+            return False, False, "dispatcher_unavailable"
+        captured_generation = await self._captured_generation(chat_id)
+        intent = ProactiveMessageIntent(
+            chat_id=chat_id,
+            source="dream_visible",
+            reason="dream_completed_visible",
+            guidance=(
+                "把下面这段梦境内容作为轻量分享自然地说出来；不要提后台、调度器或系统任务。\n"
+                f"梦境内容：{str(dream_text or '').strip()}"
+            ),
+            suggested_social_intent="share",
+            suggested_action_tier="chat",
+            urgency=0.12,
+            cost=0.0,
+            cooldown=self._visible_cooldown_seconds(),
+            intent="share",
+            metadata={
+                "captured_generation": captured_generation,
+                "candidate_version": captured_generation,
+                "intent_class": "scheduled_ritual",
+                "dream_run_id": str(pending.get("run_id", "") or ""),
+                "chat_kind": "group" if "GroupMessage" in str(chat_id or "") else "private",
+            },
+        )
+        decision = await dispatcher.dispatch(intent)
+        queued = bool(getattr(decision, "synthetic_event_queued", False))
+        if queued:
+            return True, True, ""
+        blocked_reason = str(getattr(decision, "blocked_reason", "") or "dispatch_rejected")
+        retryable = blocked_reason == "dispatcher_shutdown" or blocked_reason.startswith(
+            ("safety_check_error:", "event_enqueue:")
+        )
+        retryable = retryable or blocked_reason in {
+            "attention_gate_unavailable",
+            "dispatch_rejected",
+            "event_enqueue_rejected",
+        }
+        return not retryable, False, blocked_reason
 
     def bind_dependencies(self, dream_agent, dream_generator, db_service=None, promotion_engine=None):
         self.dream_agent = dream_agent
@@ -575,11 +645,17 @@ class DreamScheduler:
             if not pending["visible_send_done"]:
                 target = getattr(self.config.life, "dream_send_target", "") or session_id
                 try:
-                    if not outbound_send_allowed():
-                        failures.append("visible_send_shutdown_rejected")
-                    else:
-                        await self.context.send_message(target, MessageChain().message(dream_text))
+                    settled, queued, blocked_reason = await self._dispatch_visible_dream(
+                        target,
+                        dream_text,
+                        pending,
+                    )
+                    pending["visible_dispatch_queued"] = bool(queued)
+                    pending["visible_dispatch_reason"] = str(blocked_reason or "")
+                    if settled:
                         pending["visible_send_done"] = True
+                    else:
+                        failures.append(f"visible_send:{blocked_reason}")
                 except Exception as exc:
                     failures.append("visible_send")
                     logger.warning(f"[DreamScheduler] dream push degraded: {exc}")
@@ -686,7 +762,7 @@ class DreamScheduler:
             return {
                 "performed": True,
                 "session_id": session_id,
-                "dream_visible": bool(dream_text and self.dream_visible),
+                "dream_visible": bool(pending.get("visible_dispatch_queued", False)),
                 "summary": str(maintenance.get("summary", "") or ""),
                 "promotion_report": pending["promotion_report"],
                 "stage_status": stage_status,

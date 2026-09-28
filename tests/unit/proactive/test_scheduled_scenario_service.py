@@ -693,6 +693,7 @@ class ScheduledScenarioServiceTests(unittest.TestCase):
         metadata = dispatcher.intents[0].metadata
         self.assertEqual(metadata["scenario_id"], "2026-05-11:morning_greeting:ff:GroupMessage:10001")
         self.assertEqual(metadata["candidate_version"], 7)
+        self.assertEqual(metadata["captured_generation"], 7)
         self.assertIn(metadata["claim_id"], metadata["dispatch_id"])
 
     def test_new_candidate_version_supersedes_previous_delivery_key(self):

@@ -12,12 +12,36 @@ import astrbot.api.message_components as Comp
 
 from ..contracts.reread import RereadActionRequest, RereadDispatchResult
 from ..contracts.turn_outcome import (
+    can_send_text,
     claim_text_output,
     record_text_failed,
     record_text_sent,
     release_text_output,
 )
 from ...infrastructure.runtime.outbound_send_guard import outbound_send_allowed
+from ...proactive.rhythm import evaluate_proactive_rhythm
+
+
+_SERIOUS_REREAD_MARKERS = (
+    "自杀",
+    "轻生",
+    "遗书",
+    "抢救",
+    "急救",
+    "报警",
+    "杀了自己",
+    "kill myself",
+    "suicide",
+    "overdose",
+    "emergency",
+)
+_SERIOUS_RISK_FLAGS = {
+    "medical/legal/financial_sensitive",
+    "sensitive_topic",
+    "self_harm",
+    "suicide_risk",
+    "high_risk_topic",
+}
 
 
 class RereadActionDispatcher:
@@ -25,13 +49,26 @@ class RereadActionDispatcher:
 
     MAX_SETTLEMENT_RETRY_TASKS = 64
 
-    def __init__(self, *, context=None, config=None, runtime_coordinator=None, dialogue_store=None, reread_observer=None, owner_registry=None):
+    def __init__(
+        self,
+        *,
+        context=None,
+        config=None,
+        runtime_coordinator=None,
+        dialogue_store=None,
+        reread_observer=None,
+        owner_registry=None,
+        state_engine=None,
+        proactive_dispatcher=None,
+    ):
         self.context = context
         self.config = config
         self.runtime_coordinator = runtime_coordinator
         self.dialogue_store = dialogue_store
         self.reread_observer = reread_observer
         self.owner_registry = owner_registry
+        self.state_engine = state_engine
+        self.proactive_dispatcher = proactive_dispatcher
         self._settlement_retry_tasks: dict[str, asyncio.Task] = {}
         self._background_tasks: set[asyncio.Task] = set()
         self._active_dispatches: set[asyncio.Task] = set()
@@ -66,6 +103,94 @@ class RereadActionDispatcher:
 
     def refresh_config(self, config) -> None:
         self.config = config
+
+    def bind_proactive_dispatcher(self, dispatcher) -> None:
+        self.proactive_dispatcher = dispatcher
+
+    @staticmethod
+    def _event_risk_flags(event: Any) -> set[str]:
+        if not hasattr(event, "get_extra"):
+            return set()
+        raw = event.get_extra("astrmai_risk_flags", []) or []
+        if isinstance(raw, str):
+            raw = [raw]
+        return {str(item or "").strip().lower() for item in raw if str(item or "").strip()}
+
+    @classmethod
+    def _serious_reread(cls, event: Any, text: str) -> bool:
+        if cls._event_risk_flags(event) & _SERIOUS_RISK_FLAGS:
+            return True
+        normalized = " ".join(str(text or "").strip().lower().split())
+        return any(marker in normalized for marker in _SERIOUS_REREAD_MARKERS)
+
+    async def _guard_bypass(self, event: Any, request: RereadActionRequest) -> tuple[bool, str]:
+        if getattr(self.config, "life", None) is not None and evaluate_proactive_rhythm(self.config).quiet_hours:
+            return False, "quiet_hours"
+        if self._serious_reread(event, request.text):
+            return False, "serious_topic"
+
+        snapshot: dict[str, Any] = {}
+        coordinator = self.runtime_coordinator
+        snapshot_reader = getattr(coordinator, "get_activity_snapshot", None)
+        if callable(snapshot_reader):
+            snapshot = await snapshot_reader(request.chat_id)
+            if not isinstance(snapshot, dict):
+                raise TypeError("activity snapshot must be a mapping")
+        raw_wait_targets = snapshot.get("wait_targets", []) or []
+        if not isinstance(raw_wait_targets, (list, tuple, set)):
+            raw_wait_targets = [raw_wait_targets]
+        if any(str(item or "").strip() for item in raw_wait_targets):
+            return False, "user_waiting"
+        if int(snapshot.get("executor_pending", 0) or 0) > 0:
+            return False, "user_waiting"
+
+        now = time.time()
+        conversation = getattr(self.config, "conversation", None)
+        recent_guard = max(
+            0.0,
+            float(getattr(conversation, "group_reread_recent_bot_guard_sec", 8.0) or 0.0),
+        )
+        bot_id = str(
+            getattr(self.state_engine, "bot_id", "")
+            or getattr(event, "get_self_id", lambda: "")()
+            or ""
+        )
+        latest_sender = str(snapshot.get("latest_activity_sender_id", "") or "")
+        latest_ts = float(snapshot.get("latest_activity_ts", 0.0) or 0.0)
+        recent_bot = bool(
+            recent_guard > 0
+            and bot_id
+            and latest_sender == bot_id
+            and latest_ts > 0
+            and now - latest_ts < recent_guard
+        )
+        state_loader = getattr(self.state_engine, "get_state", None)
+        if callable(state_loader):
+            state = state_loader(request.chat_id)
+            if inspect.isawaitable(state):
+                state = await state
+            committed_at = float(getattr(state, "last_committed_bot_reply_at", 0.0) or 0.0)
+            recent_bot = recent_bot or bool(
+                recent_guard > 0 and committed_at > 0 and now - committed_at < recent_guard
+            )
+        if recent_bot:
+            return False, "recent_bot_message"
+
+        cooldown_reader = getattr(self.proactive_dispatcher, "is_cooldown_active", None)
+        if callable(cooldown_reader):
+            try:
+                cooldown_active = cooldown_reader(
+                    request.chat_id,
+                    "topic_participation",
+                    now=now,
+                )
+            except TypeError:
+                cooldown_active = cooldown_reader(request.chat_id, "topic_participation")
+            if inspect.isawaitable(cooldown_active):
+                cooldown_active = await cooldown_active
+            if cooldown_active:
+                return False, "cooldown"
+        return True, ""
 
     def _note_claim_rollback_degraded(self, chat_id: str, send_key: str, reason: str) -> None:
         self._claim_rollback_degraded += 1
@@ -552,6 +677,26 @@ class RereadActionDispatcher:
         if context is None or not hasattr(context, "send_message"):
             await self._restore_observer_pending(request.chat_id)
             return RereadDispatchResult("failed", detail="context_unavailable")
+        if not can_send_text(event, "reread").allowed:
+            return RereadDispatchResult("duplicate", detail="turn_outcome_terminal")
+        try:
+            allowed, guard_reason = await self._guard_bypass(event, request)
+        except Exception as exc:
+            logger.warning(
+                "[RereadAction] bypass guard unavailable; preserving normal message propagation: %s",
+                type(exc).__name__,
+            )
+            await self._abandon_observer_pending(request.chat_id)
+            if hasattr(event, "set_extra"):
+                event.set_extra("astrmai_reread_guard_status", "unavailable")
+                event.set_extra("astrmai_reread_guard_reason", type(exc).__name__)
+            return RereadDispatchResult("blocked", detail="guard_unavailable")
+        if not allowed:
+            await self._abandon_observer_pending(request.chat_id)
+            if hasattr(event, "set_extra"):
+                event.set_extra("astrmai_reread_guard_status", "blocked")
+                event.set_extra("astrmai_reread_guard_reason", guard_reason)
+            return RereadDispatchResult("blocked", detail=guard_reason)
         if not claim_text_output(event, "reread").allowed:
             return RereadDispatchResult("duplicate", detail="turn_outcome_terminal")
         coordinator = self.runtime_coordinator

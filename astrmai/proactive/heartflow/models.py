@@ -17,6 +17,7 @@ class HeartflowChatState:
     current_focus: str
     recent_impulse: str
     cooldown_tags: list[str] = field(default_factory=list)
+    captured_generation: int = 0
 
 
 @dataclass(slots=True)

@@ -2847,6 +2847,33 @@ class AttentionGate:
             "at",
         }
 
+    @staticmethod
+    def _semantic_media_component_types(event: AstrMessageEvent) -> set[str]:
+        message = getattr(getattr(event, "message_obj", None), "message", None) or []
+        semantic_media = {
+            "image",
+            "record",
+            "audio",
+            "voice",
+            "video",
+            "file",
+            "json",
+            "xml",
+            "card",
+            "share",
+            "node",
+            "nodes",
+            "forward",
+        }
+        component_types = {
+            str(getattr(component, "type", component.__class__.__name__))
+            .split(".")[-1]
+            .lstrip("_")
+            .lower()
+            for component in message
+        }
+        return component_types & semantic_media
+
     def _classify_topic_activity(
         self,
         chat_id: str,
@@ -2874,8 +2901,21 @@ class AttentionGate:
         if bool(event.get_extra("astrmai_is_command", False)) or bool(event.get_extra("heartflow_is_command", False)):
             result["reason"] = "command"
             return result
-        if not self._is_pure_text_activity_event(event):
+        pure_text_activity = self._is_pure_text_activity_event(event)
+        semantic_media_types = self._semantic_media_component_types(event)
+        if not pure_text_activity and not semantic_media_types:
             result["reason"] = "non_plain_text"
+            return result
+
+        if semantic_media_types:
+            self_id = get_event_self_id(event)
+            is_at_bot = self._is_at_bot_event(event, self_id)
+            is_reply_to_bot = self._is_reply_to_bot_event(event, self_id)
+            result["effective_response"] = bool(is_private or is_at_bot or is_reply_to_bot)
+            result["kind"] = "media"
+            result["reason"] = "semantic_media:" + ",".join(sorted(semantic_media_types))
+            result["preview"] = "[media:" + ",".join(sorted(semantic_media_types)) + "]"
+            result["valid"] = True
             return result
 
         projection = MessageRenderer.project_topic_preview(event, max_chars=120)

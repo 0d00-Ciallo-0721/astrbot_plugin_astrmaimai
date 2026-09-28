@@ -22,8 +22,15 @@ def install_reply_engine_stubs():
         def __init__(self, qq):
             self.qq = qq
 
+    class Reply:
+        def __init__(self, id, **kwargs):
+            self.id = id
+            for key, value in kwargs.items():
+                setattr(self, key, value)
+
     message_components_mod.Plain = Plain
     message_components_mod.At = At
+    message_components_mod.Reply = Reply
     sys.modules["astrbot.api.message_components"] = message_components_mod
 
     affection_mod = types.ModuleType("astrmai.Heart.affection_router")

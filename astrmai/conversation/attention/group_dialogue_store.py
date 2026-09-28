@@ -129,6 +129,84 @@ class SocialFeedbackRecord:
 
 
 @dataclass(slots=True)
+class SocialFeedbackAggregate:
+    """Bounded, redacted feedback state derived from raw observation records."""
+
+    actor_id: str
+    window_start: float
+    last_updated_at: float
+    response_count: int = 0
+    unanswered_count: int = 0
+    followup_count: int = 0
+    reaction_count: int = 0
+    positive_count: int = 0
+    negative_count: int = 0
+    suppression_until: float = 0.0
+    processed_feedback_ids: list[str] = field(default_factory=list)
+
+    MAX_COUNT = 8
+    # The aggregate window must cover the longest bounded suppression period;
+    # otherwise explicit-negative state would disappear before its TTL.
+    WINDOW_SECONDS = 3600.0
+    NEGATIVE_SUPPRESSION_SECONDS = 3600.0
+
+    def apply(self, record: SocialFeedbackRecord) -> None:
+        if record.feedback_id in self.processed_feedback_ids:
+            return
+        self.processed_feedback_ids.append(record.feedback_id)
+        self.processed_feedback_ids = self.processed_feedback_ids[-32:]
+        now = float(record.feedback_at or 0.0)
+        self.last_updated_at = max(self.last_updated_at, now)
+        kind = str(record.feedback_kind or "").strip().lower()
+        if kind in {"direct_quote", "direct_mention", "target_followup", "semantic_followup", "followup", "echo"}:
+            self.response_count = min(self.MAX_COUNT, self.response_count + 1)
+            if kind != "echo":
+                self.followup_count = min(self.MAX_COUNT, self.followup_count + 1)
+        elif kind == "reaction":
+            self.response_count = min(self.MAX_COUNT, self.response_count + 1)
+            self.reaction_count = min(self.MAX_COUNT, self.reaction_count + 1)
+        elif kind in {"explicit_positive", "direct_wakeup", "force_engage"}:
+            self.response_count = min(self.MAX_COUNT, self.response_count + 1)
+            self.positive_count = min(self.MAX_COUNT, self.positive_count + 1)
+        elif kind == "proactive_unanswered":
+            self.unanswered_count = min(self.MAX_COUNT, self.unanswered_count + 1)
+        elif kind == "explicit_negative":
+            self.negative_count = min(self.MAX_COUNT, self.negative_count + 1)
+            self.suppression_until = max(
+                self.suppression_until,
+                now + self.NEGATIVE_SUPPRESSION_SECONDS,
+            )
+
+    def summary(self, now: float) -> dict[str, Any]:
+        age = max(0.0, float(now) - float(self.last_updated_at or 0.0))
+        if age > self.WINDOW_SECONDS:
+            return {
+                "actor_id": self.actor_id,
+                "proactive_response_rate": 0.0,
+                "consecutive_unanswered_count": 0,
+                "recent_followup_strength": 0.0,
+                "recent_reaction_strength": 0.0,
+                "explicit_negative_suppression": False,
+                "positive_engagement_strength": 0.0,
+                "suppression_until": 0.0,
+                "feedback_age_seconds": age,
+            }
+        total = self.response_count + self.unanswered_count
+        decay = max(0.0, 1.0 - age / self.WINDOW_SECONDS)
+        return {
+            "actor_id": self.actor_id,
+            "proactive_response_rate": round(self.response_count / max(1, total), 3),
+            "consecutive_unanswered_count": min(self.MAX_COUNT, self.unanswered_count),
+            "recent_followup_strength": round(min(1.0, self.followup_count / self.MAX_COUNT) * decay, 3),
+            "recent_reaction_strength": round(min(1.0, self.reaction_count / self.MAX_COUNT) * decay, 3),
+            "explicit_negative_suppression": bool(self.suppression_until > now),
+            "positive_engagement_strength": round(min(1.0, self.positive_count / self.MAX_COUNT) * decay, 3),
+            "suppression_until": self.suppression_until if self.suppression_until > now else 0.0,
+            "feedback_age_seconds": round(age, 3),
+        }
+
+
+@dataclass(slots=True)
 class GroupSocialIncident:
     incident_id: str
     kind: str
@@ -175,6 +253,7 @@ class GroupDialogueStore:
         self._pending_direct: dict[str, list[PendingDirectItem]] = {}
         self._bot_turns: dict[str, list[BotTurnRecord]] = {}
         self._feedback_records: dict[str, list[SocialFeedbackRecord]] = {}
+        self._feedback_aggregates: dict[str, dict[str, SocialFeedbackAggregate]] = {}
         self._social_incidents: dict[str, list[GroupSocialIncident]] = {}
         self._sequence_by_chat: dict[str, int] = {}
         self._lock = asyncio.Lock()
@@ -204,6 +283,7 @@ class GroupDialogueStore:
             pending_removed = self._pending_direct.pop(key, None) is not None
             bot_turns_removed = self._bot_turns.pop(key, None) is not None
             feedback_removed = self._feedback_records.pop(key, None) is not None
+            aggregate_removed = self._feedback_aggregates.pop(key, None) is not None
             incidents_removed = self._social_incidents.pop(key, None) is not None
             self._sequence_by_chat.pop(key, None)
             return (
@@ -212,6 +292,7 @@ class GroupDialogueStore:
                 or pending_removed
                 or bot_turns_removed
                 or feedback_removed
+                or aggregate_removed
                 or incidents_removed
             )
 
@@ -534,6 +615,18 @@ class GroupDialogueStore:
                     return record
             records.append(record)
             self._feedback_records[key] = records[-160:]
+            aggregates = self._feedback_aggregates.setdefault(key, {})
+            actor_key = str(record.actor_id or "__chat__").strip() or "__chat__"
+            aggregate = aggregates.get(actor_key)
+            if aggregate is None or timestamp - aggregate.last_updated_at > SocialFeedbackAggregate.WINDOW_SECONDS:
+                aggregate = SocialFeedbackAggregate(
+                    actor_id=actor_key,
+                    window_start=timestamp,
+                    last_updated_at=timestamp,
+                )
+                aggregates[actor_key] = aggregate
+            aggregate.apply(record)
+            self._feedback_aggregates[key] = dict(list(aggregates.items())[-32:])
         return record
 
     async def get_feedback_records(
@@ -545,6 +638,68 @@ class GroupDialogueStore:
         key = self._resolve_chat_key(chat_id)
         async with self._lock:
             return list(self._feedback_records.get(key, [])[-max(1, int(limit or 1)) :])
+
+    async def get_feedback_summary(
+        self,
+        chat_id: str,
+        *,
+        actor_id: str = "",
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """Read bounded feedback indicators; never returns raw feedback text."""
+        key = self._resolve_chat_key(chat_id)
+        timestamp = time.time() if now is None else float(now)
+        async with self._lock:
+            aggregates = self._feedback_aggregates.get(key, {})
+            chat_summary = aggregates.get("__chat__")
+            actor_summary = aggregates.get(str(actor_id or "").strip()) if actor_id else None
+            result = dict(chat_summary.summary(timestamp) if chat_summary else {})
+            if actor_summary is not None:
+                actor_data = actor_summary.summary(timestamp)
+                for field_name in (
+                    "proactive_response_rate",
+                    "consecutive_unanswered_count",
+                    "recent_followup_strength",
+                    "recent_reaction_strength",
+                    "explicit_negative_suppression",
+                    "positive_engagement_strength",
+                    "suppression_until",
+                ):
+                    if field_name == "explicit_negative_suppression":
+                        result[field_name] = bool(result.get(field_name) or actor_data.get(field_name))
+                    elif field_name == "suppression_until":
+                        result[field_name] = max(float(result.get(field_name, 0.0) or 0.0), float(actor_data.get(field_name, 0.0) or 0.0))
+                    else:
+                        result[field_name] = max(float(result.get(field_name, 0.0) or 0.0), float(actor_data.get(field_name, 0.0) or 0.0))
+            result["chat_id"] = key
+            result["actor_id"] = str(actor_id or "").strip()
+            return result
+
+    async def cleanup_feedback(self, *, now: float | None = None) -> int:
+        """Drop expired aggregate and raw feedback entries without touching other chats."""
+        timestamp = time.time() if now is None else float(now)
+        removed = 0
+        async with self._lock:
+            for chat_id in list(self._feedback_aggregates):
+                aggregates = self._feedback_aggregates[chat_id]
+                for actor_id in list(aggregates):
+                    if timestamp - float(aggregates[actor_id].last_updated_at or 0.0) > SocialFeedbackAggregate.WINDOW_SECONDS:
+                        aggregates.pop(actor_id, None)
+                        removed += 1
+                if not aggregates:
+                    self._feedback_aggregates.pop(chat_id, None)
+            for chat_id in list(self._feedback_records):
+                records = self._feedback_records[chat_id]
+                kept = [
+                    item for item in records
+                    if timestamp - float(item.feedback_at or 0.0) <= SocialFeedbackAggregate.WINDOW_SECONDS
+                ][-160:]
+                removed += len(records) - len(kept)
+                if kept:
+                    self._feedback_records[chat_id] = kept
+                else:
+                    self._feedback_records.pop(chat_id, None)
+        return removed
 
     async def get_actor_tail(
         self,
@@ -1135,6 +1290,11 @@ class GroupDialogueStore:
                 for chat_id, items in self._feedback_records.items()
                 if items
             }
+            feedback_aggregates = {
+                chat_id: [self._serialize_dataclass(item) for item in items.values()]
+                for chat_id, items in self._feedback_aggregates.items()
+                if items
+            }
             social_incidents = {
                 chat_id: [self._serialize_dataclass(item) for item in items[-80:]]
                 for chat_id, items in self._social_incidents.items()
@@ -1163,6 +1323,7 @@ class GroupDialogueStore:
             "pending_direct": pending_direct,
             "bot_turns": bot_turns,
             "feedback_records": feedback_records,
+            "feedback_aggregates": feedback_aggregates,
             "social_incidents": social_incidents,
             "sequence_by_chat": sequence_by_chat,
         }
@@ -1189,6 +1350,7 @@ class GroupDialogueStore:
                 "pending_direct",
                 "bot_turns",
                 "feedback_records",
+                "feedback_aggregates",
                 "social_incidents",
             )
         ):
@@ -1338,6 +1500,11 @@ class GroupDialogueStore:
                         if writer_generation != current_generation:
                             diagnostics["dropped_generation_count"] += 1
                             continue
+                    elif payload_key == "feedback_records":
+                        feedback_at = float(getattr(item, "feedback_at", 0.0) or 0.0)
+                        if now - feedback_at > SocialFeedbackAggregate.WINDOW_SECONDS:
+                            diagnostics["dropped_expired_count"] += 1
+                            continue
                     items.append(item)
                 items = items[-80:]
                 if not items:
@@ -1364,6 +1531,44 @@ class GroupDialogueStore:
                 restored_chat_ids.add(key)
                 if restored_causal % 16 == 0:
                     await asyncio.sleep(0.001)
+        for chat_id, items_payload in dict(payload.get("feedback_aggregates", {}) or {}).items():
+            try:
+                key = self._resolve_chat_key(chat_id)
+            except ValueError:
+                continue
+            restored_items: dict[str, SocialFeedbackAggregate] = {}
+            for item_payload in list(items_payload or []):
+                try:
+                    valid_names = {field.name for field in dataclass_fields(SocialFeedbackAggregate)}
+                    item = SocialFeedbackAggregate(**{k: v for k, v in dict(item_payload or {}).items() if k in valid_names})
+                    if item.actor_id and now - float(item.last_updated_at or 0.0) <= item.WINDOW_SECONDS:
+                        item.processed_feedback_ids = list(item.processed_feedback_ids or [])[-32:]
+                        restored_items[item.actor_id] = item
+                except Exception:
+                    diagnostics["invalid_count"] += 1
+            if restored_items:
+                async with self._lock:
+                    self._feedback_aggregates[key] = restored_items
+                restored_causal += 1
+                restored_chat_ids.add(key)
+        # Rebuild from bounded raw records as well, so snapshots created before
+        # the aggregate field was introduced retain their feedback semantics.
+        async with self._lock:
+            for key, records in self._feedback_records.items():
+                aggregates: dict[str, SocialFeedbackAggregate] = {}
+                for record in records[-160:]:
+                    actor_key = str(record.actor_id or "__chat__").strip() or "__chat__"
+                    aggregate = aggregates.get(actor_key)
+                    if aggregate is None:
+                        aggregate = SocialFeedbackAggregate(
+                            actor_id=actor_key,
+                            window_start=float(record.feedback_at or now),
+                            last_updated_at=float(record.feedback_at or now),
+                        )
+                        aggregates[actor_key] = aggregate
+                    aggregate.apply(record)
+                if aggregates:
+                    self._feedback_aggregates[key] = dict(list(aggregates.items())[-32:])
         async with self._lock:
             for chat_id, sequence in dict(payload.get("sequence_by_chat", {}) or {}).items():
                 try:

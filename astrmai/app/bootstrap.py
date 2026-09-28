@@ -520,6 +520,7 @@ class PluginBootstrap:
             dialogue_store=runtime.dialogue_store,
             reread_observer=group_reread_observer,
             owner_registry=getattr(runtime, "owner_registry", None),
+            state_engine=runtime.state_engine,
         )
         post_reply_feedback_coordinator = PostReplyFeedbackCoordinator(
             private_chat_manager=private_chat_manager,
@@ -607,6 +608,10 @@ class PluginBootstrap:
         proactive_task = self._build_proactive_task(runtime, reflector)
         if proactive_task is not None:
             proactive_task.expression_governance_runner = expression_governance_runner
+            reread_dispatcher = getattr(runtime, "reread_action_dispatcher", None)
+            bind_dispatcher = getattr(reread_dispatcher, "bind_proactive_dispatcher", None)
+            if callable(bind_dispatcher):
+                bind_dispatcher(proactive_task.proactive_dispatcher)
         return LifecycleServices(
             reflector=reflector,
             reflect_tracker=reflect_tracker,

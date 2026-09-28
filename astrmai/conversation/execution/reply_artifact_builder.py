@@ -20,9 +20,16 @@ except ImportError:  # pragma: no cover
         def __init__(self, text=""):
             self.text = text
 
+    class _CompatReply:
+        def __init__(self, id=None, **kwargs):
+            self.id = id
+            for key, value in kwargs.items():
+                setattr(self, key, value)
+
     class _CompatComp:
         At = _CompatAt
         Plain = _CompatPlain
+        Reply = _CompatReply
 
     Comp = _CompatComp()
 
@@ -34,10 +41,13 @@ from ..concurrency.controls import (
     record_conversation_concurrency_trace,
     resolve_conversation_concurrency_flags,
 )
+from ..contracts.reply_form import ReplyForm, normalize_reply_form
 from ..contracts.focus_context import FreshnessState, ReplyMode
 from ..contracts.reply_artifact import OutboundPolicy, VisibleReplyArtifact
+from ..contracts.turn_target import TurnTarget
 from ..contracts.turn_identity import build_turn_send_key
 from ..reply_shape_policy import resolve_reply_shape_policy, should_apply_micro_reply_postprocess
+from .qq_action_dispatcher import QQActionDispatcher
 
 
 def _component_instance(cls: Any, value: Any, attr_name: str, **kwargs: Any):
@@ -57,6 +67,13 @@ def _plain_component(text: str):
 
 def _at_component(uid: Any):
     return _component_instance(Comp.At, uid, "qq", qq=uid)
+
+
+def _reply_component(message_id: Any):
+    reply_cls = getattr(Comp, "Reply", None)
+    if reply_cls is None:
+        return None
+    return _component_instance(reply_cls, message_id, "id", id=message_id)
 
 
 def _hash_send_key(send_key: str) -> str:
@@ -318,6 +335,121 @@ class ReplyArtifactMixin:
         stale_reason: str = "",
         is_proactive: bool = False,
     ) -> VisibleReplyArtifact:
+        raw_form = event.get_extra("astrmai_reply_form", "") if event is not None else ""
+        raw_target = (
+            event.get_extra(
+                "astrmai_turn_target",
+                event.get_extra("astrmai_proactive_target", None),
+            )
+            if event is not None
+            else None
+        )
+        target = TurnTarget.from_value(raw_target)
+        if str(raw_form or "").strip().lower() == ReplyForm.REACTION.value and not target.target_event_id and event is not None:
+            for pending in event.get_extra("astrmai_pending_actions", []) or []:
+                if not isinstance(pending, dict):
+                    continue
+                message_id = str(pending.get("message_id", "") or "").strip()
+                if message_id:
+                    target = TurnTarget(target_event_id=message_id, confidence=1.0, target_source="pending_action")
+                    break
+        intent = ""
+        is_private = False
+        reaction_supported = False
+        reaction_capability_reason = "reaction_api_unavailable"
+        if event is not None:
+            intent = str(
+                event.get_extra("astrmai_intent", event.get_extra("astrmai_proactive_intent", "")) or ""
+            )
+            is_private = bool(event.get_extra("is_private_chat", False))
+            reaction_supported, reaction_capability_reason = QQActionDispatcher.reaction_capability(event)
+        form_decision = normalize_reply_form(
+            raw_form,
+            intent=intent,
+            target=target,
+            is_private=is_private,
+            # Reaction capability and executable action are checked below so a
+            # missing target gets its precise contract reason first.
+            reaction_supported=True,
+        )
+        form = form_decision.form
+        raw_form_name = str(raw_form or "").strip().lower()
+        if event is not None and raw_form_name == ReplyForm.REACTION.value:
+            event.set_extra("astrmai_reaction_action_suppressed", form is not ReplyForm.REACTION)
+        if form is ReplyForm.SILENCE:
+            reason = form_decision.reason or "form_silence"
+            return VisibleReplyArtifact(
+                visible_text="",
+                segments=[],
+                persistable_text="",
+                blocked_reason=reason,
+                metadata={
+                    "reply_form": form.value,
+                    "requested_reply_form": form_decision.requested_form,
+                    "reply_form_degraded": form_decision.degraded,
+                    "reply_form_reason": reason,
+                    "reply_form_sender_route": form_decision.sender_route,
+                    "reply_mode": reply_mode.value,
+                    "freshness_state": freshness_state.value,
+                },
+            )
+        form_reason = form_decision.reason
+        form_target_event_id = target.target_event_id
+        target_invalid = bool(
+            event is not None
+            and (
+                event.get_extra("astrmai_target_expired", False)
+                or event.get_extra("astrmai_target_valid", True) is False
+            )
+        )
+        if target_invalid and str(raw_form or "").strip().lower() in {ReplyForm.QUOTE_REPLY.value, ReplyForm.REACTION.value}:
+            form = ReplyForm.SHORT_ACK
+            form_reason = "quote_target_expired" if str(raw_form).strip().lower() == ReplyForm.QUOTE_REPLY.value else "reaction_target_expired"
+        if form is ReplyForm.QUOTE_REPLY:
+            canonical = event.get_extra("astrmai_conversation_event", None) if event is not None else None
+            form_target_event_id = (
+                form_target_event_id
+                or str(getattr(canonical, "reply_target_event_id", "") or "").strip()
+                or str(getattr(canonical, "quote_event_id", "") or "").strip()
+                or str(event.get_extra("astrmai_reply_target_event_id", "") if event is not None else "").strip()
+            )
+            has_quote_target = bool(
+                target.target_event_id
+                or getattr(canonical, "reply_target_event_id", "")
+                or getattr(canonical, "quote_event_id", "")
+                or (event.get_extra("astrmai_reply_target_event_id", "") if event is not None else "")
+            )
+            if not has_quote_target or target_invalid:
+                form = ReplyForm.SHORT_ACK
+                form_reason = "quote_target_expired" if target_invalid else "quote_target_missing"
+        elif form is ReplyForm.REACTION:
+            reaction_action = QQActionDispatcher.reaction_action(
+                event,
+                target_event_id=form_target_event_id,
+            )
+            target_confidence = float(target.confidence or 0.0)
+            if not target.target_event_id or target_confidence < 0.5:
+                form = ReplyForm.SHORT_ACK
+                form_reason = "target_missing_or_low_confidence"
+            elif target_invalid:
+                form = ReplyForm.SHORT_ACK
+                form_reason = "reaction_target_expired"
+            elif reaction_action is None:
+                form = ReplyForm.SHORT_ACK
+                form_reason = "reaction_action_missing_or_invalid"
+            elif not reaction_supported:
+                form = ReplyForm.SHORT_ACK
+                form_reason = reaction_capability_reason
+            else:
+                form_target_event_id = reaction_action.message_id
+                if event is not None:
+                    event.set_extra("astrmai_reaction_action_suppressed", False)
+        effective_route = form_decision.sender_route
+        if form is not form_decision.form:
+            from ..contracts.reply_form import FORM_SPECS
+            effective_route = FORM_SPECS[form].sender_route
+        if event is not None and raw_form_name == ReplyForm.REACTION.value:
+            event.set_extra("astrmai_reaction_action_suppressed", form is not ReplyForm.REACTION)
         force_segment = "\n\n" in str(text or "")
         policy = self._build_outbound_policy(reply_mode, freshness_state, stale_reason)
         if not policy.should_send:
@@ -329,6 +461,26 @@ class ReplyArtifactMixin:
                 metadata={"reply_mode": reply_mode.value, "freshness_state": freshness_state.value},
             )
 
+        if form is ReplyForm.REACTION:
+            return VisibleReplyArtifact(
+                visible_text="",
+                segments=[],
+                persistable_text="",
+                metadata={
+                    "segment_count": 0,
+                    "reply_form": form.value,
+                    "requested_reply_form": form_decision.requested_form,
+                    "reply_form_degraded": bool(form_reason or form_decision.degraded),
+                    "reply_form_reason": form_reason,
+                    "reply_form_sender_route": effective_route,
+                    "reply_form_target_event_id": form_target_event_id,
+                    "reply_form_action_only": True,
+                    "reaction_capability": reaction_capability_reason,
+                    "reply_mode": reply_mode.value,
+                    "freshness_state": freshness_state.value,
+                },
+            )
+
         if force_segment:
             clean_parts = [
                 self._clean_reply_content(part)
@@ -338,6 +490,8 @@ class ReplyArtifactMixin:
             clean_text = "\n\n".join(part for part in clean_parts if part)
         else:
             clean_text = self._clean_reply_content(text)
+        if form is ReplyForm.SHORT_ACK:
+            clean_text = self._trim_text_with_cap(clean_text, 36)
         if freshness_state == FreshnessState.STALE_BUT_SALVAGEABLE and policy.late_rewrite_allowed:
             clean_text = self._rewrite_late_reply(reply_mode, clean_text)
         clean_text, stance_metadata = self._apply_stance_first_reply_constraints(clean_text, event=event)
@@ -390,6 +544,12 @@ class ReplyArtifactMixin:
             persistable_text=visible_text,
             metadata={
                 "segment_count": len(segments),
+                "reply_form": form.value,
+                "requested_reply_form": form_decision.requested_form,
+                "reply_form_degraded": bool(form_reason or form_decision.degraded),
+                "reply_form_reason": form_reason,
+                "reply_form_sender_route": effective_route,
+                "reply_form_target_event_id": form_target_event_id,
                 "reply_mode": reply_mode.value,
                 "freshness_state": freshness_state.value,
                 "segment_strategy": policy.segment_strategy,
@@ -566,6 +726,12 @@ class ReplyArtifactMixin:
 
                     segment_text = self._strip_duplicate_native_at_text(event, seg, at_targets) if index == 0 else seg
                     chain = MessageChain()
+                    if index == 0 and artifact.metadata.get("reply_form") == ReplyForm.QUOTE_REPLY.value:
+                        quote_id = str(artifact.metadata.get("reply_form_target_event_id", "") or "").strip()
+                        if quote_id:
+                            reply_component = _reply_component(int(quote_id) if quote_id.isdigit() else quote_id)
+                            if reply_component is not None:
+                                chain.chain.append(reply_component)
                     if index == 0 and at_targets:
                         for target_id in at_targets:
                             uid: Any = int(target_id) if str(target_id).isdigit() else target_id

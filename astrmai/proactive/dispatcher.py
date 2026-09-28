@@ -5,11 +5,12 @@ import inspect
 import re
 import time
 from collections import deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Awaitable, Callable
 
 from astrbot.api import logger
 
+from ..conversation.contracts.turn_target import TargetKind, TurnTarget
 from ..memory.contracts.learning_retrieval import LearningFocusContext
 from .history_store import ProactiveHistoryStore
 from .rhythm import evaluate_proactive_rhythm
@@ -17,6 +18,64 @@ from .rhythm import evaluate_proactive_rhythm
 
 CompletionCallback = Callable[[bool, str], Awaitable[None] | None]
 ClaimValidator = Callable[[str], Awaitable[bool | None] | bool | None]
+
+
+ALLOWED_PROACTIVE_INTENTS = frozenset(
+    {"answer", "followup", "comfort", "share", "break_silence", "ritual"}
+)
+PROACTIVE_SOURCE_INTENTS = {
+    "group_signin": "ritual",
+    "scheduled_scenario": "ritual",
+    "dream_visible": "share",
+    "heartflow": "followup",
+    "wakeup": "break_silence",
+}
+
+PROACTIVE_COOLDOWN_CLASSES = frozenset(
+    {"greeting", "topic_participation", "scheduled_ritual"}
+)
+
+
+def normalize_proactive_intent(value: Any, *, source: str = "", reason: str = "") -> str:
+    candidate = str(value or "").strip().lower().replace("-", "_")
+    if candidate in ALLOWED_PROACTIVE_INTENTS:
+        return candidate
+    normalized_source = str(source or "").strip().lower()
+    normalized_reason = str(reason or "").strip().lower()
+    if normalized_source == "wakeup" and any(
+        marker in normalized_reason for marker in ("answer", "reply", "question", "direct")
+    ):
+        return "answer"
+    if normalized_source == "heartflow" and any(
+        marker in normalized_reason for marker in ("comfort", "distress", "sad", "negative")
+    ):
+        return "comfort"
+    return PROACTIVE_SOURCE_INTENTS.get(normalized_source, "break_silence")
+
+
+def normalize_proactive_target(value: Any, *, metadata: dict[str, Any] | None = None) -> TurnTarget:
+    target = TurnTarget.from_value(value)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    if (
+        bool(metadata.get("target_expired", False))
+        or metadata.get("target_actor_exists", True) is False
+        or metadata.get("target_message_exists", True) is False
+        or metadata.get("target_thread_exists", True) is False
+        or metadata.get("target_source_trusted", True) is False
+    ):
+        return TurnTarget()
+    if target.target_kind == TargetKind.NONE:
+        return TurnTarget()
+    if target.confidence < 0.5:
+        return TurnTarget()
+    if not str(target.target_source or target.evidence).strip():
+        return TurnTarget()
+    if not any(
+        str(value or "").strip()
+        for value in (target.target_actor_id, target.target_event_id, target.target_thread_id)
+    ):
+        return TurnTarget()
+    return target
 
 
 def append_proactive_stage(event: Any, stage: str, status: str, reason: str = "") -> None:
@@ -44,6 +103,35 @@ class ProactiveMessageIntent:
     intent_id: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
     claim_validator: ClaimValidator | None = field(default=None, repr=False, compare=False)
+    # Keep new fields after the historical defaults for positional callers.
+    intent: str = ""
+    target: TurnTarget | dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        self.intent = normalize_proactive_intent(
+            self.intent,
+            source=self.source,
+            reason=self.reason,
+        )
+        self.target = normalize_proactive_target(self.target, metadata=self.metadata)
+
+    def as_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload.pop("claim_validator", None)
+        payload["target"] = self.target.as_dict()
+        return payload
+
+    @classmethod
+    def from_value(cls, value: Any) -> "ProactiveMessageIntent":
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, dict):
+            raise TypeError("proactive intent payload must be a mapping")
+        payload = dict(value)
+        payload.pop("claim_validator", None)
+        allowed = {item.name for item in fields(cls) if item.init}
+        payload = {key: item for key, item in payload.items() if key in allowed}
+        return cls(**payload)
 
 
 @dataclass(slots=True)
@@ -101,6 +189,82 @@ class ProactiveDispatcher:
         self._terminal_order: deque[str] = deque()
         self._shutting_down = False
         self._dispatch_lock = asyncio.Lock()
+
+    @staticmethod
+    def _intent_cooldown_class(intent: ProactiveMessageIntent | dict[str, Any]) -> str:
+        metadata = (
+            intent.metadata
+            if isinstance(intent, ProactiveMessageIntent)
+            else dict(intent.get("metadata", {}) or {})
+        )
+        explicit = str(metadata.get("intent_class", "") or "").strip().lower()
+        if explicit in PROACTIVE_COOLDOWN_CLASSES:
+            return explicit
+        source = str(
+            intent.source if isinstance(intent, ProactiveMessageIntent) else intent.get("source", "")
+        ).strip().lower()
+        normalized_intent = str(
+            intent.intent if isinstance(intent, ProactiveMessageIntent) else intent.get("intent", "")
+        ).strip().lower()
+        if source in {"group_signin", "scheduled_scenario", "dream_visible"} or normalized_intent == "ritual":
+            return "scheduled_ritual"
+        if source == "wakeup" or normalized_intent == "break_silence":
+            return "greeting"
+        return "topic_participation"
+
+    @staticmethod
+    def _cooldown_key(chat_id: str, intent_class: str) -> str:
+        return f"{str(chat_id or '')}\x1f{str(intent_class or '')}"
+
+    def _refresh_legacy_cooldown_alias(self, chat_id: str, *, now: float) -> None:
+        prefix = f"{str(chat_id or '')}\x1f"
+        active_values = [
+            float(value or 0.0)
+            for key, value in self._cooldowns.items()
+            if key.startswith(prefix) and float(value or 0.0) > now
+        ]
+        if active_values:
+            self._cooldowns[str(chat_id or "")] = max(active_values)
+        else:
+            self._cooldowns.pop(str(chat_id or ""), None)
+
+    def set_cooldown(self, chat_id: str, intent_class: str, until_ts: float) -> None:
+        normalized_class = str(intent_class or "").strip().lower()
+        if normalized_class not in PROACTIVE_COOLDOWN_CLASSES:
+            normalized_class = "topic_participation"
+        until = float(until_ts or 0.0)
+        key = self._cooldown_key(chat_id, normalized_class)
+        if until <= time.time():
+            self._cooldowns.pop(key, None)
+        else:
+            self._cooldowns[key] = until
+        self._refresh_legacy_cooldown_alias(str(chat_id or ""), now=time.time())
+
+    def cooldown_until(self, chat_id: str, intent_class: str, *, now: float | None = None) -> float:
+        current = time.time() if now is None else float(now)
+        normalized_class = str(intent_class or "").strip().lower()
+        if normalized_class not in PROACTIVE_COOLDOWN_CLASSES:
+            normalized_class = "topic_participation"
+        key = self._cooldown_key(chat_id, normalized_class)
+        value = float(self._cooldowns.get(key, 0.0) or 0.0)
+        if value and value <= current:
+            self._cooldowns.pop(key, None)
+            value = 0.0
+            self._refresh_legacy_cooldown_alias(str(chat_id or ""), now=current)
+        if value > current:
+            return value
+        prefix = f"{str(chat_id or '')}\x1f"
+        if any(item.startswith(prefix) for item in self._cooldowns):
+            return 0.0
+        legacy = float(self._cooldowns.get(str(chat_id or ""), 0.0) or 0.0)
+        if legacy and legacy <= current:
+            self._cooldowns.pop(str(chat_id or ""), None)
+            return 0.0
+        return legacy
+
+    def is_cooldown_active(self, chat_id: str, intent_class: str, *, now: float | None = None) -> bool:
+        current = time.time() if now is None else float(now)
+        return self.cooldown_until(chat_id, intent_class, now=current) > current
 
     def _register_owner_task(self, task: asyncio.Task, *, task_family: str, scope_id: str, run_id: str) -> None:
         registry = getattr(self, "owner_registry", None)
@@ -475,6 +639,18 @@ class ProactiveDispatcher:
             ),
         }
 
+    async def _feedback_snapshot(self, chat_id: str, *, actor_id: str = "") -> dict[str, Any]:
+        store = getattr(self.state_engine, "dialogue_store", None)
+        reader = getattr(store, "get_feedback_summary", None)
+        if not callable(reader):
+            return {}
+        try:
+            value = await self._maybe_await(reader(chat_id, actor_id=actor_id))
+            return dict(value or {}) if isinstance(value, dict) else {}
+        except Exception as exc:
+            logger.debug("[ProactiveDispatcher] feedback snapshot degraded: %s", type(exc).__name__)
+            return {}
+
     async def _activity_snapshot(self, chat_id: str) -> dict[str, Any]:
         if not self.runtime_coordinator or not hasattr(self.runtime_coordinator, "get_activity_snapshot"):
             return {}
@@ -554,12 +730,21 @@ class ProactiveDispatcher:
             talk_value = float(talk_willingness) if talk_willingness is not None else None
         except (TypeError, ValueError):
             talk_value = None
-        cooldown_until = float(self._cooldowns.get(intent.chat_id, 0.0) or 0.0)
-        if cooldown_until and now >= cooldown_until:
-            self._cooldowns.pop(intent.chat_id, None)
-            cooldown_until = 0.0
+        intent_class = self._intent_cooldown_class(intent)
+        cooldown_until = self.cooldown_until(intent.chat_id, intent_class, now=now)
         generation_current, captured_generation = await self._proactive_generation_current(intent)
         scheduling = await self._scheduling_snapshot(intent.chat_id)
+        feedback = await self._feedback_snapshot(
+            intent.chat_id,
+            actor_id=str(
+                intent.metadata.get("focus_speaker_id", "")
+                or getattr(intent.target, "target_actor_id", "")
+                or ""
+            ),
+        )
+        explicit_negative = bool(feedback.get("explicit_negative_suppression", False))
+        unanswered_count = int(feedback.get("consecutive_unanswered_count", 0) or 0)
+        direct_wakeup = bool(intent.metadata.get("direct_wakeup", False) or intent.metadata.get("astrmai_direct_wakeup", False))
         checks = {
             "has_attention_gate": bool(self.attention_gate and hasattr(self.attention_gate, "inject_external_event")),
             "chat_active": active,
@@ -571,6 +756,7 @@ class ProactiveDispatcher:
             "energy": energy,
             "min_energy": min_energy,
             "talk_willingness": talk_value,
+            "intent_class": intent_class,
             "cooldown_until": cooldown_until,
             "cooldown_clear": now >= cooldown_until,
             "source": intent.source,
@@ -585,6 +771,9 @@ class ProactiveDispatcher:
             "captured_generation": captured_generation,
             "generation_current": generation_current,
             **scheduling,
+            "feedback": feedback,
+            "feedback_consumer": "dispatcher" if feedback else "none",
+            "feedback_form_hint": "silence" if explicit_negative else ("short_ack" if unanswered_count >= 2 else ""),
         }
         if not checks["has_attention_gate"]:
             return False, "attention_gate_unavailable", checks
@@ -602,8 +791,12 @@ class ProactiveDispatcher:
             return False, "capacity_unavailable", checks
         if noise_block:
             return False, noise_block, checks
-        if cooldown_until and now < cooldown_until:
+        if cooldown_until and now < cooldown_until and not direct_wakeup:
             return False, "cooldown", checks
+        if explicit_negative and not direct_wakeup:
+            return False, "feedback_explicit_negative", checks
+        if unanswered_count >= 2 and not direct_wakeup:
+            return False, "feedback_unanswered", checks
         if energy is not None and min_energy > 0 and energy < min_energy:
             return False, "low_energy", checks
         if intent.source == "scheduled_scenario":
@@ -616,10 +809,7 @@ class ProactiveDispatcher:
         return True, "", checks
 
     def _intent_record(self, intent: ProactiveMessageIntent, decision: ProactiveDispatchDecision) -> dict[str, Any]:
-        intent_payload = asdict(intent)
-        # Runtime validators are callables and must not leak into management
-        # or export payloads.
-        intent_payload.pop("claim_validator", None)
+        intent_payload = intent.as_dict()
         metadata = dict(intent_payload.get("metadata", {}) or {})
         intent_payload["candidate_version"] = int(metadata.get("candidate_version", 0) or 0)
         intent_payload["revision"] = int(metadata.get("revision", intent_payload["candidate_version"]) or 0)
@@ -871,7 +1061,12 @@ class ProactiveDispatcher:
                         cooldown_seconds = 0.0
                     if cooldown_seconds > 0:
                         cooldown_until = time.time() + cooldown_seconds
-                        self._cooldowns[str(item.get("chat_id", "") or "")] = cooldown_until
+                        intent_payload = dict(item.get("intent", {}) or {})
+                        self.set_cooldown(
+                            str(item.get("chat_id", "") or ""),
+                            self._intent_cooldown_class(intent_payload),
+                            cooldown_until,
+                        )
                 decision = payload
                 break
         if callback:
@@ -1127,6 +1322,8 @@ class ProactiveDispatcher:
                 "astrmai_proactive_source": intent.source,
                 "astrmai_proactive_reason": intent.reason,
                 "astrmai_proactive_guidance": intent.guidance,
+                "astrmai_proactive_intent": intent.intent,
+                "astrmai_proactive_target": intent.target.as_dict(),
                 "astrmai_proactive_intent_id": intent.intent_id,
                 "astrmai_proactive_urgency": float(intent.urgency or 0.0),
                 "astrmai_proactive_cost": float(intent.cost or 0.0),
@@ -1137,6 +1334,9 @@ class ProactiveDispatcher:
                 "astrmai_learning_focus_context": learning_focus_context,
                 "astrmai_loop_source": "proactive_dispatcher",
                 "astrmai_proactive_dispatch_decision": decision,
+                "astrmai_feedback_consumer": checks.get("feedback_consumer", "none"),
+                "astrmai_feedback_summary": dict(checks.get("feedback", {}) or {}),
+                "astrmai_feedback_form_hint": checks.get("feedback_form_hint", ""),
                 "astrmai_proactive_completion_callback": _completion,
                 "astrmai_proactive_generation": int(intent.metadata.get("captured_generation", 0) or 0),
                 "astrmai_proactive_claim_token": str(intent.metadata.get("claim_token", "") or ""),

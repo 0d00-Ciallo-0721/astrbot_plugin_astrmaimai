@@ -283,6 +283,26 @@ class PlannerCognitiveLoopRefactorTests(unittest.TestCase):
                 self.assertEqual(planner.turn_trace_history[0]["status"], f"skipped_{action}")
                 self.assertEqual(planner.turn_trace_history[0]["cognitive"]["action"], action)
 
+    def test_planner_treats_silence_form_as_terminal_before_text_planning(self):
+        decision = self.planner_mod.CognitiveDecision(
+            action="reply",
+            reply_need="reply",
+            form="silence",
+            intent="observe",
+            memory_policy="light",
+        )
+        planner = self._make_planner(decision)
+        event = _FakeEvent(text="ambient group message")
+        _install_focus_extras(event)
+
+        result = asyncio.run(planner.plan_and_execute(event, [event]))
+
+        self.assertEqual(result, "")
+        self.assertEqual(planner.executor.calls, [])
+        self.assertEqual(event.get_extra("astrmai_wait_reason"), "form_silence")
+        self.assertTrue(event.get_extra("astrmai_reply_form_terminal"))
+        self.assertEqual(planner.turn_trace_history[-1]["status"], "skipped_silence")
+
     def test_plan_and_execute_delegates_only_to_prepared_execution_chain(self):
         planner = self._make_planner(
             self.planner_mod.CognitiveDecision(

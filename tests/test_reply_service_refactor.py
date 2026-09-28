@@ -265,6 +265,170 @@ class RefactoredReplyServiceTests(unittest.TestCase):
         self.assertEqual(state, self.reply_mod.FreshnessState.FRESH)
         self.assertEqual(reason, "")
 
+    def test_closed_reply_forms_reach_visible_artifact_or_silence(self):
+        service = self._service()
+        forms = ("silence", "short_ack", "quote_reply", "answer", "comfort", "reaction", "topic_start")
+        for form in forms:
+            event = FakeEvent("user-1", "Alice", "visible response")
+            event.set_extra("astrmai_reply_form", form)
+            if form == "quote_reply":
+                event.set_extra("astrmai_turn_target", SimpleNamespace(target_event_id="message-1", confidence=0.9))
+            if form == "reaction":
+                event.set_extra("astrmai_pending_actions", [{"action_type": "message_emoji_reaction", "message_id": "message-1"}])
+            artifact = service._build_visible_reply_artifact("visible response", event=event)
+            assert artifact.metadata.get("reply_form") == form or (
+                form in {"quote_reply", "reaction"} and artifact.metadata.get("reply_form") == "short_ack"
+            )
+            if form == "silence":
+                assert artifact.blocked_reason == "form_silence"
+                assert artifact.segments == []
+
+    def test_quote_form_is_consumed_by_unified_text_sender(self):
+        service = self._service()
+        event = FakeEvent("user-1", "Alice", "quoted answer")
+        event.set_extra("astrmai_reply_form", "quote_reply")
+        event.set_extra("astrmai_turn_target", SimpleNamespace(target_event_id="message-42", confidence=0.95))
+
+        artifact = asyncio.run(service.handle_reply(event, "quoted answer", event.unified_msg_origin))
+
+        self.assertTrue(artifact.sent)
+        chain = service.state_engine.gateway.context.sent[0][1].chain
+        self.assertEqual(getattr(chain[0], "id", ""), "message-42")
+        self.assertEqual(getattr(chain[1], "text", ""), "quoted answer")
+
+    def test_reaction_form_commits_action_without_visible_text(self):
+        class _ReactionApi:
+            def __init__(self):
+                self.calls = []
+
+            async def call_action(self, action, **kwargs):
+                self.calls.append((action, kwargs))
+                return {"status": "ok"}
+
+        service = self._service()
+        api = _ReactionApi()
+        event = FakeEvent("user-1", "Alice", "unrelated generated text")
+        event.bot = SimpleNamespace(api=api)
+        event.set_extra("astrmai_reply_form", "reaction")
+        event.set_extra("astrmai_turn_target", SimpleNamespace(target_event_id="message-42", confidence=0.95))
+        event.set_extra(
+            "astrmai_pending_actions",
+            [{
+                "action_type": "message_emoji_reaction",
+                "message_id": "message-42",
+                "payload": {"emoji_id": "66"},
+            }],
+        )
+
+        artifact = asyncio.run(service.handle_reply(event, event.message_str, event.unified_msg_origin))
+
+        self.assertTrue(artifact.sent)
+        self.assertEqual(artifact.visible_text, "")
+        self.assertEqual(artifact.segments, [])
+        self.assertEqual(service.state_engine.gateway.context.sent, [])
+        self.assertEqual(api.calls[0][0], "set_msg_emoji_like")
+        self.assertEqual(api.calls[0][1]["message_id"], "message-42")
+        self.assertEqual(event.get_extra("astrmai_qq_action_results")[-1]["status"], "sent")
+        self.assertFalse(event.get_extra("astrmai_reply_sent", False))
+
+    def test_reaction_action_failure_does_not_send_fallback_text(self):
+        class _FailingReactionApi:
+            async def call_action(self, action, **kwargs):
+                raise RuntimeError("api_rejected:set_msg_emoji_like")
+
+        service = self._service()
+        event = FakeEvent("user-1", "Alice", "unrelated generated text")
+        event.bot = SimpleNamespace(api=_FailingReactionApi())
+        event.set_extra("astrmai_reply_form", "reaction")
+        event.set_extra("astrmai_turn_target", SimpleNamespace(target_event_id="message-42", confidence=0.95))
+        event.set_extra(
+            "astrmai_pending_actions",
+            [{
+                "action_type": "message_emoji_reaction",
+                "message_id": "message-42",
+                "payload": {"emoji_id": "66"},
+            }],
+        )
+
+        artifact = asyncio.run(service.handle_reply(event, event.message_str, event.unified_msg_origin))
+
+        self.assertFalse(artifact.sent)
+        self.assertEqual(service.state_engine.gateway.context.sent, [])
+        self.assertEqual(event.get_extra("astrmai_qq_action_results")[-1]["status"], "failed")
+        self.assertEqual(artifact.metadata.get("send_status"), "failed")
+
+    def test_reaction_without_platform_capability_degrades_before_action_commit(self):
+        class _UnexpectedReactionApi:
+            def __init__(self):
+                self.calls = []
+                self.supported_actions = {"send_msg"}
+
+            async def call_action(self, action, **kwargs):
+                self.calls.append((action, kwargs))
+                return {"status": "ok"}
+
+        service = self._service()
+        api = _UnexpectedReactionApi()
+        event = FakeEvent("user-1", "Alice", "short fallback")
+        event.bot = SimpleNamespace(api=api)
+        event.set_extra("astrmai_reply_form", "reaction")
+        event.set_extra("astrmai_turn_target", SimpleNamespace(target_event_id="message-42", confidence=0.95))
+        event.set_extra(
+            "astrmai_pending_actions",
+            [{
+                "action_type": "message_emoji_reaction",
+                "message_id": "message-42",
+                "payload": {"emoji_id": "66"},
+            }],
+        )
+
+        artifact = asyncio.run(service.handle_reply(event, event.message_str, event.unified_msg_origin))
+
+        self.assertTrue(artifact.sent)
+        self.assertEqual(artifact.metadata.get("reply_form"), "short_ack")
+        self.assertEqual(len(service.state_engine.gateway.context.sent), 1)
+        self.assertEqual(api.calls, [])
+
+    def test_reply_form_failures_are_explicit_and_short(self):
+        service = self._service()
+        quote_event = FakeEvent("user-1", "Alice", "long answer " * 30)
+        quote_event.set_extra("astrmai_reply_form", "quote_reply")
+        quote = service._build_visible_reply_artifact(quote_event.message_str, event=quote_event)
+        self.assertEqual(quote.metadata["reply_form"], "short_ack")
+        self.assertEqual(quote.metadata["reply_form_reason"], "target_missing_or_low_confidence")
+        self.assertLessEqual(len(quote.visible_text), 40)
+
+        reaction_event = FakeEvent("user-1", "Alice", "long answer " * 30)
+        reaction_event.set_extra("astrmai_reply_form", "reaction")
+        reaction = service._build_visible_reply_artifact(reaction_event.message_str, event=reaction_event)
+        self.assertEqual(reaction.metadata["reply_form"], "short_ack")
+        self.assertEqual(reaction.metadata["reply_form_reason"], "target_missing_or_low_confidence")
+        self.assertLessEqual(len(reaction.visible_text), 40)
+
+    def test_late_reconnect_requires_salvage_association(self):
+        service = self._service()
+        associated = FakeEvent("user-1", "Alice", "old question")
+        associated.set_extra("astrmai_turn_target", SimpleNamespace(target_event_id="event-1", confidence=0.9))
+        self.assertTrue(
+            service._late_reconnect_eligible(
+                associated,
+                "superseded_by_newer_activity_same_thread:Bob:2.0s",
+            )
+        )
+        self.assertTrue(
+            service._late_reconnect_eligible(
+                associated,
+                "same_actor_direct_update:Alice:1.0s",
+            )
+        )
+        unrelated = FakeEvent("user-1", "Alice", "old question")
+        self.assertFalse(
+            service._late_reconnect_eligible(
+                unrelated,
+                "superseded_by_newer_activity_unknown_thread:Bob:2.0s",
+            )
+        )
+
     def test_private_tts_appends_voice_after_text(self):
         service = self._service()
         self._enable_tts(service, send_text_with_audio=True)

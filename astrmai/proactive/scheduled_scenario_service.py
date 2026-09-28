@@ -941,7 +941,7 @@ class ScheduledScenarioService:
         # can only be superseded immediately afterwards.
         rhythm = evaluate_proactive_rhythm(self.config, now=timestamp)
         states = list(self.state_engine.get_active_states() or []) if hasattr(self.state_engine, "get_active_states") else []
-        eligible_states: list[Any] = []
+        eligible_states: list[tuple[Any, int]] = []
         preflight_blocked: dict[str, int] = {}
         for state in states[:64]:
             chat_id = str(getattr(state, "chat_id", "") or "")
@@ -969,7 +969,7 @@ class ScheduledScenarioService:
             if next_due > timestamp:
                 preflight_blocked["cooldown"] = preflight_blocked.get("cooldown", 0) + 1
                 continue
-            eligible_states.append(state)
+            eligible_states.append((state, int(getattr(state, "proactive_generation", 0) or 0)))
 
         if not eligible_states:
             self._last_report = {
@@ -997,7 +997,7 @@ class ScheduledScenarioService:
         attempted = 0
         queued = 0
         blocked: dict[str, int] = dict(preflight_blocked)
-        for state in eligible_states:
+        for state, captured_generation in eligible_states:
             chat_id = str(getattr(state, "chat_id", "") or "")
             chat_kind = self._chat_kind(state)
             if not chat_id:
@@ -1006,7 +1006,7 @@ class ScheduledScenarioService:
                 continue
             if chat_kind == "private" and not bool(getattr(life, "enable_private_proactive", True)):
                 continue
-            candidate_version = int(getattr(state, "proactive_generation", 0) or 0)
+            candidate_version = captured_generation
             base_delivery_key = f"{plan_date}:{scenario}:{chat_id}"
             # Keep the legacy key for generation zero, while making later
             # candidates distinct across user-activity generations.
@@ -1084,6 +1084,7 @@ class ScheduledScenarioService:
                         "scenario_id": f"{plan_date}:{scenario}:{chat_id}",
                         "candidate_version": candidate_version,
                         "revision": candidate_version,
+                        "captured_generation": captured_generation,
                         "dispatch_id": f"{delivery_key}:{claim_token}",
                         "allow_inactive_chat": bool(
                             getattr(life, "scheduled_scenarios_allow_inactive_chat", False)

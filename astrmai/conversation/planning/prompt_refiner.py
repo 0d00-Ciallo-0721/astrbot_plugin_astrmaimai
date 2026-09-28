@@ -12,6 +12,7 @@ from astrbot.api.event import AstrMessageEvent
 from ...infrastructure.compat.legacy_compat import read_legacy_prompt_envelope
 from ..contracts.prompt_envelope import PromptEnvelope, ReplyMode
 from ..contracts.turn_context import MemoryInjectionDecision, ensure_turn_context, get_turn_context
+from ..contracts.turn_target import TurnTarget
 from ...memory.retrieval.learning_retrieval_events import LearningRetrievalEventWriter
 from ...memory.retrieval.learning_retrieval_selector import LearningRetrievalSelector
 from ...learning.release.flags import ReleaseCheckpoint, runtime_kill_switch_active
@@ -1584,6 +1585,23 @@ class PromptRefiner:
                     "如果不自然，可以保持沉默。不要提到系统机制或这段指引。\n"
                     + proactive_guidance[:500]
                 )
+            proactive_intent = str(event.get_extra("astrmai_proactive_intent", "") or "").strip()
+            proactive_target = TurnTarget.from_value(
+                event.get_extra("astrmai_proactive_target", None)
+            )
+            target_kind = getattr(proactive_target.target_kind, "value", proactive_target.target_kind)
+            target_summary = (
+                f"kind={target_kind}; actor={proactive_target.target_actor_id or 'none'}; "
+                f"event={proactive_target.target_event_id or 'none'}; "
+                f"thread={proactive_target.target_thread_id or 'none'}; "
+                f"confidence={proactive_target.confidence:.2f}; "
+                f"source={proactive_target.target_source or proactive_target.resolved_by or 'none'}"
+            )
+            sections.append(
+                "---主动动机与目标（仅本轮动态参考）---\n"
+                f"intent={proactive_intent or 'break_silence'}; target={target_summary}\n"
+                "空目标表示面向会话的公开表达；不得自行猜测、@或引用未提供的对象。"
+            )
         if context_package is not None:
             rendered_context_package = str(context_package.render() or "").strip()
             if rendered_context_package:

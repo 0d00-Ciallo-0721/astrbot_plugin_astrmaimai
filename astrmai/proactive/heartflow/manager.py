@@ -313,15 +313,19 @@ class HeartflowManager:
             self._impulse_decisions_by_chat.pop(chat_id, None)
             self._action_decisions_by_chat.pop(chat_id, None)
 
-    async def _load_state_values(self, chat_id: str) -> tuple[float, float]:
+    async def _load_state_values(self, chat_id: str) -> tuple[float, float, int]:
         if not self.state_engine or not hasattr(self.state_engine, "get_state"):
-            return 0.6, 0.0
+            return 0.6, 0.0, 0
         try:
             state = await self.state_engine.get_state(chat_id)
         except Exception as exc:
             logger.debug(f"[Heartflow] state lookup degraded for {chat_id}: {exc}")
-            return 0.6, 0.0
-        return self._clamp(self._float_attr(state, "energy", 0.6)), self._clamp(self._float_attr(state, "mood", 0.0), -1.0, 1.0)
+            return 0.6, 0.0, 0
+        return (
+            self._clamp(self._float_attr(state, "energy", 0.6)),
+            self._clamp(self._float_attr(state, "mood", 0.0), -1.0, 1.0),
+            int(getattr(state, "proactive_generation", 0) or 0),
+        )
 
     async def _compute_chat_cycle(
         self,
@@ -456,7 +460,7 @@ class HeartflowManager:
         recent_count = self._int_snapshot(snapshot, "recent_activity_count")
         recent_count_60s = self._int_snapshot(snapshot, "recent_activity_count_60s")
         preview = str(snapshot.get("latest_activity_preview", "") or "").strip()
-        energy, mood = await self._load_state_values(chat_id)
+        energy, mood, captured_generation = await self._load_state_values(chat_id)
 
         fatigue = self._clamp(1.0 - energy)
         if session is not None:
@@ -499,6 +503,7 @@ class HeartflowManager:
             current_focus=preview[:160],
             recent_impulse=impulse,
             cooldown_tags=self._recent_tags(chat_id),
+            captured_generation=captured_generation,
         )
 
     @staticmethod
@@ -855,6 +860,7 @@ class HeartflowManager:
                 "scenario_id": f"heartflow:{state.chat_id}:{pulse.pulse_type}",
                 "candidate_version": int(getattr(state, "proactive_generation", 0) or 0),
                 "revision": int(getattr(state, "proactive_generation", 0) or 0),
+                "captured_generation": int(getattr(state, "captured_generation", 0) or 0),
             },
         )
 

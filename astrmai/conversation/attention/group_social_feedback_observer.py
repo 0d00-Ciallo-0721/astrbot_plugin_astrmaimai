@@ -22,6 +22,18 @@ class GroupSocialFeedbackObserver:
 
     DEFAULT_WINDOW_SEC = 45.0
     DEFAULT_MAX_ACTIVE = 5
+    _NEGATIVE_FEEDBACK_MARKERS = (
+        "别总插话",
+        "不要插话",
+        "别插话",
+        "别再说了",
+        "先别说",
+        "停止主动",
+        "别主动",
+        "不要主动",
+        "闭嘴",
+    )
+    _POSITIVE_FEEDBACK_MARKERS = ("继续说", "说得好", "有帮助", "继续", "喜欢")
 
     def __init__(self, *, config=None, dialogue_store=None, gateway=None, owner_registry=None):
         self.config = config
@@ -207,7 +219,7 @@ class GroupSocialFeedbackObserver:
                     self._stats["silent_timeout" if not observation.evidence else "impacted_timeout"] += 1
                 await self._record_feedback(
                     observation,
-                    kind="silent" if not observation.evidence else "observation_closed",
+                    kind="proactive_unanswered" if not observation.evidence else "observation_closed",
                     status=observation.status,
                 )
             except asyncio.CancelledError:
@@ -401,6 +413,19 @@ class GroupSocialFeedbackObserver:
             if len(exact_thread) == 1:
                 matched = exact_thread[0]
                 kind, action, confidence = "reaction", "record_only", 0.8
+
+        if matched is None and text:
+            exact_thread = [item for item in active if incoming_thread and item.thread_id == incoming_thread]
+            candidates = exact_thread or (active if len(active) == 1 else [])
+            lowered_text = text.lower()
+            explicit_negative = any(marker in lowered_text for marker in self._NEGATIVE_FEEDBACK_MARKERS)
+            explicit_positive = any(marker in lowered_text for marker in self._POSITIVE_FEEDBACK_MARKERS)
+            if candidates and explicit_negative:
+                matched = candidates[0]
+                kind, action, confidence = "explicit_negative", "record_only", 1.0
+            elif candidates and explicit_positive:
+                matched = candidates[0]
+                kind, action, confidence = "explicit_positive", "attention_boost", 0.9
 
         if matched is None and sender_id:
             target_matches = [item for item in active if sender_id in item.target_user_ids]

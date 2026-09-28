@@ -21,6 +21,14 @@ class GroupSigninService:
         self.config = config
         self._last_run = {"status": "idle", "signed": 0, "partial": 0, "failed": 0}
 
+    def _enabled(self) -> bool:
+        life = getattr(self.config, "life", None)
+        return bool(getattr(life, "enable_proactive", True))
+
+    def _cooldown_seconds(self) -> float:
+        life = getattr(self.config, "life", None)
+        return max(60.0, float(getattr(life, "wakeup_cooldown", 600.0) or 600.0))
+
     @staticmethod
     def _extract_group_id(chat_id: str) -> str:
         text = str(chat_id or "").strip()
@@ -93,10 +101,10 @@ class GroupSigninService:
             "优先轻松、低压、容易被忽略的语气。"
         )
 
-    async def _dispatch_after_sign(self, chat_id: str, group_id: str) -> None:
+    async def _dispatch_after_sign(self, chat_id: str, group_id: str, captured_generation: int):
         if not self.dispatcher:
             logger.debug("[GroupSigninService] proactive dispatcher unavailable; skip follow-up message")
-            return
+            return None
         intent = ProactiveMessageIntent(
             chat_id=chat_id,
             source="group_signin",
@@ -106,15 +114,25 @@ class GroupSigninService:
             suggested_action_tier="chat",
             urgency=0.22,
             cost=0.0,
-            cooldown=0.0,
-            metadata={"group_id": group_id, "sign_source": "daily_group_sign"},
+            cooldown=self._cooldown_seconds(),
+            intent="ritual",
+            metadata={
+                "group_id": group_id,
+                "sign_source": "daily_group_sign",
+                "captured_generation": int(captured_generation or 0),
+                "candidate_version": int(captured_generation or 0),
+                "intent_class": "scheduled_ritual",
+                "chat_kind": "group",
+            },
         )
         try:
             decision = await self.dispatcher.dispatch(intent)
             if not decision.allowed:
                 logger.debug(f"[GroupSigninService] proactive follow-up blocked: {decision.blocked_reason}")
+            return decision
         except Exception as exc:
             logger.error(f"[GroupSigninService] proactive dispatch failed for {chat_id}: {exc}")
+            return None
 
     def _resolve_api(self):
         gateway = getattr(self.state_engine, "gateway", None)
@@ -152,6 +170,9 @@ class GroupSigninService:
 
     async def run_once(self, now_ts: float | None = None) -> None:
         now_ts = time.time() if now_ts is None else float(now_ts)
+        if not self._enabled():
+            self._last_run = {"status": "disabled", "signed": 0, "partial": 0, "failed": 0}
+            return
         if not self._within_sign_window(now_ts):
             return
 
@@ -162,6 +183,7 @@ class GroupSigninService:
             group_id = self._extract_group_id(chat_id)
             if not group_id:
                 continue
+            captured_generation = int(getattr(state, "proactive_generation", 0) or 0)
             if self._already_signed_today(state, today):
                 continue
             intent_saved = await self._persist_marker(
@@ -196,7 +218,11 @@ class GroupSigninService:
                 stats["partial"] += 1
                 continue
             logger.info(f"[GroupSigninService] signed active group={group_id}")
-            await self._dispatch_after_sign(chat_id, group_id)
+            await self._dispatch_after_sign(
+                chat_id,
+                group_id,
+                captured_generation,
+            )
             stats["signed"] += 1
         if stats["partial"]:
             stats["status"] = "partial"
@@ -206,6 +232,7 @@ class GroupSigninService:
 
     def describe_status(self) -> dict[str, Any]:
         return {
+            "enabled": self._enabled(),
             "sign_hour": self.SIGN_HOUR,
             "state_key": self.STATE_KEY,
             "last_run": dict(self._last_run),

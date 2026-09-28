@@ -94,6 +94,51 @@ class QQActionDispatcher:
                 event.set_extra("astrmai_pending_actions", normalized)
         return actions
 
+    @classmethod
+    def reaction_action(cls, event, *, target_event_id: str = "") -> PendingQQAction | None:
+        """Return one executable emoji-reaction action for the current event."""
+        expected_id = str(target_event_id or "").strip()
+        for action in cls._queued_actions(event):
+            if canonical_action_type(action.action_type) != "message_emoji_reaction":
+                continue
+            if not action.message_id or not str(action.payload.get("emoji_id", "") or "").strip():
+                continue
+            if expected_id and action.message_id != expected_id:
+                continue
+            return action
+        return None
+
+    @staticmethod
+    def reaction_capability(event) -> tuple[bool, str]:
+        """Resolve reaction support from the bound platform API, not a default flag."""
+        explicit = event.get_extra("astrmai_reaction_supported", None) if hasattr(event, "get_extra") else None
+        if explicit is False:
+            return False, "event_override_disabled"
+        api = getattr(getattr(event, "bot", None), "api", None)
+        if api is None or not callable(getattr(api, "call_action", None)):
+            return False, "reaction_api_unavailable"
+        advertised = None
+        for owner in (event, api):
+            for name in ("supported_actions", "supported_capabilities", "capabilities"):
+                candidate = getattr(owner, name, None)
+                if candidate is not None:
+                    advertised = candidate
+                    break
+            if advertised is not None:
+                break
+        if advertised is not None:
+            if isinstance(advertised, dict):
+                advertised = advertised.keys()
+            elif isinstance(advertised, str):
+                advertised = (advertised,)
+            try:
+                names = {str(item or "").strip() for item in advertised}
+            except TypeError:
+                names = set()
+            if names and not ({"set_msg_emoji_like", "message_emoji_reaction", "message_emoji_reaction_action"} & names):
+                return False, "reaction_action_not_advertised"
+        return True, "reaction_api_available"
+
     def _prune_keys(self) -> None:
         cutoff = time.time() - self.ACTION_TTL_SECONDS
         self._executed_keys = {key: ts for key, ts in self._executed_keys.items() if ts >= cutoff}
@@ -353,10 +398,16 @@ class QQActionDispatcher:
     async def commit(self, event, chat_id: str, *, send_key: str = "") -> list[dict[str, str]]:
         if not self._enabled():
             return []
+        suppress_reaction = bool(
+            event.get_extra("astrmai_reaction_action_suppressed", False)
+            if hasattr(event, "get_extra")
+            else False
+        )
         actions = [
             action
             for action in self._queued_actions(event)
             if canonical_action_type(action.action_type) in {"poke", "message_emoji_reaction", "like", "withdraw", "quote_reply"}
+            and not (suppress_reaction and canonical_action_type(action.action_type) == "message_emoji_reaction")
         ]
         if not actions:
             return []

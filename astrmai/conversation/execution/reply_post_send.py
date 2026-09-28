@@ -40,6 +40,10 @@ class ReplyPostSendMixin:
             )
             if target.target_kind != TargetKind.NONE:
                 return target
+            if bool(event.get_extra("astrmai_is_proactive_event", False)):
+                # An empty proactive target is public conversation semantics;
+                # never promote the synthetic candidate sender to an actor.
+                return TurnTarget()
         source_event_id = self._resolve_source_event_id(event)
         sender_id = str(event.get_sender_id() or "").strip()
         sender_name = str(event.get_sender_name() or "").strip()

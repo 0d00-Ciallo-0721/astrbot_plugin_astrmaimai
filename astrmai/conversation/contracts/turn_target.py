@@ -28,6 +28,8 @@ class TurnTarget:
     target_actor_id: str = ""
     target_actor_name: str = ""
     target_event_id: str = ""
+    target_thread_id: str = ""
+    target_source: str = ""
     topic_epoch: int = 0
     attention_topic_key: str = ""
     source_event_ids: tuple[str, ...] = field(default_factory=tuple)
@@ -42,6 +44,8 @@ class TurnTarget:
             "target_actor_id": self.target_actor_id,
             "target_actor_name": self.target_actor_name,
             "target_event_id": self.target_event_id,
+            "target_thread_id": self.target_thread_id,
+            "target_source": self.target_source,
             "topic_epoch": int(self.topic_epoch or 0),
             "attention_topic_key": self.attention_topic_key,
             "source_event_ids": list(self.source_event_ids),
@@ -56,7 +60,26 @@ class TurnTarget:
         if isinstance(value, cls):
             return value
         if not isinstance(value, Mapping):
-            return cls()
+            if not any(hasattr(value, field_name) for field_name in ("target_event_id", "target_thread_id", "target_actor_id", "confidence")):
+                return cls()
+            value = {
+                field_name: getattr(value, field_name, default)
+                for field_name, default in (
+                    ("target_kind", TargetKind.NONE.value),
+                    ("target_actor_id", ""),
+                    ("target_actor_name", ""),
+                    ("target_event_id", ""),
+                    ("target_thread_id", ""),
+                    ("target_source", ""),
+                    ("topic_epoch", 0),
+                    ("attention_topic_key", ""),
+                    ("source_event_ids", ()),
+                    ("evidence", ""),
+                    ("confidence", 0.0),
+                    ("resolved_by", "focus_resolver_v1"),
+                    ("created_at", 0.0),
+                )
+            }
         try:
             kind = TargetKind(str(value.get("target_kind", TargetKind.NONE.value) or TargetKind.NONE.value))
         except ValueError:
@@ -66,6 +89,8 @@ class TurnTarget:
             target_actor_id=str(value.get("target_actor_id", "") or ""),
             target_actor_name=str(value.get("target_actor_name", "") or ""),
             target_event_id=str(value.get("target_event_id", "") or ""),
+            target_thread_id=str(value.get("target_thread_id", "") or ""),
+            target_source=str(value.get("target_source", "") or ""),
             topic_epoch=max(0, int(value.get("topic_epoch", 0) or 0)),
             attention_topic_key=str(value.get("attention_topic_key", "") or "").strip(),
             source_event_ids=_ordered_unique(value.get("source_event_ids", ()) or ()),

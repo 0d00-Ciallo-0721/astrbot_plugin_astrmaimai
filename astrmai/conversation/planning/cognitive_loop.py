@@ -29,6 +29,7 @@ class CognitiveDecision:
     forbid_history_continuation: bool = True
     inner_monologue: str = ""
     reply_need: str = "reply"  # reply | wait | ignore
+    form: str = "answer"
     social_intent: str = "answer"
     action_tier: str = "chat"  # none | chat | full | sys3
     allowed_action_families: list[str] = field(default_factory=list)
@@ -104,7 +105,7 @@ class CognitiveLoop:
         "If the user clearly negates an action, record its family in negated_tool_families and do not plan it. "
         "planned_tool_goal and planned_tool_target_hint must be short semantic summaries; never invent QQ IDs, message IDs, or private message text. "
         'Return strict JSON with keys: action, intent, memory_policy, retrieve_keys, '
-        "style_policy, forbid_history_continuation, inner_monologue, reply_need, "
+        "style_policy, forbid_history_continuation, inner_monologue, reply_need, form, "
         "social_intent, action_tier, allowed_action_families, planned_tool_families, planned_tool_names, planned_tool_goal, planned_tool_target_hint, planned_tool_mode, negated_tool_families, stance, state_bias, "
         "risk_flags, attack_confidence, member_action_purpose, member_action_target, "
         "member_action_confidence, "
@@ -130,7 +131,7 @@ class CognitiveLoop:
         "Now return the final strict JSON only. "
         "Do not ask for more tools. "
         'Required keys: action, intent, memory_policy, retrieve_keys, '
-        "style_policy, forbid_history_continuation, inner_monologue, reply_need, "
+        "style_policy, forbid_history_continuation, inner_monologue, reply_need, form, "
         "social_intent, action_tier, allowed_action_families, planned_tool_families, planned_tool_names, planned_tool_goal, planned_tool_target_hint, planned_tool_mode, negated_tool_families, stance, state_bias, "
         "risk_flags, attack_confidence, member_action_purpose, member_action_target, member_action_confidence."
     )
@@ -584,6 +585,7 @@ class CognitiveLoop:
         memory_policy = self._normalize_memory_policy(data.get("memory_policy"))
         retrieve_keys = self._normalize_retrieve_keys(data.get("retrieve_keys"), memory_policy)
         social_intent = self._normalize_social_intent(data.get("social_intent", data.get("intent", "")))
+        form = self._normalize_form(data.get("form"), social_intent=social_intent, reply_need=reply_need)
         risk_flags = self._normalize_string_list(data.get("risk_flags"))
         attack_confidence = self._normalize_confidence(data.get("attack_confidence"))
         if social_intent == "pushback" and not self._allow_pushback(attack_confidence, risk_flags):
@@ -605,6 +607,7 @@ class CognitiveLoop:
             forbid_history_continuation=bool(data.get("forbid_history_continuation", True)),
             inner_monologue=str(data.get("inner_monologue", "") or "").strip(),
             reply_need=reply_need,
+            form=form,
             social_intent=social_intent,
             action_tier=action_tier,
             allowed_action_families=self._normalize_string_list(data.get("allowed_action_families")),
@@ -668,6 +671,24 @@ class CognitiveLoop:
         if normalized not in {"reply", "wait", "ignore"}:
             return "reply"
         return normalized
+
+    @staticmethod
+    def _normalize_form(value: Any, *, social_intent: str, reply_need: str) -> str:
+        from ..contracts.reply_form import ReplyForm, normalize_reply_form
+
+        if reply_need in {"wait", "ignore"}:
+            return ReplyForm.SILENCE.value
+        default = ReplyForm.COMFORT if social_intent == "comfort" else ReplyForm.ANSWER
+        intent = {
+            "comfort": "comfort",
+            "join": "share",
+            "observe": "followup",
+            "answer": "answer",
+            "inquire": "answer",
+            "recall": "answer",
+            "redirect": "answer",
+        }.get(social_intent, "answer")
+        return normalize_reply_form(value, default=default, intent=intent).form.value
 
     @staticmethod
     def _normalize_social_intent(value: Any) -> str:
