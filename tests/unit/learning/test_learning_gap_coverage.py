@@ -350,6 +350,67 @@ class LearningGapCoverageTests(unittest.TestCase):
         self.assertEqual([item["group_id"] for item in overview["top_unprocessed_groups"]], ["chat-small", "chat-ready"])
         self.assertEqual([item["group_id"] for item in overview["eligible_groups"]], ["chat-ready"])
 
+    def test_backlog_group_discovery_rejects_non_mapping_with_stage_diagnostic(self):
+        class _BadDiscoveryDB:
+            async def list_learning_log_groups_async(self, *_args, **_kwargs):
+                return ["not-a-group"]
+
+        config = SimpleNamespace(
+            evolution=SimpleNamespace(
+                enable_expression_mining=True,
+                enable_backlog_mining=True,
+                backlog_min_unprocessed_logs=3,
+                backlog_batch_size=5,
+                backlog_group_limit=1,
+                backlog_failure_cooldown_sec=60,
+                min_mining_context=3,
+            ),
+            reply=SimpleNamespace(fallback_text="fallback"),
+        )
+        manager = self.evolution_mod.EvolutionManager(
+            _BadDiscoveryDB(), SimpleNamespace(config=config), config=config
+        )
+
+        report = asyncio.run(manager.run_backlog_mining_once())
+
+        assert report["processed_groups"] == []
+        assert report["errors"]
+        assert report["errors"][0]["stage"] == "group_discovery_item"
+        assert report["errors"][0]["value_type"] == "str"
+
+    def test_backlog_snapshot_rejects_string_without_advancing_or_success(self):
+        class _BadSnapshotDB:
+            async def list_learning_log_groups_async(self, *_args, **_kwargs):
+                return [{"group_id": "chat-bad", "count": 5}]
+
+            async def load_learning_snapshot_async(self, *_args, **_kwargs):
+                return "not-a-snapshot"
+
+        config = SimpleNamespace(
+            evolution=SimpleNamespace(
+                enable_expression_mining=True,
+                enable_backlog_mining=True,
+                backlog_min_unprocessed_logs=3,
+                backlog_batch_size=5,
+                backlog_group_limit=1,
+                backlog_failure_cooldown_sec=60,
+                min_mining_context=3,
+            ),
+            reply=SimpleNamespace(fallback_text="fallback"),
+        )
+        manager = self.evolution_mod.EvolutionManager(
+            _BadSnapshotDB(), SimpleNamespace(config=config), config=config
+        )
+
+        report = asyncio.run(manager.run_backlog_mining_once())
+
+        assert report["processed_groups"] == []
+        assert report["errors"]
+        assert report["errors"][0]["stage"] == "snapshot_load"
+        assert report["errors"][0]["value_type"] == "str"
+        assert manager._backlog_failure_counts["chat-bad"] == 1
+        assert manager._backlog_failure_until["chat-bad"] > 0
+
 
 if __name__ == "__main__":
     unittest.main()

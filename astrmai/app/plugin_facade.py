@@ -604,7 +604,31 @@ class PluginFacade(RuntimeFacadeProtocol):
             "astrmai_evolution_record_scheduled", False
         ):
             return True
+        canonical = None
+        gate = getattr(self.runtime, "attention_gate", None)
+        ensure_canonical = getattr(gate, "ensure_conversation_event", None)
+        if not callable(ensure_canonical):
+            ensure_canonical = getattr(gate, "_get_or_build_conversation_event", None)
+        if callable(ensure_canonical):
+            try:
+                canonical = ensure_canonical(event)
+            except Exception as exc:
+                if hasattr(event, "set_extra"):
+                    event.set_extra("astrmai_learning_record_diagnostic", "canonical_event_unavailable")
+                    event.set_extra("astrmai_learning_record_diagnostic_type", type(exc).__name__)
+                logger.debug("[AstrMai] canonical learning event unavailable", exc_info=True)
+        elif hasattr(event, "set_extra"):
+            event.set_extra("astrmai_learning_record_diagnostic", "canonical_event_builder_unavailable")
         envelope = LearningMessageEnvelope.from_event(event)
+        if canonical is not None and hasattr(event, "set_extra"):
+            event.set_extra("astrmai_learning_record_diagnostic", "canonical_event_ready")
+        canonical_ready = bool(
+            envelope.conversation_event
+            and int(envelope.conversation_event.get("schema_version", 0) or 0) > 0
+            and str(envelope.conversation_event.get("event_id", "") or "").strip()
+        )
+        if not canonical_ready and hasattr(event, "set_extra"):
+            event.set_extra("astrmai_evolution_record_degraded", "canonical_event_unavailable")
 
         def schedule(awaitable) -> bool:
             if manager is not None and hasattr(manager, "track_task"):
@@ -691,6 +715,8 @@ class PluginFacade(RuntimeFacadeProtocol):
                 if inserted and hasattr(event, "set_extra"):
                     event.set_extra("astrmai_evolution_recorded", True)
                     event.set_extra("astrmai_evolution_record_source", "outbox")
+                    if not canonical_ready:
+                        event.set_extra("astrmai_evolution_record_degraded", "canonical_event_unavailable")
                 if hasattr(event, "set_extra"):
                     event.set_extra("astrmai_evolution_record_pending", False)
                     if not inserted:
@@ -717,7 +743,7 @@ class PluginFacade(RuntimeFacadeProtocol):
             if not callable(recorder):
                 return
             try:
-                await recorder(envelope)
+                result = await recorder(envelope)
             except Exception as exc:
                 if hasattr(event, "set_extra"):
                     event.set_extra("astrmai_evolution_record_failed", type(exc).__name__)
@@ -728,6 +754,9 @@ class PluginFacade(RuntimeFacadeProtocol):
             if hasattr(event, "set_extra"):
                 event.set_extra("astrmai_evolution_recorded", True)
                 event.set_extra("astrmai_evolution_record_pending", False)
+                if isinstance(result, dict) and result.get("degraded"):
+                    event.set_extra("astrmai_evolution_record_degraded", "canonical_event_unavailable")
+                    event.set_extra("astrmai_evolution_record_source", "degraded")
 
         if hasattr(event, "set_extra"):
             event.set_extra("astrmai_evolution_record_pending", True)

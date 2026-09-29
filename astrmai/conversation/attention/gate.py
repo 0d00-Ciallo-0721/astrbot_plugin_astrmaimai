@@ -3415,6 +3415,10 @@ class AttentionGate:
         event.set_extra("astrmai_conversation_event_id_source", canonical.event_id_source)
         return canonical
 
+    def ensure_conversation_event(self, event: AstrMessageEvent) -> ConversationEvent:
+        """Build the canonical event before detached consumers snapshot ingress."""
+        return self._get_or_build_conversation_event(event)
+
     def _build_message_dedup_key(self, event: AstrMessageEvent) -> tuple[str, bool]:
         chat_id = str(getattr(event, "unified_msg_origin", "") or "")
         message_id = str(getattr(getattr(event, "message_obj", None), "message_id", "") or "")

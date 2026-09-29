@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 import hashlib
 import time
 from typing import Any, Mapping
@@ -18,11 +18,22 @@ class LearningMessageEnvelope:
     conversation_event: Mapping[str, Any] | None = None
     received_at: float = 0.0
 
+    @staticmethod
+    def _event_mapping(value: Any) -> Mapping[str, Any] | None:
+        if isinstance(value, Mapping):
+            return dict(value)
+        if is_dataclass(value):
+            return asdict(value)
+        return None
+
     @classmethod
     def from_event(cls, event: Any) -> "LearningMessageEnvelope":
         get_extra = getattr(event, "get_extra", lambda *_args, **_kwargs: None)
+        canonical = cls._event_mapping(get_extra("astrmai_conversation_event", None))
         event_id = str(
-            get_extra("astrmai_event_id", None)
+            (canonical or {}).get("event_id", "")
+            or get_extra("astrmai_conversation_event_id", None)
+            or get_extra("astrmai_event_id", None)
             or get_extra("event_id", None)
             or getattr(getattr(event, "message_obj", None), "message_id", "")
             or ""
@@ -41,7 +52,7 @@ class LearningMessageEnvelope:
             sender_id=sender_id,
             sender_name=str(getattr(event, "get_sender_name", lambda: "")() or ""),
             content=content,
-            conversation_event=get_extra("astrmai_conversation_event", None),
+            conversation_event=canonical,
             received_at=timestamp or time.time(),
         )
 

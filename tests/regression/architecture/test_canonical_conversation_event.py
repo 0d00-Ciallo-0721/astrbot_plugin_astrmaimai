@@ -7,6 +7,7 @@ from astrmai.conversation.contracts.conversation_event import ConversationEvent
 from astrmai.infrastructure.persistence.database_service import DatabaseService
 from astrmai.infrastructure.persistence.orm_models import MessageLog
 from astrmai.infrastructure.persistence.persistence_schema import _MIGRATIONS
+from astrmai.learning.contracts.learning_envelope import LearningMessageEnvelope
 
 
 class StubEvent:
@@ -174,6 +175,44 @@ def test_message_log_compatibility_projection_preserves_canonical_fields():
     assert row.image_refs == '["image-a"]'
     assert row.topic_epoch == 4
     assert row.provenance == "original"
+
+
+def test_learning_envelope_snapshots_canonical_identity_and_structured_fields():
+    raw = StubEvent(
+        sender_id="10001",
+        sender_name="发送者",
+        text="带图引用",
+        message_id="msg-learning",
+        components=[
+            SimpleNamespace(
+                type="Reply",
+                id="quoted-message",
+                sender_id="20001",
+                sender_nickname="被引用者",
+            ),
+            SimpleNamespace(type="At", qq="30001"),
+        ],
+    )
+    canonical = ConversationEvent.from_astr_event(
+        raw,
+        self_id="bot",
+        image_refs=["image-a"],
+        topic_epoch=4,
+    )
+    raw._extras["astrmai_conversation_event"] = canonical
+
+    envelope = LearningMessageEnvelope.from_event(raw)
+    payload = envelope.as_dict()
+    fields = DatabaseService._conversation_event_log_fields(payload["conversation_event"])
+
+    assert envelope.event_id == canonical.event_id == "msg-learning"
+    assert fields["event_id"] == canonical.event_id
+    assert fields["event_schema_version"] == canonical.schema_version
+    assert fields["provenance"] == canonical.provenance
+    assert fields["image_refs"] == '["image-a"]'
+    assert fields["quote_event_id"] == "quoted-message"
+    assert fields["causal_parent_event_id"] == "quoted-message"
+    assert fields["source_event_ids"] == '["msg-learning"]'
 
 
 def test_message_log_migrations_append_canonical_columns_without_reordering_history():

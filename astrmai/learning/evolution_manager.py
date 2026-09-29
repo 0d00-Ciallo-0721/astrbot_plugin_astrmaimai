@@ -8,6 +8,7 @@ import math
 import re
 import time
 import uuid
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -69,6 +70,98 @@ from .runtime.learning_lane import LearningLaneBudget, LearningLaneConfig
 from .runtime.provider_adapter import LearningProviderCallAdapter
 from .release.flags import ReleaseCheckpoint
 from .release.runtime_gate import runtime_gate_check
+
+
+class _LearningInputContractError(ValueError):
+    """Raised when a learning adapter returns a shape outside its contract."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        stage: str,
+        pipeline: str = "",
+        group_id: str = "",
+        value: Any = None,
+    ) -> None:
+        super().__init__(message)
+        self.stage = str(stage or "unknown")
+        self.pipeline = str(pipeline or "")
+        self.group_id = str(group_id or "")
+        self.value_type = type(value).__name__ if value is not None else "NoneType"
+        if isinstance(value, (list, tuple, set, frozenset)):
+            self.value_shape = f"{self.value_type}(len={len(value)})"
+        elif isinstance(value, Mapping):
+            self.value_shape = f"{self.value_type}(keys={len(value)})"
+        else:
+            self.value_shape = self.value_type
+
+    def as_report(self) -> dict[str, str]:
+        return {
+            "stage": self.stage,
+            "pipeline": self.pipeline,
+            "group_id": self.group_id,
+            "error_type": type(self).__name__,
+            "value_type": self.value_type,
+            "value_shape": self.value_shape,
+            "error": str(self),
+        }
+
+
+def _require_mapping(
+    value: Any,
+    *,
+    stage: str,
+    pipeline: str = "",
+    group_id: str = "",
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise _LearningInputContractError(
+            f"{stage} expected mapping, received {type(value).__name__}",
+            stage=stage,
+            pipeline=pipeline,
+            group_id=group_id,
+            value=value,
+        )
+    return value
+
+
+def _require_list(
+    value: Any,
+    *,
+    stage: str,
+    pipeline: str = "",
+    group_id: str = "",
+) -> list[Any]:
+    if value is None:
+        return []
+    if not isinstance(value, (list, tuple)):
+        raise _LearningInputContractError(
+            f"{stage} expected list, received {type(value).__name__}",
+            stage=stage,
+            pipeline=pipeline,
+            group_id=group_id,
+            value=value,
+        )
+    return list(value)
+
+
+def _log_learning_contract_failure(diagnostic: Mapping[str, Any]) -> None:
+    message = (
+        "[Evolution-Backlog] input contract failed "
+        "stage=%s pipeline=%s group_id=%s value_type=%s"
+    )
+    args = (
+        diagnostic.get("stage", "unknown"),
+        diagnostic.get("pipeline", ""),
+        diagnostic.get("group_id", ""),
+        diagnostic.get("value_type", "unknown"),
+    )
+    exception_logger = getattr(logger, "exception", None)
+    if callable(exception_logger):
+        exception_logger(message, *args)
+    else:
+        logger.warning(message, *args, exc_info=True)
 
 
 def _jargon_sense_evidence(evidence: dict[str, Any], sense: dict[str, Any]) -> dict[str, Any]:
@@ -1124,28 +1217,32 @@ class EvolutionManager:
             }
         loader = getattr(db, "load_learning_snapshot_async", None)
         if callable(loader):
-            snapshot = dict(
-                await loader(
-                    group_id,
-                    limit=limit,
-                    pipelines=pipelines,
-                    replay_recent=replay_recent,
-                )
-                or {}
+            raw_snapshot = await loader(
+                group_id,
+                limit=limit,
+                pipelines=pipelines,
+                replay_recent=replay_recent,
             )
+            snapshot = dict(_require_mapping(
+                {} if raw_snapshot is None else raw_snapshot,
+                stage="snapshot_load",
+                group_id=group_id,
+            ))
         else:
             sync_loader = getattr(db, "load_learning_snapshot", None)
             if callable(sync_loader):
-                snapshot = dict(
-                    await asyncio.to_thread(
-                        sync_loader,
-                        group_id,
-                        limit,
-                        pipelines=pipelines,
-                        replay_recent=replay_recent,
-                    )
-                    or {}
+                raw_snapshot = await asyncio.to_thread(
+                    sync_loader,
+                    group_id,
+                    limit,
+                    pipelines=pipelines,
+                    replay_recent=replay_recent,
                 )
+                snapshot = dict(_require_mapping(
+                    {} if raw_snapshot is None else raw_snapshot,
+                    stage="snapshot_load",
+                    group_id=group_id,
+                ))
             else:
                 pipeline_logs = {
                     pipeline: list(
@@ -1166,19 +1263,34 @@ class EvolutionManager:
                     "created_at": time.time(),
                     "transactional": False,
                 }
-        raw_logs = list(snapshot.get("logs") or [])
+        raw_logs = _require_list(
+            snapshot.get("logs"),
+            stage="snapshot_logs",
+            group_id=group_id,
+        )
         enriched = await self._attach_learning_visual_context(group_id, raw_logs)
         enriched_by_id = {
             int(self._field(item, "id", 0) or 0): item
             for item in enriched
         }
         snapshot["logs"] = enriched
+        raw_pipeline_value = snapshot.get("pipeline_logs")
+        raw_pipeline_logs = _require_mapping(
+            {} if raw_pipeline_value is None else raw_pipeline_value,
+            stage="snapshot_pipeline_logs",
+            group_id=group_id,
+        )
         snapshot["pipeline_logs"] = {
             pipeline: [
                 enriched_by_id.get(int(self._field(item, "id", 0) or 0), item)
-                for item in list(logs or [])
+                for item in _require_list(
+                    logs,
+                    stage="snapshot_pipeline_items",
+                    pipeline=str(pipeline),
+                    group_id=group_id,
+                )
             ]
-            for pipeline, logs in dict(snapshot.get("pipeline_logs") or {}).items()
+            for pipeline, logs in raw_pipeline_logs.items()
         }
         snapshot["transactional"] = True
         return snapshot
@@ -1244,27 +1356,35 @@ class EvolutionManager:
     ) -> list[dict[str, Any]]:
         replay_recent = self._pipeline_replay_recent(pipeline)
         if hasattr(self.db, "list_learning_log_groups_async"):
-            return list(
-                await self.db.list_learning_log_groups_async(
-                    pipeline,
-                    min_count=min_count,
-                    limit=limit,
-                    replay_recent=replay_recent,
-                )
-                or []
+            raw_groups = await self.db.list_learning_log_groups_async(
+                pipeline,
+                min_count=min_count,
+                limit=limit,
+                replay_recent=replay_recent,
             )
+            groups = _require_list(raw_groups, stage="group_discovery", pipeline=pipeline)
+            return [
+                dict(_require_mapping(item, stage="group_discovery_item", pipeline=pipeline))
+                for item in groups
+            ]
         if hasattr(self.db, "list_learning_log_groups"):
-            return list(
-                await asyncio.to_thread(
-                    self.db.list_learning_log_groups,
-                    pipeline,
-                    min_count=min_count,
-                    limit=limit,
-                    replay_recent=replay_recent,
-                )
-                or []
+            raw_groups = await asyncio.to_thread(
+                self.db.list_learning_log_groups,
+                pipeline,
+                min_count=min_count,
+                limit=limit,
+                replay_recent=replay_recent,
             )
-        return await self._list_unprocessed_log_groups(min_count=min_count, limit=limit)
+            groups = _require_list(raw_groups, stage="group_discovery", pipeline=pipeline)
+            return [
+                dict(_require_mapping(item, stage="group_discovery_item", pipeline=pipeline))
+                for item in groups
+            ]
+        groups = await self._list_unprocessed_log_groups(min_count=min_count, limit=limit)
+        return [
+            dict(_require_mapping(item, stage="group_discovery_item", pipeline=pipeline))
+            for item in groups
+        ]
 
     async def _advance_pipeline_checkpoint(
         self,
@@ -2270,8 +2390,13 @@ class EvolutionManager:
             if event_id:
                 conversation_event.setdefault("event_id", event_id)
         else:
+            conversation_event = LearningMessageEnvelope._event_mapping(
+                event.get_extra("astrmai_conversation_event", None)
+            ) or {}
             event_id = str(
-                event.get_extra("astrmai_event_id", None)
+                conversation_event.get("event_id")
+                or event.get_extra("astrmai_conversation_event_id", None)
+                or event.get_extra("astrmai_event_id", None)
                 or getattr(getattr(event, "message_obj", None), "message_id", "")
                 or ""
             ).strip()
@@ -2279,7 +2404,10 @@ class EvolutionManager:
             group_id = event.unified_msg_origin
             sender_id = event.get_sender_id()
             sender_name = event.get_sender_name()
-            conversation_event = event.get_extra("astrmai_conversation_event", None)
+        canonical_available = bool(
+            conversation_event.get("event_id")
+            and int(conversation_event.get("schema_version", 0) or 0) > 0
+        )
         append_result = await self._append_message_log_result(
             group_id=group_id,
             sender_id=sender_id,
@@ -2299,6 +2427,7 @@ class EvolutionManager:
                     else "duplicate_event"
                 ),
                 "event_id": event_id,
+                "degraded": not canonical_available,
                 "diagnostics": {
                     key: append_result.get(key)
                     for key in (
@@ -2320,7 +2449,16 @@ class EvolutionManager:
             content=str(rich_text or ""),
         ).to_payload()
         await self._publish_learning_event("publish_learning_message_recorded", payload)
-        return {"recorded": True, "event_id": event_id}
+        return {
+            "recorded": True,
+            "event_id": event_id,
+            "degraded": not canonical_available,
+            "diagnostics": (
+                {"canonical_event": "unavailable"}
+                if not canonical_available
+                else {}
+            ),
+        }
 
     async def enqueue_user_message(self, envelope: LearningMessageEnvelope) -> bool:
         """Durably enqueue an immutable learning ingress and kick the worker."""
@@ -4188,14 +4326,31 @@ class EvolutionManager:
         group_limit = self._backlog_group_limit()
         batch_size = self._backlog_batch_size()
         group_map: dict[str, dict[str, Any]] = {}
+        discovery_errors: list[dict[str, Any]] = []
         for pipeline in ("expression", "jargon"):
             if not self._pipeline_enabled(pipeline):
                 continue
-            pipeline_groups = await self._list_pipeline_log_groups(
-                pipeline,
-                min_count=threshold,
-                limit=group_limit * 3,
-            )
+            try:
+                pipeline_groups = await self._list_pipeline_log_groups(
+                    pipeline,
+                    min_count=threshold,
+                    limit=group_limit * 3,
+                )
+            except Exception as exc:
+                if isinstance(exc, _LearningInputContractError):
+                    diagnostic = exc.as_report()
+                else:
+                    diagnostic = {
+                        "stage": "group_discovery",
+                        "pipeline": pipeline,
+                        "error_type": type(exc).__name__,
+                        "value_type": "unknown",
+                        "value_shape": "unknown",
+                        "error": str(exc),
+                    }
+                _log_learning_contract_failure(diagnostic)
+                discovery_errors.append(diagnostic)
+                continue
             for item in pipeline_groups:
                 group_id = str(item.get("group_id", "") or "")
                 if not group_id:
@@ -4227,7 +4382,7 @@ class EvolutionManager:
             "candidate_groups": groups,
             "processed_groups": [],
             "skipped_groups": [],
-            "errors": [],
+            "errors": list(discovery_errors),
             "run_retention": purge_report,
             "message_log_retention": message_log_purge,
         }
@@ -4252,9 +4407,53 @@ class EvolutionManager:
                     {"group_id": group_id, "reason": "failure_cooldown", "retry_after": failure_until}
                 )
                 continue
-            snapshot = await self._load_learning_snapshot(group_id, batch_size)
-            logs = list(snapshot.get("logs") or [])
-            pipeline_logs = dict(snapshot.get("pipeline_logs") or {})
+            try:
+                snapshot = await self._load_learning_snapshot(group_id, batch_size)
+                snapshot_map = _require_mapping(
+                    snapshot,
+                    stage="snapshot_load",
+                    group_id=group_id,
+                )
+                logs = _require_list(
+                    snapshot_map.get("logs"),
+                    stage="snapshot_logs",
+                    group_id=group_id,
+                )
+                raw_pipeline_value = snapshot_map.get("pipeline_logs")
+                raw_pipeline_logs = _require_mapping(
+                    {} if raw_pipeline_value is None else raw_pipeline_value,
+                    stage="snapshot_pipeline_logs",
+                    group_id=group_id,
+                )
+                pipeline_logs = {
+                    str(pipeline): _require_list(
+                        items,
+                        stage="snapshot_pipeline_items",
+                        pipeline=str(pipeline),
+                        group_id=group_id,
+                    )
+                    for pipeline, items in raw_pipeline_logs.items()
+                }
+            except Exception as exc:
+                diagnostic = (
+                    exc.as_report()
+                    if isinstance(exc, _LearningInputContractError)
+                    else {
+                        "stage": "snapshot_load",
+                        "pipeline": "",
+                        "group_id": group_id,
+                        "error_type": type(exc).__name__,
+                        "value_type": "unknown",
+                        "value_shape": "unknown",
+                        "error": str(exc),
+                    }
+                )
+                _log_learning_contract_failure(diagnostic)
+                failure_count = int(self._backlog_failure_counts.get(group_id, 0) or 0) + 1
+                self._backlog_failure_counts[group_id] = failure_count
+                self._backlog_failure_until[group_id] = time.time() + self._backlog_failure_cooldown()
+                report["errors"].append(diagnostic)
+                continue
             eligible_pipelines = [
                 pipeline
                 for pipeline, items in pipeline_logs.items()
@@ -4372,8 +4571,21 @@ class EvolutionManager:
                 failure_count = int(self._backlog_failure_counts.get(group_id, 0) or 0) + 1
                 self._backlog_failure_counts[group_id] = failure_count
                 self._backlog_failure_until[group_id] = time.time() + self._backlog_failure_cooldown()
-                logger.warning(f"[Evolution-Backlog] mining failed for {group_id}: {exc}")
-                report["errors"].append({"group_id": group_id, "error": str(exc)})
+                diagnostic = {
+                    "stage": "mining_group",
+                    "pipeline": ",".join(
+                        str(item.get("pipeline") or "")
+                        for item in list(group.get("pipelines") or [])
+                        if isinstance(item, Mapping)
+                    ),
+                    "group_id": group_id,
+                    "error_type": type(exc).__name__,
+                    "value_type": "unknown",
+                    "value_shape": "unknown",
+                    "error": str(exc),
+                }
+                _log_learning_contract_failure(diagnostic)
+                report["errors"].append(diagnostic)
 
         self._last_backlog_report = report
         return report
@@ -4387,12 +4599,37 @@ class EvolutionManager:
     ):
         """Call the snapshot-aware API while retaining legacy test adapters."""
         method = self.process_logs_and_mine
-        if isinstance(snapshot, dict):
-            logs = list(snapshot.get("logs") or [])
-            pipeline_snapshots = dict(snapshot.get("pipeline_logs") or {})
-        else:
-            logs = list(snapshot or [])
+        if isinstance(snapshot, Mapping):
+            logs = _require_list(
+                snapshot.get("logs"),
+                stage="snapshot_process_logs",
+                group_id=group_id,
+            )
+            raw_pipeline_value = snapshot.get("pipeline_logs")
+            raw_pipeline_snapshots = _require_mapping(
+                {} if raw_pipeline_value is None else raw_pipeline_value,
+                stage="snapshot_process_pipeline_logs",
+                group_id=group_id,
+            )
+            pipeline_snapshots = {
+                str(pipeline): _require_list(
+                    items,
+                    stage="snapshot_process_pipeline_items",
+                    pipeline=str(pipeline),
+                    group_id=group_id,
+                )
+                for pipeline, items in raw_pipeline_snapshots.items()
+            }
+        elif isinstance(snapshot, (list, tuple)):
+            logs = list(snapshot)
             pipeline_snapshots = {}
+        else:
+            raise _LearningInputContractError(
+                f"snapshot_process expected mapping or list, received {type(snapshot).__name__}",
+                stage="snapshot_process",
+                group_id=group_id,
+                value=snapshot,
+            )
         try:
             parameters = inspect.signature(method).parameters
         except (TypeError, ValueError):

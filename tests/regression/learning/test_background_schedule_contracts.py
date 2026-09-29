@@ -125,6 +125,64 @@ class _LearningDb:
 
 
 class BackgroundScheduleContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_facade_builds_canonical_event_before_detached_learning_snapshot(self):
+        captured = []
+        build_calls = []
+
+        class _Gate:
+            def ensure_conversation_event(self, event):
+                build_calls.append(event)
+                canonical = {
+                    "event_id": "canonical-1",
+                    "schema_version": 1,
+                    "provenance": "original",
+                    "message_kind": "text",
+                }
+                event.set_extra("astrmai_conversation_event", canonical)
+                return canonical
+
+        class _Evolution:
+            async def record_user_message(self, envelope):
+                captured.append(envelope)
+
+        class _Event:
+            unified_msg_origin = "group-1"
+            message_str = "hello"
+            message_obj = SimpleNamespace(message_id="platform-1", timestamp=123.0)
+
+            def __init__(self):
+                self._extras = {}
+
+            def get_sender_id(self):
+                return "u1"
+
+            def get_sender_name(self):
+                return "Alice"
+
+            def get_extra(self, key, default=None):
+                return self._extras.get(key, default)
+
+            def set_extra(self, key, value):
+                self._extras[key] = value
+
+        facade = PluginFacade.__new__(PluginFacade)
+        facade.runtime = SimpleNamespace(
+            attention_gate=_Gate(),
+            evolution=_Evolution(),
+            lifecycle=SimpleNamespace(manager=None),
+            owner_registry=None,
+        )
+        event = _Event()
+
+        self.assertTrue(facade._schedule_evolution_record(event))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        self.assertEqual(build_calls, [event])
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0].event_id, "canonical-1")
+        self.assertEqual(captured[0].conversation_event["schema_version"], 1)
+
     async def test_learning_envelope_is_immutable_and_has_stable_fallback_id(self):
         class _Event:
             unified_msg_origin = "group-1"
