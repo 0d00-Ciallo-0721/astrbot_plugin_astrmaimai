@@ -1023,7 +1023,7 @@ class ContextRuntimeWiringTests(unittest.TestCase):
         self.assertTrue(include_recent)
         self.assertEqual(reason, "tail_followup_recent")
 
-    def test_recent_fallback_skips_tail_recent_when_recent_tail_is_not_same_chain(self):
+    def test_recent_fallback_keeps_real_tail_even_when_followup_chain_is_unclear(self):
         mixin_mod = importlib.import_module("astrmai.conversation.planning.planner_prompt_context")
 
         class DummyPlanner(mixin_mod.PlannerPromptContextMixin):
@@ -1041,8 +1041,8 @@ class ContextRuntimeWiringTests(unittest.TestCase):
             "Bob: lunch first?\nCarol: milk tea also works.",
             post_compaction_recovery_rounds=0,
         )
-        self.assertFalse(include_recent)
-        self.assertEqual(reason, "warm_sufficient")
+        self.assertTrue(include_recent)
+        self.assertEqual(reason, "warm_with_recent_minimum")
 
     def test_recent_fallback_keeps_recent_for_vision_mainline_question(self):
         mixin_mod = importlib.import_module("astrmai.conversation.planning.planner_prompt_context")

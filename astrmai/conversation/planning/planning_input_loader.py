@@ -9,6 +9,9 @@ from typing import Any, Callable
 from astrbot.api import logger
 
 from ..contracts.prompt_envelope import PromptEnvelope
+from ..contracts.dialog_history_policy import DialogHistoryPolicy
+from ..contracts.topic_attention_anchor import TopicAttentionAnchor
+from ..contracts.topic_bridge import BridgeDecision
 from ..contracts.turn_context import ensure_turn_context
 from ...memory.contracts.learning_retrieval import LearningFocusContext
 from ...infrastructure.runtime.trace_runtime import debug_trace
@@ -165,6 +168,23 @@ class PlanningInputLoader:
             learning_focus_context = None
         if prompt_envelope is not None:
             prompt_envelope.learning_focus_context = learning_focus_context
+            anchor_prompt = str(
+                event.get_extra("astrmai_topic_attention_anchor_prompt", "")
+                if hasattr(event, "get_extra")
+                else ""
+            ).strip()
+            if anchor_prompt:
+                prompt_envelope.topic_attention_anchor_block = anchor_prompt
+                anchor = ensure_turn_context(event).continuity.topic_attention_anchor
+                prompt_envelope.topic_attention_anchor_event_ids = list(anchor.recent_event_ids)
+            bridge_prompt = str(
+                event.get_extra("astrmai_cross_topic_bridge_prompt", "")
+                if hasattr(event, "get_extra") else ""
+            ).strip()
+            if bridge_prompt:
+                prompt_envelope.cross_topic_bridge_block = bridge_prompt
+                bridge = ensure_turn_context(event).continuity.topic_bridge
+                prompt_envelope.cross_topic_bridge_event_ids = list(bridge.evidence_event_ids)
         result: dict[str, Any] = {
             # Deprecated compatibility mirrors for legacy readers outside the main reply chain.
             "slang_context": "",
@@ -282,6 +302,11 @@ class PlanningInputLoader:
         return {
             "summary": store.summary(chat_id),
             "snapshot": store.snapshot(chat_id),
+            "topic_anchor_prompt": (
+                store.topic_anchor_prompt(chat_id)
+                if hasattr(store, "topic_anchor_prompt")
+                else ""
+            ),
         }
 
     def _heartflow_snapshot(self, chat_id: str) -> dict[str, Any]:
@@ -507,6 +532,7 @@ class PlanningInputLoader:
     def _apply_continuity(self, event, continuity: dict[str, Any]) -> None:
         summary = str(continuity.get("summary", "") or "")
         snapshot = continuity.get("snapshot", {}) or {}
+        topic_anchor_prompt = str(continuity.get("topic_anchor_prompt", "") or "").strip()
         private_topic_context = ""
         private_topic_label = ""
         private_topic_inherited = False
@@ -533,8 +559,34 @@ class PlanningInputLoader:
         turn_context.continuity.goal_status = str(snapshot.get("goal_status", "") or "")
         turn_context.continuity.continuity_weight = str(snapshot.get("continuity_weight", "") or "")
         turn_context.continuity.turn_count = int(snapshot.get("turn_count", 0) or 0)
+        turn_context.continuity.topic_attention_anchor = TopicAttentionAnchor.from_value(
+            snapshot.get("topic_anchor", {})
+        )
+        bridge = BridgeDecision()
+        policy = DialogHistoryPolicy.from_event(event)
+        source_epoch = turn_context.continuity.topic_attention_anchor.topic_epoch
+        if policy.group_id and source_epoch and policy.topic_epoch != source_epoch:
+            store = getattr(self.planner, "conversation_continuity", None)
+            canonical = event.get_extra("astrmai_conversation_event", None) if hasattr(event, "get_extra") else None
+            if store is not None and canonical is not None and hasattr(store, "evaluate_topic_bridge"):
+                try:
+                    bridge = store.evaluate_topic_bridge(
+                        policy.group_id,
+                        event=canonical,
+                        target_topic_epoch=policy.topic_epoch,
+                        rotation_reason=policy.rotation_reason,
+                    )
+                except (TypeError, ValueError, AttributeError) as exc:
+                    logger.debug(f"[PlanningInputLoader] topic bridge degraded: {exc}")
+                    bridge = BridgeDecision(reason="evaluation_error")
+            topic_anchor_prompt = ""
+            turn_context.continuity.topic_attention_anchor = TopicAttentionAnchor()
+        turn_context.continuity.topic_bridge = bridge
         if summary and hasattr(event, "set_extra"):
             event.set_extra("astrmai_conversation_continuity_summary", summary)
+        if hasattr(event, "set_extra"):
+            event.set_extra("astrmai_topic_attention_anchor_prompt", topic_anchor_prompt)
+            event.set_extra("astrmai_cross_topic_bridge_prompt", bridge.prompt_text())
         turn_context.continuity.conversation_summary = summary
 
     def _apply_heartflow(self, event, heartflow: dict[str, Any]) -> None:

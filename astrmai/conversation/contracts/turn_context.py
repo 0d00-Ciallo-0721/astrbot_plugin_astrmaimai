@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from .topic_attention_anchor import TopicAttentionAnchor
+from .topic_bridge import BridgeDecision
+
 
 TURN_CONTEXT_EXTRA_KEY = "astrmai_turn_context"
 
@@ -117,6 +120,8 @@ class ContinuitySnapshot:
     goal_status: str = ""
     continuity_weight: str = ""
     turn_count: int = 0
+    topic_attention_anchor: TopicAttentionAnchor = field(default_factory=TopicAttentionAnchor)
+    topic_bridge: BridgeDecision = field(default_factory=BridgeDecision)
     dialogue_store_version: str = ""
     compaction_status: str = ""
     compaction_eligibility_reason: str = ""

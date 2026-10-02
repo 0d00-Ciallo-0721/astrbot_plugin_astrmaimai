@@ -60,6 +60,7 @@ class WarmContextBundle:
     summary_text: str = ""
     quote_text: str = ""
     quote_event_ids: list[str] = field(default_factory=list)
+    quote_entries: list[tuple[str, str]] = field(default_factory=list)
     has_latest_assistant: bool = False
     """Whether the latest assistant message is present in the selected quotes.
 
@@ -2024,9 +2025,9 @@ class GroupDialogueStore:
         *,
         max_tokens: int,
         include_identity: bool = False,
-    ) -> tuple[str, list[str], bool]:
+    ) -> tuple[str, list[str], bool, list[tuple[str, str]]]:
         if not segments or max_tokens <= 0:
-            return "", [], False
+            return "", [], False, []
         candidate_pool = segments[-8:] if len(segments) > 8 else list(segments)
         ordered = [
             segment
@@ -2085,13 +2086,13 @@ class GroupDialogueStore:
                 continue
             seen_keys.add(key)
             deduped.append(segment)
-        lines = [
-            self._format_segment_line(segment, include_identity=include_identity)
+        quote_entries = [
+            (segment.event_id, line)
             for segment in deduped
-            if self._format_segment_line(segment, include_identity=include_identity)
+            if (line := self._format_segment_line(segment, include_identity=include_identity))
         ]
-        quote_event_ids = [segment.event_id for segment in deduped if segment.event_id]
-        return "\n".join(lines).strip(), quote_event_ids, has_latest_assistant
+        quote_event_ids = [event_id for event_id, _ in quote_entries if event_id]
+        return "\n".join(line for _, line in quote_entries).strip(), quote_event_ids, has_latest_assistant, quote_entries
 
     async def get_warm_context_bundle(
         self,
@@ -2124,7 +2125,7 @@ class GroupDialogueStore:
                 summary_candidates = self._select_warm_summary_segments(candidates)
                 warm_units = self._extract_warm_topic_units(summary_candidates)
                 summary_text = self._build_warm_summary_v2(summary_candidates, max_tokens=summary_budget)
-                quote_text, quote_event_ids, has_latest_assistant = self._build_warm_quotes(
+                quote_text, quote_event_ids, has_latest_assistant, quote_entries = self._build_warm_quotes(
                     candidates,
                     max_tokens=quote_budget if quote_budget > 0 else max_tokens,
                     include_identity=include_identity,
@@ -2133,6 +2134,7 @@ class GroupDialogueStore:
                     summary_text=summary_text,
                     quote_text=quote_text,
                     quote_event_ids=quote_event_ids,
+                    quote_entries=quote_entries,
                     has_latest_assistant=has_latest_assistant,
                     topic_preview=" | ".join(
                         f"{unit.slot}:{self._preview_text(unit.text, 24)}"

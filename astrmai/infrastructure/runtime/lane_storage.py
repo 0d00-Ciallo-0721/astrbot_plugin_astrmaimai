@@ -63,6 +63,7 @@ class LaneStorageMixin:
         rotate = False
         rotate_reason = ""
         old_history: List[dict] = []
+        rotation_seed: List[dict] = []
         if conversation_id:
             try:
                 old_conversation = await self.conversation_manager.get_conversation(
@@ -84,6 +85,8 @@ class LaneStorageMixin:
                 persona_core_version=persona_core_version,
             )
             rotate = bool(rotate_reason)
+            if rotate and (lane_key.subsystem, lane_key.task_family) == ("sys2", "dialog"):
+                rotation_seed = self._build_rotation_seed(old_history, lane_key)
 
         target_conversation_id = conversation_id
         if not target_conversation_id or rotate:
@@ -98,6 +101,7 @@ class LaneStorageMixin:
                 if not target_conversation_id or rotate:
                     target_conversation_id = await self.conversation_manager.new_conversation(
                         unified_msg_origin=lane_umo,
+                        content=rotation_seed or None,
                         title=self._build_title(lane_key),
                         persona_id=persona_id or None,
                     )
@@ -111,16 +115,6 @@ class LaneStorageMixin:
                         f"old sessions on provider side may still consume resources "
                         f"(conversation_manager has no terminate API)"
                     )
-            if rotate and old_history and (lane_key.subsystem, lane_key.task_family) == ("sys2", "dialog"):
-                await self.conversation_manager.update_conversation(
-                    unified_msg_origin=lane_umo,
-                    conversation_id=target_conversation_id,
-                    history=[{"role": "assistant", "content": self._build_rolling_summary(old_history)}],
-                    title=self._build_title(lane_key),
-                    persona_id=persona_id or None,
-                    token_usage=None,
-                )
-
         async def _load_and_normalize(curr_conversation_id: str) -> List[dict]:
             conversation = await self.conversation_manager.get_conversation(
                 lane_umo,
@@ -217,6 +211,8 @@ class LaneStorageMixin:
         template_id: str = "",
         schema_id: str = "",
         persona_core_version: str = "",
+        user_event_id: str = "",
+        assistant_event_id: str = "",
     ) -> List[dict]:
         lane_umo, conversation_id, history, _ = await self._ensure_lane_with_timeout(
             lane_key=lane_key,
@@ -237,8 +233,8 @@ class LaneStorageMixin:
                 create_if_not_exists=True,
             )
             history = self._normalize_history(self._load_history(conversation), lane_key)
-            user_turn = self.build_history_turn("user", user_content)
-            assistant_turn = self.build_history_turn("assistant", assistant_content)
+            user_turn = self.build_history_turn("user", user_content, user_event_id)
+            assistant_turn = self.build_history_turn("assistant", assistant_content, assistant_event_id)
             if user_turn:
                 history.append(user_turn)
             if assistant_turn:
@@ -263,6 +259,7 @@ class LaneStorageMixin:
         base_origin: Optional[str],
         raw_user_text: Any,
         artifact: VisibleReplyArtifact,
+        history_user_text: Any = None,
         token_usage: Optional[int] = None,
         prefix_hash: str = "",
         model_id: str = "",
@@ -270,6 +267,8 @@ class LaneStorageMixin:
         template_id: str = "",
         schema_id: str = "",
         persona_core_version: str = "",
+        user_event_id: str = "",
+        assistant_event_id: str = "",
     ) -> List[dict]:
         if artifact.blocked or not artifact.persistable_text:
             lane_umo, conversation_id, history, _ = await self._ensure_lane_with_timeout(
@@ -286,7 +285,7 @@ class LaneStorageMixin:
         return await self.append_exchange(
             lane_key=lane_key,
             base_origin=base_origin,
-            user_content=raw_user_text,
+            user_content=raw_user_text if history_user_text is None else history_user_text,
             assistant_content=artifact.persistable_text,
             token_usage=token_usage,
             prefix_hash=prefix_hash,
@@ -295,6 +294,8 @@ class LaneStorageMixin:
             template_id=template_id,
             schema_id=schema_id,
             persona_core_version=persona_core_version,
+            user_event_id=user_event_id,
+            assistant_event_id=assistant_event_id,
         )
 
     async def get_lane_history(

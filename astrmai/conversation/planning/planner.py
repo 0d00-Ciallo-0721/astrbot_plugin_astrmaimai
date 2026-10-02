@@ -1947,6 +1947,19 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         history_policy = DialogHistoryPolicy.from_event(event)
         sender_id = history_policy.current_sender_id
         source_event_id = ""
+        canonical_event = event.get_extra("astrmai_conversation_event", None) if event is not None else None
+        if canonical_event is not None and getattr(canonical_event, "event_id", ""):
+            source_event_id = str(canonical_event.event_id).strip()
+        assistant_outbound_ids: tuple[str, ...] = ()
+        if event is not None:
+            committed_turn = event.get_extra("astrmai_committed_bot_turn", None)
+            assistant_outbound_ids = tuple(
+                dict.fromkeys(
+                    str(item or "").strip()
+                    for item in (getattr(committed_turn, "outbound_message_ids", ()) or ())
+                    if str(item or "").strip()
+                )
+            )
         if event is not None:
             if not sender_id:
                 try:
@@ -1954,11 +1967,13 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                 except Exception:
                     sender_id = ""
             message_obj = getattr(event, "message_obj", None)
-            source_event_id = str(
+            platform_event_id = str(
                 getattr(message_obj, "message_id", "")
                 or getattr(event, "message_id", "")
                 or ""
             ).strip()
+            if not source_event_id:
+                source_event_id = platform_event_id
         self.conversation_continuity.record(
             chat_id=chat_id,
             focus_preview=focus_preview,
@@ -1978,6 +1993,8 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             ),
             sender_id=sender_id,
             source_event_id=source_event_id,
+            assistant_outbound_ids=assistant_outbound_ids,
+            anchor_event=canonical_event or event,
             topic_epoch=history_policy.topic_epoch if history_policy.group_id else None,
         )
 

@@ -316,6 +316,7 @@ class PlannerPromptContextMixin:
         warm_topics_preview: str,
         warm_zone_has_latest_assistant: bool,
         warm_zone_quote_event_ids: list[str],
+        warm_zone_quote_entries: list[tuple[str, str]],
         last_assistant_reply: str,
         current_speaker_block: str,
         near_context_priority: bool,
@@ -335,6 +336,7 @@ class PlannerPromptContextMixin:
             warm_topics_preview=warm_topics_preview,
             warm_zone_has_latest_assistant=warm_zone_has_latest_assistant,
             warm_zone_quote_event_ids=list(warm_zone_quote_event_ids or []),
+            warm_zone_quote_entries=list(warm_zone_quote_entries or []),
             last_assistant_reply=last_assistant_reply,
             current_speaker_block=current_speaker_block,
             referenced_entity_block=referenced_entity_block,
@@ -385,21 +387,32 @@ class PlannerPromptContextMixin:
                 history_policy.bind(event)
         lane_key, base_origin = resolve_dialog_lane_identity(event, chat_id)
         try:
-            return await lane_manager.get_recent_transcript(
+            result = await lane_manager.get_recent_transcript(
                 lane_key=lane_key,
                 base_origin=base_origin,
                 max_turns=4,
                 max_age_seconds=max_age_seconds,
+                include_event_ids=True,
             )
+            if isinstance(result, tuple):
+                if event is not None and hasattr(event, "set_extra"):
+                    event.set_extra("astrmai_recent_transcript_event_ids", result[1])
+                return result[0]
+            return result
         except TypeError as exc:
-            if "max_age_seconds" not in str(exc):
+            if "max_age_seconds" not in str(exc) and "include_event_ids" not in str(exc):
                 logger.debug(f"[{chat_id}] recent transcript load failed: {exc}")
                 return ""
             try:
+                kwargs = {
+                    "lane_key": lane_key,
+                    "base_origin": base_origin,
+                    "max_turns": 4,
+                }
+                if "max_age_seconds" not in str(exc):
+                    kwargs["max_age_seconds"] = max_age_seconds
                 return await lane_manager.get_recent_transcript(
-                    lane_key=lane_key,
-                    base_origin=base_origin,
-                    max_turns=4,
+                    **kwargs,
                 )
             except Exception as fallback_exc:
                 logger.debug(f"[{chat_id}] recent transcript legacy load failed: {fallback_exc}")
@@ -630,7 +643,10 @@ class PlannerPromptContextMixin:
             and self._recent_tail_stays_on_followup_chain(focus_message_text, recent_transcript)
         ):
             return True, "tail_followup_recent"
-        return False, "warm_sufficient"
+        # A warm summary is an older projection. Keep the real lane tail so
+        # speaker order, short follow-ups, and the latest unresolved turn are
+        # still available; the shared refiner budget trims older context later.
+        return True, "warm_with_recent_minimum"
 
     def _set_disable_rag_injection(self, ctx, disabled: bool) -> None:
         if not ctx:
@@ -719,6 +735,7 @@ class PlannerPromptContextMixin:
         warm_zone_quotes = "" if warm_bundle is None else str(getattr(warm_bundle, "quote_text", "") or "").strip()
         warm_topics_preview = "" if warm_bundle is None else str(getattr(warm_bundle, "topic_preview", "") or "").strip()
         warm_zone_quote_event_ids = [] if warm_bundle is None else list(getattr(warm_bundle, "quote_event_ids", []) or [])
+        warm_zone_quote_entries = [] if warm_bundle is None else list(getattr(warm_bundle, "quote_entries", []) or [])
         if history_policy.group_id:
             history_policy = replace(
                 history_policy,
@@ -937,12 +954,16 @@ class PlannerPromptContextMixin:
             warm_topics_preview=warm_topics_preview,
             warm_zone_has_latest_assistant=warm_zone_has_latest_assistant,
             warm_zone_quote_event_ids=warm_zone_quote_event_ids,
+            warm_zone_quote_entries=warm_zone_quote_entries,
             last_assistant_reply=last_assistant_reply,
             current_speaker_block=current_speaker_block,
             referenced_entity_block=referenced_entity_block,
             near_context_priority=near_context_priority,
             focus_message_identity=self._render_event_line(focus_event),
             context_package=context_package,
+        )
+        prompt_envelope.recent_transcript_event_ids = list(
+            focus_event.get_extra("astrmai_recent_transcript_event_ids", []) or []
         )
         reply_shape_source_text = str(
             focus_event.get_extra("astrmai_rich_text", focus_event.message_str) or ""

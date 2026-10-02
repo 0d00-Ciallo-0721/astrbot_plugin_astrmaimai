@@ -1,11 +1,25 @@
 from __future__ import annotations
 
+import re
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Iterable
-import re
 
 from ..contracts.dialog_history_policy import DialogHistoryPolicy
+from ..contracts.topic_attention_anchor import (
+    ANCHOR_MAX_EVENT_IDS,
+    ANCHOR_MAX_ID_CHARS,
+    ANCHOR_MAX_OPEN_LOOP_CHARS,
+    ANCHOR_MAX_PARTICIPANTS,
+    ANCHOR_MAX_PROMPT_CHARS,
+    ANCHOR_MAX_SERIALIZED_CHARS,
+    ANCHOR_MAX_SOURCE_CHARS,
+    ANCHOR_MAX_SUBJECT_CHARS,
+    ANCHOR_SOURCE_VALUES,
+    TopicAttentionAnchor,
+)
+from ..contracts.topic_bridge import BRIDGE_MAX_EVENT_IDS, BRIDGE_MAX_PROMPT_CHARS, BRIDGE_MAX_TURNS, BridgeDecision
 
 
 @dataclass(slots=True)
@@ -22,6 +36,7 @@ class ConversationTurnRecord:
     goal_status: str = ""
     sender_id: str = ""
     source_event_id: str = ""
+    assistant_outbound_ids: tuple[str, ...] = field(default_factory=tuple)
     topic_epoch: int = 0
 
 
@@ -43,13 +58,20 @@ class ConversationContinuityState:
     last_sender_id: str = ""
     last_event_id: str = ""
     topic_participants: set[str] = field(default_factory=set)
+    topic_anchor: TopicAttentionAnchor = field(default_factory=TopicAttentionAnchor)
     turns: list[ConversationTurnRecord] = field(default_factory=list)
+    bridge_anchor: TopicAttentionAnchor = field(default_factory=TopicAttentionAnchor)
+    bridge_turns: list[ConversationTurnRecord] = field(default_factory=list)
+    event_id_map: dict[str, str] = field(default_factory=dict)
 
 
 class ConversationContinuityStore:
     MAX_TURNS_PER_CHAT = 12
     TURN_TTL_SECONDS = 30 * 60
     SOFT_DECAY_SECONDS = 10 * 60
+    BRIDGE_TTL_SECONDS = 120
+    BRIDGE_SAME_ACTOR_SECONDS = 90
+    BRIDGE_MAX_PROMPT_CHARS = BRIDGE_MAX_PROMPT_CHARS
     TOPIC_SIMILARITY_THRESHOLD = 0.28
     WEAK_TOPIC_SIMILARITY_THRESHOLD = 0.45
     INTERNAL_TOPIC_ENVELOPE_RE = re.compile(
@@ -57,6 +79,14 @@ class ConversationContinuityStore:
         re.DOTALL,
     )
     NONSEMANTIC_TOPIC_RE = re.compile(r"^[\W_]+$", re.UNICODE)
+    ANCHOR_MAX_PARTICIPANTS = ANCHOR_MAX_PARTICIPANTS
+    ANCHOR_MAX_SUBJECT_CHARS = ANCHOR_MAX_SUBJECT_CHARS
+    ANCHOR_MAX_OPEN_LOOP_CHARS = ANCHOR_MAX_OPEN_LOOP_CHARS
+    ANCHOR_MAX_EVENT_IDS = ANCHOR_MAX_EVENT_IDS
+    ANCHOR_MAX_PROMPT_CHARS = ANCHOR_MAX_PROMPT_CHARS
+    ANCHOR_MAX_ID_CHARS = ANCHOR_MAX_ID_CHARS
+    ANCHOR_MAX_SOURCE_CHARS = ANCHOR_MAX_SOURCE_CHARS
+    ANCHOR_MAX_SERIALIZED_CHARS = ANCHOR_MAX_SERIALIZED_CHARS
 
     def __init__(self):
         self._states: dict[str, ConversationContinuityState] = {}
@@ -69,6 +99,57 @@ class ConversationContinuityStore:
         self._group_topic_active_ttl_seconds = 1200.0
         self._group_topic_confirm_after_seconds = 1800.0
         self._group_provider_topic_session_enabled = True
+
+    @staticmethod
+    def _anchor_event_value(event: Any, name: str, default: Any = "") -> Any:
+        if event is None:
+            return default
+        if isinstance(event, Mapping):
+            return event.get(name, default)
+        return getattr(event, name, default)
+
+    @classmethod
+    def _anchor_append_unique(cls, values: Iterable[Any], value: Any, limit: int) -> tuple[str, ...]:
+        result: list[str] = []
+        for item in values:
+            normalized = str(item or "").strip()
+            if normalized and normalized not in result:
+                result.append(normalized)
+        normalized = str(value or "").strip()
+        if normalized and normalized not in result:
+            result.append(normalized)
+        return tuple(result[-max(1, int(limit or 1)) :])
+
+    @classmethod
+    def _normalize_evidence_ids(cls, values: Iterable[Any], limit: int) -> tuple[str, ...]:
+        normalized: list[str] = []
+        for value in values:
+            item = str(value or "").strip()
+            if item and item not in normalized:
+                normalized.append(item)
+        return tuple(normalized[-max(1, int(limit or 1)) :])
+
+    @classmethod
+    def _anchor_is_question(cls, text: str) -> bool:
+        value = cls._topic_message_text(text)
+        return bool(value and (value.endswith(("?", "？")) or any(marker in value for marker in ("吗", "么", "是否", "怎么", "为什么"))))
+
+    def _anchor_view(self, state: ConversationContinuityState, now: float) -> dict[str, Any]:
+        anchor = state.topic_anchor
+        if not anchor.subject_preview or not anchor.updated_at:
+            return {}
+        if (
+            now - anchor.updated_at > self.TURN_TTL_SECONDS
+            or anchor.updated_at - now > self.TURN_TTL_SECONDS
+        ):
+            return {}
+        payload = anchor.as_dict()
+        payload["age_seconds"] = max(0.0, now - anchor.updated_at)
+        return payload
+
+    @classmethod
+    def _empty_anchor_view(cls) -> dict[str, Any]:
+        return TopicAttentionAnchor().as_dict()
 
     def refresh_config(self, config: Any) -> None:
         """Refresh private-topic timing without changing existing conversation state."""
@@ -124,6 +205,18 @@ class ConversationContinuityStore:
             state = ConversationContinuityState(chat_id=chat_id)
             self._states[chat_id] = state
         return state
+
+    def register_event_id_mapping(self, chat_id: str, *, canonical_id: str, platform_id: str) -> None:
+        """Keep a bounded, explicit mapping between canonical and platform IDs."""
+        canonical = str(canonical_id or "").strip()[: self.ANCHOR_MAX_ID_CHARS]
+        platform = str(platform_id or "").strip()[: self.ANCHOR_MAX_ID_CHARS]
+        if not canonical or not platform or canonical == platform:
+            return
+        state = self._state(str(chat_id or ""))
+        state.event_id_map[canonical] = platform
+        state.event_id_map[platform] = canonical
+        if len(state.event_id_map) > self.ANCHOR_MAX_EVENT_IDS * 2:
+            state.event_id_map = dict(list(state.event_id_map.items())[-self.ANCHOR_MAX_EVENT_IDS * 2 :])
 
     @staticmethod
     def _normalize_topic_text(text: str) -> str:
@@ -609,7 +702,11 @@ class ConversationContinuityStore:
         state.last_sender_id = ""
         state.last_event_id = ""
         state.topic_participants.clear()
+        state.topic_anchor = TopicAttentionAnchor()
         state.turns = []
+        state.bridge_anchor = TopicAttentionAnchor()
+        state.bridge_turns = []
+        state.event_id_map.clear()
         return True
 
     def recent(self, chat_id: str, *, now: float | None = None) -> list[ConversationTurnRecord]:
@@ -643,7 +740,305 @@ class ConversationContinuityStore:
             "last_sender_id": state.last_sender_id,
             "last_event_id": state.last_event_id,
             "topic_participants": sorted(state.topic_participants),
+            "topic_anchor": self._anchor_view(state, now) or self._empty_anchor_view(),
         }
+
+    def update_topic_anchor(
+        self,
+        chat_id: str,
+        *,
+        event: Any = None,
+        subject_preview: str = "",
+        reply_text: str = "",
+        anchor_event: Any = None,
+        event_id: str = "",
+        actor_id: str = "",
+        topic_epoch: int | None = None,
+        open_loop: str = "",
+        source: Iterable[str] = (),
+        confidence: float = 0.7,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """Update one bounded anchor without creating a second history store."""
+        now = time.time() if now is None else float(now)
+        state = self._state(str(chat_id or ""))
+        if not self._anchor_view(state, now):
+            state.topic_anchor = TopicAttentionAnchor()
+        current = state.topic_anchor
+        event = anchor_event or event
+        canonical_event_id = self._anchor_event_value(event, "event_id", "")
+        event_id = str(
+            canonical_event_id
+            or event_id
+            or self._anchor_event_value(event, "platform_message_id", "")
+            or ""
+        ).strip()[: self.ANCHOR_MAX_ID_CHARS]
+        actor_id = str(
+            self._anchor_event_value(event, "actor_id", "") or actor_id or ""
+        ).strip()[: self.ANCHOR_MAX_ID_CHARS]
+        epoch = max(
+            0,
+            int(
+                topic_epoch
+                if topic_epoch is not None
+                else self._anchor_event_value(event, "topic_epoch", 0) or state.topic_epoch or 0
+            ),
+        )
+        subject = self._sanitize_topic_preview(subject_preview)
+        if not subject:
+            subject = self._sanitize_topic_preview(self._anchor_event_value(event, "visible_text", ""))
+        subject = subject[: self.ANCHOR_MAX_SUBJECT_CHARS]
+        if not subject and not event_id and not actor_id:
+            return current.as_dict()
+        current_subject = current.subject_preview
+        epoch_changed = bool(current.topic_epoch and epoch and current.topic_epoch != epoch)
+        changed = epoch_changed or bool(
+            current_subject and subject and not self._is_same_topic(current_subject, subject)
+        )
+        if event_id and event_id in current.recent_event_ids and not changed:
+            return current.as_dict()
+        if changed:
+            if current.subject_preview and current.updated_at and 0 <= now - current.updated_at < self.BRIDGE_TTL_SECONDS:
+                state.bridge_anchor = current
+                state.bridge_turns = [
+                    turn for turn in state.turns
+                    if turn.topic_epoch == current.topic_epoch
+                    and 0 <= now - turn.timestamp < self.BRIDGE_TTL_SECONDS
+                ][-BRIDGE_MAX_TURNS:]
+            participant_ids: tuple[str, ...] = ()
+            event_ids: tuple[str, ...] = ()
+            sources: tuple[str, ...] = ("topic_transition",)
+            current_open_loop = ""
+        else:
+            participant_ids = current.participants
+            event_ids = current.recent_event_ids
+            sources = current.source
+            current_open_loop = current.open_loop
+        participant_ids = self._anchor_append_unique(participant_ids, actor_id, self.ANCHOR_MAX_PARTICIPANTS)
+        event_ids = self._anchor_append_unique(event_ids, event_id, self.ANCHOR_MAX_EVENT_IDS)
+        for evidence_id in (
+            self._anchor_event_value(event, "quote_event_id", ""),
+            self._anchor_event_value(event, "reply_target_event_id", ""),
+            self._anchor_event_value(event, "causal_parent_event_id", ""),
+        ):
+            event_ids = self._anchor_append_unique(
+                event_ids,
+                str(evidence_id or "").strip()[: self.ANCHOR_MAX_ID_CHARS],
+                self.ANCHOR_MAX_EVENT_IDS,
+            )
+        if isinstance(source, (str, bytes)):
+            source = (source,)
+        incoming_sources = [
+            str(item).strip()[: self.ANCHOR_MAX_SOURCE_CHARS]
+            for item in source
+            if str(item).strip() in ANCHOR_SOURCE_VALUES
+        ]
+        if event_id:
+            incoming_sources.append("user_message" if not bool(self._anchor_event_value(event, "is_bot", False)) else "assistant_reply")
+        platform_id = self._anchor_event_value(event, "platform_message_id", "")
+        if event_id and platform_id:
+            self.register_event_id_mapping(chat_id, canonical_id=event_id, platform_id=platform_id)
+        if self._anchor_event_value(event, "quote_event_id", ""):
+            incoming_sources.append("quote")
+        if self._anchor_event_value(event, "reply_target_event_id", ""):
+            incoming_sources.append("reply_target")
+        if reply_text:
+            incoming_sources.append("assistant_reply")
+            if self._anchor_is_question(reply_text):
+                current_open_loop = self._sanitize_topic_preview(reply_text)[: self.ANCHOR_MAX_OPEN_LOOP_CHARS]
+                incoming_sources.append("explicit_question")
+            else:
+                current_open_loop = ""
+        elif open_loop:
+            current_open_loop = self._sanitize_topic_preview(open_loop)[: self.ANCHOR_MAX_OPEN_LOOP_CHARS]
+        elif current_open_loop and subject and subject != current_subject:
+            current_open_loop = ""
+        elif current_open_loop and event is not None and not self._anchor_event_value(event, "is_bot", False):
+            current_open_loop = ""
+        for incoming_source in incoming_sources or ["user_message"]:
+            sources = self._anchor_append_unique(sources, incoming_source, 8)
+        try:
+            bounded_confidence = max(0.0, min(1.0, float(confidence or 0.0)))
+        except (TypeError, ValueError):
+            bounded_confidence = 0.0
+        state.topic_anchor = TopicAttentionAnchor(
+            topic_epoch=epoch,
+            participants=participant_ids,
+            subject_preview=subject or current_subject,
+            open_loop=current_open_loop,
+            recent_event_ids=event_ids,
+            updated_at=now,
+            confidence=bounded_confidence,
+            source=sources,
+        )
+        return state.topic_anchor.as_dict()
+
+    def topic_anchor_view(self, chat_id: str, *, now: float | None = None) -> dict[str, Any]:
+        now = time.time() if now is None else float(now)
+        state = self._state(str(chat_id or ""))
+        self.recent(chat_id, now=now)
+        return self._anchor_view(state, now)
+
+    def topic_anchor_prompt(self, chat_id: str, *, now: float | None = None) -> str:
+        now = time.time() if now is None else float(now)
+        view = self.topic_anchor_view(chat_id, now=now)
+        if not view:
+            return ""
+        lines = [
+            "话题注意力锚点（动态上下文，非稳定系统规则）：",
+            f"- subject={str(view.get('subject_preview', ''))[:self.ANCHOR_MAX_SUBJECT_CHARS]}",
+            f"- participants={','.join(view.get('participants', [])[:self.ANCHOR_MAX_PARTICIPANTS])}",
+            f"- open_loop={str(view.get('open_loop', ''))[:self.ANCHOR_MAX_OPEN_LOOP_CHARS] or 'none'}",
+            f"- source={','.join(view.get('source', [])) or 'unknown'}; age_seconds={int(view.get('age_seconds', 0) or 0)}; confidence={float(view.get('confidence', 0.0) or 0.0):.2f}",
+        ]
+        return "\n".join(lines)[: self.ANCHOR_MAX_PROMPT_CHARS]
+
+    def evaluate_topic_bridge(
+        self,
+        chat_id: str,
+        *,
+        event: Any,
+        target_topic_epoch: int,
+        rotation_reason: str = "",
+        now: float | None = None,
+    ) -> BridgeDecision:
+        """Read the previous topic without changing its epoch, anchor or history."""
+        now = time.time() if now is None else float(now)
+        chat_key = str(chat_id or "").strip()
+        source = self._states.get(chat_key)
+        source_epoch = int(source.topic_epoch or 0) if source else 0
+        target_epoch = max(0, int(target_topic_epoch or 0))
+
+        def deny(reason: str) -> BridgeDecision:
+            return BridgeDecision(
+                reason=reason,
+                source_chat_key=chat_key,
+                target_chat_key=chat_key,
+                source_topic_epoch=source_epoch,
+                target_topic_epoch=target_epoch,
+                created_at=now,
+            )
+
+        event_chat = str(self._anchor_event_value(event, "chat_id", "") or "").strip()
+        if not chat_key or not event_chat or event_chat != chat_key:
+            return deny("chat_mismatch")
+        text = self._sanitize_topic_preview(self._anchor_event_value(event, "visible_text", ""))
+        if rotation_reason == "explicit_topic_switch" or self._is_explicit_topic_switch(text) or self._is_confirmation_no(text) or "不聊了" in text:
+            return deny("explicit_topic_switch")
+        if source is None:
+            return deny("no_source_anchor")
+        source_anchor = source.topic_anchor
+        source_turns = source.turns
+        if source.bridge_anchor.topic_epoch and (
+            source_anchor.topic_epoch != source_epoch
+            or source.bridge_anchor.topic_epoch == target_epoch - 1
+        ):
+            source_anchor = source.bridge_anchor
+            source_turns = source.bridge_turns
+            source_epoch = source_anchor.topic_epoch
+        if not source_anchor.subject_preview:
+            return deny("no_source_anchor")
+        if source_epoch == target_epoch:
+            return deny("same_topic")
+        if source_epoch <= 0 or target_epoch != source_epoch + 1:
+            return deny("non_adjacent_topic")
+        if source.goal_status in {"guarded", "redirected"} or source.last_social_intent in {"boundary", "redirect"}:
+            return deny("closed_or_guarded_topic")
+        anchor = source_anchor
+        age = now - anchor.updated_at
+        if age < 0 or age >= min(self.BRIDGE_TTL_SECONDS, self.TURN_TTL_SECONDS, self._group_topic_active_ttl_seconds):
+            return deny("expired")
+        recent_turns = tuple(
+            turn for turn in source_turns
+            if turn.topic_epoch == source_epoch and 0 <= now - turn.timestamp < self.BRIDGE_TTL_SECONDS
+        )[-BRIDGE_MAX_TURNS:]
+        actual_ids = tuple(
+            dict.fromkeys(
+                [
+                    turn.source_event_id
+                    for turn in recent_turns
+                    if turn.source_event_id
+                ]
+                + [
+                    outbound_id
+                    for turn in recent_turns
+                    for outbound_id in turn.assistant_outbound_ids
+                    if outbound_id
+                ]
+            )
+        )
+        if not actual_ids:
+            return deny("no_recent_evidence")
+        current_event_id = str(self._anchor_event_value(event, "event_id", "") or "").strip()
+        target_ids = tuple(dict.fromkeys(
+            str(self._anchor_event_value(event, name, "") or "").strip()
+            for name in ("reply_target_event_id", "quote_event_id", "causal_parent_event_id")
+        ))
+        target_ids = tuple(item for item in target_ids if item)
+        mapped_target_ids = tuple(
+            dict.fromkeys(
+                item
+                for target_id in target_ids
+                for item in (target_id, source.event_id_map.get(target_id, ""))
+                if item
+            )
+        )
+        if current_event_id in actual_ids or any(item == current_event_id for item in mapped_target_ids):
+            return deny("duplicate_event")
+        if target_ids and not any(item in actual_ids for item in mapped_target_ids):
+            return deny("unverified_reply_target")
+        actor = str(self._anchor_event_value(event, "actor_id", "") or "").strip()
+        same_actor = bool(actor and actor in anchor.participants and actor == source.last_sender_id)
+        short_text = bool(text and len(text) <= 20)
+        if target_ids:
+            reason, confidence = "explicit_reply", 0.95
+            evidence = tuple(item for item in actual_ids if item in mapped_target_ids)[:BRIDGE_MAX_EVENT_IDS]
+        elif not same_actor:
+            return deny("actor_mismatch")
+        elif anchor.open_loop and short_text and (
+            self._is_same_topic(text, anchor.open_loop)
+            or self._normalize_topic_text(text) in {"是", "对", "好", "可以", "有空", "没有", "不行"}
+        ):
+            reason, confidence = "open_loop_answer", 0.85
+            evidence = actual_ids[-BRIDGE_MAX_EVENT_IDS:]
+        elif now - recent_turns[-1].timestamp <= self.BRIDGE_SAME_ACTOR_SECONDS and short_text and self._is_short_topic_followup(text):
+            reason, confidence = "same_actor_followup", 0.75
+            evidence = actual_ids[-BRIDGE_MAX_EVENT_IDS:]
+        else:
+            has_reference_word = any(word in text for word in ("他", "她", "它", "这个", "那个", "上面", "刚才", "继续", "然后"))
+            return deny("insufficient_evidence" if has_reference_word else "unrelated_topic")
+        turns = tuple(
+            f"user: {turn.focus_preview[:120]} | assistant: {turn.reply_preview[:120]}"
+            for turn in recent_turns if turn.focus_preview or turn.reply_preview
+        )
+        if not turns:
+            return deny("no_recent_evidence")
+        return BridgeDecision(
+            allowed=True,
+            reason=reason,
+            confidence=confidence,
+            source_chat_key=chat_key,
+            target_chat_key=chat_key,
+            source_topic_epoch=source_epoch,
+            target_topic_epoch=target_epoch,
+            evidence_event_ids=evidence,
+            source_anchor_preview=anchor.subject_preview[:self.ANCHOR_MAX_SUBJECT_CHARS],
+            source_open_loop=anchor.open_loop[:self.ANCHOR_MAX_OPEN_LOOP_CHARS],
+            turns=turns,
+            created_at=now,
+            expires_at=now + min(self.BRIDGE_TTL_SECONDS - age, self._group_topic_active_ttl_seconds - age),
+            source_age_seconds=age,
+        )
+
+    def restore_snapshot(self, chat_id: str, snapshot: Any) -> None:
+        """Restore only known continuity fields; malformed anchor fields degrade locally."""
+        if not isinstance(snapshot, Mapping):
+            return
+        state = self._state(str(chat_id or ""))
+        for field_name in ("current_topic", "current_goal", "goal_status", "last_social_intent", "last_action_taken"):
+            if field_name in snapshot and isinstance(snapshot[field_name], str):
+                setattr(state, field_name, snapshot[field_name])
+        state.topic_anchor = TopicAttentionAnchor.from_value(snapshot.get("topic_anchor", {}))
 
     def summary(self, chat_id: str, *, now: float | None = None) -> str:
         now = time.time() if now is None else now
@@ -691,6 +1086,8 @@ class ConversationContinuityStore:
         lightweight_event: bool = False,
         sender_id: str = "",
         source_event_id: str = "",
+        assistant_outbound_ids: Iterable[Any] = (),
+        anchor_event: Any = None,
         topic_epoch: int | None = None,
         now: float | None = None,
     ) -> ConversationTurnRecord:
@@ -712,6 +1109,9 @@ class ConversationContinuityStore:
             reply_need=str(reply_need or "reply"),
             sender_id=str(sender_id or ""),
             source_event_id=str(source_event_id or ""),
+            assistant_outbound_ids=self._normalize_evidence_ids(
+                assistant_outbound_ids, self.ANCHOR_MAX_EVENT_IDS
+            ),
             topic_epoch=max(0, int(topic_epoch or 0)),
         )
         # 设计意图：lightweight_event 和 wait/ignore 是非实质性轮次，
@@ -772,6 +1172,26 @@ class ConversationContinuityStore:
         state.last_event_id = item.source_event_id or state.last_event_id
         if item.sender_id:
             state.topic_participants.add(item.sender_id)
+        self.update_topic_anchor(
+            chat_id,
+            subject_preview=item.focus_preview,
+            reply_text=item.reply_preview,
+            open_loop=item.goal_summary if self._anchor_is_question(item.goal_summary) else "",
+            source=("user_message",) if item.focus_preview else (),
+            anchor_event=anchor_event,
+            event_id=item.source_event_id,
+            actor_id=item.sender_id,
+            topic_epoch=state.topic_epoch,
+            confidence=0.7 if item.focus_preview else 0.0,
+            now=now,
+        )
+        platform_event_id = self._anchor_event_value(anchor_event, "platform_message_id", "")
+        if item.source_event_id and platform_event_id and item.source_event_id != platform_event_id:
+            self.register_event_id_mapping(
+                chat_id,
+                canonical_id=item.source_event_id,
+                platform_id=platform_event_id,
+            )
         state.continuity_weight = self._continuity_weight(state, now)
         item.goal_status = goal_status
         state.turns = [*self.recent(chat_id, now=now), item][-self.MAX_TURNS_PER_CHAT :]
@@ -788,4 +1208,5 @@ __all__ = [
     "ConversationContinuityState",
     "ConversationContinuityStore",
     "ConversationTurnRecord",
+    "TopicAttentionAnchor",
 ]

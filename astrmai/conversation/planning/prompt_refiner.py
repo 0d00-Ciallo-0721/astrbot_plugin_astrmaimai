@@ -222,6 +222,41 @@ class PromptRefiner:
         return "..." + cleaned[-(budget - 3) :].lstrip()
 
     @staticmethod
+    def _truncate_recent_transcript(text: str, budget_chars: int) -> str:
+        """Keep a real role-ordered tail, preferring a complete latest pair."""
+        lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+        budget = max(0, int(budget_chars or 0))
+        if not lines or budget <= 0:
+            return ""
+        if len("\n".join(lines)) <= budget:
+            return "\n".join(lines)
+
+        def role(line: str) -> str:
+            speaker = line.split(":", 1)[0].strip().lower()
+            return "assistant" if speaker in {"bot", "astrmai", "assistant"} else "user"
+
+        best = ""
+        for start in range(len(lines) - 1, -1, -1):
+            candidate_lines = lines[start:]
+            candidate = "\n".join(candidate_lines)
+            if len(candidate) > budget:
+                continue
+            if len(candidate_lines) >= 2 and any(
+                role(candidate_lines[index]) == "user" and role(candidate_lines[index + 1]) == "assistant"
+                for index in range(len(candidate_lines) - 1)
+            ):
+                best = candidate
+        if best:
+            return best
+        latest = lines[-1]
+        if len(latest) <= budget:
+            return latest
+        prefix, separator, body = latest.partition(":")
+        if separator and len(prefix) + 4 < budget:
+            return f"{prefix}:...{body[-(budget - len(prefix) - 4):]}"
+        return latest[-budget:]
+
+    @staticmethod
     def _truncate_memory_text(text: str, budget_chars: int) -> str:
         cleaned = " ".join(str(text or "").split())
         budget = max(0, int(budget_chars or 0))
@@ -565,6 +600,8 @@ class PromptRefiner:
         memory_text: str,
         memory_meta: dict[str, object],
         soft_background_text: str,
+        anchor_text: str = "",
+        bridge_text: str = "",
     ) -> dict[str, object]:
         trimmed_sections: list[str] = []
         budget = self.FLEX_CONTEXT_BUDGET_CHARS
@@ -572,11 +609,13 @@ class PromptRefiner:
         recent_rendered = str(recent_text or "").strip()
         memory_rendered = str(memory_text or "").strip()
         soft_background_rendered = str(soft_background_text or "").strip()
+        anchor_rendered = self._truncate_soft_background_text(anchor_text, 900)
+        bridge_rendered = self._truncate_soft_background_text(bridge_text, 900)
 
         def _combined_length() -> int:
             return sum(
                 len(part)
-                for part in (warm_rendered, recent_rendered, memory_rendered, soft_background_rendered)
+                for part in (warm_rendered, recent_rendered, anchor_rendered, bridge_rendered, memory_rendered, soft_background_rendered)
                 if part
             )
 
@@ -584,66 +623,70 @@ class PromptRefiner:
             soft_background_rendered = ""
             trimmed_sections.append("soft_background")
 
+        recent_floor = min(len(recent_rendered), budget) if recent_rendered else 0
+
+        if memory_rendered and _combined_length() > budget:
+            memory_rendered = self._truncate_memory_text(memory_rendered, self.MEMORY_CONTEXT_MIN_CHARS)
+            trimmed_sections.append("memory:preview")
+
         if warm_rendered and _combined_length() > budget:
             warm_summary = str((warm_meta or {}).get("warm_summary", "") or "").strip()
             warm_quotes = str((warm_meta or {}).get("warm_quotes", "") or "").strip()
+            has_structured_warm = bool(warm_summary or warm_quotes)
             if warm_quotes:
                 warm_quotes = ""
                 trimmed_sections.append("warm_quotes")
-            warm_rendered = "\n".join(part for part in (warm_summary, warm_quotes) if part).strip() or warm_rendered
-            if len(warm_rendered) > self.WARM_CONTEXT_MIN_CHARS:
+            if has_structured_warm:
+                warm_rendered = "\n".join(part for part in (warm_summary, warm_quotes) if part).strip()
+            if warm_rendered:
                 remaining_budget = max(
-                    self.WARM_CONTEXT_MIN_CHARS,
-                    budget - sum(
+                    0,
+                    budget - recent_floor - len(anchor_rendered) - len(bridge_rendered) - sum(
                         len(part)
-                        for part in (recent_rendered, memory_rendered, soft_background_rendered)
+                        for part in (memory_rendered, soft_background_rendered)
                         if part
                     ),
                 )
                 if len(warm_rendered) > remaining_budget:
-                    warm_rendered = self._truncate_soft_background_text(
-                        warm_rendered,
-                        max(self.WARM_CONTEXT_MIN_CHARS, remaining_budget),
-                    )
+                    warm_rendered = self._truncate_soft_background_text(warm_rendered, remaining_budget)
                     trimmed_sections.append("warm_summary:truncated")
 
+        if bridge_rendered and _combined_length() > budget:
+            bridge_rendered = self._truncate_soft_background_text(
+                bridge_rendered, max(0, budget - recent_floor - len(anchor_rendered) - len(memory_rendered))
+            )
+            trimmed_sections.append("bridge:truncated")
+
+        if anchor_rendered and _combined_length() > budget:
+            anchor_rendered = self._truncate_soft_background_text(
+                anchor_rendered, max(0, budget - recent_floor - len(bridge_rendered) - len(memory_rendered))
+            )
+            trimmed_sections.append("anchor:truncated")
+
         if memory_rendered and _combined_length() > budget:
-            proactive_text = str((memory_meta or {}).get("proactive_recall", "") or "").strip()
-            injection_text = str((memory_meta or {}).get("injection", "") or "").strip()
-            proactive_preview = self._memory_preview(proactive_text, self.MEMORY_PREVIEW_TARGET_CHARS) if proactive_text else ""
-            injection_preview = self._memory_preview(injection_text, self.MEMORY_PREVIEW_TARGET_CHARS) if injection_text else ""
-            memory_rendered = "\n".join(part for part in (proactive_preview, injection_preview) if part).strip()
-            trimmed_sections.append("memory:preview")
-            if memory_rendered and _combined_length() > budget and len(memory_rendered) > self.MEMORY_CONTEXT_MIN_CHARS:
-                remaining_budget = max(
-                    self.MEMORY_CONTEXT_MIN_CHARS,
-                    budget - sum(
-                        len(part)
-                        for part in (warm_rendered, recent_rendered, soft_background_rendered)
-                        if part
-                    ),
-                )
-                if len(memory_rendered) > remaining_budget:
-                    memory_rendered = self._truncate_memory_text(
-                        memory_rendered,
-                        max(self.MEMORY_CONTEXT_MIN_CHARS, remaining_budget),
-                    )
-                    trimmed_sections.append("memory:truncated")
+            memory_rendered = self._truncate_memory_text(
+                memory_rendered, max(0, budget - recent_floor - len(anchor_rendered) - len(bridge_rendered))
+            )
+            trimmed_sections.append("memory:truncated")
+
+        if warm_rendered and _combined_length() > budget:
+            warm_rendered = self._truncate_soft_background_text(
+                warm_rendered,
+                max(0, budget - recent_floor - len(anchor_rendered) - len(bridge_rendered) - len(memory_rendered)),
+            )
+            trimmed_sections.append("warm_summary:truncated")
 
         if recent_rendered and _combined_length() > budget:
             remaining_budget = max(
-                self.RECENT_CONTEXT_MIN_CHARS,
+                1,
                 budget - sum(
                     len(part)
-                    for part in (warm_rendered, memory_rendered, soft_background_rendered)
+                    for part in (warm_rendered, anchor_rendered, bridge_rendered, memory_rendered, soft_background_rendered)
                     if part
                 ),
             )
             if len(recent_rendered) > remaining_budget:
-                recent_rendered = self._truncate_from_tail(
-                    recent_rendered,
-                    max(self.RECENT_CONTEXT_MIN_CHARS, remaining_budget),
-                )
+                recent_rendered = self._truncate_recent_transcript(recent_rendered, remaining_budget)
                 trimmed_sections.append("recent:tail_truncated")
 
         return {
@@ -659,6 +702,8 @@ class PromptRefiner:
             ],
             "warm_text": warm_rendered,
             "recent_text": recent_rendered,
+            "anchor_text": anchor_rendered,
+            "bridge_text": bridge_rendered,
             "memory_text": memory_rendered,
             "soft_background_text": soft_background_rendered,
             "warm_rendered_chars": len(warm_rendered),
@@ -1200,15 +1245,42 @@ class PromptRefiner:
                     )
 
         recent_transcript = prompt_envelope.recent_transcript.strip()
+        recent_event_ids = list(getattr(prompt_envelope, "recent_transcript_event_ids", []) or [])
         recent_transcript_source = getattr(prompt_envelope, "recent_transcript_source", "").strip()
         recent_transcript_reason = getattr(prompt_envelope, "recent_transcript_reason", "").strip()
         warm_zone_transcript = getattr(prompt_envelope, "warm_zone_transcript", "").strip()
         warm_zone_transcript_source = getattr(prompt_envelope, "warm_zone_transcript_source", "").strip()
         warm_zone_summary = getattr(prompt_envelope, "warm_zone_summary", "").strip()
         warm_zone_quotes = getattr(prompt_envelope, "warm_zone_quotes", "").strip()
-        warm_context_for_dedup = "\n".join(part for part in (warm_zone_summary, warm_zone_quotes) if part).strip()
-        if not warm_context_for_dedup:
-            warm_context_for_dedup = warm_zone_transcript
+        anchor_text = str(getattr(prompt_envelope, "topic_attention_anchor_block", "") or "").strip()
+        bridge_text = str(getattr(prompt_envelope, "cross_topic_bridge_block", "") or "").strip()
+        canonical_event = event.get_extra("astrmai_conversation_event", None)
+        seen_event_ids = {
+            str(event_id).strip()
+            for event_id in (
+                getattr(canonical_event, "event_id", ""),
+                *recent_event_ids,
+                *list(getattr(prompt_envelope, "topic_attention_anchor_event_ids", []) or []),
+                *list(getattr(prompt_envelope, "cross_topic_bridge_event_ids", []) or []),
+            )
+            if str(event_id).strip()
+        }
+        quote_entries = list(getattr(prompt_envelope, "warm_zone_quote_entries", []) or [])
+        warm_quote_lines = warm_zone_quotes.splitlines()
+        quote_ids = list(getattr(prompt_envelope, "warm_zone_quote_event_ids", []) or [])
+        if quote_entries:
+            warm_zone_quotes = "\n".join(
+                str(line) for event_id, line in quote_entries
+                if str(event_id or "").strip() not in seen_event_ids
+            ).strip()
+        elif len(quote_ids) == len(warm_quote_lines):
+            warm_zone_quotes = "\n".join(
+                line for event_id, line in zip(quote_ids, warm_quote_lines)
+                if str(event_id or "").strip() not in seen_event_ids
+            ).strip()
+        if warm_zone_summary or warm_quote_lines:
+            warm_zone_transcript = "\n".join(part for part in (warm_zone_summary, warm_zone_quotes) if part).strip()
+            prompt_envelope.warm_zone_quotes = warm_zone_quotes
         raw_user_text = (prompt_envelope.raw_user_text or prompt).strip()
         focus_message_text = (prompt_envelope.focus_message_text or raw_user_text or prompt).strip()
         focus_message_identity = str(getattr(prompt_envelope, "focus_message_identity", "") or "").strip()
@@ -1421,7 +1493,6 @@ class PromptRefiner:
         legacy_recent_transcript = self._deduplicate_transcript(
             recent_transcript,
             [
-                warm_context_for_dedup,
                 focus_message_text,
                 direct_context_text,
                 related_context_text,
@@ -1445,7 +1516,6 @@ class PromptRefiner:
             dedup_recent, recent_removed_lines = self._deduplicate_transcript_with_stats(
                 recent_transcript,
                 [
-                    warm_context_for_dedup,
                     focus_message_text,
                     direct_context_text,
                     related_context_text,
@@ -1486,9 +1556,13 @@ class PromptRefiner:
             memory_text=memory_text,
             memory_meta=memory_meta,
             soft_background_text=soft_background_block,
+            anchor_text=anchor_text,
+            bridge_text=bridge_text,
         )
         warm_zone_transcript = str(flex_budget_meta.get("warm_text", "") or "").strip()
         recent_transcript = str(flex_budget_meta.get("recent_text", "") or "").strip()
+        anchor_text = str(flex_budget_meta.get("anchor_text", "") or "").strip()
+        bridge_text = str(flex_budget_meta.get("bridge_text", "") or "").strip()
         memory_text = str(flex_budget_meta.get("memory_text", "") or "").strip()
         soft_background_block = str(flex_budget_meta.get("soft_background_text", "") or "").strip()
         effective_proactive_recall = memory_text
@@ -1514,6 +1588,8 @@ class PromptRefiner:
         prompt_envelope.memory_context_rendered_chars = int(flex_budget_meta.get("memory_rendered_chars", 0) or 0)
         prompt_envelope.recent_transcript = recent_transcript
         prompt_envelope.warm_zone_transcript = warm_zone_transcript
+        prompt_envelope.topic_attention_anchor_block = anchor_text
+        prompt_envelope.cross_topic_bridge_block = bridge_text
         context_dedup_stats = {
             "enabled": context_dedup_enabled,
             "observe_only": context_dedup_observe_only,
@@ -1644,6 +1720,16 @@ class PromptRefiner:
                         source=recent_transcript_source or "recent_transcript",
                     )
                 )
+            )
+        if anchor_text:
+            sections.append(
+                "---话题注意力锚点（仅作本轮参考）---\n"
+                + PromptEnvelope.sanitize_derived_context(anchor_text, source="topic_attention_anchor")
+            )
+        if bridge_text:
+            sections.append(
+                "---跨话题桥接（仅作本轮参考）---\n"
+                + PromptEnvelope.sanitize_derived_context(bridge_text, source="cross_topic_bridge")
             )
         if warm_zone_transcript:
             warm_title = "---近期对话脉络---"

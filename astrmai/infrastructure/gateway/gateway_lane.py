@@ -5,6 +5,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 from astrbot.api import logger
 
+from ...conversation.contracts.conversation_event import ConversationEvent
 from ...conversation.contracts.dialog_history_policy import DialogHistoryPolicy
 from ..context_economy import PromptEnvelope, WorkloadFamily, WorkloadPolicy
 from ..runtime.lane_manager import LaneKey
@@ -27,6 +28,17 @@ from ..runtime.outbound_send_guard import provider_request_allowed
 
 class GatewayLaneMixin:
     @staticmethod
+    def _provider_safe_contexts(contexts: Optional[List[Any]]) -> List[Any]:
+        """Remove AstrMai-only identity metadata before host Provider serialization."""
+        safe: List[Any] = []
+        for item in list(contexts or []):
+            if isinstance(item, dict):
+                safe.append({key: value for key, value in item.items() if key not in {"event_id", "message_id", "id"}})
+            else:
+                safe.append(item)
+        return safe
+
+    @staticmethod
     def _assert_provider_request_allowed(event: Any) -> None:
         if provider_request_allowed(event):
             return
@@ -34,6 +46,42 @@ class GatewayLaneMixin:
             event.set_extra("astrmai_provider_request_blocked", True)
             event.set_extra("astrmai_provider_request_block_reason", "shutdown_rejected")
         raise GatewayShutdownRejected()
+
+    @staticmethod
+    def _build_history_user_text(
+        event: Any,
+        *,
+        raw_user_text: str,
+        prompt: str,
+    ) -> str | None:
+        if event is None or not hasattr(event, "get_extra"):
+            return None
+        canonical = event.get_extra("astrmai_conversation_event", None)
+        if not isinstance(canonical, ConversationEvent) or canonical.is_bot:
+            return None
+
+        content = str(canonical.visible_text or "").strip()
+        media_markers: list[str] = []
+        if canonical.image_refs:
+            media_markers.append("[图片]")
+        if canonical.attachment_refs:
+            media_markers.append("[附件]")
+        if not content and canonical.interaction_kind:
+            content = f"[互动：{canonical.interaction_kind}]"
+        if media_markers:
+            marker_text = " ".join(media_markers)
+            content = f"{content}\n{marker_text}".strip() if content else marker_text
+        if not content:
+            return ""
+
+        actor_name = str(canonical.actor_name or "群友").replace("\r", " ").replace("\n", " ").strip()
+        reply_target_name = str(canonical.reply_target_actor_name or "").replace("\r", " ").replace("\n", " ").strip()
+        reply_prefix = ""
+        if reply_target_name:
+            reply_prefix = f"[回复 {reply_target_name}] "
+        elif canonical.reply_target_event_id or canonical.quote_event_id:
+            reply_prefix = "[回复上一条消息] "
+        return f"{actor_name}: {reply_prefix}{content}".strip()
 
     def _lane_prepare_timeout(self, event: Any, *, critical_path: bool = True) -> float:
         timing = getattr(getattr(self, "config", None), "timing", None)
@@ -261,12 +309,30 @@ class GatewayLaneMixin:
                 if persist_timeout <= 0.0:
                     raise asyncio.TimeoutError("lane persistence exceeded turn budget")
                 artifact = self._build_lane_artifact(result, artifact_text)
+                history_user_text = self._build_history_user_text(
+                    event,
+                    raw_user_text=raw_user_text,
+                    prompt=prompt,
+                )
                 await asyncio.wait_for(
                     self.lane_manager.append_visible_reply_artifact(
                         lane_key=effective_lane_key,
                         base_origin=base_origin,
                         raw_user_text=raw_user_text or prompt,
                         artifact=artifact,
+                        history_user_text=history_user_text,
+                        user_event_id=(
+                            str(
+                                getattr(
+                                    event.get_extra("astrmai_conversation_event", None),
+                                    "event_id",
+                                    "",
+                                )
+                                or ""
+                            ).strip()
+                            if event is not None and hasattr(event, "get_extra")
+                            else ""
+                        ),
                         token_usage=usage.get("total_tokens", 0),
                         prefix_hash=workload_policy.effective_prefix_hash,
                         model_id=model_id,
@@ -484,6 +550,7 @@ class GatewayLaneMixin:
             item.model_dump() if isinstance(item, Message) else item
             for item in list(contexts or [])
         ]
+        normalized_contexts = self_gateway._provider_safe_contexts(normalized_contexts)
         request = ProviderRequest(
             prompt=prompt,
             image_urls=image_urls or [],
@@ -763,6 +830,7 @@ class GatewayLaneMixin:
         group_policy_active = bool(history_policy.group_id)
         if group_policy_active and not history_policy.uses_lane_history:
             history = []
+        history = self._provider_safe_contexts(history)
         allow_provider_session = bool(
             not group_policy_active or history_policy.allow_provider_session
         )
@@ -1113,6 +1181,7 @@ class GatewayLaneMixin:
         group_policy_active = bool(history_policy.group_id)
         if group_policy_active and not history_policy.uses_lane_history:
             history = []
+        history = self._provider_safe_contexts(history)
         allow_provider_session = bool(
             not group_policy_active or history_policy.allow_provider_session
         )

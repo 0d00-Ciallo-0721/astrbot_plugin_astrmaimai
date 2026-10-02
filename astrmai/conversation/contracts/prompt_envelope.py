@@ -62,6 +62,7 @@ class PromptEnvelope:
     raw_user_text: str = ""
     prompt_revision: str = ""
     recent_transcript: str = ""
+    recent_transcript_event_ids: list[str] = field(default_factory=list)
     recent_transcript_source: str = ""
     recent_transcript_reason: str = ""
     warm_zone_transcript: str = ""
@@ -71,6 +72,11 @@ class PromptEnvelope:
     warm_topics_preview: str = ""
     warm_zone_has_latest_assistant: bool = False
     warm_zone_quote_event_ids: list[str] = field(default_factory=list)
+    warm_zone_quote_entries: list[tuple[str, str]] = field(default_factory=list)
+    topic_attention_anchor_block: str = ""
+    topic_attention_anchor_event_ids: list[str] = field(default_factory=list)
+    cross_topic_bridge_block: str = ""
+    cross_topic_bridge_event_ids: list[str] = field(default_factory=list)
     last_assistant_reply: str = ""
     current_speaker_block: str = ""
     referenced_entity_block: str = ""

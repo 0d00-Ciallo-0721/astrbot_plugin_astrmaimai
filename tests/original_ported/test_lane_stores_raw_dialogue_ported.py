@@ -5,6 +5,8 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 
+from astrmai.conversation.contracts.conversation_event import ConversationEvent
+from astrmai.conversation.contracts.reply_artifact import VisibleReplyArtifact
 from tests.original_ported.helpers import _install_astrbot_stubs
 
 
@@ -46,6 +48,14 @@ class _FakeResponse:
 class _FakeContext:
     async def llm_generate(self, **kwargs):
         return _FakeResponse("ok")
+
+
+class _FakeEvent:
+    def __init__(self, canonical):
+        self._extras = {"astrmai_conversation_event": canonical}
+
+    def get_extra(self, key, default=None):
+        return self._extras.get(key, default)
 
 
 class LaneStoresRawDialogueTests(unittest.TestCase):
@@ -101,6 +111,112 @@ class LaneStoresRawDialogueTests(unittest.TestCase):
         self.assertEqual(history[0]["role"], "user")
         self.assertEqual(history[0]["content"], "[Alice] 说: 为什么不可以")
         self.assertNotIn("导演旁白", history[0]["content"])
+
+    def test_canonical_user_history_uses_explicit_visible_contract(self):
+        conversation_manager = _FakeConversationManager()
+        lane_manager = self.lane_mod.LaneManager(conversation_manager)
+        gateway = self.gateway_mod.GlobalModelGateway(
+            _FakeContext(),
+            SimpleNamespace(
+                infra=SimpleNamespace(max_concurrent_llm_calls=2, llm_retries=0, backoff_factor=1.5, api_timeout=10),
+                provider=SimpleNamespace(fallback_models=[]),
+                global_settings=SimpleNamespace(debug_mode=False),
+            ),
+        )
+        gateway.set_lane_manager(lane_manager)
+        lane_key = self.lane_mod.LaneKey(subsystem="sys2", task_family="dialog", scope_id="group-1")
+        canonical = ConversationEvent(
+            event_id="evt-42",
+            chat_id="default:GroupMessage:group-1",
+            chat_kind="group",
+            timestamp=1.0,
+            actor_id="10001",
+            actor_name="Alice",
+            visible_text="继续刚才的方案",
+            rich_text="继续刚才的方案",
+            message_kind="text",
+            role="user",
+            reply_target_event_id="evt-41",
+            reply_target_actor_name="AstrMai",
+            image_refs=("private-image-ref",),
+        )
+        event = _FakeEvent(canonical)
+        artifact = VisibleReplyArtifact(
+            visible_text="我继续说。",
+            segments=["我继续说。"],
+            persistable_text="我继续说。",
+        )
+
+        async def _run():
+            history_user_text = gateway._build_history_user_text(
+                event,
+                raw_user_text="[事件=evt-42 | 发言人=Alice（ID:10001） | 角色=成员 | 类型=text | 来源=original]\n内容：继续刚才的方案",
+                prompt="包装提示词",
+            )
+            await lane_manager.append_visible_reply_artifact(
+                lane_key=lane_key,
+                base_origin="default:GroupMessage:group-1",
+                raw_user_text="[事件=evt-42 | 发言人=Alice（ID:10001） | 角色=成员 | 类型=text | 来源=original]\n内容：继续刚才的方案",
+                history_user_text=history_user_text,
+                artifact=artifact,
+            )
+            lane_umo = lane_manager.resolve_lane_umo("default:GroupMessage:group-1", lane_key)
+            conversation_id = await conversation_manager.get_curr_conversation_id(lane_umo)
+            return conversation_manager.conversations[conversation_id].history
+
+        history = asyncio.run(_run())
+
+        self.assertEqual([item["role"] for item in history], ["user", "assistant"])
+        self.assertIn("继续刚才的方案", history[0]["content"])
+        self.assertIn("[回复 AstrMai]", history[0]["content"])
+        self.assertIn("[图片]", history[0]["content"])
+        self.assertNotIn("事件=evt-42", history[0]["content"])
+        self.assertNotIn("10001", history[0]["content"])
+        self.assertNotIn("private-image-ref", history[0]["content"])
+        self.assertEqual(history[1]["content"], "我继续说。")
+
+    def test_empty_history_user_text_does_not_create_user_turn(self):
+        lane_manager = self.lane_mod.LaneManager(_FakeConversationManager())
+        lane_key = self.lane_mod.LaneKey(subsystem="sys2", task_family="dialog", scope_id="group-1")
+        artifact = VisibleReplyArtifact(
+            visible_text="仅保存助手回复",
+            segments=["仅保存助手回复"],
+            persistable_text="仅保存助手回复",
+        )
+
+        async def _run():
+            return await lane_manager.append_visible_reply_artifact(
+                lane_key=lane_key,
+                base_origin="default:GroupMessage:group-1",
+                raw_user_text="[事件=internal | 发言人=hidden | 角色=成员 | 类型=text | 来源=synthetic]",
+                history_user_text="",
+                artifact=artifact,
+            )
+
+        history = asyncio.run(_run())
+        self.assertEqual([item["role"] for item in history], ["assistant"])
+
+    def test_assistant_internal_envelope_stays_out_of_history(self):
+        lane_manager = self.lane_mod.LaneManager(_FakeConversationManager())
+        lane_key = self.lane_mod.LaneKey(subsystem="sys2", task_family="dialog", scope_id="group-1")
+        artifact = VisibleReplyArtifact(
+            visible_text="内部载荷",
+            segments=["内部载荷"],
+            persistable_text="[事件=evt-9 | 发言人=Bot（ID:bot-1） | 角色=机器人 | 类型=text | 来源=bot_echo]\n内容：内部载荷",
+        )
+
+        async def _run():
+            return await lane_manager.append_visible_reply_artifact(
+                lane_key=lane_key,
+                base_origin="default:GroupMessage:group-1",
+                raw_user_text="普通用户消息",
+                history_user_text="普通用户消息",
+                artifact=artifact,
+            )
+
+        history = asyncio.run(_run())
+        self.assertEqual([item["role"] for item in history], ["user"])
+        self.assertNotIn("内部载荷", str(history))
 
 
 if __name__ == "__main__":

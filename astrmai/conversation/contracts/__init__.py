@@ -36,6 +36,8 @@ _EXPORTS = {
     "TurnTarget": ".turn_target",
     "TargetKind": ".turn_target",
     "ActorSet": ".turn_target",
+    "TopicAttentionAnchor": ".topic_attention_anchor",
+    "BridgeDecision": ".topic_bridge",
     "build_p0_thread_id": ".turn_identity",
     "build_turn_send_key": ".turn_identity",
     "TURN_OUTCOME_EXTRA_KEY": ".turn_outcome",
