@@ -178,11 +178,12 @@ class GroupRereadObserver:
         message = getattr(getattr(event, "message_obj", None), "message", None)
         if not message:
             return bool(str(getattr(event, "message_str", "") or "").strip())
-        if len(message) != 1:
-            return False
-        component = message[0]
-        component_type = str(getattr(component, "type", component.__class__.__name__)).lstrip("_").lower()
-        return component_type in {"plain", "text"}
+        for component in message:
+            raw_type = getattr(component, "type", component.__class__.__name__)
+            component_type = str(getattr(raw_type, "value", raw_type)).lstrip("_").lower()
+            if component_type not in {"plain", "text"}:
+                return False
+        return True
 
     def _restore_pending_locked(self, state: _GroupRereadState) -> bool:
         """Restore a passive pending request to the observation window."""
@@ -430,9 +431,11 @@ class GroupRereadObserver:
             state = self._states.get(str(chat_id))
             if state is None or (token and state.inflight_token != str(token)):
                 return False
-            if token is None and state.inflight_token:
+            if not token and state.inflight_token:
                 return False
-            trigger_kind = state.inflight_trigger_kind or "unknown"
+            trigger_kind = state.inflight_trigger_kind or str(
+                getattr(state.pending_request, "trigger_kind", "") or ""
+            )
             state.inflight_token = ""
             state.inflight_trigger_kind = ""
             state.inflight_started_at = 0.0
@@ -446,7 +449,7 @@ class GroupRereadObserver:
             return False
         async with self._lock:
             state = self._states.get(str(chat_id))
-            if state is None or not state.inflight_token:
+            if state is None or not state.inflight_token or not token:
                 return False
             if token and state.inflight_token != str(token):
                 self._stats["release_stale"] += 1
@@ -468,7 +471,12 @@ class GroupRereadObserver:
             state = self._states.get(str(chat_id))
             if state is None or (token and state.inflight_token != str(token)):
                 return False
-            trigger_kind = state.inflight_trigger_kind or "unknown"
+            if not token and state.inflight_token:
+                return False
+            trigger_kind = state.inflight_trigger_kind or str(
+                getattr(state.pending_request, "trigger_kind", "") or ""
+            )
+            had_lease = bool(state.inflight_token)
             state.inflight_token = ""
             state.inflight_trigger_kind = ""
             state.inflight_started_at = 0.0
@@ -477,7 +485,9 @@ class GroupRereadObserver:
                 state.pending_records = []
                 state.pending_expires_at = 0.0
                 state.records = []
-            self._stats["pending_abandoned_after_send"] += 1
+            self._stats[
+                "pending_abandoned_after_send" if had_lease else "pending_abandoned_before_send"
+            ] += 1
             return True
 
     async def commit_dispatch(self, chat_id: str, token: str, *, trigger_kind: str = "") -> bool:

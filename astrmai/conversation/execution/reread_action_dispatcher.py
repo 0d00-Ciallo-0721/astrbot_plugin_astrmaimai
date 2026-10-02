@@ -141,7 +141,10 @@ class RereadActionDispatcher:
             raw_wait_targets = [raw_wait_targets]
         if any(str(item or "").strip() for item in raw_wait_targets):
             return False, "user_waiting"
-        if int(snapshot.get("executor_pending", 0) or 0) > 0:
+        if (
+            request.trigger_kind != "group_reread_passive"
+            and int(snapshot.get("executor_pending", 0) or 0) > 0
+        ):
             return False, "user_waiting"
 
         now = time.time()
@@ -660,6 +663,7 @@ class RereadActionDispatcher:
 
     async def dispatch(self, event: Any, request: RereadActionRequest) -> RereadDispatchResult:
         if self._shutting_down:
+            await self._restore_observer_pending(request.chat_id)
             return RereadDispatchResult("shutdown", detail="dispatcher_shutdown")
         task = asyncio.current_task()
         if task is not None:
@@ -672,32 +676,38 @@ class RereadActionDispatcher:
 
     async def _dispatch_impl(self, event: Any, request: RereadActionRequest) -> RereadDispatchResult:
         if self._shutting_down:
+            await self._restore_observer_pending(request.chat_id)
             return RereadDispatchResult("shutdown", detail="dispatcher_shutdown")
         context = self.context
         if context is None or not hasattr(context, "send_message"):
             await self._restore_observer_pending(request.chat_id)
             return RereadDispatchResult("failed", detail="context_unavailable")
         if not can_send_text(event, "reread").allowed:
+            await self._restore_observer_pending(request.chat_id)
             return RereadDispatchResult("duplicate", detail="turn_outcome_terminal")
         try:
             allowed, guard_reason = await self._guard_bypass(event, request)
+        except asyncio.CancelledError:
+            await self._restore_observer_pending(request.chat_id)
+            raise
         except Exception as exc:
             logger.warning(
                 "[RereadAction] bypass guard unavailable; preserving normal message propagation: %s",
                 type(exc).__name__,
             )
-            await self._abandon_observer_pending(request.chat_id)
+            await self._restore_observer_pending(request.chat_id)
             if hasattr(event, "set_extra"):
                 event.set_extra("astrmai_reread_guard_status", "unavailable")
                 event.set_extra("astrmai_reread_guard_reason", type(exc).__name__)
             return RereadDispatchResult("blocked", detail="guard_unavailable")
         if not allowed:
-            await self._abandon_observer_pending(request.chat_id)
+            await self._restore_observer_pending(request.chat_id)
             if hasattr(event, "set_extra"):
                 event.set_extra("astrmai_reread_guard_status", "blocked")
                 event.set_extra("astrmai_reread_guard_reason", guard_reason)
             return RereadDispatchResult("blocked", detail=guard_reason)
         if not claim_text_output(event, "reread").allowed:
+            await self._restore_observer_pending(request.chat_id)
             return RereadDispatchResult("duplicate", detail="turn_outcome_terminal")
         coordinator = self.runtime_coordinator
         send_key = self._send_key(request)
@@ -710,6 +720,7 @@ class RereadActionDispatcher:
             if coordinator is not None and hasattr(coordinator, "claim_send"):
                 if not await coordinator.claim_send(request.chat_id, send_key):
                     release_text_output(event, "reread")
+                    await self._restore_observer_pending(request.chat_id)
                     return RereadDispatchResult("duplicate", detail="send_claim_exists")
                 claim_owned = True
             if self.reread_observer is not None and hasattr(self.reread_observer, "claim_dispatch"):
@@ -742,6 +753,15 @@ class RereadActionDispatcher:
             chain.chain.append(Comp.Plain(request.text))
             send_started = True
             result = await context.send_message(getattr(event, "unified_msg_origin", request.chat_id), chain)
+            if result is False:
+                if claim_owned:
+                    await self._rollback_send_claim(request.chat_id, send_key, "send_unavailable")
+                release_text_output(event, "reread")
+                restored = await self._restore_observer_pending(request.chat_id, observer_token)
+                if not restored:
+                    await self._release_observer_claim(request.chat_id, observer_token)
+                record_text_failed(event, "reread_send_unavailable")
+                return RereadDispatchResult("failed", detail="send_unavailable")
             outbound_ids = () if result is None or isinstance(result, bool) else (str(result),)
             send_completed = True
             settlement_ok = await self._settle_sent(

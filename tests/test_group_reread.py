@@ -2,10 +2,13 @@ import asyncio
 import collections
 import importlib
 import sys
+import subprocess
 import tempfile
 import time
 import unittest
 from types import SimpleNamespace
+from enum import Enum
+from pathlib import Path
 
 from tests.helpers.astrbot_stubs import install_astrbot_stubs
 
@@ -19,6 +22,7 @@ class _Event:
         self._group_id = group_id
         self.message_obj = SimpleNamespace(message_id=message_id, message=list(chain or []))
         self._extra = {}
+        self.stopped = False
 
     def get_sender_id(self):
         return self._sender_id
@@ -34,6 +38,9 @@ class _Event:
 
     def set_extra(self, key, value):
         self._extra[key] = value
+
+    def stop_event(self):
+        self.stopped = True
 
 
 class _Coordinator:
@@ -114,6 +121,420 @@ class GroupRereadTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp_dir.cleanup()
+
+    def test_plain_enum_and_plain_fragments_reach_threshold(self):
+        component_type = Enum("ComponentType", {"Plain": "Plain", "At": "At"})
+        observer = self.observer_mod.GroupRereadObserver(config=self.config)
+
+        async def _run():
+            result = None
+            for index in range(5):
+                event = _Event(
+                    "原样",
+                    sender_id="same-user",
+                    message_id=f"plain-{index}",
+                    chain=[
+                        SimpleNamespace(type=component_type.Plain, text="原"),
+                        SimpleNamespace(type=component_type.Plain, text="样"),
+                    ],
+                )
+                result = await observer.observe(event)
+            mixed = _Event(
+                "原样",
+                sender_id="mixed-user",
+                message_id="mixed",
+                chain=[SimpleNamespace(type=component_type.Plain), SimpleNamespace(type=component_type.At)],
+            )
+            return result, await observer.observe(mixed)
+
+        result, mixed = asyncio.run(_run())
+        self.assertIsNotNone(result)
+        self.assertEqual(result.text, "原样")
+        self.assertIsNone(mixed)
+
+    def test_installed_plain_through_entry_facade_and_dispatcher(self):
+        script = r'''
+import asyncio
+import sys
+from types import SimpleNamespace
+sys.path.insert(0, sys.argv[1])
+from astrbot.api.message_components import Plain
+from tests.test_group_reread import GroupRereadTests
+suite = GroupRereadTests()
+suite.setUp()
+from tests.unit.presentation.test_message_entry_gap_coverage import _Event, _Facade
+from astrmai.presentation.dto.message_scope import IngressDecision
+from astrmai.presentation.events.message_entry import handle_global_message
+from astrmai.app.plugin_facade import PluginFacade
+from astrmai.conversation.ingress.dedupe import _debounce_cache
+from astrmai.infrastructure.runtime.outbound_send_guard import OUTBOUND_SEND_GATE
+
+class Context:
+    def __init__(self, receipt):
+        self.receipt = receipt
+        self.sent = []
+    async def send_message(self, origin, chain):
+        self.sent.append(chain.chain[0].text)
+        return self.receipt
+
+async def run(same_sender, receipt):
+    _debounce_cache.clear()
+    OUTBOUND_SEND_GATE.open()
+    observer = suite.observer_mod.GroupRereadObserver(config=suite.config)
+    context = Context(receipt)
+    dispatcher = suite.dispatcher_mod.RereadActionDispatcher(
+        context=context, config=suite.config, reread_observer=observer,
+    )
+    facade = _Facade()
+    facade.decision_type = IngressDecision
+    facade.runtime = SimpleNamespace(group_reread_observer=observer, reread_action_dispatcher=dispatcher)
+    async def record(event):
+        event.set_extra('astrmai_incoming_recorded', True)
+        return True
+    facade.record_incoming_without_reply = record
+    facade.try_dispatch_group_reread = PluginFacade.try_dispatch_group_reread.__get__(facade)
+    events = []
+    for index in range(5):
+        event = _Event(text='echo', sender_id='u' if same_sender else f'u{index}')
+        event.message_obj.message_id = f'm{index}'
+        event.message_obj.message = [Plain('ec'), Plain('ho')]
+        events.append(event)
+        async for item in handle_global_message(facade, event):
+            pass
+    assert observer._stats['threshold_hit'] == 1
+    assert context.sent == ['echo']
+    assert not any(event.stopped for event in events[:4])
+    assert events[-1].stopped is receipt
+    if receipt is False:
+        assert events[-1].get_extra('astrmai_group_reread_status') == 'failed'
+        assert observer._states[events[-1].unified_msg_origin].cooldown_until == 0
+        assert observer._states[events[-1].unified_msg_origin].pending_request is None
+        assert facade.calls.count('attention') == 5
+    else:
+        assert facade.calls.count('attention') == 4
+        assert events[-1].get_extra('astrmai_reread_outbound_message_ids') == []
+    await dispatcher.shutdown()
+
+async def main():
+    await run(True, True)
+    await run(False, True)
+    await run(True, False)
+try:
+    asyncio.run(main())
+finally:
+    suite.tearDown()
+'''
+        with tempfile.TemporaryDirectory() as isolated:
+            result = subprocess.run(
+                [sys.executable, "-B", "-c", script, str(Path(__file__).resolve().parents[1])],
+                cwd=isolated, capture_output=True, text=True, errors="replace", timeout=60,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_entry_guard_cancellation_restores_passive_pending(self):
+        from tests.unit.presentation.test_message_entry_gap_coverage import _Event as EntryEvent, _Facade
+        from astrmai.presentation.dto.message_scope import IngressDecision
+        from astrmai.presentation.events.message_entry import handle_global_message
+        from astrmai.app.plugin_facade import PluginFacade
+        from astrmai.conversation.ingress.dedupe import _debounce_cache
+        from astrmai.infrastructure.runtime.outbound_send_guard import OUTBOUND_SEND_GATE
+
+        async def run():
+            _debounce_cache.clear()
+            OUTBOUND_SEND_GATE.open()
+            self.config.conversation.group_reread_cooldown_sec = 45
+            observer = self.observer_mod.GroupRereadObserver(config=self.config)
+            context = _Context()
+            dispatcher = self.dispatcher_mod.RereadActionDispatcher(
+                context=context, config=self.config, reread_observer=observer,
+            )
+            facade = _Facade()
+            facade.decision_type = IngressDecision
+            facade.runtime = SimpleNamespace(group_reread_observer=observer, reread_action_dispatcher=dispatcher)
+
+            async def record(event):
+                event.set_extra("astrmai_incoming_recorded", True)
+                return True
+
+            facade.record_incoming_without_reply = record
+            facade.try_dispatch_group_reread = PluginFacade.try_dispatch_group_reread.__get__(facade)
+            entered = asyncio.Event()
+            original_guard = dispatcher._guard_bypass
+
+            async def blocking_guard(event, request):
+                entered.set()
+                await asyncio.Event().wait()
+
+            dispatcher._guard_bypass = blocking_guard
+
+            async def enter(index):
+                event = EntryEvent(text="echo", sender_id=f"u{index}")
+                event.message_obj.message_id = f"guard-cancel-{index}"
+                async for _ in handle_global_message(facade, event):
+                    pass
+                return event
+
+            for index in range(4):
+                await enter(index)
+            task = asyncio.create_task(enter(4))
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            state = next(iter(observer._states.values()))
+            self.assertIsNotNone(state.pending_request)
+            self.assertEqual(observer._stats["threshold_hit"], 1)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertIsNone(state.pending_request)
+            self.assertEqual(state.pending_records, [])
+            self.assertEqual(len(state.records), 5)
+            self.assertEqual(state.inflight_token, "")
+            self.assertEqual(state.cooldown_until, 0)
+            self.assertEqual(context.sent, [])
+            dispatcher._guard_bypass = original_guard
+            retry = await enter(5)
+            self.assertEqual(observer._stats["pending_blocked"], 0)
+            self.assertEqual(len(context.sent), 1)
+            self.assertTrue(retry.stopped)
+            await dispatcher.shutdown()
+
+        asyncio.run(run())
+
+    def test_empty_plain_and_zero_width_text_do_not_count(self):
+        component_type = Enum("ComponentType", {"Plain": "Plain"})
+        observer = self.observer_mod.GroupRereadObserver(config=self.config)
+
+        async def _run():
+            results = []
+            for index in range(5):
+                results.append(
+                    await observer.observe(
+                        _Event(
+                            "\u200b",
+                            sender_id=f"blank-{index}",
+                            message_id=f"blank-{index}",
+                            chain=[SimpleNamespace(type=component_type.Plain, text="")],
+                        )
+                    )
+                )
+            return results
+
+        self.assertEqual(asyncio.run(_run()), [None] * 5)
+
+    def test_preclaim_pending_restore_is_immediately_retryable(self):
+        observer = self.observer_mod.GroupRereadObserver(config=self.config)
+
+        async def _run():
+            request = None
+            for index in range(5):
+                request = await observer.observe(_Event("早", sender_id=f"u-{index}", message_id=f"m-{index}"))
+            state = observer._states["default:GroupMessage:group-1"]
+            restored = await observer.restore_pending(request.chat_id)
+            restored_pending = state.pending_request
+            restored_records = len(state.records)
+            retry = await observer.observe(_Event("早", sender_id="u-retry", message_id="m-retry"))
+            return request, state, restored, restored_pending, restored_records, retry
+
+        request, state, restored, restored_pending, restored_records, retry = asyncio.run(_run())
+        self.assertIsNotNone(request)
+        self.assertTrue(restored)
+        self.assertIsNone(restored_pending)
+        self.assertEqual(restored_records, 5)
+        self.assertIsNotNone(retry)
+
+    def test_preclaim_abandon_clears_pending_without_post_send_stat(self):
+        observer = self.observer_mod.GroupRereadObserver(config=self.config)
+
+        async def _run():
+            request = None
+            for index in range(5):
+                request = await observer.observe(_Event("早", sender_id=f"u-{index}", message_id=f"m-{index}"))
+            abandoned = await observer.abandon_pending(request.chat_id)
+            state = observer._states[request.chat_id]
+            return abandoned, state, observer.describe_status()["stats"]
+
+        abandoned, state, stats = asyncio.run(_run())
+        self.assertTrue(abandoned)
+        self.assertIsNone(state.pending_request)
+        self.assertEqual(state.pending_records, [])
+        self.assertEqual(stats.get("pending_abandoned_after_send", 0), 0)
+        self.assertEqual(stats.get("pending_abandoned_before_send"), 1)
+
+    def test_pending_operations_without_token_preserve_owned_lease(self):
+        observer = self.observer_mod.GroupRereadObserver(config=self.config)
+
+        async def _run():
+            chat = "default:GroupMessage:group-1"
+            token = await observer.claim_dispatch(chat)
+            self.assertFalse(await observer.abandon_pending(chat))
+            self.assertFalse(await observer.restore_pending(chat))
+            self.assertFalse(await observer.release_dispatch(chat))
+            self.assertEqual(observer._states[chat].inflight_token, token)
+            self.assertTrue(await observer.release_dispatch(chat, token))
+
+        asyncio.run(_run())
+
+    def test_false_host_receipt_does_not_commit_or_stop(self):
+        observer = self.observer_mod.GroupRereadObserver(config=self.config)
+        self.config.conversation.group_reread_cooldown_sec = 60
+
+        class _FalseContext(_Context):
+            async def send_message(self, origin, chain):
+                self.sent.append((origin, chain))
+                return False
+
+        async def _run():
+            request = None
+            for index in range(5):
+                request = await observer.observe(_Event("早", sender_id=f"u-{index}", message_id=f"m-{index}"))
+            event = _Event("早", sender_id="u-4", message_id="m-4")
+            dispatcher = self.dispatcher_mod.RereadActionDispatcher(
+                context=_FalseContext(),
+                config=self.config,
+                runtime_coordinator=_Coordinator(),
+                reread_observer=observer,
+            )
+            result = await dispatcher.dispatch(event, request)
+            return result, event, observer._states[request.chat_id], dispatcher
+
+        result, event, state, dispatcher = asyncio.run(_run())
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.detail, "send_unavailable")
+        self.assertFalse(result.sent)
+        self.assertFalse(event.stopped)
+        self.assertFalse(event.get_extra("astrmai_group_reread_dispatched", False))
+        self.assertFalse(state.cooldown_until > time.monotonic())
+        self.assertIsNone(state.pending_request)
+        self.assertEqual(len(state.records), 5)
+
+    def test_true_host_receipt_is_sent_without_fabricating_message_id(self):
+        observer = self.observer_mod.GroupRereadObserver(config=self.config)
+        self.config.conversation.group_reread_cooldown_sec = 60
+
+        class _TrueContext(_Context):
+            async def send_message(self, origin, chain):
+                self.sent.append((origin, chain))
+                return True
+
+        async def _run():
+            request = None
+            for index in range(5):
+                request = await observer.observe(_Event("早", sender_id=f"u-{index}", message_id=f"m-{index}"))
+            event = _Event("早", sender_id="u-4", message_id="m-4")
+            dispatcher = self.dispatcher_mod.RereadActionDispatcher(
+                context=_TrueContext(), config=self.config,
+                runtime_coordinator=_Coordinator(), reread_observer=observer,
+            )
+            return await dispatcher.dispatch(event, request), observer._states[request.chat_id]
+
+        result, state = asyncio.run(_run())
+        self.assertTrue(result.sent)
+        self.assertEqual(result.outbound_message_ids, ())
+        self.assertGreater(state.cooldown_until, time.monotonic())
+
+    def test_none_receipt_preserves_legacy_success_without_message_id(self):
+        class _LegacyContext(_Context):
+            async def send_message(self, origin, chain):
+                self.sent.append((origin, chain))
+                return None
+
+        contract = importlib.import_module("astrmai.conversation.contracts.reread")
+        dispatcher = self.dispatcher_mod.RereadActionDispatcher(context=_LegacyContext())
+        event = _Event("echo", sender_id="u", message_id="legacy")
+        request = contract.RereadActionRequest(event.unified_msg_origin, "echo", "legacy", "group_reread_passive")
+        result = asyncio.run(dispatcher.dispatch(event, request))
+        self.assertTrue(result.sent)
+        self.assertEqual(result.outbound_message_ids, ())
+
+    def test_passive_reread_ignores_executor_busy_but_active_does_not(self):
+        class _BusyCoordinator(_Coordinator):
+            async def get_activity_snapshot(self, _chat_id):
+                return {"executor_pending": 1, "wait_targets": []}
+
+        contract_mod = importlib.import_module("astrmai.conversation.contracts.reread")
+        passive = contract_mod.RereadActionRequest(
+            chat_id="default:GroupMessage:group-1", text="早", fingerprint="passive-busy",
+            trigger_kind="group_reread_passive",
+        )
+        active = contract_mod.RereadActionRequest(
+            chat_id="default:GroupMessage:group-1", text="早", fingerprint="active-busy",
+            trigger_kind="group_reread_active",
+        )
+
+        async def _run():
+            dispatcher = self.dispatcher_mod.RereadActionDispatcher(
+                context=_Context(), config=self.config,
+                runtime_coordinator=_BusyCoordinator(),
+            )
+            event = _Event("早", sender_id="u-1", message_id="busy")
+            return await dispatcher.dispatch(event, passive), await dispatcher.dispatch(event, active)
+
+        passive_result, active_result = asyncio.run(_run())
+        self.assertTrue(passive_result.sent)
+        self.assertEqual(active_result.detail, "user_waiting")
+
+    def test_guard_rejection_restores_real_pending_then_next_message_can_send(self):
+        observer = self.observer_mod.GroupRereadObserver(config=self.config)
+
+        class _WaitingCoordinator(_Coordinator):
+            waiting = True
+
+            async def get_activity_snapshot(self, _chat_id):
+                return {"wait_targets": ["u"] if self.waiting else [], "executor_pending": 2}
+
+        async def _run():
+            request = None
+            for index in range(5):
+                request = await observer.observe(_Event("echo", sender_id=f"u-{index}", message_id=f"m-{index}"))
+            coordinator = _WaitingCoordinator()
+            context = _Context()
+            dispatcher = self.dispatcher_mod.RereadActionDispatcher(
+                context=context, config=self.config, runtime_coordinator=coordinator, reread_observer=observer,
+            )
+            first = await dispatcher.dispatch(_Event("echo", sender_id="u-4", message_id="m-4"), request)
+            state = observer._states[request.chat_id]
+            self.assertIsNone(state.pending_request)
+            self.assertEqual(state.pending_records, [])
+            self.assertEqual(len(state.records), 5)
+            self.assertEqual(state.inflight_token, "")
+            self.assertEqual(state.cooldown_until, 0)
+            coordinator.waiting = False
+            event = _Event("echo", sender_id="next", message_id="next")
+            retry = await observer.observe(event)
+            second = await dispatcher.dispatch(event, retry)
+            return first, second, context
+
+        first, second, context = asyncio.run(_run())
+        self.assertEqual(first.detail, "user_waiting")
+        self.assertTrue(second.sent)
+        self.assertEqual(len(context.sent), 1)
+
+    def test_real_coordinator_busy_passive_send_keeps_executor_lease(self):
+        from astrmai.infrastructure.runtime.chat_runtime_coordinator import ChatRuntimeCoordinator
+
+        async def _run():
+            coordinator = ChatRuntimeCoordinator()
+            observer = self.observer_mod.GroupRereadObserver(config=self.config)
+            chat = "default:GroupMessage:group-1"
+            lease = await coordinator.try_acquire_executor(chat, thread_id="ordinary")
+            context = _Context()
+            dispatcher = self.dispatcher_mod.RereadActionDispatcher(
+                context=context, config=self.config, runtime_coordinator=coordinator, reread_observer=observer,
+            )
+            request = None
+            for index in range(5):
+                event = _Event("echo", sender_id=f"u-{index}", message_id=f"m-{index}")
+                request = await observer.observe(event)
+            first, duplicate = await asyncio.gather(
+                dispatcher.dispatch(event, request), dispatcher.dispatch(event, request),
+            )
+            self.assertEqual((await coordinator.get_activity_snapshot(chat))["executor_pending"], 1)
+            self.assertTrue(await coordinator.release_executor(chat, lease=lease))
+            return first, duplicate, context
+
+        first, duplicate, context = asyncio.run(_run())
+        self.assertTrue(first.sent)
+        self.assertFalse(duplicate.sent)
+        self.assertEqual(len(context.sent), 1)
 
     def test_five_messages_trigger_passive_reread(self):
         observer = self.observer_mod.GroupRereadObserver(config=self.config)
