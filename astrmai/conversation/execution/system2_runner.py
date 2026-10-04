@@ -3,17 +3,20 @@ from __future__ import annotations
 import asyncio
 import inspect
 import sys
+import uuid
 
 from astrbot.api import logger
 
 from ...infrastructure.runtime.dialog_lane_identity import resolve_dialog_lane_identity
 from ...infrastructure.runtime.lane_manager import LaneKey
-from ...infrastructure.runtime.trace_runtime import debug_trace
+from ...infrastructure.runtime.trace_runtime import debug_trace, record_terminal_outcome
 from ...infrastructure.runtime.turn_call_ledger import (
     begin_stage,
     clamp_timeout_to_turn_budget,
     finish_stage,
+    remaining_turn_budget,
 )
+from ..contracts.turn_context import ensure_turn_context
 from ..contracts.turn_outcome import mark_system2_handled
 from .followup_manager import FollowupManager
 
@@ -244,6 +247,18 @@ class System2Runner:
         await self.followup_manager.finalize_after_reply(chat_id, main_event, reply_sent)
 
     async def run(self, main_event, events_to_process: list | None = None):
+        attempt_id = uuid.uuid4().hex
+        main_event.set_extra("astrmai_attempt_id", attempt_id)
+        for key in (
+            "astrmai_execution_status", "astrmai_execution_signal",
+            "astrmai_queue_timeout_stage", "astrmai_cancel_source",
+            "astrmai_terminal_outcome", "astrmai_terminal_attempt_id",
+            "astrmai_budget_timeout_stage",
+        ):
+            main_event.set_extra(key, "")
+        main_event.set_extra("astrmai_reply_sent", False)
+        main_event.set_extra("astrmai_side_input_timings", [])
+        ensure_turn_context(main_event).side_inputs.timings.clear()
         chat_id = main_event.unified_msg_origin
         thread_id = self._turn_thread_id(main_event)
         queue_events = self._prepare_queue_events(main_event, events_to_process)
@@ -263,6 +278,7 @@ class System2Runner:
         lock = None
         acquired_mode = ""
         lock_exc_info = None
+        release_exc = None
         try:
             timeout_sec = self._lock_wait_timeout(main_event)
             if timeout_sec <= 0.0:
@@ -313,7 +329,36 @@ class System2Runner:
             lock_stage = ""
             self._reset_runtime_reply_extras(main_event)
             await self._prepare_system2_runtime(main_event, chat_id)
-            reply_sent = await self._execute_planner(main_event, queue_events)
+            strong = any(main_event.get_extra(key, False) for key in (
+                "astrmai_at_bot_wakeup", "astrmai_group_direct_wakeup", "astrmai_reply_wakeup",
+            ))
+            remaining = remaining_turn_budget(main_event) if strong else None
+            budget_stage = begin_stage(main_event, "system2.planner", metadata={
+                "attempt_id": attempt_id, "budget_kind": "turn",
+                "configured_timeout": remaining,
+                "replay_count": int(main_event.get_extra("astrmai_atwake_replay_count", 0)),
+            })
+            deadline = asyncio.timeout(remaining)
+            try:
+                async with deadline:
+                    reply_sent = await self._execute_planner(main_event, queue_events)
+            except asyncio.TimeoutError:
+                if not deadline.expired():
+                    finish_stage(main_event, budget_stage, status="error", reason="TimeoutError")
+                    raise
+                main_event.set_extra("astrmai_execution_status", "budget_exhausted")
+                main_event.set_extra("astrmai_budget_timeout_stage", "system2.planner")
+                finish_stage(main_event, budget_stage, status="timeout", reason="budget_exhausted",
+                             metadata={"remaining_budget": remaining_turn_budget(main_event)})
+                return bool(main_event.get_extra("astrmai_reply_sent", False))
+            except asyncio.CancelledError:
+                finish_stage(main_event, budget_stage, status="cancelled", reason="CancelledError",
+                             metadata={"cancel_source": str(main_event.get_extra("astrmai_cancel_source", ""))})
+                raise
+            except BaseException as exc:
+                finish_stage(main_event, budget_stage, status="error", reason=type(exc).__name__)
+                raise
+            finish_stage(main_event, budget_stage, metadata={"remaining_budget": remaining_turn_budget(main_event)})
             await self._finalize_followups(chat_id, main_event, reply_sent)
             return reply_sent
         except System2QueueTimeout as exc:
@@ -337,22 +382,79 @@ class System2Runner:
             lock_exc_info = (type(exc), exc, exc.__traceback__)
             finish_stage(main_event, lock_stage, status="error", reason=type(exc).__name__)
             raise
+        except BaseException as exc:
+            lock_exc_info = (type(exc), exc, exc.__traceback__)
+            finish_stage(main_event, lock_stage, status="error", reason=type(exc).__name__)
+            raise
         finally:
             if acquired_mode:
                 try:
                     await self._release_lock(lock, acquired_mode, lock_exc_info)
-                except BaseException as release_exc:
+                except BaseException as release_error:
                     if lock_exc_info:
                         logger.warning(
                             "[AstrMai] system2 lock release failed while preserving "
-                            f"{lock_exc_info[0].__name__}: {type(release_exc).__name__}"
+                            f"{lock_exc_info[0].__name__}: {type(release_error).__name__}"
                         )
                     else:
-                        raise
+                        release_exc = release_error
+                        lock_exc_info = (type(release_error), release_error, release_error.__traceback__)
             logger.debug(f"[AstrMai] System2 execution finished safely for {chat_id}.")
+            execution_status = str(main_event.get_extra("astrmai_execution_status", "") or "")
+            if bool(main_event.get_extra("astrmai_reply_sent", False)):
+                terminal_status = "reply_sent"
+            elif lock_exc_info and issubclass(lock_exc_info[0], asyncio.CancelledError):
+                terminal_status = (
+                    "superseded" if main_event.get_extra("astrmai_cancel_source", "")
+                    in {"generation_advanced", "turn_task_replaced"} else "cancelled"
+                )
+            elif lock_exc_info and not isinstance(lock_exc_info[1], System2QueueTimeout):
+                terminal_status = "error"
+            elif execution_status in {"queue_timeout", "background_queue_timeout"}:
+                terminal_status = "queue_timeout"
+            elif execution_status == "budget_exhausted":
+                terminal_status = "timeout"
+            elif execution_status in {"cancelled", "stale_drop", "skipped_wait"}:
+                terminal_status = execution_status
+            else:
+                terminal_status = "no_visible_reply"
+            try:
+                record_terminal_outcome(
+                    main_event,
+                    terminal_status,
+                    stage=str(main_event.get_extra("astrmai_queue_timeout_stage", "")
+                              or main_event.get_extra("astrmai_budget_timeout_stage", "") or "system2"),
+                    reason=execution_status,
+                )
+                planner = getattr(self.runtime, "system2_planner", None)
+                store = getattr(planner, "raw_trace_store", None)
+                if store is not None:
+                    builder = getattr(planner, "_build_raw_trace_events", None)
+                    rows = builder(chat_id, main_event) if callable(builder) else main_event.get_extra("astrmai_trace_log", [])
+                    terminal_rows = [
+                        {**row, "event_id": f"{attempt_id}:turn.terminal"}
+                        for row in rows
+                        if row.get("stage") == "turn.terminal" and row.get("attempt_id") == attempt_id
+                    ]
+                    await store.append_many(chat_id, terminal_rows)
+            except asyncio.CancelledError:
+                if lock_exc_info is None:
+                    raise
+                logger.warning("[AstrMai] terminal persistence cancelled while preserving original exception")
+            except Exception as diagnostic_error:
+                logger.warning("[AstrMai] terminal diagnostic failed: %s", type(diagnostic_error).__name__)
+            except BaseException as diagnostic_error:
+                if lock_exc_info is None:
+                    raise
+                logger.warning(
+                    "[AstrMai] terminal diagnostic aborted while preserving %s: %s",
+                    lock_exc_info[0].__name__, type(diagnostic_error).__name__,
+                )
             debug_trace(
                 main_event,
                 "system2.exit",
                 reply_sent=bool(main_event.get_extra("astrmai_reply_sent", False)),
             )
+            if release_exc is not None:
+                raise release_exc
 __all__ = ["System2Runner"]

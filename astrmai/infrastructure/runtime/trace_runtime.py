@@ -129,6 +129,34 @@ def debug_trace(event: Any, stage: str, **fields: Any) -> str:
     return trace_id
 
 
+def record_terminal_outcome(event: Any, status: str, *, stage: str = "", reason: str = "") -> str:
+    """Record a bounded, privacy-safe terminal outcome for one turn."""
+    attempt_id = event.get_extra("astrmai_attempt_id", "") if hasattr(event, "get_extra") else ""
+    if attempt_id and event.get_extra("astrmai_terminal_attempt_id", "") == attempt_id:
+        return ensure_trace_id(event)
+    normalized = str(status or "error").strip().lower()
+    allowed = {
+        "reply_sent", "no_visible_reply", "skipped_wait", "cancelled", "superseded",
+        "timeout", "queue_timeout", "stale_drop", "error",
+    }
+    if normalized not in allowed:
+        normalized = "error"
+    if hasattr(event, "set_extra"):
+        event.set_extra("astrmai_terminal_outcome", normalized)
+        event.set_extra("astrmai_terminal_attempt_id", attempt_id)
+    turn = event.get_extra("astrmai_turn_identity", None) if hasattr(event, "get_extra") else None
+    return debug_trace(
+        event, "turn.terminal", terminal_stage=stage, reason=reason, status=normalized,
+        outcome=normalized, attempt_id=attempt_id,
+        event_id=f"{attempt_id}:turn.terminal" if attempt_id else "",
+        generation=getattr(turn, "generation", 0),
+        turn_id=getattr(turn, "turn_id", ""),
+        wake=bool(event.get_extra("astrmai_at_bot_wakeup", False) or event.get_extra("astrmai_group_direct_wakeup", False) or event.get_extra("astrmai_reply_wakeup", False)) if hasattr(event, "get_extra") else False,
+        cancel_source=event.get_extra("astrmai_cancel_source", "") if hasattr(event, "get_extra") else "",
+        execution_status=event.get_extra("astrmai_execution_status", "") if hasattr(event, "get_extra") else "",
+    )
+
+
 __all__ = [
     "FocusSnapshot",
     "GatewaySnapshot",
@@ -140,4 +168,5 @@ __all__ = [
     "ensure_trace_id",
     "new_trace_id",
     "preview_text",
+    "record_terminal_outcome",
 ]

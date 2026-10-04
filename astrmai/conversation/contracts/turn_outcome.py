@@ -537,6 +537,55 @@ def ensure_turn_outcome(event: Any) -> TurnOutcome:
         return _ensure_turn_outcome_unlocked(event)
 
 
+def rebind_unsent_superseded_wakeup(event: Any, previous_turn: Any, next_turn: Any) -> bool:
+    """Transfer one settled, unsent generation cancellation to a replay attempt."""
+    with _event_lock(event):
+        if _get_extra(event, "astrmai_turn_identity") != previous_turn:
+            return False
+        if (
+            previous_turn.chat_id != next_turn.chat_id
+            or previous_turn.thread_id != next_turn.thread_id
+            or previous_turn.mode != next_turn.mode
+            or previous_turn.sender_id != next_turn.sender_id
+            or previous_turn.input_message_ids != next_turn.input_message_ids
+            or previous_turn.created_at != next_turn.created_at
+            or str(getattr(event, "unified_msg_origin", "")) != previous_turn.chat_id
+            or next_turn.generation <= previous_turn.generation
+            or _get_extra(event, "astrmai_cancel_source") != "generation_advanced"
+            or _get_extra(event, "astrmai_terminal_outcome") != "superseded"
+            or _get_extra(event, "astrmai_atwake_replay_count", 0)
+        ):
+            return False
+        outcome = _ensure_turn_outcome_unlocked(event)
+        if (
+            outcome.malformed or outcome.reply_sent or outcome.reply_sent_segments or outcome.fallback_sent
+            or outcome.tool_actions_sent or outcome.tool_action_count
+            or outcome.output_claim
+            or (outcome.system2_handled
+                and outcome.terminal_status is not TurnOutcomeStatus.SUPERSEDED
+                and outcome.terminal_reason != "system2_cancelled")
+            or outcome.tool_action_keys or outcome.tool_action_claimed_keys or outcome.tool_action_uncertain
+            or outcome.uncertain_tool_action_keys or outcome.deferred_replay_claimed
+            or outcome.deferred_replayed
+            or (outcome.terminal_status not in {
+                TurnOutcomeStatus.ACTIVE, TurnOutcomeStatus.SUPERSEDED,
+            } and not (outcome.terminal_status is TurnOutcomeStatus.SKIPPED
+                       and outcome.terminal_reason == "system2_cancelled"))
+        ):
+            return False
+        _set_extra(event, "astrmai_turn_identity", next_turn)
+        _set_extra(event, "astrmai_turn_generation", next_turn.generation)
+        _set_extra(event, "astrmai_atwake_replay_count", 1)
+        _set_extra(event, "astrmai_execution_status", "")
+        outcome.turn_id, outcome.trace_id = _identity(event)
+        outcome.turn_generation = next_turn.generation
+        outcome.terminal_status = TurnOutcomeStatus.ACTIVE
+        outcome.terminal_reason = ""
+        outcome.system2_handled = False
+        _persist(event, outcome)
+        return True
+
+
 def _normalize_text_kind(kind: str) -> str:
     normalized = str(kind or "").strip().lower()
     if normalized in {"fallback", "reread"}:

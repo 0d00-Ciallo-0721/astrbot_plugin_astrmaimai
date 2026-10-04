@@ -352,7 +352,14 @@ class ChatRuntimeCoordinator:
             if stale_task is not None and not stale_task.done():
                 self._increment_metric_locked("stale_turn_cancelled")
         if stale_task is not None and not stale_task.done():
-            stale_task.cancel()
+            event = getattr(stale_task, "_astrmai_diagnostic_event", None)
+            try:
+                if event is not None:
+                    event.set_extra("astrmai_cancel_source", "generation_advanced")
+            except Exception as exc:
+                logger.warning("[AstrMai] cancellation diagnostic failed: %s", type(exc).__name__)
+            finally:
+                stale_task.cancel()
         return next_generation
 
     async def register_turn_task(self, turn: Any, task: asyncio.Task) -> bool:
@@ -379,7 +386,14 @@ class ChatRuntimeCoordinator:
                 self._active_turn_tasks.discard(previous_task)
             self._active_turn_tasks.add(task)
         if previous_task is not None and previous_task is not task and not previous_task.done():
-            previous_task.cancel()
+            event = getattr(previous_task, "_astrmai_diagnostic_event", None)
+            try:
+                if event is not None:
+                    event.set_extra("astrmai_cancel_source", "turn_task_replaced")
+            except Exception as exc:
+                logger.warning("[AstrMai] cancellation diagnostic failed: %s", type(exc).__name__)
+            finally:
+                previous_task.cancel()
         return True
 
     async def unregister_turn_task(self, turn: Any, task: asyncio.Task) -> None:

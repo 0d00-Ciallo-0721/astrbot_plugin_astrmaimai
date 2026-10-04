@@ -1245,6 +1245,8 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         reply_text: str | None = None,
         refresh_snapshot_only: bool = False,
     ) -> None:
+        if status == "skipped_wait":
+            debug_trace(event, "turn.outcome_candidate", outcome=status, candidate_stage="execution.executor")
         if (
             hasattr(event, "get_extra")
             and hasattr(event, "set_extra")

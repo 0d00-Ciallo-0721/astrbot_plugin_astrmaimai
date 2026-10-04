@@ -50,6 +50,10 @@ from ..contracts.dialog_history_policy import DialogHistoryPolicy
 from ..contracts.focus_context import FocusThreadContext, FreshnessState, VisionBundle
 from ..contracts.prompt_envelope import PromptEnvelope
 from ..contracts.reread import RereadActionRequest
+from ..contracts.wait_signal_policy import (
+    WAIT_FALLBACK_TEXT,
+    decide_wait_signal_policy,
+)
 from ..vision_state import (
     classify_vision_failure_text,
     guard_unresolved_image_reply,
@@ -230,6 +234,7 @@ from ...infrastructure.runtime.turn_call_ledger import (
     begin_stage,
     clamp_timeout_to_turn_budget,
     finish_stage,
+    remaining_turn_budget,
     record_vision_observation,
 )
 
@@ -292,6 +297,95 @@ class ConcurrentExecutor:
 
     def bind_reread_action_dispatcher(self, dispatcher) -> None:
         self.reread_action_dispatcher = dispatcher
+
+    async def _handle_wait_signal(
+        self,
+        event: AstrMessageEvent,
+        chat_id: str,
+        bot_id: str,
+        *,
+        model: str,
+    ) -> Optional[str]:
+        # A wait signal is still part of the current turn.  Do not turn a
+        # stale, shutdown, or already-cancelled turn into a new visible send.
+        # These checks stay at the policy boundary so the ordinary wait path
+        # remains unchanged and the unified reply/send chain remains the only
+        # path that can emit the acknowledgement.
+        execution_status = str(event.get_extra("astrmai_execution_status", "") or "").strip()
+        if execution_status in {"stale_drop", "superseded"}:
+            event.set_extra("astrmai_wait_policy_decision", "reject")
+            event.set_extra("astrmai_wait_policy_reason", execution_status)
+            event.set_extra("astrmai_wait_signal_observed", True)
+            return None
+        if execution_status in {"shutdown", "shutdown_rejected", "cancelled", "task_cancelled"}:
+            event.set_extra("astrmai_wait_policy_decision", "reject")
+            event.set_extra("astrmai_wait_policy_reason", execution_status)
+            event.set_extra("astrmai_wait_signal_observed", True)
+            return None
+        policy = decide_wait_signal_policy(event)
+        if hasattr(event, "set_extra"):
+            event.set_extra("astrmai_wait_signal_observed", True)
+            event.set_extra(
+                "astrmai_wait_policy_decision",
+                "fallback" if policy.require_visible_ack else "allow_wait" if policy.allow_wait else "reject",
+            )
+            event.set_extra("astrmai_wait_policy_reason", policy.reason)
+            event.set_extra("astrmai_wait_target_present", policy.wait_target_present)
+            event.set_extra("astrmai_wait_fallback_form", "visible_ack" if policy.require_visible_ack else "")
+            event.set_extra("astrmai_wait_generation", int(event.get_extra("astrmai_turn_generation", 0) or 0))
+            event.set_extra("astrmai_wait_replay_count", int(event.get_extra("astrmai_atwake_replay_count", 0) or 0))
+            event.set_extra(
+                "astrmai_wait_send_claim_state",
+                "consumed" if policy.reason == "send_claim_consumed" else "available",
+            )
+        debug_trace(
+            event,
+            "execution.executor.wait_signal",
+            model=model,
+            decision="fallback" if policy.require_visible_ack else "allow_wait" if policy.allow_wait else "reject",
+            reason=policy.reason,
+            wait_target_present=policy.wait_target_present,
+        )
+        if not policy.require_visible_ack:
+            if hasattr(event, "set_extra"):
+                event.set_extra("astrmai_execution_signal", "wait")
+                event.set_extra("astrmai_execution_status", "skipped_wait")
+            return None
+
+        if not await self._check_pre_model_freshness(event, chat_id, "wait signal fallback"):
+            event.set_extra("astrmai_execution_status", "stale_drop")
+            event.set_extra("astrmai_wait_signal_observed", True)
+            event.set_extra("astrmai_wait_policy_decision", "reject")
+            event.set_extra("astrmai_wait_policy_reason", "stale_generation")
+            return None
+
+        was_reply_sent = bool(event.get_extra("astrmai_reply_sent", False))
+        try:
+            visible = await self._finalize_reply(
+                event,
+                chat_id,
+                bot_id,
+                WAIT_FALLBACK_TEXT,
+                trace_mode="wait_signal_ack",
+                model=model,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if hasattr(event, "set_extra"):
+                event.set_extra("astrmai_wait_fallback_error", type(exc).__name__)
+                if not was_reply_sent:
+                    event.set_extra("astrmai_reply_sent", False)
+            debug_trace(
+                event,
+                "execution.executor.wait_signal_fallback_failed",
+                model=model,
+                error=type(exc).__name__,
+            )
+            return None
+        if visible is None and not was_reply_sent and hasattr(event, "set_extra"):
+            event.set_extra("astrmai_reply_sent", False)
+        return visible
 
     def _build_vision_bundle(
         self,
@@ -2326,6 +2420,13 @@ class ConcurrentExecutor:
                 safe_reply_text, failure_kind = self._validate_visible_output(event, reply_text)
                 if failure_kind:
                     raise ValueError(failure_kind)
+                if "[SYSTEM_WAIT_SIGNAL]" in reply_text:
+                    return await self._handle_wait_signal(
+                        event,
+                        chat_id,
+                        runtime["bot_id"],
+                        model=provider_id,
+                    )
                 return await self._finalize_reply(
                     event,
                     chat_id,
@@ -2579,11 +2680,12 @@ class ConcurrentExecutor:
                 if not reply_text:
                     raise ValueError("empty tool reply")
                 if "[SYSTEM_WAIT_SIGNAL]" in reply_text:
-                    if hasattr(event, "set_extra"):
-                        event.set_extra("astrmai_execution_signal", "wait")
-                        event.set_extra("astrmai_execution_status", "skipped_wait")
-                    debug_trace(event, "execution.executor.wait_signal", model=provider_id)
-                    return None
+                    return await self._handle_wait_signal(
+                        event,
+                        chat_id,
+                        runtime["bot_id"],
+                        model=provider_id,
+                    )
                 if "[TERMINAL_YIELD]:" in reply_text:
                     if event.get_extra("astrmai_reread_request", None):
                         if await self._dispatch_reread_request(event):
@@ -2699,12 +2801,19 @@ class ConcurrentExecutor:
                 "chat_id": str(chat_id or ""),
                 "thread_id": self._turn_thread_id(event),
                 "lock_scope": "thread" if self._turn_thread_id(event) else "chat_fallback",
+                "budget_kind": "executor_lock",
+                "configured_timeout": self._executor_lock_wait_timeout(event),
+                "remaining_budget": remaining_turn_budget(event),
+                "attempt_id": str(event.get_extra("astrmai_attempt_id", "") or ""),
+                "generation": int(event.get_extra("astrmai_turn_generation", 0) or 0),
+                "replay_count": int(event.get_extra("astrmai_atwake_replay_count", 0) or 0),
             },
         )
         try:
             chat_lock, using_runtime_coordinator, lock_outcome = await self._acquire_chat_execution_lock(chat_id, event)
         except asyncio.CancelledError:
-            finish_stage(event, lock_stage, status="cancelled", reason="acquire_cancelled")
+            finish_stage(event, lock_stage, status="cancelled", reason="acquire_cancelled",
+                         metadata={"cancel_source": str(event.get_extra("astrmai_cancel_source", "") or "external_or_superseded")})
             raise
         except Exception as exc:
             finish_stage(event, lock_stage, status="error", reason=type(exc).__name__)

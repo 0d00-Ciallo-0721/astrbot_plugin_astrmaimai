@@ -71,6 +71,9 @@ _EXPORTS = {
     "SocialFeedbackDecision": ".social_feedback",
     "SocialFeedbackEvidence": ".social_feedback",
     "SocialFeedbackObservation": ".social_feedback",
+    "WAIT_FALLBACK_TEXT": ".wait_signal_policy",
+    "WaitSignalPolicy": ".wait_signal_policy",
+    "decide_wait_signal_policy": ".wait_signal_policy",
 }
 
 __all__ = list(_EXPORTS)

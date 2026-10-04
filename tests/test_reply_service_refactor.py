@@ -1188,6 +1188,58 @@ class RefactoredReplyServiceTests(unittest.TestCase):
         self.assertFalse(artifact.sent)
         self.assertEqual(artifact.blocked_reason, "send_failed")
 
+    def test_host_false_receipt_does_not_commit_or_mark_reply_sent(self):
+        from astrmai.conversation.attention.group_dialogue_store import GroupDialogueStore
+
+        state_engine = FakeStateEngine()
+        state_engine.config.reply.typing_speed_factor = 0.0
+        state_engine.gateway.context.send_message = AsyncMock(return_value=False)
+        store = GroupDialogueStore()
+        service = self.reply_mod.ReplyService(
+            state_engine=state_engine,
+            mood_manager=SimpleNamespace(),
+            dialogue_store=store,
+        )
+        service._settle_post_send = _noop_post_send
+        event = FakeEvent("user-1", "Alice", "false-receipt")
+
+        artifact = asyncio.run(service.handle_reply(event, "undelivered reply", event.unified_msg_origin))
+        counts = asyncio.run(store.snapshot_counts(event.unified_msg_origin))
+
+        self.assertFalse(artifact.sent)
+        self.assertEqual(artifact.metadata.get("send_status"), "failed")
+        self.assertEqual(artifact.metadata.get("send_failure_reason"), "host_send_returned_false")
+        self.assertEqual(event.get_extra("astrmai_reply_delivery_status"), "failed")
+        self.assertFalse(event.get_extra("astrmai_reply_sent", False))
+        self.assertIsNone(event.get_extra("astrmai_reply_commit_id"))
+        self.assertEqual(event.get_extra("astrmai_reply_outbound_message_ids", []), [])
+        self.assertEqual(counts["segments"], 0)
+        state_engine.gateway.context.send_message.assert_awaited_once()
+
+    def test_host_true_receipt_keeps_success_commit_path(self):
+        from astrmai.conversation.attention.group_dialogue_store import GroupDialogueStore
+
+        state_engine = FakeStateEngine()
+        state_engine.config.reply.typing_speed_factor = 0.0
+        state_engine.gateway.context.send_message = AsyncMock(return_value=True)
+        store = GroupDialogueStore()
+        service = self.reply_mod.ReplyService(
+            state_engine=state_engine,
+            mood_manager=SimpleNamespace(),
+            dialogue_store=store,
+        )
+        service._settle_post_send = _noop_post_send
+        event = FakeEvent("user-1", "Alice", "true-receipt")
+
+        artifact = asyncio.run(service.handle_reply(event, "delivered reply", event.unified_msg_origin))
+        turns = asyncio.run(store.get_recent_bot_turns(event.unified_msg_origin, target_sender_id="user-1"))
+
+        self.assertTrue(artifact.sent)
+        self.assertEqual(event.get_extra("astrmai_reply_delivery_status"), "sent")
+        self.assertTrue(event.get_extra("astrmai_reply_sent", False))
+        self.assertEqual(len(turns), 1)
+        state_engine.gateway.context.send_message.assert_awaited_once()
+
     def test_cancelled_send_releases_turn_outcome_claim(self):
         state_engine = FakeStateEngine()
         service = self.reply_mod.ReplyService(

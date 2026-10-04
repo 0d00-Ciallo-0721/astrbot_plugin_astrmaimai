@@ -29,8 +29,10 @@ from ..contracts.turn_outcome import (
     release_deferred_replay,
     record_text_failed,
     settle_completion_callback,
+    rebind_unsent_superseded_wakeup,
+    ensure_turn_outcome,
 )
-from ..contracts.turn_identity import TurnIdentity, build_p0_thread_id
+from ..contracts.turn_identity import TurnIdentity, build_p0_thread_id, build_turn_send_key
 from ..threading.group_thread_resolver import resolve_group_thread
 from ...infrastructure.compat.legacy_compat import emit_legacy_focus_thread_extras
 from ...infrastructure.gateway.output_guard import validate_visible_output_text
@@ -70,6 +72,15 @@ class DeferredReplayExecutionTimeout(asyncio.TimeoutError):
 
     stage = "task_execution"
     kind = "task_execution_timeout"
+
+
+@dataclass(slots=True)
+class StrongWakeupHandoff:
+    event: Any
+    task: asyncio.Task
+    turn: TurnIdentity
+    expires_at: float
+    successor_generation: int = 0
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -177,6 +188,8 @@ class AttentionGate:
     ATTENTION_WINDOW_MAX_EVENTS = 12
     BACKGROUND_TASK_MAX_CONCURRENCY = 8
     MESSAGE_DEDUP_FALLBACK_TTL_SECONDS = 2.0
+    STRONG_WAKEUP_HANDOFF_TTL_SECONDS = 60.0
+    STRONG_WAKEUP_HANDOFF_MAX = 128
 
     def __init__(
         self,
@@ -213,6 +226,8 @@ class AttentionGate:
         self.turn_trace_callback = turn_trace_callback
         self.background_task_budget = background_task_budget
         self.owner_registry = owner_registry
+        self._strong_wakeup_running: dict[tuple[str, str], StrongWakeupHandoff] = {}
+        self._strong_wakeup_pending: dict[tuple[str, str], StrongWakeupHandoff] = {}
         self._proactive_injection_lock: dict[str, asyncio.Lock] = {}
         self._proactive_dispatching: dict[str, bool] = {}
         self._deferred_messages: dict[str, list] = {}  # ponytail: R12 — queue blocked messages
@@ -892,6 +907,10 @@ class AttentionGate:
         if not self._workers_shutdown:
             self._workers_shutdown = True
             self._shutdown_generation += 1
+            for handoff in self._strong_wakeup_pending.values():
+                self._trace_wakeup_handoff(handoff.event, "shutdown")
+            self._strong_wakeup_pending.clear()
+            self._strong_wakeup_running.clear()
 
     def mark_runtime_started(self) -> None:
         """Record the successful runtime transition used by startup warmup."""
@@ -1393,8 +1412,101 @@ class AttentionGate:
                 break
         return count
 
+    @staticmethod
+    def _trace_wakeup_handoff(event, reason: str) -> None:
+        try:
+            debug_trace(event, "atwake.handoff", reason=reason,
+                        replay_count=int(event.get_extra("astrmai_atwake_replay_count", 0)),
+                        generation=int(event.get_extra("astrmai_turn_generation", 0)),
+                        thread_id=str(event.get_extra("astrmai_turn_thread_id", "")))
+        except Exception:
+            logger.debug("[AttentionGate] wakeup handoff diagnostic degraded", exc_info=True)
+
+    def _is_strong_wakeup(self, event) -> bool:
+        perception = ensure_turn_context(event).perception
+        if perception.chat_id:
+            return bool(perception.is_strong_wakeup)
+        direct, at_bot, reply_bot, _ = self._resolve_wakeup_flags(
+            event, get_event_self_id(event), str(getattr(event, "message_str", "") or ""),
+        )
+        return bool(direct or at_bot or reply_bot)
+
+    def _complete_wakeup_successor(self, event) -> None:
+        turn = event.get_extra("astrmai_turn_identity", None)
+        if turn is None:
+            return
+        key = (turn.chat_id, turn.thread_id)
+        handoff = self._strong_wakeup_pending.get(key)
+        if handoff is None:
+            return
+        outcome = ensure_turn_outcome(event)
+        if (outcome.reply_sent or outcome.fallback_sent or outcome.tool_actions_sent
+                or outcome.output_claim or outcome.tool_action_uncertain
+                or outcome.tool_action_claimed_keys):
+            self._strong_wakeup_pending.pop(key, None)
+            reason = ("successor_visible_reply" if outcome.reply_sent or outcome.fallback_sent
+                      or outcome.tool_actions_sent else "successor_output_owned")
+            self._trace_wakeup_handoff(handoff.event, reason)
+            return
+        if handoff.successor_generation != turn.generation:
+            return
+        self._strong_wakeup_pending.pop(key, None)
+        self._fire_priority_task(self._replay_strong_wakeup(handoff, turn))
+
+    async def _replay_strong_wakeup(self, handoff: StrongWakeupHandoff, successor: TurnIdentity) -> None:
+        event = handoff.event
+        try:
+            # The old attempt must finish its terminal and output settlement
+            # before the original event can be handed to another attempt.
+            remaining = max(0.0, handoff.expires_at - time.monotonic())
+            if not handoff.task.done():
+                done, _ = await asyncio.wait({handoff.task}, timeout=remaining)
+                if not done:
+                    self._trace_wakeup_handoff(event, "expired_waiting_settlement")
+                    return
+            if self._workers_shutdown:
+                self._trace_wakeup_handoff(event, "shutdown")
+                return
+            if time.monotonic() >= handoff.expires_at:
+                self._trace_wakeup_handoff(event, "expired")
+                return
+            if (handoff.turn.chat_id, handoff.turn.thread_id) != (successor.chat_id, successor.thread_id):
+                self._trace_wakeup_handoff(event, "boundary_mismatch")
+                return
+            if not await self.runtime_coordinator.is_current_turn(successor):
+                self._trace_wakeup_handoff(event, "generation_mismatch")
+                return
+            successor_claim = await self.runtime_coordinator.get_send_claim(
+                successor.chat_id, build_turn_send_key(successor),
+            )
+            if successor_claim and (successor_claim["status"] != "failed"
+                                    or successor_claim["outbound_message_ids"]):
+                self._trace_wakeup_handoff(event, "successor_send_claim_exists")
+                return
+            claim = await self.runtime_coordinator.get_send_claim(
+                handoff.turn.chat_id, build_turn_send_key(handoff.turn),
+            )
+            if claim and (claim["status"] != "failed" or claim["outbound_message_ids"]):
+                self._trace_wakeup_handoff(event, "send_claim_exists")
+                return
+            # No await between the final generation check and ownership transfer.
+            if self._workers_shutdown or not await self.runtime_coordinator.is_current_turn(successor):
+                self._trace_wakeup_handoff(event, "generation_or_shutdown")
+                return
+            replay_turn = replace(handoff.turn, generation=successor.generation)
+            if not rebind_unsent_superseded_wakeup(event, handoff.turn, replay_turn):
+                self._trace_wakeup_handoff(event, "ownership_rejected")
+                return
+            self._trace_wakeup_handoff(event, "replay_started")
+            await self._run_managed_system2_task(self.sys2_process(event, [event]), event)
+        except asyncio.CancelledError:
+            self._trace_wakeup_handoff(event, "replay_cancelled")
+            raise
+
     async def _run_managed_system2_task(self, coro, event, *, deferred_replay: bool = False):
         task = asyncio.current_task()
+        if task is not None:
+            task._astrmai_diagnostic_event = event
         turn = event.get_extra("astrmai_turn_identity", None) if hasattr(event, "get_extra") else None
         coordinator = self.runtime_coordinator
         registered = True
@@ -1406,8 +1518,24 @@ class AttentionGate:
             if deferred_replay:
                 raise RuntimeError("deferred replay task registration rejected")
             return None
+        callback_code = getattr(self.sys2_process, "__code__", None)
+        is_system2 = callback_code is not None and getattr(coro, "cr_code", None) is callback_code
+        key = (turn.chat_id, turn.thread_id) if turn is not None else None
+        tracked = None
+        if is_system2 and key is not None and self._is_strong_wakeup(event):
+            if not event.get_extra("astrmai_atwake_replay_count", 0):
+                tracked = StrongWakeupHandoff(
+                    event, task, turn, time.monotonic() + self.STRONG_WAKEUP_HANDOFF_TTL_SECONDS,
+                )
+                self._strong_wakeup_running[key] = tracked
+                while len(self._strong_wakeup_running) > self.STRONG_WAKEUP_HANDOFF_MAX:
+                    removed = self._strong_wakeup_running.pop(next(iter(self._strong_wakeup_running)))
+                    self._trace_wakeup_handoff(removed.event, "capacity")
+        completed = False
         try:
-            return await coro
+            result = await coro
+            completed = True
+            return result
         except (BackgroundTaskQueueTimeout, BackgroundTaskQueueFull):
             # Queue admission failures are compensable deferred work, not a
             # System2 execution failure.  Let _run_background_task classify
@@ -1419,10 +1547,19 @@ class AttentionGate:
             if deferred_replay:
                 raise
             await self._handle_system2_failure(event, exc)
+            completed = True
             return None
         finally:
             if coordinator is not None and hasattr(coordinator, "unregister_turn_task"):
                 await coordinator.unregister_turn_task(turn, task)
+            if tracked is not None and self._strong_wakeup_running.get(key) is tracked:
+                self._strong_wakeup_running.pop(key, None)
+            if is_system2 and (completed or event.get_extra("astrmai_reply_sent", False)
+                              or event.get_extra("tool_actions_sent", False)):
+                try:
+                    self._complete_wakeup_successor(event)
+                except Exception:
+                    logger.warning("[AttentionGate] wakeup completion degraded", exc_info=True)
 
     async def _run_background_slot(self, awaitable_factory, event=None, *, admission_deadline: float | None = None):
         acquired = False
@@ -1451,6 +1588,11 @@ class AttentionGate:
             metadata={
                 "limit": int(self.BACKGROUND_TASK_MAX_CONCURRENCY),
                 "timeout_sec": timeout_sec,
+                "budget_kind": "background_slot",
+                "configured_timeout": max(0.1, configured_timeout),
+                "remaining_budget": remaining_turn_budget(event),
+                "attempt_id": str(event.get_extra("astrmai_attempt_id", "") or "") if event is not None else "",
+                "replay_count": int(event.get_extra("astrmai_atwake_replay_count", 0) or 0) if event is not None else 0,
             },
         )
         try:
@@ -1485,7 +1627,8 @@ class AttentionGate:
                 "attention background semaphore wait timed out"
             ) from exc
         except asyncio.CancelledError:
-            finish_stage(event, wait_stage, status="cancelled", reason="superseded_or_shutdown")
+            finish_stage(event, wait_stage, status="cancelled", reason="superseded_or_shutdown",
+                         metadata={"cancel_source": str(event.get_extra("astrmai_cancel_source", "") or "external_or_superseded") if event is not None else ""})
             raise
         except Exception as exc:
             finish_stage(event, wait_stage, status="error", reason=type(exc).__name__)
@@ -1683,6 +1826,10 @@ class AttentionGate:
             if event is not None and hasattr(event, "set_extra"):
                 event.set_extra("deferred_terminal_status", "shutdown")
             return False
+        strong = event is not None and self._is_strong_wakeup(event)
+        if strong and event.get_extra("astrmai_atwake_replay_count", 0):
+            self._trace_wakeup_handoff(event, "replay_limit")
+            return False
         limit = max(1, int(self._deferred_attention_config("attention_deferred_queue_max", 128)))
         if len(self._deferred_attention_work) >= limit:
             self._record_deferred_rejection(event, reason="deferred_queue_full")
@@ -1719,6 +1866,8 @@ class AttentionGate:
         if replay_metadata:
             item["replay_metadata"] = self._json_safe(replay_metadata)
             item.setdefault("diagnostics", {})["replay_metadata"] = item["replay_metadata"]
+        if strong:
+            item["max_attempts"] = 1
         self._deferred_attention_work[work_id] = item
         self._schedule_deferred_persist(item)
         self._deferred_attention_counts["total"] += 1
@@ -1873,6 +2022,17 @@ class AttentionGate:
                         terminal=True,
                     )
                 if status in {"shutdown", "cancelled", "budget_exhausted", "superseded"}:
+                    cancel_source = str(event.get_extra("astrmai_cancel_source", "") or "")
+                    if status == "cancelled" and cancel_source in {
+                        "generation_advanced",
+                        "turn_task_replaced",
+                    } and not bool(event.get_extra("astrmai_reply_sent", False)):
+                        return decision(
+                            "superseded",
+                            f"cancel_source_{cancel_source}",
+                            kind="superseded",
+                            terminal=True,
+                        )
                     return decision(status, f"turn_{status}", kind=status, terminal=True)
                 reason = str(replay_decision.reason or "deferred_replay_not_allowed")
                 if reason in {"output_claim_exists", "deferred_replay_claimed"}:
@@ -1906,6 +2066,16 @@ class AttentionGate:
                         "skipped_already_terminal",
                         "execution_already_terminal",
                         kind="already_terminal",
+                        terminal=True,
+                    )
+                cancel_source = str(event.get_extra("astrmai_cancel_source", "") or "")
+                if cancel_source in {"generation_advanced", "turn_task_replaced"} and not bool(
+                    event.get_extra("astrmai_reply_sent", False)
+                ):
+                    return decision(
+                        "superseded",
+                        f"cancel_source_{cancel_source}",
+                        kind="superseded",
                         terminal=True,
                     )
                 if status == "stale_drop":
@@ -2065,6 +2235,8 @@ class AttentionGate:
                     self._set_deferred_terminal(item, "skipped", reason=replay_decision.reason)
                     continue
                 replay_claimed = True
+                if self._is_strong_wakeup(event):
+                    event.set_extra("astrmai_atwake_replay_count", 1)
             original_remaining = remaining_turn_budget(event)
             item.setdefault("diagnostics", {})
             item["diagnostics"].update(
@@ -2142,6 +2314,11 @@ class AttentionGate:
                             retry_factory=retry_factory,
                             _deferred_replay=True,
                         )
+                        if (event is not None and self._is_strong_wakeup(event)
+                                and not event.get_extra("astrmai_reply_sent", False)
+                                and event.get_extra("astrmai_execution_status", "")
+                                in {"queue_timeout", "budget_exhausted"}):
+                            raise asyncio.TimeoutError("strong wakeup replay budget exhausted")
                 finally:
                     self._deferred_attention_replay_active.discard(str(work_id))
                 self._deferred_replay_diagnostics(item, event)["replay_budget_remaining_ms"] = round(
@@ -2239,6 +2416,8 @@ class AttentionGate:
     ):
         started = False
         deferred = False
+        completed = False
+        completed = False
 
         async def _execute() -> Any:
             nonlocal started
@@ -2484,12 +2663,16 @@ class AttentionGate:
                 else:
                     result = await slot_wait_and_execute
             if (
-                not started
+                (not started or (
+                    event is not None and self._is_strong_wakeup(event)
+                    and event.get_extra("astrmai_execution_status", "") == "queue_timeout"
+                    and str(event.get_extra("astrmai_queue_timeout_stage", "")).startswith("system2.")
+                ))
                 and not _deferred_replay
                 and retry_factory is not None
                 and event is not None
                 and str(event.get_extra("astrmai_execution_status", "") or "")
-                in {"background_queue_timeout", "background_queue_rejected"}
+                in {"background_queue_timeout", "background_queue_rejected", "queue_timeout"}
             ):
                 deferred = self._defer_attention_work(
                     event=event,
@@ -2504,6 +2687,7 @@ class AttentionGate:
                     ),
                     replay_metadata=deferred_metadata,
                 )
+            completed = True
             return result
         except (BackgroundTaskQueueTimeout, BackgroundTaskQueueFull, asyncio.TimeoutError) as exc:
             if not started and not _deferred_replay:
@@ -2523,6 +2707,11 @@ class AttentionGate:
                     return None
             raise
         finally:
+            if completed and event is not None:
+                try:
+                    self._complete_wakeup_successor(event)
+                except Exception:
+                    logger.warning("[AttentionGate] background wakeup settlement degraded", exc_info=True)
             if not started and hasattr(coro, "close"):
                 coro.close()
 
@@ -3199,6 +3388,13 @@ class AttentionGate:
             event.set_extra("astrmai_group_thread_confidence", resolution.confidence)
         else:
             thread_id = build_p0_thread_id(mode, chat_id)
+        key = (chat_id, thread_id)
+        now = time.monotonic()
+        for expired_key, pending in list(self._strong_wakeup_pending.items()):
+            if pending.expires_at <= now:
+                self._strong_wakeup_pending.pop(expired_key, None)
+                self._trace_wakeup_handoff(pending.event, "expired")
+        handoff = self._strong_wakeup_pending.get(key) or self._strong_wakeup_running.get(key)
         generation = await coordinator.advance_generation(chat_id, thread_id)
         created_at = time.time()
         turn = TurnIdentity(
@@ -3215,6 +3411,19 @@ class AttentionGate:
         event.set_extra("astrmai_turn_thread_id", thread_id)
         event.set_extra("astrmai_turn_generation", generation)
         event.set_extra("astrmai_turn_created_at", created_at)
+        if handoff is not None and handoff.event is not event:
+            if self._workers_shutdown or self._is_strong_wakeup(event):
+                self._strong_wakeup_pending.pop(key, None)
+                if self._strong_wakeup_running.get(key) is handoff:
+                    self._strong_wakeup_running.pop(key, None)
+                self._trace_wakeup_handoff(handoff.event, "new_strong_wakeup_or_shutdown")
+            elif handoff.expires_at > now and not handoff.event.get_extra("astrmai_atwake_replay_count", 0):
+                handoff.successor_generation = generation
+                self._strong_wakeup_pending[key] = handoff
+                while len(self._strong_wakeup_pending) > self.STRONG_WAKEUP_HANDOFF_MAX:
+                    removed = self._strong_wakeup_pending.pop(next(iter(self._strong_wakeup_pending)))
+                    self._trace_wakeup_handoff(removed.event, "capacity")
+                self._trace_wakeup_handoff(handoff.event, "superseded_pending")
 
     def _bind_private_batch_turn(self, focus_event, batch_events: list[AstrMessageEvent], chat_id: str) -> None:
         if not batch_events:
@@ -3872,6 +4081,10 @@ class AttentionGate:
         reply_text: str | None = None,
     ) -> None:
         event.set_extra("astrmai_pre_planner_trace_status", str(status or ""))
+        try:
+            self._complete_wakeup_successor(event)
+        except Exception:
+            logger.warning("[AttentionGate] wakeup completion degraded", exc_info=True)
         trace_state = str(event.get_extra("astrmai_pre_planner_trace_state", "") or "")
         if trace_state in {"pending", "persisted"} or bool(
             event.get_extra("astrmai_pre_planner_trace_finalized", False)

@@ -15,6 +15,7 @@ from ..contracts.topic_bridge import BridgeDecision
 from ..contracts.turn_context import ensure_turn_context
 from ...memory.contracts.learning_retrieval import LearningFocusContext
 from ...infrastructure.runtime.trace_runtime import debug_trace
+from ...infrastructure.runtime.turn_call_ledger import begin_stage, finish_stage, remaining_turn_budget
 
 
 @dataclass(slots=True)
@@ -41,6 +42,11 @@ class TimedSideInput:
     ok: bool = True
     error: str = ""
     skipped_reason: str = ""
+    outcome: str = "success"
+    attempt_id: str = ""
+    configured_timeout: float | None = None
+    remaining_budget: float | None = None
+    cancel_source: str = ""
 
 
 class PlanningInputLoader:
@@ -60,23 +66,75 @@ class PlanningInputLoader:
         ok = True
         error = ""
         value = default
+        outcome = "success"
+        strong = any(event.get_extra(key, False) for key in (
+            "astrmai_at_bot_wakeup", "astrmai_group_direct_wakeup", "astrmai_reply_wakeup",
+        )) if hasattr(event, "get_extra") else False
+        timeout = remaining_turn_budget(event, reserve_for_reply=True) if strong else None
+        attempt_id = str(event.get_extra("astrmai_attempt_id", "") or "") if hasattr(event, "get_extra") else ""
+        stage = begin_stage(event, "planning.side_input", metadata={
+            "name": name, "budget_kind": "side_input", "attempt_id": attempt_id,
+            "configured_timeout": timeout,
+        })
         try:
+            if timeout is not None and timeout <= 0:
+                raise asyncio.TimeoutError()
             loaded = loader()
-            value = await loaded if inspect.isawaitable(loaded) else loaded
+            if inspect.isawaitable(loaded):
+                value = await asyncio.wait_for(loaded, timeout=timeout) if timeout is not None else await loaded
+            else:
+                value = loaded
+        except asyncio.CancelledError:
+            source = str(event.get_extra("astrmai_cancel_source", "") or "external_or_superseded")
+            item = TimedSideInput(
+                name=name, value=default,
+                elapsed_ms=round((time.perf_counter() - started) * 1000, 2),
+                ok=False, error="CancelledError", outcome="cancelled", attempt_id=attempt_id,
+                configured_timeout=timeout, remaining_budget=remaining_turn_budget(event), cancel_source=source,
+            )
+            self._record_timing(event, item)
+            finish_stage(event, stage, status="cancelled", reason="CancelledError", metadata={"cancel_source": source})
+            debug_trace(
+                event, "planning.side_input", name=name,
+                elapsed_ms=round((time.perf_counter() - started) * 1000, 2),
+                ok=False, error="CancelledError", cancel_source=source,
+            )
+            raise
+        except asyncio.TimeoutError:
+            ok = False
+            error = "TimeoutError"
+            outcome = "side_input_timeout"
+            value = default
         except Exception as exc:
             ok = False
-            error = f"{type(exc).__name__}: {exc}"
+            error = type(exc).__name__
+            outcome = "side_input_error"
             value = default
-            logger.debug(f"[PlanningInputLoader] {name} degraded: {exc}")
+            logger.debug(f"[PlanningInputLoader] {name} degraded: {error}")
+        except BaseException as exc:
+            finish_stage(event, stage, status="error", reason=type(exc).__name__)
+            raise
         elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
-        debug_trace(event, "planning.side_input", name=name, elapsed_ms=elapsed_ms, ok=ok, error=error)
-        return TimedSideInput(name=name, value=value, elapsed_ms=elapsed_ms, ok=ok, error=error)
+        remaining = remaining_turn_budget(event)
+        finish_stage(event, stage, status="success" if ok else "timeout" if outcome == "side_input_timeout" else "error",
+                     reason=outcome, metadata={"degraded": not ok, "remaining_budget": remaining})
+        debug_trace(event, "planning.side_input", name=name, elapsed_ms=elapsed_ms, ok=ok, error=error,
+                    outcome=outcome, degraded=not ok, configured_timeout=timeout, remaining_budget=remaining,
+                    attempt_id=attempt_id, budget_kind="side_input")
+        return TimedSideInput(name=name, value=value, elapsed_ms=elapsed_ms, ok=ok, error=error,
+                              outcome=outcome, attempt_id=attempt_id, configured_timeout=timeout, remaining_budget=remaining)
 
     def _record_timing(self, event, item: TimedSideInput) -> dict[str, Any]:
         timing = {
             "name": item.name,
             "elapsed_ms": item.elapsed_ms,
             "ok": bool(item.ok),
+            "outcome": item.outcome,
+            "attempt_id": item.attempt_id,
+            "degraded": not item.ok and item.outcome != "cancelled",
+            "configured_timeout": item.configured_timeout,
+            "remaining_budget": item.remaining_budget,
+            "cancel_source": item.cancel_source,
         }
         if item.error:
             timing["error"] = item.error[:160]
@@ -100,6 +158,18 @@ class PlanningInputLoader:
         debug_trace(event, "planning.side_input", name=name, elapsed_ms=0.0, ok=True, skipped_reason=reason)
         return self._record_timing(event, item)
 
+    @staticmethod
+    async def _gather_side_inputs(*coroutines):
+        tasks = [asyncio.create_task(coro) for coro in coroutines]
+        try:
+            return await asyncio.gather(*tasks)
+        finally:
+            # Child cancellation must not leave siblings running past the attempt.
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     async def load_pre_budget(self, event, chat_id: str) -> PreBudgetInputs:
         actor_id = self._current_actor_id(event)
         agency_task = self._run_timed(
@@ -110,11 +180,10 @@ class PlanningInputLoader:
         )
         continuity_task = self._run_timed(event, "continuity_snapshot", lambda: self._continuity_snapshot(chat_id), {})
         heartflow_task = self._run_timed(event, "heartflow_snapshot", lambda: self._heartflow_snapshot(chat_id), {})
-        agency_item, continuity_item, heartflow_item = await asyncio.gather(
+        agency_item, continuity_item, heartflow_item = await self._gather_side_inputs(
             agency_task,
             continuity_task,
             heartflow_task,
-            return_exceptions=True,
         )
         timings = [self._record_timing(event, item) for item in (agency_item, continuity_item, heartflow_item)]
         agency = agency_item.value or {}
@@ -234,7 +303,7 @@ class PlanningInputLoader:
                     ),
                 ]
             )
-        loaded_items = await asyncio.gather(*tasks, return_exceptions=True)
+        loaded_items = await self._gather_side_inputs(*tasks)
         for item in loaded_items:
             self._record_timing(event, item)
             result[item.name] = item.value
@@ -510,7 +579,15 @@ class PlanningInputLoader:
                 return await state_engine.get_user_profile(str(user_id))
             return None
 
-        state, profile = await asyncio.gather(_get_state(), _get_profile(), return_exceptions=True)
+        async def _optional_result(callback):
+            try:
+                return await callback()
+            except Exception as exc:
+                return exc
+
+        state, profile = await self._gather_side_inputs(
+            _optional_result(_get_state), _optional_result(_get_profile),
+        )
         relationship_vec = None
         if user_id and hasattr(state_engine, "relationship_engine"):
             relationship_engine = getattr(state_engine, "relationship_engine", None)
