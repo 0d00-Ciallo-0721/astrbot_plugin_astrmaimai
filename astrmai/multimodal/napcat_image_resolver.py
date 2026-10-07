@@ -136,7 +136,8 @@ class NapCatImageResolver:
         if item not in failure_details:
             failure_details.append(item)
 
-    def _extract_payload_image_references(self, payload: Any) -> list[list[str]]:
+    @classmethod
+    def _extract_payload_image_references(cls, payload: Any) -> list[list[str]]:
         data = payload
         if isinstance(data, dict) and isinstance(data.get("data"), (dict, list)):
             data = data["data"]
@@ -155,7 +156,7 @@ class NapCatImageResolver:
                 if str(segment.get("type", "")).lower() != "image":
                     continue
                 values = segment.get("data") if isinstance(segment.get("data"), dict) else segment
-                candidates = self._unique_refs(
+                candidates = cls._unique_refs(
                     values.get(key)
                     for key in (
                         "local_path",
@@ -167,7 +168,7 @@ class NapCatImageResolver:
                     )
                 )
             elif segment.__class__.__name__.lower() == "image":
-                candidates = self._unique_refs(
+                candidates = cls._unique_refs(
                     getattr(segment, key, None)
                     for key in ("path", "file", "url", "image_url", "src")
                 )

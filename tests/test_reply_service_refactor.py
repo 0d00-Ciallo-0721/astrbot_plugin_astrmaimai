@@ -96,6 +96,307 @@ class RefactoredReplyServiceTests(unittest.TestCase):
 
         self.assertIs(service.qq_action_dispatcher.action_store, store)
 
+    def _quote_case(self, *, message_id="88", text="引用正文", extra_actions=None):
+        from astrmai.conversation.contracts.turn_identity import TurnIdentity
+        service = self._service()
+        service.config.reply.typing_speed_factor = 0.0
+        service.runtime_coordinator = _ClaimingRuntimeCoordinator()
+        service.qq_action_dispatcher.runtime_coordinator = service.runtime_coordinator
+        from astrmai.conversation.attention.group_dialogue_store import GroupDialogueStore
+        service.dialogue_store = GroupDialogueStore()
+        service._settle_post_send = _noop_post_send
+        event = FakeEvent("123", "Alice", "question")
+        event.message_obj = SimpleNamespace(message_id="99")
+        event.bot = SimpleNamespace(api=SimpleNamespace(call_action=AsyncMock(return_value={"status": "ok"})))
+        event.set_extra("astrmai_trace_id", "quote-trace")
+        event.set_extra("astrmai_attempt_id", "quote-attempt")
+        event.set_extra("astrmai_turn_identity", TurnIdentity(
+            mode="group", chat_id=event.unified_msg_origin,
+            thread_id=event.unified_msg_origin, generation=17,
+        ))
+        event.set_extra("astrmai_pending_actions", [{
+            "action": "quote_reply", "action_instance_id": "quote-instance",
+            "message_id": message_id, "group_id": event.get_group_id(),
+            "payload": {"text": text},
+        }, *(extra_actions or [])])
+        return service, event
+
+    def test_queued_quote_owns_single_body_and_committed_history(self):
+        service, event = self._quote_case(text="引用第一段\n\n引用第二段\n\n引用第三段")
+        context = service.state_engine.gateway.context
+        async def _run():
+            artifact = await service.handle_reply(event, "普通第一段\n\n普通第二段", event.unified_msg_origin)
+            turns = await service.dialogue_store.get_recent_bot_turns(event.unified_msg_origin, target_sender_id="123")
+            return artifact, turns
+        artifact, turns = asyncio.run(_run())
+        self.assertEqual(len(context.sent), 1)
+        chain = context.sent[0][1].chain
+        self.assertEqual(str(chain[0].id), "88")
+        self.assertEqual(chain[-1].text, artifact.persistable_text)
+        self.assertIn("引用第三段", chain[-1].text)
+        self.assertNotIn("普通", chain[-1].text)
+        event.bot.api.call_action.assert_not_awaited()
+        self.assertTrue(artifact.sent)
+        self.assertTrue(event.get_extra("astrmai_reply_sent"))
+        self.assertEqual(len(service.runtime_coordinator.commits), 1)
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0].reply_text, artifact.persistable_text)
+
+    def test_queued_quote_only_preserves_visible_body(self):
+        service, event = self._quote_case()
+        artifact = asyncio.run(service.handle_reply(event, "", event.unified_msg_origin))
+        self.assertTrue(artifact.sent)
+        self.assertEqual(len(service.state_engine.gateway.context.sent), 1)
+        self.assertEqual(artifact.persistable_text, "引用正文")
+        event.bot.api.call_action.assert_not_awaited()
+
+    def test_queued_quote_false_receipt_does_not_fallback_to_qq_send(self):
+        service, event = self._quote_case()
+        context = service.state_engine.gateway.context
+        context.send_message = AsyncMock(return_value=False)
+        context.conversation_manager.add_message_pair = AsyncMock()
+        artifact = asyncio.run(service.handle_reply(event, "普通正文", event.unified_msg_origin))
+        self.assertFalse(artifact.sent)
+        chain = context.send_message.await_args.args[1].chain
+        self.assertEqual(str(chain[0].id), "88")
+        self.assertFalse(event.get_extra("astrmai_reply_sent", False))
+        context.conversation_manager.add_message_pair.assert_not_awaited()
+        event.bot.api.call_action.assert_not_awaited()
+
+    def test_invalid_quote_target_preserves_normal_reply_without_extra_body(self):
+        service, event = self._quote_case(message_id="")
+        artifact = asyncio.run(service.handle_reply(event, "普通正文", event.unified_msg_origin))
+        self.assertTrue(artifact.sent)
+        self.assertEqual(len(service.state_engine.gateway.context.sent), 1)
+        self.assertEqual(artifact.persistable_text, "普通正文")
+        event.bot.api.call_action.assert_not_awaited()
+
+    def test_quote_body_and_non_body_action_are_independent(self):
+        service, event = self._quote_case(extra_actions=[{
+            "action": "poke", "target_id": "123", "group_id": "group-1",
+        }])
+        artifact = asyncio.run(service.handle_reply(event, "普通正文", event.unified_msg_origin))
+        self.assertTrue(artifact.sent)
+        self.assertEqual(len(service.state_engine.gateway.context.sent), 1)
+        event.bot.api.call_action.assert_awaited_once_with("send_poke", user_id=123, group_id="group-1")
+
+    def test_quote_transport_error_keeps_uncertain_claim_and_never_resends(self):
+        from astrmai.conversation.contracts.turn_outcome import can_send_fallback
+        service, event = self._quote_case()
+        context = service.state_engine.gateway.context
+        context.send_message = AsyncMock(side_effect=TimeoutError("receipt lost"))
+        with self.assertRaises(TimeoutError):
+            asyncio.run(service.handle_reply(event, "normal", event.unified_msg_origin))
+        self.assertFalse(can_send_fallback(event).allowed)
+        self.assertFalse(event.get_extra("astrmai_reply_sent", False))
+        self.assertFalse(service.runtime_coordinator.commits)
+        artifact = asyncio.run(service.handle_reply(event, "retry", event.unified_msg_origin))
+        self.assertFalse(artifact.sent)
+        self.assertEqual(context.send_message.await_count, 1)
+        event.bot.api.call_action.assert_not_awaited()
+
+    def test_quote_cancel_during_send_does_not_release_uncertain_delivery(self):
+        from astrmai.conversation.contracts.turn_outcome import can_send_fallback
+        service, event = self._quote_case()
+        context = service.state_engine.gateway.context
+        async def _run():
+            started = asyncio.Event()
+            async def send(*args):
+                started.set()
+                await asyncio.Event().wait()
+            context.send_message = AsyncMock(side_effect=send)
+            task = asyncio.create_task(service.handle_reply(event, "normal", event.unified_msg_origin))
+            await asyncio.wait_for(started.wait(), 2)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertFalse(can_send_fallback(event).allowed)
+            self.assertFalse(event.get_extra("astrmai_reply_sent", False))
+            turns = await service.dialogue_store.get_recent_bot_turns(event.unified_msg_origin, target_sender_id="123")
+            self.assertEqual(turns, [])
+            await service.handle_reply(event, "retry", event.unified_msg_origin)
+        asyncio.run(_run())
+        self.assertEqual(context.send_message.await_count, 1)
+        self.assertFalse(service.runtime_coordinator.commits)
+        event.bot.api.call_action.assert_not_awaited()
+
+    def test_quote_cancel_after_receipt_preserves_history_then_propagates(self):
+        service, event = self._quote_case()
+        context = service.state_engine.gateway.context
+        async def _run():
+            settlement_started = asyncio.Event()
+            release = asyncio.Event()
+            original_commit = service.runtime_coordinator.commit_send
+            async def commit(*args):
+                settlement_started.set()
+                await release.wait()
+                await original_commit(*args)
+            service.runtime_coordinator.commit_send = commit
+            task = asyncio.create_task(service.handle_reply(event, "normal", event.unified_msg_origin))
+            await asyncio.wait_for(settlement_started.wait(), 2)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 2)
+            self.assertTrue(service._post_send_tasks)
+            self.assertFalse(service.runtime_coordinator.commits)
+            self.assertTrue(event.get_extra("astrmai_reply_sent", False))
+            turns = await service.dialogue_store.get_recent_bot_turns(event.unified_msg_origin, target_sender_id="123")
+            self.assertEqual(len(turns), 1)
+            self.assertEqual(turns[0].reply_text, "引用正文")
+            await service.handle_reply(event, "retry", event.unified_msg_origin)
+            release.set()
+            await asyncio.gather(*service._post_send_tasks)
+        asyncio.run(_run())
+        self.assertEqual(len(context.sent), 1)
+        self.assertEqual(len(service.runtime_coordinator.commits), 1)
+        event.bot.api.call_action.assert_not_awaited()
+
+    def test_quote_cancel_in_prepare_releases_text_ownership(self):
+        from astrmai.conversation.contracts.turn_outcome import can_send_fallback
+        service, event = self._quote_case()
+        service._check_reply_freshness = AsyncMock(side_effect=asyncio.CancelledError)
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(service.handle_reply(event, "normal", event.unified_msg_origin))
+        self.assertTrue(can_send_fallback(event).allowed)
+        self.assertFalse(service.runtime_coordinator.claims)
+        self.assertEqual(service.state_engine.gateway.context.sent, [])
+
+    def test_quote_settlement_failure_keeps_delivered_history_without_retry(self):
+        service, event = self._quote_case()
+        service.runtime_coordinator.commit_send = AsyncMock(side_effect=RuntimeError("settlement unavailable"))
+        async def run():
+            artifact = await service.handle_reply(event, "normal", event.unified_msg_origin)
+            self.assertTrue(artifact.sent)
+            turns = await service.dialogue_store.get_recent_bot_turns(event.unified_msg_origin, target_sender_id="123")
+            self.assertEqual([turn.reply_text for turn in turns], ["引用正文"])
+            retry = await service.handle_reply(event, "retry", event.unified_msg_origin)
+            self.assertFalse(retry.sent)
+        asyncio.run(run())
+        self.assertEqual(len(service.state_engine.gateway.context.sent), 1)
+        event.bot.api.call_action.assert_not_awaited()
+
+    def test_quote_cancelled_settlement_does_not_claim_committed(self):
+        service, event = self._quote_case()
+        service.runtime_coordinator.commit_send = AsyncMock(side_effect=asyncio.CancelledError)
+        async def run():
+            with self.assertRaises(asyncio.CancelledError):
+                await service.handle_reply(event, "normal", event.unified_msg_origin)
+            turns = await service.dialogue_store.get_recent_bot_turns(event.unified_msg_origin, target_sender_id="123")
+            self.assertEqual([turn.reply_text for turn in turns], ["引用正文"])
+            retry = await service.handle_reply(event, "retry", event.unified_msg_origin)
+            self.assertFalse(retry.sent)
+        with patch("astrmai.conversation.execution.reply_artifact_builder.debug_trace") as trace:
+            asyncio.run(run())
+        self.assertFalse(any(call.args[1] == "reply.send_committed" for call in trace.call_args_list))
+        self.assertTrue(any(call.args[1] == "reply.send_settlement_cancelled" for call in trace.call_args_list))
+        self.assertEqual(len(service.state_engine.gateway.context.sent), 1)
+        self.assertFalse(service.runtime_coordinator.commits)
+
+    def test_invalid_quote_with_partial_normal_send_never_adds_merged_body(self):
+        service, event = self._quote_case(message_id="")
+        context = service.state_engine.gateway.context
+        context.send_message = AsyncMock(side_effect=["msg-1", RuntimeError("second segment failed")])
+        async def run():
+            artifact = await service.handle_reply(event, "first\n\nsecond\n\nthird", event.unified_msg_origin)
+            self.assertTrue(artifact.sent)
+            self.assertEqual(artifact.metadata["send_status"], "partial_sent")
+            self.assertEqual(artifact.persistable_text, "first")
+            turns = await service.dialogue_store.get_recent_bot_turns(event.unified_msg_origin, target_sender_id="123")
+            self.assertEqual([turn.reply_text for turn in turns], ["first"])
+        asyncio.run(run())
+        self.assertEqual(context.send_message.await_count, 2)
+        event.bot.api.call_action.assert_not_awaited()
+
+    def test_quote_cancel_after_claim_before_transport_releases_own_send_key(self):
+        from astrmai.conversation.contracts.turn_outcome import can_send_fallback
+        from astrmai.conversation.contracts.focus_context import FreshnessState
+        service, event = self._quote_case()
+        service._check_reply_freshness = AsyncMock(side_effect=[
+            (FreshnessState.FRESH, ""), asyncio.CancelledError,
+        ])
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(service.handle_reply(event, "normal", event.unified_msg_origin))
+        self.assertTrue(can_send_fallback(event).allowed)
+        self.assertEqual(len(service.runtime_coordinator.commits), 1)
+        self.assertEqual(service.runtime_coordinator.commits[0][2], ["failed:cancelled_before_quote_send"])
+        self.assertEqual(service.state_engine.gateway.context.sent, [])
+
+    def test_quote_real_runtime_claim_matches_false_and_uncertain_receipts(self):
+        from astrmai.infrastructure.runtime.chat_runtime_coordinator import ChatRuntimeCoordinator
+        from astrmai.conversation.contracts.turn_identity import TurnIdentity
+        for result, expected in [(False, "failed"), (TimeoutError("lost receipt"), "claimed")]:
+            with self.subTest(expected=expected):
+                service, event = self._quote_case()
+                coordinator = ChatRuntimeCoordinator()
+                service.runtime_coordinator = coordinator
+                service.qq_action_dispatcher.runtime_coordinator = coordinator
+                context = service.state_engine.gateway.context
+                context.send_message = AsyncMock(return_value=result) if result is False else AsyncMock(side_effect=result)
+                async def run():
+                    generation = await coordinator.advance_generation(event.unified_msg_origin, "quote-thread")
+                    event.set_extra("astrmai_turn_identity", TurnIdentity(
+                        mode="group", chat_id=event.unified_msg_origin,
+                        thread_id="quote-thread", generation=generation,
+                    ))
+                    if result is False:
+                        artifact = await service.handle_reply(event, "normal", event.unified_msg_origin)
+                        self.assertFalse(artifact.sent)
+                    else:
+                        with self.assertRaises(TimeoutError):
+                            await service.handle_reply(event, "normal", event.unified_msg_origin)
+                    key = event.get_extra("astrmai_reply_send_key")
+                    claim = await coordinator.get_send_claim(event.unified_msg_origin, key)
+                    self.assertEqual(claim["status"], expected)
+                    self.assertEqual(claim["outbound_message_ids"], [])
+                    self.assertEqual(await coordinator.claim_send(event.unified_msg_origin, key), result is False)
+                    self.assertEqual(await service.dialogue_store.get_recent_bot_turns(
+                        event.unified_msg_origin, target_sender_id="123"), [])
+                asyncio.run(run())
+                self.assertEqual(context.send_message.await_count, 1)
+                event.bot.api.call_action.assert_not_awaited()
+
+    def test_quote_preserves_stale_and_shutdown_guards(self):
+        from astrmai.infrastructure.runtime.outbound_send_guard import OUTBOUND_SEND_GATE, bind_event_generation
+        for guard in ("stale", "shutdown"):
+            with self.subTest(guard=guard):
+                service, event = self._quote_case()
+                if guard == "stale":
+                    service.runtime_coordinator = _StaleTurnRuntimeCoordinator()
+                else:
+                    OUTBOUND_SEND_GATE.open()
+                    bind_event_generation(event)
+                    OUTBOUND_SEND_GATE.close()
+                artifact = asyncio.run(service.handle_reply(event, "normal", event.unified_msg_origin))
+                self.assertFalse(artifact.sent)
+                self.assertEqual(service.state_engine.gateway.context.sent, [])
+                event.bot.api.call_action.assert_not_awaited()
+
+    def test_quote_expired_or_cross_group_target_keeps_normal_reply(self):
+        for invalid in ("expired", "cross_group"):
+            with self.subTest(invalid=invalid):
+                service, event = self._quote_case()
+                if invalid == "expired":
+                    event.set_extra("astrmai_target_expired", True)
+                else:
+                    event.get_extra("astrmai_pending_actions")[0]["group_id"] = "another-group"
+                artifact = asyncio.run(service.handle_reply(event, "普通正文", event.unified_msg_origin))
+                self.assertTrue(artifact.sent)
+                self.assertEqual(artifact.persistable_text, "普通正文")
+                self.assertEqual(len(service.state_engine.gateway.context.sent), 1)
+                event.bot.api.call_action.assert_not_awaited()
+
+    def test_last_valid_queued_quote_is_the_single_body(self):
+        service, event = self._quote_case(extra_actions=[{
+            "action": "quote_reply", "action_instance_id": "second-quote",
+            "message_id": "89", "group_id": "group-1", "payload": {"text": "最终引用正文"},
+        }])
+        artifact = asyncio.run(service.handle_reply(event, "normal", event.unified_msg_origin))
+        chain = service.state_engine.gateway.context.sent[0][1].chain
+        self.assertEqual(str(chain[0].id), "89")
+        self.assertEqual(artifact.persistable_text, "最终引用正文")
+        self.assertEqual(len(service.state_engine.gateway.context.sent), 1)
+        event.bot.api.call_action.assert_not_awaited()
+
     def _enable_tts(self, service, **overrides):
         values = {
             "enabled": True,

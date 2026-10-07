@@ -21,12 +21,21 @@ class _BudgetLease:
     task_name: str = "unknown"
     scope_key: str = ""
     started_at: float = 0.0
+    timeout_scope: asyncio.Timeout | None = None
 
 
 _ACTIVE_BUDGET_LEASES: ContextVar[tuple[_BudgetLease, ...]] = ContextVar(
     "astrmai_active_background_budget_leases",
     default=(),
 )
+
+
+def current_background_execution_timeout() -> bool:
+    """Identify budget-originated cancellation before inner finally records it."""
+    return any(
+        lease.active and lease.timeout_scope is not None and lease.timeout_scope.expired()
+        for lease in _ACTIVE_BUDGET_LEASES.get()
+    )
 
 
 class BackgroundTaskQueueFull(RuntimeError):
@@ -184,6 +193,7 @@ class BackgroundTaskBudget:
             task_name=task_name,
             scope_key=scope_key,
             started_at=started_at,
+            timeout_scope=timeout_scope,
         )
         self._active_leases[id(lease)] = lease
         lease_token = None
@@ -741,4 +751,5 @@ __all__ = [
     "BackgroundTaskQueueFull",
     "BackgroundTaskQueueTimeout",
     "BackgroundTaskExecutionTimeout",
+    "current_background_execution_timeout",
 ]

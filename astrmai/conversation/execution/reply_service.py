@@ -38,10 +38,12 @@ from ..contracts.focus_context import FreshnessState, ReplyMode
 from ..contracts.reply_artifact import OutboundPolicy, VisibleReplyArtifact
 from ..contracts.committed_reply import CommittedBotTurn
 from ..contracts.turn_outcome import (
+    TurnOutcomeStatus,
     claim_text_output,
     record_text_failed,
     record_text_sent,
     release_text_output,
+    mark_terminal,
 )
 from ..concurrency.controls import resolve_conversation_concurrency_flags
 from .text_segmenter import TextSegmenter
@@ -176,7 +178,7 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
         requested_form = str(
             event.get_extra("astrmai_reply_form", "") if hasattr(event, "get_extra") else ""
         ).strip().lower()
-        if not raw_text and requested_form != "reaction":
+        if not raw_text and requested_form != "reaction" and self.qq_action_dispatcher.quote_reply_action(event) is None:
             return VisibleReplyArtifact("", [], "", blocked_reason="empty_reply")
 
         normalized_outcome_kind = (
@@ -187,6 +189,8 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
             normalized_outcome_kind == "reply"
             and not concurrency_flags.send_claim_enabled
         )
+        if self.qq_action_dispatcher.quote_reply_action(event) is not None:
+            track_turn_outcome = True
         if track_turn_outcome and not claim_text_output(event, normalized_outcome_kind).allowed:
             debug_trace(
                 event,
@@ -209,7 +213,12 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
 
         with observe_stage(event, "reply.prepare") as prepare_stage:
             reply_mode = self._resolve_reply_mode(event)
-            freshness_state, stale_reason = await self._check_reply_freshness(event, chat_id)
+            try:
+                freshness_state, stale_reason = await self._check_reply_freshness(event, chat_id)
+            except asyncio.CancelledError:
+                if track_turn_outcome:
+                    release_text_output(event, normalized_outcome_kind)
+                raise
             if freshness_state == FreshnessState.FRESH and reply_mode == ReplyMode.LATE_RECONNECT:
                 reply_mode = ReplyMode.CASUAL_FOLLOWUP
                 event.set_extra("astrmai_reply_mode", reply_mode.value)
@@ -334,10 +343,22 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
             except asyncio.CancelledError:
                 if track_turn_outcome:
                     release_text_output(event, normalized_outcome_kind)
+                if artifact.metadata.get("quote_send_started") and not artifact.sent:
+                    mark_terminal(event, TurnOutcomeStatus.CANCELLED, "quote_delivery_uncertain")
+                    self.qq_action_dispatcher.record_quote_reply_delivery(event, artifact, "uncertain")
+                raise
+            except Exception:
+                if artifact.metadata.get("quote_delivery_uncertain"):
+                    mark_terminal(event, TurnOutcomeStatus.SKIPPED, "quote_delivery_uncertain")
+                    self.qq_action_dispatcher.record_quote_reply_delivery(event, artifact, "uncertain")
+                elif artifact.metadata.get("quote_action_instance_id"):
+                    record_text_failed(event, "quote_send_failed")
+                    self.qq_action_dispatcher.record_quote_reply_delivery(event, artifact, "failed")
                 raise
             send_stage["sent"] = bool(sent)
             send_stage["sent_segment_count"] = int(artifact.metadata.get("sent_segment_count", 0) or 0)
         if not sent:
+            self.qq_action_dispatcher.record_quote_reply_delivery(event, artifact, "failed")
             if track_turn_outcome:
                 release_text_output(event, normalized_outcome_kind)
                 record_text_failed(
@@ -410,7 +431,8 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
                 ),
                 kind=normalized_outcome_kind,
             )
-        if not action_commit_done:
+        self.qq_action_dispatcher.record_quote_reply_delivery(event, artifact, "sent")
+        if not action_commit_done and not artifact.metadata.get("quote_cancelled_after_delivery"):
             try:
                 await self.qq_action_dispatcher.commit(
                     event,
@@ -529,6 +551,8 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
         else:
             await post_send_coro
         artifact.metadata.setdefault("send_status", "sent")
+        if artifact.metadata.get("quote_cancelled_after_delivery"):
+            raise asyncio.CancelledError
         return artifact
 
 

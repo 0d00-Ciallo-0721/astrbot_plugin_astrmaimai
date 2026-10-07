@@ -94,6 +94,43 @@ class QQActionDispatcher:
                 event.set_extra("astrmai_pending_actions", normalized)
         return actions
 
+    def quote_reply_action(self, event) -> PendingQQAction | None:
+        """Select a body for the visible reply sender, never a second QQ send."""
+        if not self._enabled():
+            return None
+        api = getattr(getattr(event, "bot", None), "api", None)
+        if not callable(getattr(api, "call_action", None)):
+            return None
+        if event.get_extra("astrmai_target_expired", False) or event.get_extra("astrmai_target_valid", True) is False:
+            return None
+        group_id = str(getattr(event, "get_group_id", lambda: "")() or "")
+        sender_id = str(getattr(event, "get_sender_id", lambda: "")() or "")
+        for action in reversed(self._queued_actions(event)):
+            if action.action_type != "quote_reply":
+                continue
+            if not action.message_id or len(action.message_id) > 80 or not str(action.payload.get("text") or "").strip():
+                continue
+            if action.group_id and action.group_id != group_id:
+                continue
+            if not group_id and action.target_id and action.target_id != sender_id:
+                continue
+            return action
+        return None
+
+    def record_quote_reply_delivery(self, event, artifact, status: str) -> None:
+        instance_id = str(artifact.metadata.get("quote_action_instance_id") or "")
+        if not instance_id:
+            return
+        action = next((item for item in self._queued_actions(event) if item.action_instance_id == instance_id), None)
+        if action is None:
+            return
+        turn_key = str(event.get_extra("astrmai_reply_send_key", "") or event.get_extra("astrmai_trace_id", ""))
+        trace_id = str(event.get_extra("astrmai_trace_id", "") or "")
+        self._append_result(event, action, status, "visible_reply_sender", **self._action_identity(action, turn_key, trace_id))
+        record_tool_action_result(event, action.idempotency_key(turn_key), status)
+        if status == "sent":
+            self._record_committed_tool(event, action.action_type)
+
     @classmethod
     def reaction_action(cls, event, *, target_event_id: str = "") -> PendingQQAction | None:
         """Return one executable emoji-reaction action for the current event."""
@@ -376,21 +413,6 @@ class QQActionDispatcher:
             if not message_id:
                 raise RuntimeError("没有可撤回的上一条 AstrMai 回复")
             await self._call_api(api, "delete_msg", message_id=self._coerce_identifier(message_id))
-        elif action_type == "quote_reply":
-            message_id = str(action.message_id or "").strip()
-            text = str(action.payload.get("text") or "").strip()
-            if not message_id:
-                raise RuntimeError("缺少引用消息 ID")
-            if not text:
-                raise RuntimeError("缺少引用回复正文")
-            await self._send_qq_message(
-                api,
-                action,
-                [
-                    {"type": "reply", "data": {"id": self._coerce_identifier(message_id)}},
-                    {"type": "text", "data": {"text": text}},
-                ],
-            )
         else:
             return
         self._record_committed_tool(event, action_type)
@@ -403,14 +425,21 @@ class QQActionDispatcher:
             if hasattr(event, "get_extra")
             else False
         )
+        queued_actions = self._queued_actions(event)
+        for action in queued_actions:
+            if action.action_type == "quote_reply":
+                identity = self._action_identity(action, send_key, str(event.get_extra("astrmai_trace_id", "") or ""))
+                results = event.get_extra("astrmai_qq_action_results", []) or []
+                if not any(item.get("action_id") == identity["action_id"] for item in results):
+                    self._append_result(event, action, "delegated", "visible_reply_sender", **identity)
         actions = [
             action
-            for action in self._queued_actions(event)
-            if canonical_action_type(action.action_type) in {"poke", "message_emoji_reaction", "like", "withdraw", "quote_reply"}
+            for action in queued_actions
+            if canonical_action_type(action.action_type) in {"poke", "message_emoji_reaction", "like", "withdraw"}
             and not (suppress_reaction and canonical_action_type(action.action_type) == "message_emoji_reaction")
         ]
         if not actions:
-            return []
+            return list(event.get_extra("astrmai_qq_action_results", []) or [])
         trace_id = str(event.get_extra("astrmai_trace_id", "") if hasattr(event, "get_extra") else "")
         message_obj = getattr(event, "message_obj", None)
         inbound_message_id = str(getattr(message_obj, "message_id", "") or "")

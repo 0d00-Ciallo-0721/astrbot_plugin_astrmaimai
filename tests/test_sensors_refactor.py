@@ -226,7 +226,7 @@ class RefactoredSensorsTests(unittest.TestCase):
             {("inline", "inline.jpg"), ("reply", "quoted.jpg")},
         )
 
-    def test_group_at_reply_without_chain_keeps_message_refresh_candidate(self):
+    def test_group_at_reply_without_chain_is_not_image_evidence(self):
         filters = self.sensors_mod.PreFilters(self._config(enable_vision=True, probability=0.0))
         filters._commands_loaded = True
         reply = self._reply_component([])
@@ -245,13 +245,102 @@ class RefactoredSensorsTests(unittest.TestCase):
 
         self.assertTrue(result)
         candidates = event.get_extra("astrmai_vision_candidates")
+        self.assertEqual(candidates, [])
+        self.assertEqual(event.get_extra("extracted_image_refs"), [])
+        self.assertFalse(event.get_extra("vision_prefilter_selected"))
+
+    def test_reply_at_text_only_get_msg_does_not_select_vision(self):
+        filters = self.sensors_mod.PreFilters(self._config(probability=0.0))
+        filters._commands_loaded = True
+        reply = self._reply_component([])
+        reply.id = "42"
+        event = _FakeEvent(group_id="group-1", text="解释这段文字", components=[
+            reply, self._at_component("bot-1"), self._plain_component("解释这段文字"),
+        ])
+        event.message_obj.raw_message = {"message": [
+            {"type": "reply", "data": {"id": "42"}},
+            {"type": "at", "data": {"qq": "bot-1"}},
+            {"type": "text", "data": {"text": "解释这段文字"}},
+        ], "replyElement": {"replyAbsElemType": 1, "picElem": None}}
+        from unittest.mock import AsyncMock
+        event.bot.api.call_action = AsyncMock(return_value={"data": {"message": [
+            {"type": "text", "data": {"text": "被引用的纯文本"}},
+        ]}})
+        self.assertTrue(asyncio.run(filters.should_process_message(event)))
+        self.assertEqual(event.get_extra("astrmai_vision_candidates"), [])
+        self.assertEqual(event.get_extra("extracted_image_refs"), [])
+        self.assertTrue(event.get_extra("astrmai_at_bot_wakeup"))
+        self.assertEqual(event.message_obj.message[0].id, "42")
+
+    def test_unknown_reply_get_msg_confirms_image_before_selection(self):
+        filters = self.sensors_mod.PreFilters(self._config(probability=0.0))
+        filters._commands_loaded = True
+        reply = self._reply_component([])
+        reply.id = "42"
+        event = _FakeEvent(group_id="group-1", text="看引用", components=[
+            reply, self._at_component("bot-1"), self._plain_component("看引用"),
+        ])
+        from unittest.mock import AsyncMock
+        event.bot.api.call_action = AsyncMock(return_value={"data": {"message": [
+            {"type": "image", "data": {"file": "quoted.jpg"}},
+        ]}})
+        self.assertTrue(asyncio.run(filters.should_process_message(event)))
+        candidates = event.get_extra("astrmai_vision_candidates")
         self.assertEqual(len(candidates), 1)
-        self.assertEqual(candidates[0]["source_kind"], "reply")
-        self.assertEqual(candidates[0]["reply_to_message_id"], "quoted-message-42")
-        self.assertEqual(
-            candidates[0]["candidate_refs"],
-            ["onebot-message://quoted-message-42"],
-        )
+        self.assertEqual(candidates[0]["candidate_refs"], ["quoted.jpg"])
+        self.assertEqual(candidates[0]["reply_to_message_id"], "42")
+        event.bot.api.call_action.assert_awaited_once_with("get_msg", message_id=42)
+
+    def test_unknown_reply_api_failure_is_not_image_failure(self):
+        filters = self.sensors_mod.PreFilters(self._config())
+        filters._commands_loaded = True
+        reply = self._reply_component([])
+        reply.id = "42"
+        event = _FakeEvent(group_id="group-1", text="看看", components=[
+            reply, self._at_component("bot-1"), self._plain_component("看看"),
+        ])
+        from unittest.mock import AsyncMock
+        event.bot.api.call_action = AsyncMock(side_effect=RuntimeError("unavailable"))
+        self.assertTrue(asyncio.run(filters.should_process_message(event)))
+        self.assertEqual(event.get_extra("astrmai_vision_candidates"), [])
+        self.assertFalse(event.get_extra("vision_prefilter_selected"))
+
+    def test_unknown_reply_probe_is_bounded_and_probes_one_target(self):
+        from unittest.mock import AsyncMock
+        filters = self.sensors_mod.PreFilters(self._config())
+        filters._commands_loaded = True
+        replies = [self._reply_component([]), self._reply_component([])]
+        replies[0].id, replies[1].id = "42", "43"
+        event = _FakeEvent(group_id="group-1", text="看看", components=[
+            *replies, self._at_component("bot-1"), self._plain_component("看看"),
+        ])
+        cancelled = []
+        async def wait_forever(*args, **kwargs):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.append(True)
+        event.bot.api.call_action = AsyncMock(side_effect=wait_forever)
+        self.assertTrue(asyncio.run(asyncio.wait_for(filters.should_process_message(event), 3)))
+        self.assertEqual(cancelled, [True])
+        event.bot.api.call_action.assert_awaited_once_with("get_msg", message_id=42)
+        self.assertEqual(event.get_extra("astrmai_vision_candidates"), [])
+        self.assertEqual(event.get_extra("astrmai_image_raw_component_count"), 0)
+        self.assertEqual(event.get_extra("astrmai_reply_image_probe"), "TimeoutError")
+
+    def test_unknown_reply_probe_cancellation_propagates(self):
+        from unittest.mock import AsyncMock
+        filters = self.sensors_mod.PreFilters(self._config())
+        filters._commands_loaded = True
+        reply = self._reply_component([])
+        reply.id = "42"
+        event = _FakeEvent(group_id="group-1", text="看看", components=[
+            reply, self._at_component("bot-1"), self._plain_component("看看"),
+        ])
+        event.bot.api.call_action = AsyncMock(side_effect=asyncio.CancelledError)
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(filters.should_process_message(event))
+        self.assertIsNone(event.get_extra("astrmai_reply_image_probe"))
 
     def test_napcat_raw_at_data_qq_is_recognized(self):
         filters = self.sensors_mod.PreFilters(self._config())

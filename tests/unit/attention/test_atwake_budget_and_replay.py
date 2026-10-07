@@ -313,6 +313,46 @@ async def test_background_slot_timeout_has_distinct_wait_identity():
 
 
 @pytest.mark.asyncio
+async def test_background_admission_deadline_does_not_cancel_admitted_system2():
+    from tests.unit.attention.test_atwake_supersession import Harness, Event as GateEvent
+    from astrmai.infrastructure.runtime.background_task_budget import BackgroundTaskBudget
+
+    h = Harness()
+    event = GateEvent("admitted", strong=True)
+    await h.ingress(event)
+    h.gate.config.timing = SimpleNamespace(
+        attention_background_slot_wait_timeout_sec=0.1,
+        turn_total_budget_sec=1.0,
+        main_reply_reserve_sec=0.0,
+    )
+    h.gate.background_task_budget = BackgroundTaskBudget(
+        1,
+        wait_timeout_sec=0.1,
+        execution_timeout_sec=1.0,
+    )
+    execute = h.runner._execute_planner
+
+    async def slow_execute(current, *args):
+        await asyncio.sleep(0.2)
+        return await execute(current, *args)
+
+    h.runner._execute_planner = slow_execute
+    try:
+        result = await h.gate._run_background_task(
+            h.runner.run(event),
+            event,
+            task_name="attention.system2",
+        )
+        assert result is True
+        assert h.sent == ["admitted"]
+        assert event.get_extra("astrmai_terminal_outcome") == "reply_sent"
+        assert event.get_extra("astrmai_background_budget_acquired_at")
+        assert event.get_extra("astrmai_background_execution_started") is True
+    finally:
+        await h.close()
+
+
+@pytest.mark.asyncio
 async def test_real_executor_lock_timeout_reaches_runner_terminal():
     from astrmai.conversation.execution.executor import ConcurrentExecutor
     from tests.unit.attention.test_atwake_supersession import Harness, Event as GateEvent

@@ -1,3 +1,4 @@
+import asyncio
 import inspect
 import random
 import re
@@ -15,6 +16,7 @@ from ...shared.helpers.plugin_helpers import (
     resolve_at_target_id,
 )
 from ..contracts.vision_candidate import VisionCandidate, unique_image_refs
+from ...multimodal.napcat_image_resolver import NapCatImageResolver
 from ..vision_state import derive_vision_state, user_asked_about_image
 from .poke_play import PokePlaybook
 
@@ -324,7 +326,7 @@ class PreFilters:
                         or getattr(seg, "target_id", "")
                         or ""
                     ).strip()
-                    if reply_id:
+                    if reply_id and not getattr(seg, "chain", None) and not getattr(seg, "message_str", ""):
                         pending_reply_ids.append(reply_id)
                     if hasattr(seg, 'chain'):
                         scanned_reply_images = await _scan_reply_chain(seg.chain, reply_id)
@@ -359,13 +361,30 @@ class PreFilters:
                         _append_candidate(image_refs, source_kind="inline")
 
         if has_at_bot:
-            for reply_id in pending_reply_ids:
-                if not any(candidate.reply_to_message_id == reply_id for candidate in vision_candidates):
-                    _append_candidate(
-                        [f"onebot-message://{reply_id}"],
-                        source_kind="reply",
-                        reply_to_message_id=reply_id,
+            api = getattr(getattr(event, "bot", None), "api", None)
+            call_action = getattr(api, "call_action", None)
+            # A Reply ID is context, not image evidence. Probe at most one
+            # unknown target, with a bounded wait and no image download here.
+            if callable(call_action) and pending_reply_ids:
+                reply_id = pending_reply_ids[0]
+                try:
+                    payload = await asyncio.wait_for(
+                        call_action("get_msg", message_id=NapCatImageResolver._coerce_api_id(reply_id)),
+                        timeout=1.0,
                     )
+                except Exception as exc:
+                    event.set_extra("astrmai_reply_image_probe", type(exc).__name__)
+                else:
+                    rejected = isinstance(payload, dict) and (
+                        payload.get("retcode", 0) not in (0, "0")
+                        or str(payload.get("status", "ok")).lower() not in {"ok", "success"}
+                    )
+                    references = [] if rejected else NapCatImageResolver._extract_payload_image_references(payload)
+                    event.set_extra("astrmai_reply_image_probe", "image_confirmed" if references else "unconfirmed_or_text")
+                    for refs in references:
+                        reply_image_component_count += 1
+                        reply_image_urls.append(refs[0])
+                        _append_candidate(refs, source_kind="reply", reply_to_message_id=reply_id)
                     
         # 私聊/@Bot 图片立即进入视觉；普通群图仅由概率闸门决定是否进入回复判断。
         # 普通群图即使命中，也延迟到真正回复阶段才识别，避免为最终 IGNORE 的消息付视觉调用。

@@ -282,7 +282,7 @@ class QQActionDispatcherTests(unittest.TestCase):
         self.assertEqual(result[-1]["status"], "failed")
         self.assertIn("retcode=100", result[-1]["detail"])
 
-    def test_quote_send_timeout_does_not_fallback_and_duplicate(self):
+    def test_quote_body_is_delegated_without_a_second_transport(self):
         event = _Event()
         event.bot.api = _TimeoutSendApi()
         event.set_extra(
@@ -294,8 +294,9 @@ class QQActionDispatcherTests(unittest.TestCase):
         result = asyncio.run(dispatcher.commit(event, "ff:FriendMessage:123", send_key="turn-timeout"))
         asyncio.run(dispatcher.commit(event, "ff:FriendMessage:123", send_key="turn-timeout"))
 
-        self.assertEqual([name for name, _ in event.bot.api.calls], ["send_msg"])
-        self.assertEqual(result[-1]["status"], "uncertain")
+        self.assertEqual(event.bot.api.calls, [])
+        self.assertEqual(result[-1]["status"], "delegated")
+        self.assertEqual(result[-1]["detail"], "visible_reply_sender")
 
     def test_persistent_sent_action_is_deduplicated_after_dispatcher_reload(self):
         payload = {
@@ -411,7 +412,7 @@ class QQActionDispatcherTests(unittest.TestCase):
 
     def test_transport_timeout_is_persisted_uncertain_and_never_auto_replayed(self):
         payload = {
-            "action": "quote_reply",
+            "action": "like",
             "action_instance_id": "qqai-timeout-uncertain",
             "target_id": "123",
             "message_id": "88",
@@ -419,7 +420,10 @@ class QQActionDispatcherTests(unittest.TestCase):
         }
         store = self._persistent_store()
         first_event = _Event()
-        first_event.bot.api = _TimeoutSendApi()
+        class _TimeoutLikeApi:
+            async def call_action(self, action, **kwargs):
+                raise asyncio.TimeoutError("transport timeout")
+        first_event.bot.api = _TimeoutLikeApi()
         first_event.set_extra("astrmai_pending_actions", [payload])
         first = self.mod.QQActionDispatcher(
             self.config,

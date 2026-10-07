@@ -1231,7 +1231,7 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
         self.assertFalse(result["executable"])
         self.assertEqual(result["blocked_reason"], "tool_unavailable_in_context")
 
-    def test_dispatcher_commits_quote_reply_action(self):
+    def test_dispatcher_delegates_quote_reply_to_visible_sender(self):
         event = _FakeEvent(group_id="777")
         event.bot.api = _MapApi({"send_msg": {"data": {"message_id": "out-2"}}})
         event.set_extra(
@@ -1247,12 +1247,14 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
         )
         dispatcher_mod = importlib.import_module("astrmai.conversation.execution.qq_action_dispatcher")
 
-        result = asyncio.run(dispatcher_mod.QQActionDispatcher().commit(event, "chat-1", send_key="send-2"))
+        dispatcher = dispatcher_mod.QQActionDispatcher()
+        action = dispatcher.quote_reply_action(event)
+        result = asyncio.run(dispatcher.commit(event, "chat-1", send_key="send-2"))
 
-        self.assertEqual(result[-1]["status"], "sent")
-        segments = event.bot.api.calls[0][1]["message"]
-        self.assertEqual(segments[0]["type"], "reply")
-        self.assertEqual(segments[1]["data"]["text"], "收到")
+        self.assertEqual(action.message_id, "m-current")
+        self.assertEqual(action.payload["text"], "收到")
+        self.assertEqual(result[-1]["status"], "delegated")
+        self.assertEqual(event.bot.api.calls, [])
 
     def test_meme_tool_marks_explicit_send_as_forced(self):
         event = _FakeEvent(group_id="12345")

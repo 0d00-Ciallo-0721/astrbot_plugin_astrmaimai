@@ -10,6 +10,7 @@ from astrbot.api import logger
 from ...infrastructure.runtime.dialog_lane_identity import resolve_dialog_lane_identity
 from ...infrastructure.runtime.lane_manager import LaneKey
 from ...infrastructure.runtime.trace_runtime import debug_trace, record_terminal_outcome
+from ...infrastructure.runtime.background_task_budget import current_background_execution_timeout
 from ...infrastructure.runtime.turn_call_ledger import (
     begin_stage,
     clamp_timeout_to_turn_budget,
@@ -352,8 +353,11 @@ class System2Runner:
                              metadata={"remaining_budget": remaining_turn_budget(main_event)})
                 return bool(main_event.get_extra("astrmai_reply_sent", False))
             except asyncio.CancelledError:
-                finish_stage(main_event, budget_stage, status="cancelled", reason="CancelledError",
-                             metadata={"cancel_source": str(main_event.get_extra("astrmai_cancel_source", ""))})
+                execution_timed_out = current_background_execution_timeout()
+                finish_stage(main_event, budget_stage, status="timeout" if execution_timed_out else "cancelled",
+                             reason="execution_timeout" if execution_timed_out else "CancelledError",
+                             metadata={"cancel_source": "background_execution_timeout" if execution_timed_out else
+                                       str(main_event.get_extra("astrmai_cancel_source", ""))})
                 raise
             except BaseException as exc:
                 finish_stage(main_event, budget_stage, status="error", reason=type(exc).__name__)
@@ -375,6 +379,10 @@ class System2Runner:
             return False
         except asyncio.CancelledError:
             lock_exc_info = sys.exc_info()
+            if current_background_execution_timeout():
+                main_event.set_extra("astrmai_execution_status", "execution_timeout")
+                main_event.set_extra("astrmai_budget_timeout_stage", "attention.background_execution")
+                main_event.set_extra("astrmai_cancel_source", "background_execution_timeout")
             mark_system2_handled(main_event, "system2_cancelled")
             finish_stage(main_event, lock_stage, status="cancelled", reason="acquire_cancelled")
             raise
@@ -405,6 +413,7 @@ class System2Runner:
                 terminal_status = "reply_sent"
             elif lock_exc_info and issubclass(lock_exc_info[0], asyncio.CancelledError):
                 terminal_status = (
+                    "timeout" if execution_status == "execution_timeout" else
                     "superseded" if main_event.get_extra("astrmai_cancel_source", "")
                     in {"generation_advanced", "turn_task_replaced"} else "cancelled"
                 )

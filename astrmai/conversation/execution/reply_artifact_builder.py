@@ -345,6 +345,11 @@ class ReplyArtifactMixin:
             else None
         )
         target = TurnTarget.from_value(raw_target)
+        quote_action = self.qq_action_dispatcher.quote_reply_action(event) if event is not None else None
+        if quote_action is not None:
+            raw_form = ReplyForm.QUOTE_REPLY.value
+            target = TurnTarget(target_event_id=quote_action.message_id, confidence=1.0, target_source="pending_action")
+            text = str(quote_action.payload.get("text") or "")
         if str(raw_form or "").strip().lower() == ReplyForm.REACTION.value and not target.target_event_id and event is not None:
             for pending in event.get_extra("astrmai_pending_actions", []) or []:
                 if not isinstance(pending, dict):
@@ -363,6 +368,8 @@ class ReplyArtifactMixin:
             )
             is_private = bool(event.get_extra("is_private_chat", False))
             reaction_supported, reaction_capability_reason = QQActionDispatcher.reaction_capability(event)
+        if quote_action is not None:
+            intent = "answer"
         form_decision = normalize_reply_form(
             raw_form,
             intent=intent,
@@ -523,6 +530,9 @@ class ReplyArtifactMixin:
         if reply_shape_metadata.get("reply_shape_mode") == "micro":
             raw_segments = self._single_segment(self._join_segments_for_single_send(raw_segments))
             segment_reason = "humanlike_short_single"
+        if quote_action is not None:
+            raw_segments = self._single_segment(self._join_segments_for_single_send(raw_segments))
+            segment_reason = "queued_quote_single"
         segments = [
             segment
             for segment in raw_segments
@@ -550,6 +560,7 @@ class ReplyArtifactMixin:
                 "reply_form_reason": form_reason,
                 "reply_form_sender_route": effective_route,
                 "reply_form_target_event_id": form_target_event_id,
+                "quote_action_instance_id": quote_action.action_instance_id if quote_action is not None else "",
                 "reply_mode": reply_mode.value,
                 "freshness_state": freshness_state.value,
                 "segment_strategy": policy.segment_strategy,
@@ -701,6 +712,8 @@ class ReplyArtifactMixin:
 
         tts_bridge = getattr(self, "tts_bridge", None)
         try_tts = bool(tts_bridge and tts_bridge.should_try_tts(event, chat_id, artifact))
+        if artifact.metadata.get("quote_action_instance_id"):
+            try_tts = False
         send_text_segments = True if not try_tts else bool(tts_bridge.should_send_text())
         outbound_message_ids: list[str] = []
         sent_segment_count = 0
@@ -742,6 +755,8 @@ class ReplyArtifactMixin:
                         artifact.metadata["send_status"] = "shutdown_rejected"
                         artifact.metadata["send_failure_reason"] = "outbound_send_guard"
                         break
+                    if artifact.metadata.get("quote_action_instance_id"):
+                        artifact.metadata["quote_send_started"] = True
                     sent_result = await context.send_message(event.unified_msg_origin, chain)
                     if external_result_id:
                         debug_trace(
@@ -817,7 +832,21 @@ class ReplyArtifactMixin:
                     artifact.metadata["tts_sent"] = False
                 if sent_result is not None and not isinstance(sent_result, bool):
                     outbound_message_ids.append(str(sent_result))
+        except asyncio.CancelledError:
+            if (
+                artifact.metadata.get("quote_action_instance_id")
+                and not artifact.metadata.get("quote_send_started")
+                and send_key
+                and runtime_coordinator is not None
+            ):
+                try:
+                    await runtime_coordinator.mark_send_failed(chat_id, send_key, "cancelled_before_quote_send")
+                except Exception:
+                    logger.warning("[ReplyService] cancelled quoted send claim release degraded", exc_info=True)
+            raise
         except Exception as exc:
+            if artifact.metadata.get("quote_send_started") and not artifact.sent:
+                artifact.metadata["quote_delivery_uncertain"] = True
             if artifact.sent:
                 artifact.metadata["send_status"] = "partial_sent"
                 artifact.metadata["sent_segment_count"] = sent_segment_count
@@ -830,6 +859,7 @@ class ReplyArtifactMixin:
                 artifact.metadata["send_failure_reason"] = str(exc)
             if (
                 not artifact.sent
+                and not artifact.metadata.get("quote_delivery_uncertain")
                 and send_key
                 and runtime_coordinator is not None
                 and hasattr(runtime_coordinator, "mark_send_failed")
@@ -874,8 +904,45 @@ class ReplyArtifactMixin:
         if send_key and runtime_coordinator is not None and hasattr(runtime_coordinator, "commit_send"):
             try:
                 if artifact.sent:
-                    await runtime_coordinator.commit_send(chat_id, send_key, outbound_message_ids)
-                    debug_trace(event, "reply.send_committed", chat_id=chat_id, sent_count=len(outbound_message_ids))
+                    if artifact.metadata.get("quote_action_instance_id"):
+                        settlement_coro = runtime_coordinator.commit_send(chat_id, send_key, outbound_message_ids)
+                        registry = getattr(self, "owner_registry", None)
+                        if callable(getattr(registry, "track", None)):
+                            try:
+                                settlement = registry.track(
+                                    settlement_coro, task_family="reply.send_settlement",
+                                    scope_id=chat_id, run_id=send_key, owner="ReplyService",
+                                    generation=getattr(registry, "generation", 0),
+                                    cancel_status="cancelled", name="astrmai:reply:send-settlement",
+                                )
+                            except Exception:
+                                settlement_coro.close()
+                                raise
+                        else:
+                            settlement = asyncio.create_task(settlement_coro)
+                        self._post_send_tasks.add(settlement)
+                        def finish_settlement(task):
+                            self._post_send_tasks.discard(task)
+                            if not task.cancelled() and task.exception() is not None:
+                                logger.warning("[ReplyService] quoted send settlement degraded: %s", task.exception())
+                        settlement.add_done_callback(finish_settlement)
+                        try:
+                            await asyncio.shield(settlement)
+                        except asyncio.CancelledError:
+                            artifact.metadata["quote_cancelled_after_delivery"] = True
+                            # The owned settlement may finish later. Its claimed
+                            # send key remains non-retryable while history settles.
+                    else:
+                        await runtime_coordinator.commit_send(chat_id, send_key, outbound_message_ids)
+                    claim_status = "committed"
+                    if artifact.metadata.get("quote_cancelled_after_delivery"):
+                        if not settlement.done():
+                            claim_status = "settlement_pending"
+                        elif settlement.cancelled():
+                            claim_status = "settlement_cancelled"
+                        elif settlement.exception() is not None:
+                            claim_status = "settlement_failed"
+                    debug_trace(event, "reply.send_committed" if claim_status == "committed" else f"reply.send_{claim_status}", chat_id=chat_id, sent_count=len(outbound_message_ids))
                     record_conversation_concurrency_trace(
                         event,
                         "send_claim",
@@ -883,7 +950,7 @@ class ReplyArtifactMixin:
                         chat_id=chat_id,
                         thread_id=getattr(turn, "thread_id", "") if turn is not None else "",
                         generation=getattr(turn, "generation", "") if turn is not None else "",
-                        claim_status="committed",
+                        claim_status=claim_status,
                         send_key_hash=_hash_send_key(send_key),
                     )
                 elif hasattr(runtime_coordinator, "mark_send_failed"):

@@ -39,8 +39,9 @@ from ...infrastructure.gateway.output_guard import validate_visible_output_text
 from ...infrastructure.runtime.background_task_budget import (
     BackgroundTaskQueueFull,
     BackgroundTaskQueueTimeout,
+    current_background_execution_timeout,
 )
-from ...infrastructure.runtime.trace_runtime import debug_trace, new_trace_id, preview_text
+from ...infrastructure.runtime.trace_runtime import debug_trace, new_trace_id, preview_text, record_terminal_outcome
 from ...infrastructure.runtime.outbound_send_guard import outbound_send_allowed
 from ...infrastructure.persistence.attention_deferred_outbox import AttentionDeferredOutboxStore
 from ...infrastructure.runtime.turn_call_ledger import (
@@ -1608,7 +1609,7 @@ class AttentionGate:
             acquired = True
             if event is not None and hasattr(event, "set_extra"):
                 event.set_extra("astrmai_deferred_replay_local_slot_acquired", True)
-            finish_stage(event, wait_stage, metadata={"timeout_sec": timeout_sec})
+            finish_stage(event, wait_stage, metadata={"timeout_sec": timeout_sec, "acquired_at": time.monotonic()})
         except asyncio.TimeoutError as exc:
             finish_stage(event, wait_stage, status="timeout", reason="queue_timeout")
             if event is not None and hasattr(event, "set_extra"):
@@ -2418,17 +2419,51 @@ class AttentionGate:
         deferred = False
         completed = False
         completed = False
+        admission_scope = None
+        on_budget_acquired = None
 
         async def _execute() -> Any:
             nonlocal started
+            # Older/custom budgets need not expose an acquired callback; their
+            # factory invocation is the last unambiguous admission boundary.
+            if on_budget_acquired is not None:
+                on_budget_acquired()
             started = True
+            execution_started_at = time.monotonic()
+            if event is not None and hasattr(event, "set_extra"):
+                event.set_extra("astrmai_background_execution_started", True)
             if _deferred_replay and event is not None and hasattr(event, "set_extra"):
                 event.set_extra("astrmai_deferred_replay_task_started", True)
-            return await coro
+            execution_stage = begin_stage(event, "attention.background_execution", metadata={
+                "task_name": task_name,
+                "configured_execution_timeout": getattr(budget, "execution_timeout_sec", None),
+                "remaining_budget": remaining_turn_budget(event),
+            })
+            try:
+                result = await coro
+            except asyncio.CancelledError:
+                timed_out = current_background_execution_timeout()
+                finish_stage(event, execution_stage, status="timeout" if timed_out else "cancelled",
+                             reason="execution_timeout" if timed_out else "CancelledError",
+                             metadata={"cancel_source": "background_execution_timeout" if timed_out else
+                                       str(event.get_extra("astrmai_cancel_source", "") or "external_or_superseded") if event is not None else ""})
+                raise
+            except Exception as exc:
+                finish_stage(event, execution_stage, status="error", reason=type(exc).__name__)
+                raise
+            else:
+                execution_status = str(event.get_extra("astrmai_execution_status", "") or "") if event is not None else ""
+                finish_stage(event, execution_stage, status="timeout" if execution_status == "budget_exhausted" else "success",
+                             reason=execution_status)
+                return result
+            finally:
+                if event is not None and hasattr(event, "set_extra"):
+                    event.set_extra("astrmai_background_execution_elapsed_sec", max(0.0, time.monotonic() - execution_started_at))
 
         budget = getattr(self, "background_task_budget", None)
 
         async def _after_slot() -> Any:
+            nonlocal admission_scope, on_budget_acquired
             if budget is not None:
                 scope_id = str(getattr(event, "unified_msg_origin", "") or "")
                 try:
@@ -2445,22 +2480,33 @@ class AttentionGate:
 
                 def _on_budget_acquired() -> None:
                     nonlocal budget_acquired
+                    if budget_acquired:
+                        return
+                    if admission_scope is not None:
+                        if admission_scope.expired() or (
+                            admission_scope.when() is not None
+                            and asyncio.get_running_loop().time() >= admission_scope.when()
+                        ):
+                            raise BackgroundTaskQueueTimeout("attention admission deadline exhausted")
+                        admission_scope.reschedule(None)
                     budget_acquired = True
+                    if event is not None and hasattr(event, "set_extra"):
+                        event.set_extra("astrmai_background_budget_acquired_at", time.monotonic())
                     if _deferred_replay and event is not None and hasattr(event, "set_extra"):
                         event.set_extra("astrmai_deferred_replay_background_budget_acquired", True)
                     finish_stage(
                         event,
                         budget_wait_stage,
-                        metadata={"task_name": task_name, "scope_id": scope_id},
+                        metadata={"task_name": task_name, "scope_id": scope_id, "acquired_at": time.monotonic()},
                     )
 
+                on_budget_acquired = _on_budget_acquired
                 run_kwargs = {"task_name": task_name}
-                # Background attention is non-critical to the primary reply;
-                # cap queue admission independently from the global budget
-                # so saturation still degrades within a bounded 30s window.
+                # Share the configured admission deadline across the local
+                # slot and global budget, without timing admitted execution.
                 if str(task_name or "").startswith("attention.") and supports_wait_timeout:
                     budget_timeout = min(
-                        30.0,
+                        configured_admission_timeout,
                         max(0.1, float(getattr(budget, "wait_timeout_sec", 120.0) or 120.0)),
                     )
                     if admission_deadline is not None:
@@ -2471,13 +2517,15 @@ class AttentionGate:
                     run_kwargs["wait_timeout_sec"] = budget_timeout
                 if supports_scope:
                     run_kwargs["scope_id"] = scope_id
+                budget_wait_stage = begin_stage(
+                    event,
+                    "attention.background_budget_wait",
+                    critical_path=True,
+                    metadata={"task_name": task_name, "scope_id": scope_id,
+                              "configured_timeout": configured_admission_timeout,
+                              "remaining_budget": remaining_turn_budget(event)},
+                )
                 if supports_acquired_callback:
-                    budget_wait_stage = begin_stage(
-                        event,
-                        "attention.background_budget_wait",
-                        critical_path=True,
-                        metadata={"task_name": task_name, "scope_id": scope_id},
-                    )
                     run_kwargs["on_acquired"] = _on_budget_acquired
                 try:
                     budget_awaitable = budget.run(_execute, **run_kwargs)
@@ -2487,7 +2535,12 @@ class AttentionGate:
                             if hasattr(budget_awaitable, "close"):
                                 budget_awaitable.close()
                             raise BackgroundTaskQueueTimeout("attention admission deadline exhausted")
-                        return await asyncio.wait_for(budget_awaitable, timeout=remaining)
+                        # Only admission is timed here. The budget's acquired
+                        # callback (or factory boundary) disables this timer;
+                        # its execution timeout remains independent.
+                        admission_scope = asyncio.timeout(remaining)
+                        async with admission_scope:
+                            return await budget_awaitable
                     return await budget_awaitable
                 except BackgroundTaskQueueTimeout:
                     if budget_wait_stage and not budget_acquired:
@@ -2613,9 +2666,11 @@ class AttentionGate:
                 pass
             replay_budget = current_deferred_replay_budget() if _deferred_replay else None
             admission_deadline = (
-                replay_budget.execution_deadline_monotonic
+                min(time.monotonic() + configured_admission_timeout, replay_budget.execution_deadline_monotonic)
                 if replay_budget is not None
-                else time.monotonic() + configured_admission_timeout
+                else time.monotonic() + clamp_timeout_to_turn_budget(
+                    event, configured_admission_timeout, reserve_for_reply=True,
+                )
             )
             slot_wait_and_execute = self._run_background_slot(
                 _after_slot,
@@ -2691,6 +2746,12 @@ class AttentionGate:
             return result
         except (BackgroundTaskQueueTimeout, BackgroundTaskQueueFull, asyncio.TimeoutError) as exc:
             if not started and not _deferred_replay:
+                if event is not None:
+                    if not event.get_extra("astrmai_attempt_id", ""):
+                        event.set_extra("astrmai_attempt_id", new_trace_id())
+                    record_terminal_outcome(event, "error" if isinstance(exc, BackgroundTaskQueueFull) else "queue_timeout",
+                                            stage=str(event.get_extra("astrmai_queue_timeout_stage", "") or "attention.admission"),
+                                            reason=str(event.get_extra("astrmai_execution_status", "") or type(exc).__name__))
                 deferred = self._defer_attention_work(
                     event=event,
                     task_name=task_name,
@@ -2705,6 +2766,14 @@ class AttentionGate:
                 # execution failure and must not trigger a fallback reply.
                 if not _deferred_replay:
                     return None
+            raise
+        except asyncio.CancelledError:
+            if not started and event is not None:
+                if not event.get_extra("astrmai_attempt_id", ""):
+                    event.set_extra("astrmai_attempt_id", new_trace_id())
+                source = str(event.get_extra("astrmai_cancel_source", "") or "external_or_superseded")
+                record_terminal_outcome(event, "superseded" if source in {"generation_advanced", "turn_task_replaced"} else "cancelled",
+                                        stage="attention.admission", reason=source)
             raise
         finally:
             if completed and event is not None:
@@ -4081,6 +4150,12 @@ class AttentionGate:
         reply_text: str | None = None,
     ) -> None:
         event.set_extra("astrmai_pre_planner_trace_status", str(status or ""))
+        if status in {"background_queue_timeout", "background_queue_rejected"}:
+            if not event.get_extra("astrmai_attempt_id", ""):
+                event.set_extra("astrmai_attempt_id", new_trace_id())
+            record_terminal_outcome(event, "error" if status == "background_queue_rejected" else "queue_timeout",
+                                    stage=str(event.get_extra("astrmai_queue_timeout_stage", "") or "attention.admission"),
+                                    reason=status)
         try:
             self._complete_wakeup_successor(event)
         except Exception:
