@@ -70,9 +70,9 @@ class GroupIdentityChainTests(unittest.TestCase):
         )
 
         # 三源一致：speaker block 的 QQ == focus 事件 sender == 画像层将使用的 id
-        self.assertIn("QQ: 222", block)
+        self.assertIn("实际发言人：阿乙(QQ:222)", block)
         self.assertIn("阿乙", block)
-        self.assertNotIn("QQ: 111", block)
+        self.assertNotIn("QQ:111", block)
         self.assertNotIn("阿甲", block)
         self.assertEqual(focus_event.get_sender_id(), "222")
 
@@ -84,7 +84,7 @@ class GroupIdentityChainTests(unittest.TestCase):
             SimpleNamespace(focus_sender_id="", focus_sender_name="", vision_bundle=None),
             is_lightweight_event=False,
         )
-        self.assertIn("QQ: 222", block)
+        self.assertIn("实际发言人：阿乙(QQ:222)", block)
         self.assertIn("阿乙", block)
 
     def test_group_boundary_reminder_present(self):

@@ -54,7 +54,7 @@ from ...infrastructure.runtime.turn_call_ledger import (
     rebind_turn_telemetry,
     remaining_turn_budget,
 )
-from ...shared.helpers.plugin_helpers import event_mentions_actor, get_event_self_id
+from ...shared.helpers.plugin_helpers import event_mentions_actor, get_event_self_id, message_component_type
 from ..planning.message_renderer import MessageRenderer
 from .topic_identity import resolve_attention_topic_identity
 from .decision_router import AttentionDecisionRouter
@@ -1295,8 +1295,20 @@ class AttentionGate:
             return False
         if event.get_extra("astrmai_group_direct_wakeup", False):
             return True
-        if event.get_extra("astrmai_bonus_score", 0.0) >= 1.0:
+
+        # P2 优化：使用配置的阈值而非硬编码 1.0
+        bonus_score = float(event.get_extra("astrmai_bonus_score", 0.0))
+        threshold = getattr(
+            getattr(self.config, "system1", None),
+            "nickname_wakeup_threshold",
+            0.7,
+        )
+        if bonus_score > 0.0 and bonus_score >= threshold:
+            logger.debug(
+                f"[AttentionGate] bonus_score 达到强唤醒阈值 score={bonus_score} threshold={threshold}"
+            )
             return True
+
         if self.sensors is None:
             return False
         try:
@@ -1324,7 +1336,7 @@ class AttentionGate:
             if str(name).strip()
         ]
         for component in message:
-            component_type = str(getattr(component, "type", component.__class__.__name__)).lstrip("_").lower()
+            component_type = message_component_type(component)
             if component_type != "reply":
                 continue
             reply_sender_id = str(getattr(component, "sender_id", "") or "")
@@ -1384,7 +1396,7 @@ class AttentionGate:
     def _extract_reply_target(self, event: AstrMessageEvent) -> tuple[str, str]:
         message = getattr(getattr(event, "message_obj", None), "message", None) or []
         for component in message:
-            component_type = getattr(component, "type", component.__class__.__name__).lower()
+            component_type = message_component_type(component)
             if component_type != "reply":
                 continue
             target_id = str(getattr(component, "sender_id", "") or "")
@@ -3095,7 +3107,7 @@ class AttentionGate:
         if not message:
             return bool(str(getattr(event, "message_str", "") or "").strip())
         component_types = {
-            str(getattr(component, "type", component.__class__.__name__)).lstrip("_").lower()
+            message_component_type(component)
             for component in message
         }
         return bool(str(getattr(event, "message_str", "") or "").strip()) and component_types <= {

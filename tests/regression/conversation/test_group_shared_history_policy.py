@@ -184,7 +184,8 @@ def test_short_followup_bootstraps_recent_history_without_hidden_provider_sessio
         now=1000,
     )
 
-    assert policy.history_mode == "current_topic"
+    assert policy.history_mode == "recent_only"
+    assert policy.uses_lane_history is False
     assert policy.topic_epoch == 1
     assert policy.rotation_reason == "recent_history_bootstrap"
     assert policy.allow_provider_session is False

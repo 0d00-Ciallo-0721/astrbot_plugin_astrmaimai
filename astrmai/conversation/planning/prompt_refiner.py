@@ -300,6 +300,10 @@ class PromptRefiner:
                 speaker_id = stripped.split(":", 1)[1].strip()
             elif stripped.startswith("- 昵称:"):
                 speaker_name = stripped.split(":", 1)[1].strip()
+            elif stripped.startswith("实际发言人："):
+                match = re.fullmatch(r"实际发言人：(.+)\(QQ:([^()\r\n]+)\)", stripped)
+                if match:
+                    speaker_name, speaker_id = match.groups()
         if not speaker_id and not speaker_name:
             return ""
         display_name = (

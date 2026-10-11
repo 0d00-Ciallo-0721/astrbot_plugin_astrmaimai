@@ -13,6 +13,7 @@ from ...shared.helpers.plugin_helpers import (
     event_mentions_actor,
     get_event_self_id,
     is_at_message_component,
+    message_component_type,
     resolve_at_target_id,
 )
 from ..contracts.vision_candidate import VisionCandidate, unique_image_refs
@@ -523,17 +524,142 @@ class PreFilters:
         if not clean_text and not has_payload and not has_at_bot:
             return False
 
-        # 5. 昵称点名提权
-        # 此处直接使用开头已获取的 raw_msg
+        # 5. 昵称点名提权（P2 优化：分级检查）
         nicknames = self.config.system1.nicknames if hasattr(self.config.system1, 'nicknames') else []
         if nicknames and raw_msg:
-            for nickname in nicknames:
-                if nickname and nickname in raw_msg:
-                    logger.debug(f"[AstrMai-Sensor] 🔔 触发昵称点名: {nickname}")
-                    event.set_extra("astrmai_bonus_score", 1.0) 
+            bonus_score = self._calculate_nickname_wakeup_score(
+                event,
+                raw_msg,
+                nicknames,
+                bot_id,
+            )
+            if bonus_score > 0.0:
+                event.set_extra("astrmai_bonus_score", bonus_score)
+                # 只有分数达到阈值才返回 True
+                threshold = getattr(self.config.system1, "nickname_wakeup_threshold", 0.7)
+                if bonus_score >= threshold:
+                    logger.debug(f"[AstrMai-Sensor] 昵称唤醒达到阈值 score={bonus_score} threshold={threshold}")
                     return True
+                else:
+                    logger.debug(f"[AstrMai-Sensor] 昵称分数未达阈值 score={bonus_score} threshold={threshold}")
 
         return True
+
+    def _calculate_nickname_wakeup_score(
+        self,
+        event: AstrMessageEvent,
+        raw_msg: str,
+        nicknames: list[str],
+        bot_self_id: str,
+    ) -> float:
+        """
+        P2 优化：计算昵称唤醒分数（0.0-1.0）
+
+        分级规则：
+        - 已有结构化 @bot → 1.0（昵称只是确认）
+        - 开头明确呼叫昵称 + @别人 + 疑问语气 → 0.7
+        - @别人 + 昵称（无疑问） → 0.0（不是在叫机器人）
+        - 昵称开头 → 0.8
+        - 昵称 + 疑问/请求语气 → 0.6
+        - 纯昵称提及 → 0.3
+        """
+        if not nicknames or not raw_msg:
+            return 0.0
+
+        # 1. 检查是否有 @ 组件（使用已导入的函数）
+        message_obj = getattr(event, "message_obj", None)
+        components = list(getattr(message_obj, "message", None) or [])
+
+        at_bot = False
+        at_others = []
+
+        for comp in components:
+            if is_at_message_component(comp):
+                target = resolve_at_target_id(comp)
+                if target == bot_self_id:
+                    at_bot = True
+                elif target and target != "all":
+                    at_others.append(target)
+
+        # 2. 检查昵称位置和内容
+        matched_nickname = None
+        nickname_position = -1
+
+        for nickname in nicknames:
+            if nickname and nickname in raw_msg:
+                matched_nickname = nickname
+                nickname_position = raw_msg.find(nickname)
+                break
+
+        if not matched_nickname:
+            return 0.0
+
+        nickname_at_start = raw_msg.lstrip().startswith(matched_nickname)
+
+        # 3. 检查语气特征
+        has_question = any(marker in raw_msg for marker in ["吗", "呢", "？", "?"])
+        has_request = any(marker in raw_msg for marker in ["帮", "请", "能不能", "可以", "麻烦"])
+
+        # 4. 分情况计算分数
+
+        # 情况A：已有结构化 @bot → 昵称只是确认，分数1.0
+        if at_bot:
+            logger.debug(
+                f"[AstrMai-Sensor] 昵称+@bot确认 nickname={matched_nickname} score=1.0"
+            )
+            return 1.0
+
+        # 情况B：@别人 + 昵称
+        if at_others:
+            # message_str may omit rendered mentions; preserve the actual chain order.
+            if any(message_component_type(comp) == "plain" for comp in components):
+                before_at = []
+                for comp in components:
+                    if resolve_at_target_id(comp) in at_others:
+                        break
+                    if message_component_type(comp) == "plain":
+                        before_at.append(str(getattr(comp, "text", "") or ""))
+                nickname_at_start = "".join(before_at).lstrip().startswith(matched_nickname)
+            else:
+                nickname_at_start = nickname_at_start and raw_msg.find("@") > nickname_position
+            # 子情况B1：昵称在前 + 疑问语气 → 可能在问机器人
+            if nickname_at_start and (has_question or has_request):
+                score = getattr(self.config.system1, "nickname_at_others_with_question_score", 0.7)
+                logger.debug(
+                    f"[AstrMai-Sensor] 昵称+@别人+疑问 nickname={matched_nickname} score={score}"
+                )
+                return score
+            else:
+                # 子情况B2：其他情况 → 不是在叫机器人
+                logger.debug(
+                    f"[AstrMai-Sensor] 昵称+@别人(非疑问) nickname={matched_nickname} score=0.0"
+                )
+                return 0.0
+
+        # 情况C：纯昵称呼叫（无@）
+
+        # 子情况C1：开头呼叫 → 高分
+        if nickname_at_start:
+            score = getattr(self.config.system1, "nickname_prefix_score", 0.8)
+            logger.debug(
+                f"[AstrMai-Sensor] 昵称开头呼叫 nickname={matched_nickname} position={nickname_position} score={score}"
+            )
+            return score
+
+        # 子情况C2：中间提及 + 疑问/请求语气
+        if has_question or has_request:
+            score = getattr(self.config.system1, "nickname_with_question_score", 0.6)
+            logger.debug(
+                f"[AstrMai-Sensor] 昵称+疑问/请求 nickname={matched_nickname} score={score}"
+            )
+            return score
+
+        # 子情况C3：其他情况：可能只是提及
+        score = getattr(self.config.system1, "nickname_mention_only_score", 0.3)
+        logger.debug(
+            f"[AstrMai-Sensor] 昵称纯提及 nickname={matched_nickname} score={score}"
+        )
+        return score
 
     def is_wakeup_signal(self, event: AstrMessageEvent, bot_self_id: str) -> bool:
         """检测是否为强唤醒信号 (@Bot)"""

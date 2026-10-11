@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from enum import Enum
 from importlib import import_module
 from typing import Any, List, Tuple
 
@@ -145,16 +146,19 @@ def _message_component_class(name: str):
     return getattr(_get_comp(), name, None)
 
 
+def message_component_type(component: Any) -> str:
+    value = component.get("type", "") if isinstance(component, dict) else getattr(component, "type", "")
+    if isinstance(value, Enum):
+        value = value.value
+    return str(value or component.__class__.__name__).lstrip("_").lower()
+
+
 def is_at_message_component(component: Any) -> bool:
     if component is None:
         return False
     at_component = _message_component_class("At")
     component_name = component.__class__.__name__.lstrip("_").lower()
-    component_type = str(
-        component.get("type", "")
-        if isinstance(component, dict)
-        else getattr(component, "type", "")
-    ).lstrip("_").lower()
+    component_type = message_component_type(component)
     return bool(
         (isinstance(component, at_component) if at_component else False)
         or component_name == "at"

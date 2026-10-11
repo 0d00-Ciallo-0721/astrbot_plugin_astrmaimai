@@ -156,7 +156,7 @@ class PersonaAddressingScopeTests(unittest.TestCase):
             is_lightweight_event=False,
         )
 
-        self.assertIn("QQ: 222", block)
+        self.assertIn("实际发言人：普通群友(QQ:222)", block)
         self.assertIn("默认称呼", block)
         self.assertIn("不能据此把当前发言人升级", block)
 

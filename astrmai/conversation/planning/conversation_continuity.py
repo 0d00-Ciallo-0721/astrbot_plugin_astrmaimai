@@ -98,6 +98,9 @@ class ConversationContinuityStore:
         self._group_shared_history_enabled = True
         self._group_topic_active_ttl_seconds = 1200.0
         self._group_topic_confirm_after_seconds = 1800.0
+        # P1 新增：分层 TTL
+        self._group_history_readable_ttl_seconds = 7200.0  # 2小时
+        self._group_history_persist_ttl_seconds = 86400.0  # 24小时
         self._group_provider_topic_session_enabled = True
 
     @staticmethod
@@ -195,6 +198,21 @@ class ConversationContinuityStore:
             )
             self._group_topic_active_ttl_seconds = active
             self._group_topic_confirm_after_seconds = confirm
+            # P1 修复：接入新的历史 TTL 配置
+            self._group_history_readable_ttl_seconds = max(
+                confirm,
+                min(
+                    86400.0,
+                    float(getattr(conversation_config, "group_history_readable_ttl_sec", 7200) or 7200),
+                ),
+            )
+            self._group_history_persist_ttl_seconds = max(
+                self._group_history_readable_ttl_seconds,
+                min(
+                    604800.0,
+                    float(getattr(conversation_config, "group_history_persist_ttl_sec", 86400) or 86400),
+                ),
+            )
             self._group_provider_topic_session_enabled = bool(
                 getattr(conversation_config, "group_provider_topic_session_enabled", True)
             )
@@ -444,13 +462,15 @@ class ConversationContinuityStore:
             )
 
         state = self._state(normalized_chat_id)
+        recent_turns = self.recent(normalized_chat_id, now=now)
+        stale_history = bool(recent_turns and self._topic_age_seconds(state, now) > self._group_topic_confirm_after_seconds)
         current_text = self._topic_message_text(text)
         explicit_recall = self._is_explicit_history_recall(current_text)
         explicit_switch = self._is_explicit_topic_switch(current_text)
         age_seconds = self._topic_age_seconds(state, now)
         has_topic = bool(state.current_topic and state.last_goal_update_ts)
         same_topic = bool(
-            has_topic
+            (has_topic or recent_turns)
             and self._is_same_topic(
                 state.last_focus_preview or state.current_topic,
                 current_text,
@@ -484,11 +504,20 @@ class ConversationContinuityStore:
             rotation_reason = "explicit_history_recall"
         elif not has_topic and followup_like and not explicit_switch:
             next_epoch = max(1, int(state.topic_epoch or 0) + 1)
-            mode = "current_topic"
-            rotation_reason = "recent_history_bootstrap"
+            mode = "background" if recent_turns and age_seconds > self._group_history_readable_ttl_seconds else "recent_only"
+            rotation_reason = "idle_history_evidence" if recent_turns else "recent_history_bootstrap"
+        elif recent_turns and not explicit_switch and age_seconds > self._group_topic_confirm_after_seconds and (
+            has_reply_reference or (same_topic and normalized_sender_id == state.last_sender_id)
+        ):
+            next_epoch = max(1, int(state.topic_epoch or 0) + 1)
+            mode = "recent_only" if age_seconds <= self._group_history_readable_ttl_seconds else "background"
+            rotation_reason = "idle_history_evidence"
         elif not has_topic or explicit_switch:
             next_epoch = max(1, int(state.topic_epoch or 0) + 1)
-            rotation_reason = "initial_topic" if not has_topic else "explicit_topic_switch"
+            rotation_reason = (
+                "topic_stale" if stale_history and not explicit_switch
+                else ("initial_topic" if not has_topic else "explicit_topic_switch")
+            )
         elif age_seconds <= self._group_topic_active_ttl_seconds:
             mode = "current_topic"
             allow_provider_session = self._group_provider_topic_session_enabled
@@ -681,13 +710,33 @@ class ConversationContinuityStore:
         }
 
     def _expire_state_if_stale(self, state: ConversationContinuityState, now: float) -> bool:
-        last_update = float(state.last_goal_update_ts or 0.0)
-        if (
-            not last_update
-            or now - last_update <= self.TURN_TTL_SECONDS
-            or state.topic_confirmation_requested_at
-        ):
+        """Expire topic activity independently from bounded group history."""
+        is_group = ":GroupMessage:" in state.chat_id
+        last_update = max([float(state.last_goal_update_ts or 0.0), *[item.timestamp for item in state.turns]])
+
+        if not last_update:
             return False
+
+        age = now - last_update
+
+        # 层次 0：话题确认请求中，不清理
+        if state.topic_confirmation_requested_at:
+            return False
+
+        topic_ttl = self._group_topic_confirm_after_seconds if is_group else self.TURN_TTL_SECONDS
+        if age <= topic_ttl:
+            return False
+
+        if is_group and age <= self._group_history_persist_ttl_seconds:
+            state.current_topic = ""
+            state.current_goal = ""
+            state.goal_status = ""
+            # Keep the history clock and actor evidence for later expiry/read decisions.
+            limit = 6 if age <= self._group_history_readable_ttl_seconds else 2
+            state.turns = state.turns[-limit:]
+            return False
+
+        # 层次 5：彻底清空（超过24小时）
         state.current_topic = ""
         state.current_goal = ""
         state.goal_status = ""
@@ -716,7 +765,9 @@ class ConversationContinuityStore:
         kept = [
             item
             for item in state.turns
-            if now - float(item.timestamp or 0.0) <= self.TURN_TTL_SECONDS
+            if now - float(item.timestamp or 0.0) <= (
+                self._group_history_persist_ttl_seconds if ":GroupMessage:" in chat_id else self.TURN_TTL_SECONDS
+            )
         ]
         if kept != state.turns:
             state.turns = kept[-self.MAX_TURNS_PER_CHAT :]

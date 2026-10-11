@@ -78,8 +78,7 @@ class PlannerPromptContextGuardsPortedTests(unittest.TestCase):
             is_lightweight_event=True,
         )
 
-        self.assertIn("QQ: 2639044966", block)
-        self.assertIn("昵称: 哥哥", block)
+        self.assertIn("实际发言人：哥哥(QQ:2639044966)", block)
         self.assertIn("这是群聊", block)
         self.assertIn("弱文本/图片/互动输入", block)
         self.assertIn("不要从旧对话里补出其他人的名字", block)

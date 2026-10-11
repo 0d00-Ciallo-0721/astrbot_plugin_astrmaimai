@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
 
-HistoryMode = Literal["none", "current_topic", "explicit_recall"]
+HistoryMode = Literal["none", "current_topic", "explicit_recall", "recent_only", "background"]
 POLICY_EVENT_KEY = "astrmai_dialog_history_policy"
 
 
@@ -39,7 +39,7 @@ class DialogHistoryPolicy:
         if not isinstance(value, dict):
             return cls()
         mode = str(value.get("history_mode", "none") or "none").strip()
-        if mode not in {"none", "current_topic", "explicit_recall"}:
+        if mode not in {"none", "current_topic", "explicit_recall", "recent_only", "background"}:
             mode = "none"
         try:
             topic_epoch = max(0, int(value.get("topic_epoch", 0) or 0))
@@ -60,7 +60,7 @@ class DialogHistoryPolicy:
                 for item in list(value.get("approved_event_ids", []) or [])
                 if str(item).strip()
             ),
-            allow_provider_session=bool(value.get("allow_provider_session", False)),
+            allow_provider_session=bool(value.get("allow_provider_session", False)) and mode not in {"recent_only", "background"},
             rotation_reason=str(value.get("rotation_reason", "") or "").strip(),
             topic_age_seconds=topic_age_seconds,
             continuity_evidence=tuple(

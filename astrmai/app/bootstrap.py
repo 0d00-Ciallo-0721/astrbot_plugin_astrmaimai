@@ -299,6 +299,7 @@ class PluginBootstrap:
                     conversation_settings, "group_pending_direct_ttl_sec", 1200.0
                 ),
                 snapshot_dir=snapshot_dir,
+                restore_recent_message_limit=getattr(conversation_settings, "restore_recent_message_limit", 20),
             )
         db_service.dialogue_store = dialogue_store
         gateway.dialogue_store = dialogue_store

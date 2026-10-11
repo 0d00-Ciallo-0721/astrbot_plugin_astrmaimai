@@ -52,6 +52,8 @@ class DialogueThread:
     segments: list[DialogueSegment] = field(default_factory=list)
     cold_summary: str = ""
     cold_summary_structure: ColdSummaryStructure | None = None
+    restored_at: float = 0.0
+    restored_message_timestamp: float = 0.0
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -68,6 +70,8 @@ class WarmContextBundle:
     deduplication — do not rely on stale values set before that point.
     """
     topic_preview: str = ""
+    latest_message_timestamp: float = 0.0
+    restored_message_timestamp: float = 0.0
 
 
 @dataclass(slots=True)
@@ -242,7 +246,7 @@ class GroupDialogueStore:
     SNAPSHOT_SCHEMA_VERSION = 2
     SNAPSHOT_FILENAME = "dialogue_store_state.json"
     SNAPSHOT_MAX_CHATS = 64
-    SNAPSHOT_MAX_SEGMENTS_PER_CHAT = 40
+    SNAPSHOT_MAX_SEGMENTS_PER_CHAT = 100
 
     def __init__(
         self,
@@ -252,6 +256,7 @@ class GroupDialogueStore:
         warm_zone_max_tokens: int = 1200,
         pending_direct_ttl_seconds: float = 1200.0,
         snapshot_dir: Any = None,
+        restore_recent_message_limit: int | None = None,
     ):
         self.hot_zone_ttl_seconds = float(hot_zone_ttl_seconds or 30.0)
         self.warm_zone_ttl_seconds = float(warm_zone_ttl_seconds or 300.0)
@@ -260,6 +265,10 @@ class GroupDialogueStore:
             60.0, float(pending_direct_ttl_seconds or 1200.0)
         )
         self.snapshot_dir = snapshot_dir
+        self.restore_recent_message_limit = (
+            None if restore_recent_message_limit is None
+            else max(1, min(self.SNAPSHOT_MAX_SEGMENTS_PER_CHAT, int(restore_recent_message_limit)))
+        )
         self._threads: dict[str, DialogueThread] = {}
         self._social_states: dict[str, list[GroupSocialStateItem]] = {}
         self._pending_direct: dict[str, list[PendingDirectItem]] = {}
@@ -1318,8 +1327,9 @@ class GroupDialogueStore:
                 fresh = [
                     segment
                     for segment in thread.segments
-                    if now - float(segment.timestamp or 0.0) <= self.warm_zone_ttl_seconds
-                ][-self.SNAPSHOT_MAX_SEGMENTS_PER_CHAT :]
+                    if self.restore_recent_message_limit is not None
+                    or now - float(segment.timestamp or 0.0) <= self.warm_zone_ttl_seconds
+                ][-(self.restore_recent_message_limit or 40) :]
                 if not fresh and not thread.cold_summary:
                     continue
                 chats[chat_id] = {
@@ -1438,16 +1448,27 @@ class GroupDialogueStore:
                 if segment is None:
                     continue
                 # TTL 二次校验：快照落盘到恢复之间可能已经过期
-                if now - float(segment.timestamp or 0.0) > self.warm_zone_ttl_seconds:
+                if self.restore_recent_message_limit is None and now - float(segment.timestamp or 0.0) > self.warm_zone_ttl_seconds:
                     continue
                 segments.append(segment)
+            segments = segments[-(self.restore_recent_message_limit or 40):]
             cold_summary = str((chat_payload or {}).get("cold_summary", "") or "")
             if not segments and not cold_summary:
                 continue
             async with self._lock:
                 thread = self._get_thread(key)
             async with thread.lock:
-                thread.segments = segments + thread.segments
+                existing_ids = {segment.event_id or (segment.timestamp, segment.speaker_id, segment.content) for segment in thread.segments}
+                restored_segments = []
+                for segment in segments:
+                    identity = segment.event_id or (segment.timestamp, segment.speaker_id, segment.content)
+                    if identity not in existing_ids:
+                        restored_segments.append(segment)
+                        existing_ids.add(identity)
+                thread.segments = restored_segments + thread.segments
+                if self.restore_recent_message_limit is not None and restored_segments:
+                    thread.restored_at = now
+                    thread.restored_message_timestamp = max(segment.timestamp for segment in restored_segments)
                 if cold_summary and not thread.cold_summary:
                     thread.cold_summary = cold_summary
             restored += 1
@@ -2101,6 +2122,7 @@ class GroupDialogueStore:
         max_age_seconds: float | None = None,
         max_tokens: int | None = None,
         include_identity: bool = False,
+        max_segments: int | None = None,
     ) -> WarmContextBundle:
         chat_key = self._resolve_chat_key(chat_id)
         max_age_seconds = self.warm_zone_ttl_seconds if max_age_seconds is None else float(max_age_seconds)
@@ -2112,14 +2134,21 @@ class GroupDialogueStore:
                 return WarmContextBundle()
             async with thread.lock:
                 candidates: list[DialogueSegment] = []
+                effective_age = max_age_seconds
+                if max_age_seconds == 0.0 and not (
+                    thread.restored_at and 0 <= now - thread.restored_at <= self.warm_zone_ttl_seconds
+                ):
+                    effective_age = self.warm_zone_ttl_seconds
                 for segment in thread.segments:
-                    if max_age_seconds > 0 and now - segment.timestamp > max_age_seconds:
+                    if effective_age > 0 and now - segment.timestamp > effective_age:
                         continue
                     if not self._format_segment_line(segment):
                         continue
                     candidates.append(segment)
                 if not candidates:
                     return WarmContextBundle()
+                if max_segments is not None:
+                    candidates = candidates[-max(1, min(100, int(max_segments))):]
                 summary_budget = max(1, int(max_tokens * 0.35)) if max_tokens > 0 else 0
                 quote_budget = max(1, max_tokens - summary_budget) if max_tokens > 0 else 0
                 summary_candidates = self._select_warm_summary_segments(candidates)
@@ -2131,6 +2160,8 @@ class GroupDialogueStore:
                     include_identity=include_identity,
                 )
                 return WarmContextBundle(
+                    latest_message_timestamp=max(segment.timestamp for segment in candidates),
+                    restored_message_timestamp=thread.restored_message_timestamp,
                     summary_text=summary_text,
                     quote_text=quote_text,
                     quote_event_ids=quote_event_ids,

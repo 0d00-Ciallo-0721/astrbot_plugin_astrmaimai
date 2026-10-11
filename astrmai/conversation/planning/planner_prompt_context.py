@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import time
 from typing import List, Optional
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
+
+from ...shared.helpers.plugin_helpers import message_component_type
 
 from ...infrastructure.compat.legacy_compat import emit_legacy_prompt_envelope_extras, read_legacy_focus_thread_context
 from ...infrastructure.runtime.dialog_lane_identity import resolve_dialog_lane_identity
@@ -198,10 +201,7 @@ class PlannerPromptContextMixin:
     def _has_reply_reference(message_event: AstrMessageEvent) -> bool:
         message_chain = getattr(getattr(message_event, "message_obj", None), "message", None) or []
         return any(
-            str(getattr(component, "type", component.__class__.__name__))
-            .lstrip("_")
-            .lower()
-            == "reply"
+            message_component_type(component) == "reply"
             for component in message_chain
         )
 
@@ -218,15 +218,49 @@ class PlannerPromptContextMixin:
             # （astrmai_proactive_candidate/主动开口候选），生成归因锁会让模型
             # 对着幽灵用户说"你"；主动发言不锁定单一对象
             return ""
+
+        # P0 修复：实际发言者从 actor_set.current_actor_id，不从 turn_target
+        actor_set = getattr(focus_context, "actor_set", None)
         turn_target = getattr(focus_context, "turn_target", None)
-        sender_id = str(getattr(turn_target, "target_actor_id", "") or "").strip()
-        sender_name = str(getattr(turn_target, "target_actor_name", "") or "").strip()
-        sender_id = sender_id or str(getattr(focus_context, "focus_sender_id", "") or "").strip() or cls._safe_event_sender_id(focus_event)
-        sender_name = sender_name or str(getattr(focus_context, "focus_sender_name", "") or "").strip() or cls._safe_event_sender_name(focus_event)
-        chat_id = str(getattr(focus_event, "unified_msg_origin", "") or "").strip()
-        if not sender_id and not sender_name:
+
+        # 1. 获取实际发言者
+        actual_sender_id = ""
+        actual_sender_name = ""
+
+        if actor_set is not None:
+            actual_sender_id = str(getattr(actor_set, "current_actor_id", "") or "").strip()
+
+        if not actual_sender_id:
+            actual_sender_id = str(getattr(focus_context, "focus_sender_id", "") or "").strip()
+
+        if not actual_sender_id:
+            actual_sender_id = cls._safe_event_sender_id(focus_event)
+
+        actual_sender_name = str(getattr(focus_context, "focus_sender_name", "") or "").strip()
+        if not actual_sender_name:
+            actual_sender_name = cls._safe_event_sender_name(focus_event)
+
+        if not actual_sender_id and not actual_sender_name:
             return ""
 
+        # 2. 获取引用目标（如果存在）
+        reply_target_id = ""
+        reply_target_name = ""
+
+        if turn_target is not None:
+            from astrmai.conversation.contracts.turn_target import TargetKind
+            if getattr(turn_target, "target_kind", None) == TargetKind.MESSAGE:
+                reply_target_id = str(getattr(turn_target, "target_actor_id", "") or "").strip()
+                reply_target_name = str(getattr(turn_target, "target_actor_name", "") or "").strip()
+
+        # 3. 获取 @ 目标（如果存在）
+        at_target_ids = []
+        if actor_set is not None:
+            at_actor_ids = getattr(actor_set, "at_actor_ids", ())
+            if at_actor_ids:
+                at_target_ids = [aid for aid in at_actor_ids if aid != actual_sender_id]
+
+        chat_id = str(getattr(focus_event, "unified_msg_origin", "") or "").strip()
         vision_bundle = getattr(focus_context, "vision_bundle", None)
         has_image = bool(
             list(getattr(vision_bundle, "image_urls", []) or [])
@@ -234,20 +268,41 @@ class PlannerPromptContextMixin:
         )
         interaction_kind = str(focus_event.get_extra("astrmai_interaction_kind", "") or "").strip().lower()
         message_kind = "interaction" if interaction_kind else "image" if has_image else "text"
+
+        # 4. 构建清晰的身份说明
         lines = [
-            "本轮正在回应的对象只看这一位：",
-            f"- QQ: {sender_id or 'unknown'}",
-            f"- 昵称: {sender_name or '群友'}",
-            f"- 会话: {chat_id or 'unknown'}",
-            f"- 消息类型: {message_kind}",
+            "## 本轮消息身份关系",
+            f"实际发言人：{actual_sender_name or '群友'}(QQ:{actual_sender_id or 'unknown'})",
+            f"会话：{chat_id or 'unknown'}",
+            f"消息类型：{message_kind}",
+        ]
+
+        # 标注引用关系
+        if reply_target_id and reply_target_id != actual_sender_id:
+            lines.append(f"该消息引用了：{reply_target_name or '某人'}(QQ:{reply_target_id})")
+
+        # 标注 @ 关系
+        if at_target_ids:
+            at_list = ", ".join([f"QQ:{aid}" for aid in at_target_ids[:3]])
+            if len(at_target_ids) > 3:
+                at_list += f" 等{len(at_target_ids)}人"
+            lines.append(f"同时@了：{at_list}")
+
+        # 明确指令
+        lines.extend([
+            "",
+            "你的回复对象是实际发言人，不是被引用或被@的第三方。",
             "历史里的其他发言人只是背景，不能当作当前用户，也不要把他们的名字、身份或关系套到当前用户身上。",
             "当前发言人身份只决定本轮消息归因，不自动改变人格中的默认称呼或固定关系；条件关系称呼必须有当前消息或稳定事实支持。",
             "机器人过去的回复、群友玩笑和摘要中的关系词不是关系证据，不能据此把当前发言人升级为某个固定对象。",
-        ]
+        ])
+
         if cls._is_group_event(focus_event):
             lines.append("这是群聊；如果前文出现过其他群友，本轮仍只把眼前这条消息归因给上述 QQ。")
+
         if is_lightweight_event or has_image or interaction_kind:
             lines.append("这是弱文本/图片/互动输入；除非当前图片或当前消息明确给出，不要从旧对话里补出其他人的名字。")
+
         return "\n".join(lines)
 
     @staticmethod
@@ -438,12 +493,17 @@ class PlannerPromptContextMixin:
         )
         if not store:
             return None
+        tail_options = {}
+        if max_age_seconds == 0.0:
+            conversation_settings = getattr(getattr(self.gateway, "config", None), "conversation", None)
+            tail_options["max_segments"] = int(getattr(conversation_settings, "restore_recent_message_limit", 20) or 20)
         try:
             return await store.get_warm_context_bundle(
                 chat_id,
                 max_age_seconds=max_age_seconds,
                 max_tokens=1200,
                 include_identity=include_identity,
+                **tail_options,
             )
         except TypeError:
             # Keep compatibility with lightweight test doubles and older
@@ -569,10 +629,22 @@ class PlannerPromptContextMixin:
             seen_ids.add(id(candidate))
             events.append(candidate)
         turn_target = getattr(focus_context, "turn_target", None)
-        sender_id = str(getattr(turn_target, "target_actor_id", "") or "").strip()
-        sender_name = str(getattr(turn_target, "target_actor_name", "") or "").strip()
-        sender_id = sender_id or str(getattr(focus_context, "focus_sender_id", "") or "").strip()
-        sender_name = sender_name or str(getattr(focus_context, "focus_sender_name", "") or "").strip()
+        actor_set = getattr(focus_context, "actor_set", None)
+
+        # P0 修复：实际发言者从 actor_set.current_actor_id
+        sender_id = ""
+        sender_name = ""
+
+        if actor_set is not None:
+            sender_id = str(getattr(actor_set, "current_actor_id", "") or "").strip()
+
+        if not sender_id:
+            sender_id = str(getattr(focus_context, "focus_sender_id", "") or "").strip()
+
+        if not sender_name:
+            sender_name = str(getattr(focus_context, "focus_sender_name", "") or "").strip()
+
+        # fallback 才从 event
         if not sender_id:
             try:
                 sender_id = str(focus_event.get_sender_id() or "").strip()
@@ -718,6 +790,14 @@ class PlannerPromptContextMixin:
         ambient_background_text = self._build_ambient_background_text(ambient_events)
         raw_window_text = focus_message_text
         allow_group_history = not history_policy.group_id or history_policy.history_mode != "none"
+        history_settings = getattr(getattr(self.gateway, "config", None), "conversation", None)
+        history_age_limit = 300.0
+        if history_policy.history_mode == "recent_only":
+            history_age_limit = float(getattr(history_settings, "group_history_readable_ttl_sec", 7200) or 7200)
+            if history_policy.rotation_reason == "recent_history_bootstrap":
+                history_age_limit = 0.0
+        elif history_policy.history_mode == "background":
+            history_age_limit = float(getattr(history_settings, "group_history_persist_ttl_sec", 86400) or 86400)
         warm_bundle = (
             None
             if is_lightweight_event or not allow_group_history
@@ -727,7 +807,7 @@ class PlannerPromptContextMixin:
                 max_age_seconds=(
                     history_policy.topic_age_seconds + 120.0
                     if history_policy.group_id and history_policy.history_mode == "explicit_recall"
-                    else 300.0
+                    else history_age_limit
                 ),
             )
         )
@@ -737,6 +817,13 @@ class PlannerPromptContextMixin:
         warm_zone_quote_event_ids = [] if warm_bundle is None else list(getattr(warm_bundle, "quote_event_ids", []) or [])
         warm_zone_quote_entries = [] if warm_bundle is None else list(getattr(warm_bundle, "quote_entries", []) or [])
         if history_policy.group_id:
+            if history_policy.rotation_reason == "recent_history_bootstrap" and warm_bundle is not None:
+                latest_timestamp = float(
+                    getattr(warm_bundle, "restored_message_timestamp", 0.0)
+                    or getattr(warm_bundle, "latest_message_timestamp", 0.0) or 0.0
+                )
+                if latest_timestamp:
+                    history_policy = replace(history_policy, topic_age_seconds=max(0.0, time.time() - latest_timestamp))
             history_policy = replace(
                 history_policy,
                 approved_event_ids=tuple(warm_zone_quote_event_ids),
@@ -748,7 +835,7 @@ class PlannerPromptContextMixin:
         warm_zone_transcript = "\n".join(part for part in (warm_zone_summary, warm_zone_quotes) if part).strip()
         recent_transcript = (
             ""
-            if is_lightweight_event or not allow_group_history
+            if is_lightweight_event or not allow_group_history or history_policy.history_mode in {"recent_only", "background"}
             else await self._get_recent_dialogue_transcript(
                 chat_id,
                 max_age_seconds=(
@@ -1001,6 +1088,11 @@ class PlannerPromptContextMixin:
             elif history_policy.history_mode == "current_topic":
                 prompt_envelope.guidance_lines.append(
                     "这是同一群聊话题的共同上下文；可以承接群友共同形成的话题，但必须按每条消息的发言人身份正确归因。"
+                )
+            elif history_policy.history_mode in {"recent_only", "background"}:
+                prompt_envelope.guidance_lines.append(
+                    f"群聊已静默约 {int(history_policy.topic_age_seconds)} 秒；以下是有界历史背景，"
+                    "不要默认旧话题仍活跃，只在当前问题有明确承接证据时引用，按发言人正确归因。"
                 )
             else:
                 prompt_envelope.guidance_lines.append(

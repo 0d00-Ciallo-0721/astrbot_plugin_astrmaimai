@@ -41,6 +41,25 @@ pip install -r requirements.txt
 
 配置项均在 AstrBot 插件配置页显示中文名称和说明。旧配置中的越界值会被记录并回退到安全默认值，不应导致整个插件拒绝加载。
 
+### 群聊身份、续聊与昵称唤醒
+
+本轮开发改动等待独立复验，尚未同步生产。当前消息的发言人、引用作者与被 @ 的人分别进入上下文，引用第三方不会替换当前发言人的身份。
+
+| 配置项 | 默认值 | 含义 |
+|---|---|---|
+| `conversation.group_history_readable_ttl_sec` | `7200` | 群聊旧话题超过确认窗口后，仍可按当前消息的承接证据读取有限历史 |
+| `conversation.group_history_persist_ttl_sec` | `86400` | 可读期后仅保留少量背景；超过此时长清理 continuity 历史，并非删除数据库 |
+| `conversation.restore_recent_message_limit` | `20` | 从现有群聊快照恢复的最近消息条数，范围 5–100；不表示恢复完整数据库历史 |
+| `system1.nickname_wakeup_threshold` | `0.7` | 正数昵称分数达到此值才成为强唤醒；零阈值不会让无昵称消息提权 |
+| `system1.nickname_at_others_with_question_score` | `0.7` | 明确先呼叫机器人昵称，再 @ 他人并提出问题或请求时的分数 |
+| `system1.nickname_prefix_score` | `0.8` | 无 @ 他人干扰时，昵称开头呼叫的分数 |
+| `system1.nickname_with_question_score` | `0.6` | 昵称出现在正文中并带疑问或请求语气时的分数 |
+| `system1.nickname_mention_only_score` | `0.3` | 单纯提及昵称的分数 |
+
+`@他人 + 机器人昵称` 不会仅因带问号而成为强唤醒；结构化 @ 机器人沿用现有唤醒链。未成为强唤醒的消息仍按普通群聊注意力规则处理，不能将“无强唤醒”理解为保证不回复。
+
+话题活跃期、确认证据窗口和历史读取时长是不同边界。默认超过 30 分钟后，有承接证据的历史以 `recent_only` 提供；超过 2 小时以 `background` 提供，均不恢复隐藏 provider/lane 会话。快照按条数恢复、不按消息年龄丢弃，但恢复历史的首次读取有有限温区窗口，撤回状态及群隔离仍保留。
+
 ## 数据目录
 
 运行数据由 AstrBot 写入插件数据目录，典型容器路径为：

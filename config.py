@@ -133,6 +133,37 @@ class System1Config(BaseModel):
         default=[],
         description="关键词反应规则列表，格式: '关键词:反应描述'，例如 '原神:你是原神重度玩家，听到这个词会特别兴奋'",
     )
+    # P2 优化新增：昵称唤醒分级配置
+    nickname_wakeup_threshold: float = Field(
+        default=0.7,
+        ge=0.0,
+        le=1.0,
+        description="昵称唤醒最低阈值（0.0-1.0），分数低于此值不触发强唤醒",
+    )
+    nickname_at_others_with_question_score: float = Field(
+        default=0.7,
+        ge=0.0,
+        le=1.0,
+        description="@别人 + 昵称 + 疑问语气的唤醒分数",
+    )
+    nickname_prefix_score: float = Field(
+        default=0.8,
+        ge=0.0,
+        le=1.0,
+        description="昵称开头呼叫的唤醒分数",
+    )
+    nickname_with_question_score: float = Field(
+        default=0.6,
+        ge=0.0,
+        le=1.0,
+        description="昵称 + 疑问/请求语气的唤醒分数",
+    )
+    nickname_mention_only_score: float = Field(
+        default=0.3,
+        ge=0.0,
+        le=1.0,
+        description="纯昵称提及的唤醒分数",
+    )
 
 
 class AttentionConfig(BaseModel):
@@ -435,6 +466,24 @@ class ConversationConfig(BaseModel):
     group_topic_confirm_after_sec: int = Field(
         default=1800,
         description="群聊旧话题需要明确证据后才能承接的时间边界（秒）",
+    )
+    group_history_readable_ttl_sec: int = Field(
+        default=7200,
+        ge=1800,
+        le=86400,
+        description="群聊历史仍可读取的时长（秒），超过后开始淡化（P1优化新增）",
+    )
+    group_history_persist_ttl_sec: int = Field(
+        default=86400,
+        ge=7200,
+        le=604800,
+        description="群聊历史彻底清空的时长（秒），超过后完全遗忘（P1优化新增）",
+    )
+    restore_recent_message_limit: int = Field(
+        default=20,
+        ge=5,
+        le=100,
+        description="重启后恢复的最近消息条数（P1优化新增）",
     )
     group_actor_tail_ttl_sec: int = Field(
         default=1200,

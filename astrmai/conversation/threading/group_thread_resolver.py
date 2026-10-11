@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from ...shared.helpers.plugin_helpers import message_component_type
+
 
 @dataclass(frozen=True, slots=True)
 class GroupThreadResolution:
@@ -13,7 +15,7 @@ class GroupThreadResolution:
 
 
 def _component_type(component: Any) -> str:
-    return str(getattr(component, "type", component.__class__.__name__)).lstrip("_").lower()
+    return message_component_type(component)
 
 
 def _reply_component_identity(component: Any) -> str:

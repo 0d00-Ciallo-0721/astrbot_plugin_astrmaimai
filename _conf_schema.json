@@ -184,6 +184,33 @@
         "default": [],
         "hint": "这些命令会直接走工作/工具流程，而不是普通闲聊。"
       },
+      "nickname_wakeup_threshold": {
+        "description": "昵称强唤醒阈值",
+        "type": "float",
+        "default": 0.7,
+        "hint": "分数必须大于零且达到阈值才会强唤醒。取值 0～1。"
+      },
+      "nickname_at_others_with_question_score": {
+        "description": "先呼叫机器人再提及他人的疑问分数",
+        "type": "float",
+        "default": 0.7,
+        "hint": "仅在正文开头明确呼叫机器人时使用；@他人后的昵称提及不提权。取值 0～1。"
+      },
+      "nickname_prefix_score": {
+        "description": "正文开头呼叫昵称的分数",
+        "type": "float",
+        "default": 0.8
+      },
+      "nickname_with_question_score": {
+        "description": "正文中提及昵称并疑问或请求的分数",
+        "type": "float",
+        "default": 0.6
+      },
+      "nickname_mention_only_score": {
+        "description": "仅提及昵称的分数",
+        "type": "float",
+        "default": 0.3
+      },
       "keyword_reactions": {
         "description": "关键词反应规则",
         "type": "list",
@@ -326,7 +353,25 @@
         "description": "群聊旧话题停止自动承接时间（秒）",
         "type": "int",
         "default": 1800,
-        "hint": "超过这个时间后，不再自动恢复旧话题；只有用户明确说“上次、之前、还记得”等回忆表达时才会检索旧内容。默认 1800 秒，即 30 分钟。"
+        "hint": "超过此时间停止自动承接旧话题；明确引用或同一发言人的相关追问仍可读取有界历史背景，不恢复隐藏的旧模型会话。"
+      },
+      "group_history_readable_ttl_sec": {
+        "description": "群聊历史可读时间（秒）",
+        "type": "int",
+        "default": 7200,
+        "hint": "取值 1800～86400，实际不短于话题确认边界；有承接证据时提供最近历史背景。"
+      },
+      "group_history_persist_ttl_sec": {
+        "description": "群聊历史保留时间（秒）",
+        "type": "int",
+        "default": 86400,
+        "hint": "取值 7200～604800，实际不短于可读时间；可读期后仅保留少量背景，到期清空。"
+      },
+      "restore_recent_message_limit": {
+        "description": "重启恢复最近消息条数",
+        "type": "int",
+        "default": 20,
+        "hint": "每群按条数恢复，取值 5～100；保留原时间及撤回标记，不因恢复而触发回复。"
       },
       "group_actor_tail_ttl_sec": {
         "description": "当前群友消息承接时间（秒）",

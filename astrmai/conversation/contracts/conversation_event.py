@@ -5,6 +5,8 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
+from ...shared.helpers.plugin_helpers import message_component_type, resolve_at_target_id
+
 
 CONVERSATION_EVENT_SCHEMA_VERSION = 1
 _ALLOWED_PROVENANCE = {
@@ -27,7 +29,7 @@ def _ordered_unique(values: Iterable[Any], *, limit: int = 32) -> tuple[str, ...
 
 
 def _component_type(component: Any) -> str:
-    return str(getattr(component, "type", component.__class__.__name__) or "").lstrip("_").lower()
+    return message_component_type(component)
 
 
 def _event_components(event: Any) -> list[Any]:
@@ -102,8 +104,11 @@ class ConversationEvent:
     reply_target_event_id: str = ""
     reply_target_actor_id: str = ""
     reply_target_actor_name: str = ""
+    reply_target_text: str = ""
+    reply_target_timestamp: float = 0.0
     quote_event_id: str = ""
     at_actor_ids: tuple[str, ...] = field(default_factory=tuple)
+    at_actor_names: tuple[str, ...] = field(default_factory=tuple)
     topic_epoch: int = 0
     causal_parent_event_id: str = ""
     source_event_ids: tuple[str, ...] = field(default_factory=tuple)
@@ -151,10 +156,15 @@ class ConversationEvent:
         )
         components = _event_components(event)
         at_actor_ids = _ordered_unique(
-            getattr(component, "qq", "") or getattr(component, "target", "")
+            resolve_at_target_id(component)
             for component in components
             if _component_type(component) == "at"
         )
+        at_names = {
+            resolve_at_target_id(component): str(getattr(component, "name", "") or "").strip()
+            for component in components
+            if _component_type(component) == "at"
+        }
         reply_component = next(
             (component for component in components if _component_type(component) == "reply"),
             None,
@@ -245,8 +255,11 @@ class ConversationEvent:
             reply_target_event_id=reply_event_id,
             reply_target_actor_id=reply_target_actor_id,
             reply_target_actor_name=reply_target_actor_name,
+            reply_target_text=str(getattr(reply_component, "message_str", "") or "").strip(),
+            reply_target_timestamp=float(getattr(reply_component, "time", 0.0) or 0.0),
             quote_event_id=reply_event_id,
             at_actor_ids=at_actor_ids,
+            at_actor_names=tuple(at_names.get(actor_id, "") for actor_id in at_actor_ids),
             topic_epoch=max(0, int(topic_epoch or 0)),
             causal_parent_event_id=causal_parent_event_id,
             source_event_ids=source_event_ids,
