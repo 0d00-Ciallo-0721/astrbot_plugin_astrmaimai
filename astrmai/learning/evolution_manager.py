@@ -10,10 +10,13 @@ import time
 import uuid
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, TYPE_CHECKING
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
+
+if TYPE_CHECKING:
+    from ..infrastructure.persistence.orm_models import MessageLog
 
 from ..infrastructure.runtime.background_task_budget import (
     BackgroundTaskQueueFull,
@@ -869,20 +872,72 @@ class EvolutionManager:
                 retry_after_seconds=0.0,
             )
 
+    def _store_last_mining_outcome(
+        self,
+        group_id: str,
+        *,
+        run_id: str,
+        fields: dict[str, Any] | None = None,
+        pipeline: str = "",
+        pipeline_outcome: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        normalized_group_id = str(group_id or "")
+        normalized_run_id = str(run_id or "")
+        current = self._last_mining_outcomes.get(normalized_group_id, {})
+        outcome = (
+            dict(current)
+            if str(current.get("run_id") or "") == normalized_run_id
+            else {}
+        )
+        outcome.update({"group_id": normalized_group_id, "run_id": normalized_run_id})
+        outcome.update(dict(fields or {}))
+        if pipeline:
+            pipelines = dict(outcome.get("pipelines") or {})
+            pipelines[str(pipeline)] = dict(pipeline_outcome or {})
+            outcome["pipelines"] = pipelines
+        self._last_mining_outcomes.pop(normalized_group_id, None)
+        self._last_mining_outcomes[normalized_group_id] = outcome
+        while len(self._last_mining_outcomes) > 20:
+            self._last_mining_outcomes.pop(next(iter(self._last_mining_outcomes)), None)
+        return outcome
+
     async def _settle_mining_result(
         self, group_id: str, previous_mining_at: float, lease,
         *, run_id: str, status: str, reason: str,
-    ) -> None:
+    ) -> bool | None:
         if status != "succeeded":
             self._last_mining_at[str(group_id)] = previous_mining_at
             await self._persist_mining_timestamp(group_id, previous_mining_at)
+        committed = None
         if self._task_ledger is not None and lease is not None:
-            # A failed write retains this exact intent in durable settlement;
-            # it must not become a retry of the mining work itself.
-            await settle_task_lease(
+            # False does not confirm durable enqueue (or identify a stale token).
+            # Recovery retries settlement, never the completed mining work.
+            committed = await settle_task_lease(
                 self._task_ledger, lease, run_id=run_id, status=status, error=reason,
                 retry_after_seconds=self._backlog_failure_cooldown() if status == "retry_wait" else 0.0,
             )
+        diagnostic = {
+            "group_id": str(group_id), "run_id": run_id,
+            "task_id": str(getattr(lease, "task_id", "") or ""),
+            "status": status, "reason": reason,
+            "attempt_returned": True, "committed": committed,
+            "recorded_at": time.time(),
+        }
+        self._store_last_mining_outcome(
+            group_id,
+            run_id=run_id,
+            fields={"settlement": diagnostic},
+        )
+        if committed is False:
+            try:
+                logger.warning(
+                    "[Evolution-Mining] primary settlement unconfirmed group=%s run_id=%s task_id=%s status=%s reason=%s; durable enqueue unconfirmed",
+                    group_id, run_id, diagnostic["task_id"], status, reason,
+                )
+            except Exception as exc:
+                # Logging must not replace the known result or initiate mining again.
+                diagnostic["logging_error_type"] = type(exc).__name__
+        return committed
 
     def _learning_run_retention_days(self) -> int:
         return max(
@@ -2725,10 +2780,12 @@ class EvolutionManager:
             "report": dict(report or {}),
             "recorded_at": time.time(),
         }
-        key = f"{pipeline}:{group_id}"
-        self._last_mining_outcomes[key] = outcome
-        if len(self._last_mining_outcomes) > 40:
-            self._last_mining_outcomes.pop(next(iter(self._last_mining_outcomes)), None)
+        self._store_last_mining_outcome(
+            group_id,
+            run_id=mining_run_id,
+            pipeline=pipeline,
+            pipeline_outcome=outcome,
+        )
         if persist_run:
             await self._record_pipeline_run({
                 "pipeline": pipeline,
@@ -4176,7 +4233,11 @@ class EvolutionManager:
                 "pipelines": outcomes,
                 "recorded_at": time.time(),
             }
-            self._last_mining_outcomes[str(group_id)] = aggregate
+            self._store_last_mining_outcome(
+                group_id,
+                run_id=run_id,
+                fields=aggregate,
+            )
             return outcomes
 
     async def _record_mining_outcome(
@@ -4215,9 +4276,11 @@ class EvolutionManager:
             "jargon": dict(jargon_report or {}),
             "persistence": dict(persistence_report or {}),
         }
-        self._last_mining_outcomes[str(group_id or "")] = outcome
-        if len(self._last_mining_outcomes) > 20:
-            self._last_mining_outcomes.pop(next(iter(self._last_mining_outcomes)), None)
+        self._store_last_mining_outcome(
+            group_id,
+            run_id=stable_run_id,
+            fields=outcome,
+        )
         memory_engine = getattr(self.db, "memory_engine", None)
         store = getattr(memory_engine, "v2_store", None)
         setter = getattr(store, "set_meta", None)
@@ -4321,7 +4384,7 @@ class EvolutionManager:
             self._last_mining_at[str(group_id)] = time.time()
             settlement_status = None
             settlement_reason = ""
-            settlement_finished = False
+            settlement_attempt_returned = False
             try:
                 await self._persist_mining_timestamp(group_id, self._last_mining_at[str(group_id)])
                 outcomes, skipped_reason = _parse_mining_snapshot_result(
@@ -4338,19 +4401,20 @@ class EvolutionManager:
                     group_id, previous_mining_at, lease, run_id=run_id,
                     status=settlement_status, reason=settlement_reason,
                 )
-                settlement_finished = True
+                settlement_attempt_returned = True
             except asyncio.CancelledError:
-                await asyncio.shield(
-                    self._settle_mining_result(
-                        group_id, previous_mining_at, lease, run_id=run_id,
-                        status=settlement_status, reason=settlement_reason,
-                    ) if settlement_status is not None else
-                    self._settle_cancelled_mining(group_id, previous_mining_at, lease, run_id=run_id)
-                )
+                if not settlement_attempt_returned:
+                    await asyncio.shield(
+                        self._settle_mining_result(
+                            group_id, previous_mining_at, lease, run_id=run_id,
+                            status=settlement_status, reason=settlement_reason,
+                        ) if settlement_status is not None else
+                        self._settle_cancelled_mining(group_id, previous_mining_at, lease, run_id=run_id)
+                    )
                 raise
             except Exception as exc:
                 if settlement_status is not None:
-                    if not settlement_finished:
+                    if not settlement_attempt_returned:
                         await self._settle_mining_result(
                             group_id, previous_mining_at, lease, run_id=run_id,
                             status=settlement_status, reason=settlement_reason,
@@ -4541,7 +4605,7 @@ class EvolutionManager:
             previous_mining_at = None
             settlement_status = None
             settlement_reason = ""
-            settlement_finished = False
+            settlement_attempt_returned = False
             run_id = self._mining_run_id(group_id, logs)
             mining_fingerprint = self._mining_batch_id(
                 group_id, logs, prefix="learning"
@@ -4572,19 +4636,23 @@ class EvolutionManager:
                 )
                 settlement_status = "rejected" if skipped_reason else "retry_wait" if all_failed else "succeeded"
                 settlement_reason = skipped_reason or ("all_pipelines_failed" if all_failed else "")
-                await self._settle_mining_result(
+                settlement_committed = await self._settle_mining_result(
                     group_id, previous_mining_at, lease, run_id=run_id,
                     status=settlement_status, reason=settlement_reason,
                 )
-                settlement_finished = True
+                settlement_attempt_returned = True
                 if skipped_reason:
-                    report["skipped_groups"].append({"group_id": group_id, "reason": skipped_reason})
+                    report["skipped_groups"].append({
+                        "group_id": group_id, "reason": skipped_reason,
+                        "settlement_committed": settlement_committed,
+                    })
                     continue
                 processed_count += 1
                 report["processed_groups"].append(
                     {
                         "group_id": group_id,
                         "log_count": len(logs),
+                        "settlement_committed": settlement_committed,
                         "pipelines": {
                             name: {
                                 "status": outcome.get("status"),
@@ -4605,10 +4673,11 @@ class EvolutionManager:
                 )
             except asyncio.CancelledError:
                 if settlement_status is not None:
-                    await asyncio.shield(self._settle_mining_result(
-                        group_id, previous_mining_at, lease, run_id=run_id,
-                        status=settlement_status, reason=settlement_reason,
-                    ))
+                    if not settlement_attempt_returned:
+                        await asyncio.shield(self._settle_mining_result(
+                            group_id, previous_mining_at, lease, run_id=run_id,
+                            status=settlement_status, reason=settlement_reason,
+                        ))
                 elif previous_mining_at is not None:
                     await asyncio.shield(
                         self._settle_cancelled_mining(
@@ -4632,7 +4701,7 @@ class EvolutionManager:
                 raise
             except Exception as exc:
                 if settlement_status is not None:
-                    if not settlement_finished:
+                    if not settlement_attempt_returned:
                         await self._settle_mining_result(
                             group_id, previous_mining_at, lease, run_id=run_id,
                             status=settlement_status, reason=settlement_reason,

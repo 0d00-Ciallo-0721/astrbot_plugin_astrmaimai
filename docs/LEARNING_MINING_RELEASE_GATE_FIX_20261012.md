@@ -26,9 +26,9 @@
 | 正常或部分成功 | 保留新时间与既有成功间隔 | 保留既有成功、报告与 cursor 语义 |
 | 结果尚未确定时取消 | 恢复原时间 | 保留既有取消重试，CancelledError 继续传播 |
 | 结果已确定、在结算中取消 | 按已知结果结算 | rejected 或 succeeded 的意图保持；不把已完成结果变为业务重试，取消继续传播 |
-| 结算写入失败 | 按已知结果保持时间 | 沿用持久 pending settlement；重放结算不重新运行 provider |
+| 结算写入失败 | 按已知结果保持时间 | 尝试保存 pending settlement；只有入队成功才具有持久重放保证，不重新运行 provider |
 
-所有结算复用既有 `settle_task_lease` / token CAS。旧 token 无法清理新持有者的 lease。报告或日志在结果确定后抛异常，不回滚已经完成的挖矿结果，不重复结算已经成功或进入持久重试的 lease。
+所有结算复用既有 `settle_task_lease` / token CAS。旧 token 无法清理新持有者的 lease。报告或日志在结果确定后抛异常，不回滚已经完成的挖矿结果。结算返回 False 不保证已进入持久重试：数据库不可用或队列满时也可能返回 False。后续结算可见性及结算返回后取消误报修复见 `LEARNING_SETTLEMENT_OBSERVABILITY_FIX_20261012.md`；此处保留上一轮开发验证与状态，不追认新的独立或宿主验收。
 
 不改 kill switch 配置实值、阈值、pipeline timeout、成功间隔或失败冷却数值；不重写发布门禁及公共 ledger。pipeline 内部 `blocked` 是已有的依赖阻断结果，不能冒充整轮 release 拒绝；其批次调度策略保持原状。`waiting` / `retry_wait` 等非全失败批次的现有成功间隔策略也未在本轮改写，应另行评估。
 

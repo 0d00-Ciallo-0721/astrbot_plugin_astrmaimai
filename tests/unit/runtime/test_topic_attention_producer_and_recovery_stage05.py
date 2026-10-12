@@ -239,12 +239,10 @@ class ProducerAndRecoveryStage05Tests(unittest.TestCase):
                 _store, _c, policy, decision, branch_taken = self._allow_path_case(
                     text=text, reply_to=reply_to, gap_seconds=1900
                 )
-                self.assertIn(policy.rotation_reason, {"topic_stale", "new_topic", "explicit_history_recall"})
+                self.assertIn(policy.rotation_reason, {"idle_history_evidence", "explicit_history_recall"})
                 self.assertFalse(decision.allowed)
-                if branch_taken:
-                    self.assertEqual(decision.reason, "expired")
-                else:
-                    self.assertEqual(decision.reason, "no_source_anchor")
+                self.assertEqual(decision.reason, "expired")
+                self.assertEqual(decision.prompt_text(), "")
 
     def test_accepted_bridge_reaches_final_prompt_only_as_dynamic_section(self):
         store, canonical, policy, decision, _branch = self._allow_path_case(

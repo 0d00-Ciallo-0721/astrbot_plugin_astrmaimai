@@ -41,7 +41,8 @@ def test_main_schema_v171_is_append_only_and_ready(tmp_path):
         db.execute("PRAGMA user_version = 169")
         _run_migrations(db)
         db.commit()
-        assert db.execute("PRAGMA user_version").fetchone() == (171,)
+        assert LATEST_ARCHITECTURE_SCHEMA_VERSION >= 171
+        assert db.execute("PRAGMA user_version").fetchone() == (LATEST_ARCHITECTURE_SCHEMA_VERSION,)
         report = inspect_architecture_migration(db)
         assert "learning_retrieval_event" not in report.missing_tables
         assert "learning_retrieval_event" not in report.missing_columns

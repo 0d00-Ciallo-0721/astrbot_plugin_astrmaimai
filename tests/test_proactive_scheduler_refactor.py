@@ -9,6 +9,7 @@ import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from tests.helpers.astrbot_stubs import install_astrbot_stubs
 from tests.helpers.attention_stubs import install_attention_stubs
@@ -1018,7 +1019,8 @@ class ProactiveSchedulerRefactorTests(unittest.TestCase):
             )
         )
 
-        asyncio.run(task._run_daily_diary_task_with_jitter("2026-07-18"))
+        with patch.object(self.mod.random, "randint", return_value=0):
+            asyncio.run(task._run_daily_diary_task_with_jitter("2026-07-18"))
 
         self.assertEqual(task._last_diary_date, "")
         self.assertEqual(task._diary_pending_date, "")

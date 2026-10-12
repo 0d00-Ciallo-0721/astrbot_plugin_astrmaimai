@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import List, Optional
+from typing import List, Optional, TYPE_CHECKING
 
 from astrbot.api import logger
 
 from ...conversation.planning.message_renderer import MessageRenderer
 from ..gateway.output_guard import is_safe_visible_text, sanitize_visible_reply_text
+
+if TYPE_CHECKING:
+    from .lane_manager import LaneKey
 
 
 class LaneTranscriptMixin:

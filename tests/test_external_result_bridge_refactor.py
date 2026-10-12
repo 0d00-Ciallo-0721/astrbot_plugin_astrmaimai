@@ -76,6 +76,16 @@ class _FakePrivateEvent(_FakeEvent):
 
 
 class RefactoredExternalResultBridgeTests(unittest.TestCase):
+    def setUp(self):
+        import sys
+
+        components = types.ModuleType("astrbot.api.message_components")
+        components.Plain = _Plain
+        components.Image = _Image
+        sys.modules[components.__name__] = components
+        bridge = importlib.import_module("astrmai.conversation.ingress.external_result_bridge")
+        importlib.reload(bridge)
+
     def test_bridge_injects_untrusted_external_event_without_recording_as_astrmai_reply(self):
         import sys
 

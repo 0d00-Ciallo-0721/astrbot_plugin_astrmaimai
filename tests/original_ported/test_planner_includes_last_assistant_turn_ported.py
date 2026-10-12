@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from tests.helpers.planner_stubs import install_planner_stubs
 from tests.original_ported.helpers import _install_astrbot_stubs
+from astrmai.conversation.contracts.dialog_history_policy import DialogHistoryPolicy
 
 
 class _FakeLaneManager:
@@ -128,6 +129,10 @@ class PlannerIncludesLastAssistantTurnPortedTests(unittest.TestCase):
 
         planner._should_follow_up = _no_follow
         event = _FakeEvent()
+        DialogHistoryPolicy(
+            history_mode="current_topic", group_id="group-1", topic_epoch=1,
+            current_sender_id="user-1", allow_provider_session=True,
+        ).bind(event)
 
         asyncio.run(planner.plan_and_execute(event, [event]))
 

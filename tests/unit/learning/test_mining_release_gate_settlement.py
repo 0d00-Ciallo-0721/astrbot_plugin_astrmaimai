@@ -322,6 +322,12 @@ async def test_stale_token_cannot_reject_another_owner(manager, entry, monkeypat
     assert row["retry_count"] == 0
     assert row["lease_until"] == leases[1].lease_until
     _assert_unattempted(manager)
+    diagnostic = manager.describe_learning_runtime()["mining"]["last_outcomes"][GROUP]["settlement"]
+    assert diagnostic["committed"] is False
+    assert diagnostic["task_id"] == leases[0].task_id
+    with sqlite3.connect(manager._task_ledger.db_path) as connection:
+        pending = connection.execute("SELECT status FROM background_task_pending_settlements").fetchone()[0]
+    assert pending == "superseded"
 
 
 @pytest.mark.parametrize("entry", ["backlog", "realtime"])
@@ -391,6 +397,10 @@ async def test_cancellation_propagates_and_preserves_known_settlement(manager, e
         assert float(manager.db.meta[manager._mining_timestamp_key(GROUP)]) == PREVIOUS_MINING_AT
         assert not manager._mining_cooldown_active(GROUP)
         assert manager.db.marked == []
+    if stage in {"successful_settlement", "rejected_settlement"}:
+        diagnostic = manager.describe_learning_runtime()["mining"]["last_outcomes"][GROUP]["settlement"]
+        assert diagnostic["committed"] is True
+        assert diagnostic["status"] == row["status"]
 
 
 @pytest.mark.parametrize("entry", ["backlog", "realtime"])
@@ -421,3 +431,393 @@ async def test_backlog_report_failure_does_not_rollback_completed_batch(manager,
     await manager.run_backlog_mining_once()
     manager.expression_miner.mine.assert_awaited_once()
     assert manager.db.marked == [1, 2, 3]
+
+
+@pytest.mark.parametrize("status", ["succeeded", "rejected", "retry_wait"])
+@pytest.mark.parametrize("write_fails", [False, True])
+async def test_settlement_returns_primary_commit_result(manager, status, write_fails, monkeypatch):
+    lease = await manager._task_ledger.claim(
+        task_family="learning_mining", scope_id=GROUP, input_fingerprint="commit-result",
+    )
+    manager._last_mining_at[GROUP] = time.time()
+    if write_fails:
+        monkeypatch.setattr(manager._task_ledger, "finish", AsyncMock(side_effect=RuntimeError("storage unavailable")))
+    committed = await manager._settle_mining_result(
+        GROUP, PREVIOUS_MINING_AT, lease, run_id="commit-run", status=status, reason="test-result",
+    )
+    assert committed is (not write_fails)
+    diagnostic = manager.describe_learning_runtime()["mining"]["last_outcomes"][GROUP]["settlement"]
+    assert diagnostic["committed"] is committed
+    assert diagnostic["status"] == status
+    assert diagnostic["task_id"] == lease.task_id
+    assert diagnostic["run_id"] == "commit-run"
+    row = await _row(manager)
+    assert row["status"] == ("running" if write_fails else status)
+    assert manager._mining_cooldown_active(GROUP) == (status == "succeeded")
+    if write_fails:
+        assert (await manager._task_ledger.describe_pending_settlements())["pending_total"] == 1
+
+
+@pytest.mark.parametrize("entry", ["backlog", "realtime"])
+async def test_entry_exposes_unconfirmed_commit_without_repeating_successful_work(manager, entry, monkeypatch):
+    finish = manager._task_ledger.finish
+    monkeypatch.setattr(manager._task_ledger, "finish", AsyncMock(side_effect=RuntimeError("storage unavailable")))
+    report = await _run(manager, entry)
+    diagnostic = manager.describe_learning_runtime()["mining"]["last_outcomes"][GROUP]["settlement"]
+    assert diagnostic["committed"] is False
+    assert diagnostic["attempt_returned"] is True
+    assert diagnostic["status"] == "succeeded"
+    if report is not None:
+        assert report["errors"] == []
+        assert report["processed_groups"][0]["settlement_committed"] is False
+    assert (await _row(manager))["status"] == "running"
+    assert manager.db.marked == [1, 2, 3]
+    await _run(manager, entry)
+    manager.expression_miner.mine.assert_awaited_once()
+    monkeypatch.setattr(manager._task_ledger, "finish", finish)
+    assert (await manager._task_ledger.replay_pending_settlements())["replayed"] == 1
+    assert (await _row(manager))["status"] == "succeeded"
+
+
+@pytest.mark.parametrize("entry", ["backlog", "realtime"])
+@pytest.mark.parametrize("result,status", [
+    ({"expression": {"status": "completed"}}, "succeeded"),
+    ({"expression": {"status": "failed"}}, "retry_wait"),
+    ({}, "rejected"),
+])
+async def test_entry_reports_committed_result_separately_from_business_status(manager, entry, result, status, monkeypatch):
+    monkeypatch.setattr(manager, "process_logs_and_mine", AsyncMock(return_value=result))
+    report = await _run(manager, entry)
+    diagnostic = manager.describe_learning_runtime()["mining"]["last_outcomes"][GROUP]["settlement"]
+    assert diagnostic["committed"] is True
+    assert diagnostic["attempt_returned"] is True
+    assert diagnostic["status"] == status
+    row = await _row(manager)
+    assert row["status"] == status
+    assert row["lease_token"] == ""
+    assert row["retry_count"] == (1 if status == "retry_wait" else 0)
+    if status == "retry_wait":
+        assert row["lease_until"] >= time.time() + 1700
+    else:
+        assert row["lease_until"] == 0
+    if report is not None:
+        records = report["skipped_groups"] if status == "rejected" else report["processed_groups"]
+        assert records[0]["settlement_committed"] is True
+        assert report["errors"] == []
+
+
+@pytest.mark.parametrize("entry", ["backlog", "realtime"])
+@pytest.mark.parametrize("status", ["succeeded", "rejected", "retry_wait"])
+@pytest.mark.parametrize("pending_failure", ["capacity", "storage"])
+async def test_unconfirmed_commit_does_not_claim_pending_is_durable(manager, entry, status, pending_failure, monkeypatch, caplog):
+    if status != "succeeded":
+        result = {} if status == "rejected" else {"expression": {"status": "failed"}}
+        monkeypatch.setattr(manager, "process_logs_and_mine", AsyncMock(return_value=result))
+    monkeypatch.setattr(manager._task_ledger, "finish", AsyncMock(side_effect=RuntimeError("write failed")))
+    await manager._task_ledger._ensure_pending_settlement_schema()
+    if pending_failure == "capacity":
+        monkeypatch.setattr(manager._task_ledger, "PENDING_SETTLEMENT_MAX", 0)
+    else:
+        monkeypatch.setattr(manager._task_ledger, "enqueue_pending_settlement", AsyncMock(side_effect=RuntimeError("pending write failed")))
+    report = await _run(manager, entry)
+    diagnostic = manager.describe_learning_runtime()["mining"]["last_outcomes"][GROUP]["settlement"]
+    assert diagnostic["committed"] is False
+    assert diagnostic["status"] == status
+    assert "pending_durable" not in diagnostic
+    assert "durable enqueue unconfirmed" in caplog.text
+    assert (await manager._task_ledger.describe_pending_settlements())["pending_total"] == 0
+    row = await _row(manager)
+    assert row["status"] == "running"
+    assert row["retry_count"] == 0
+    assert manager._backlog_failure_counts == {}
+    assert manager._backlog_failure_until == {}
+    if report is not None:
+        records = report["skipped_groups"] if status == "rejected" else report["processed_groups"]
+        assert records[0]["settlement_committed"] is False
+        assert report["errors"] == []
+    if status == "succeeded":
+        assert manager._mining_cooldown_active(GROUP)
+        assert manager.db.marked == [1, 2, 3]
+        await _run(manager, entry)
+        manager.expression_miner.mine.assert_awaited_once()
+    else:
+        assert manager._last_mining_at[GROUP] == PREVIOUS_MINING_AT
+        assert float(manager.db.meta[manager._mining_timestamp_key(GROUP)]) == PREVIOUS_MINING_AT
+        manager.expression_miner.mine.assert_not_awaited()
+
+
+@pytest.mark.parametrize("missing", ["ledger", "lease"])
+async def test_no_lease_settlement_is_not_applicable(manager, missing):
+    lease = await manager._task_ledger.claim(
+        task_family="learning_mining", scope_id=GROUP, input_fingerprint="no-settlement",
+    )
+    if missing == "ledger":
+        manager._task_ledger = None
+    else:
+        lease = None
+    result = await manager._settle_mining_result(
+        GROUP, PREVIOUS_MINING_AT, lease, run_id="not-applicable", status="rejected", reason="mining_not_attempted",
+    )
+    assert result is None
+    diagnostic = manager.describe_learning_runtime()["mining"]["last_outcomes"][GROUP]["settlement"]
+    assert diagnostic["committed"] is None
+    assert manager._last_mining_at[GROUP] == PREVIOUS_MINING_AT
+
+
+async def test_legacy_ledger_without_task_identity_still_reports_commit(manager):
+    manager._task_ledger = SimpleNamespace(finish=AsyncMock(return_value=True))
+    result = await manager._settle_mining_result(
+        GROUP, PREVIOUS_MINING_AT, SimpleNamespace(), run_id="legacy-run", status="succeeded", reason="",
+    )
+    assert result is True
+    diagnostic = manager._last_mining_outcomes[GROUP]["settlement"]
+    assert diagnostic["committed"] is True
+    assert diagnostic["task_id"] == ""
+    manager._task_ledger.finish.assert_awaited_once()
+
+
+@pytest.mark.parametrize("entry", ["backlog", "realtime"])
+async def test_settlement_warning_failure_does_not_rewrite_completed_work(manager, entry, monkeypatch):
+    import astrmai.learning.evolution_manager as module
+
+    finish = AsyncMock(side_effect=RuntimeError("storage failed"))
+    monkeypatch.setattr(manager._task_ledger, "finish", finish)
+    monkeypatch.setattr(module.logger, "warning", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("logging failed")))
+    report = await _run(manager, entry)
+    assert finish.await_count == 3
+    assert (await _row(manager))["status"] == "running"
+    diagnostic = manager.describe_learning_runtime()["mining"]["last_outcomes"][GROUP]["settlement"]
+    assert diagnostic["committed"] is False
+    assert diagnostic["logging_error_type"] == "RuntimeError"
+    assert manager.db.marked == [1, 2, 3]
+    assert manager._mining_cooldown_active(GROUP)
+    if report is not None:
+        assert report["errors"] == []
+    await _run(manager, entry)
+    manager.expression_miner.mine.assert_awaited_once()
+
+
+async def test_report_failure_after_unconfirmed_commit_does_not_repeat_settlement(manager, monkeypatch):
+    import astrmai.learning.evolution_manager as module
+
+    finish = AsyncMock(side_effect=RuntimeError("storage failed"))
+    monkeypatch.setattr(manager._task_ledger, "finish", finish)
+    monkeypatch.setattr(module.logger, "info", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("report failed")))
+    report = await _run(manager, "backlog")
+    assert report["errors"][0]["error"] == "report failed"
+    assert report["processed_groups"][0]["settlement_committed"] is False
+    assert finish.await_count == 3
+    assert manager._mining_cooldown_active(GROUP)
+    assert manager._backlog_failure_counts == {}
+    with sqlite3.connect(manager._task_ledger.db_path) as connection:
+        status = connection.execute("SELECT status FROM background_task_pending_settlements").fetchone()[0]
+    assert status == "succeeded"
+    await _run(manager, "backlog")
+    manager.expression_miner.mine.assert_awaited_once()
+
+
+@pytest.mark.parametrize("committed", [True, False])
+async def test_cancellation_after_settlement_returns_preserves_commit_result(manager, committed, monkeypatch):
+    import astrmai.learning.evolution_manager as module
+
+    finish = AsyncMock(wraps=manager._task_ledger.finish) if committed else AsyncMock(side_effect=RuntimeError("storage failed"))
+    monkeypatch.setattr(manager._task_ledger, "finish", finish)
+    monkeypatch.setattr(module.logger, "info", lambda *_args, **_kwargs: (_ for _ in ()).throw(asyncio.CancelledError()))
+    with pytest.raises(asyncio.CancelledError):
+        await _run(manager, "backlog")
+    assert (await _row(manager))["status"] == ("succeeded" if committed else "running")
+    assert finish.await_count == (1 if committed else 3)
+    assert manager._last_mining_outcomes[GROUP]["settlement"]["committed"] is committed
+    assert (await manager._task_ledger.describe_pending_settlements())["pending_total"] == (0 if committed else 1)
+    assert manager.db.marked == [1, 2, 3]
+    await _run(manager, "backlog")
+    manager.expression_miner.mine.assert_awaited_once()
+
+
+async def _record_pipeline_diagnostic(manager, *, group_id, run_id, pipeline):
+    return await manager._record_pipeline_state(
+        run_id=run_id,
+        pipeline=pipeline,
+        group_id=group_id,
+        logs=manager.db.logs,
+        batch_id=f"batch:{run_id}",
+        status="completed",
+        reason="",
+        cursor_before=0,
+        cursor_after=3,
+        retained_count=2,
+        report={},
+        persist_run=False,
+    )
+
+
+async def test_pipeline_diagnostics_share_one_group_slot_and_preserve_settlement(manager):
+    await manager._settle_mining_result(
+        GROUP, PREVIOUS_MINING_AT, None,
+        run_id="shared-run", status="succeeded", reason="",
+    )
+    await _record_pipeline_diagnostic(
+        manager, group_id=GROUP, run_id="shared-run", pipeline="expression",
+    )
+    await _record_pipeline_diagnostic(
+        manager, group_id=GROUP, run_id="shared-run", pipeline="jargon",
+    )
+
+    assert list(manager._last_mining_outcomes) == [GROUP]
+    assert set(manager._last_mining_outcomes[GROUP]["pipelines"]) == {"expression", "jargon"}
+    assert manager._last_mining_outcomes[GROUP]["settlement"]["run_id"] == "shared-run"
+
+
+async def test_pipeline_diagnostics_retain_twenty_groups_not_twenty_mixed_entries(manager):
+    for index in range(20):
+        group_id = f"offline:GroupMessage:{index}"
+        run_id = f"run-{index}"
+        await manager._settle_mining_result(
+            group_id, 0.0, None, run_id=run_id, status="succeeded", reason="",
+        )
+        await _record_pipeline_diagnostic(
+            manager, group_id=group_id, run_id=run_id, pipeline="expression",
+        )
+        await _record_pipeline_diagnostic(
+            manager, group_id=group_id, run_id=run_id, pipeline="jargon",
+        )
+
+    assert len(manager._last_mining_outcomes) == 20
+    assert "offline:GroupMessage:0" in manager._last_mining_outcomes
+    assert all(
+        set(outcome["pipelines"]) == {"expression", "jargon"}
+        and outcome["settlement"]["run_id"] == outcome["run_id"]
+        for outcome in manager._last_mining_outcomes.values()
+    )
+
+    await _record_pipeline_diagnostic(
+        manager,
+        group_id="offline:GroupMessage:20",
+        run_id="run-20",
+        pipeline="expression",
+    )
+    assert len(manager._last_mining_outcomes) == 20
+    assert "offline:GroupMessage:0" not in manager._last_mining_outcomes
+    assert "offline:GroupMessage:20" in manager._last_mining_outcomes
+
+
+async def test_pipeline_diagnostic_new_run_does_not_inherit_previous_run_state(manager):
+    await manager._settle_mining_result(
+        GROUP, PREVIOUS_MINING_AT, None,
+        run_id="old-run", status="succeeded", reason="",
+    )
+    await _record_pipeline_diagnostic(
+        manager, group_id=GROUP, run_id="old-run", pipeline="expression",
+    )
+    await _record_pipeline_diagnostic(
+        manager, group_id=GROUP, run_id="new-run", pipeline="jargon",
+    )
+
+    outcome = manager.describe_learning_runtime()["mining"]["last_outcomes"][GROUP]
+    assert outcome["run_id"] == "new-run"
+    assert set(outcome["pipelines"]) == {"jargon"}
+    assert "settlement" not in outcome
+
+
+async def test_settlement_diagnostics_are_bounded_and_do_not_reuse_another_run(manager):
+    for index in range(25):
+        await manager._settle_mining_result(
+            f"offline:GroupMessage:{index}", 0.0, None,
+            run_id=f"run-{index}", status="succeeded", reason="",
+        )
+    assert len(manager._last_mining_outcomes) == 20
+    assert "offline:GroupMessage:0" not in manager._last_mining_outcomes
+    manager._last_mining_outcomes[GROUP] = {"run_id": "previous-run", "pipelines": {"expression": {"status": "completed"}}}
+    await manager._settle_mining_result(
+        GROUP, PREVIOUS_MINING_AT, None, run_id="new-run", status="rejected", reason="mining_not_attempted",
+    )
+    assert "pipelines" not in manager._last_mining_outcomes[GROUP]
+    assert manager._last_mining_outcomes[GROUP]["run_id"] == "new-run"
+
+
+async def test_settlement_keeps_latest_diagnostic_when_existing_report_cache_is_large(manager):
+    manager._last_mining_outcomes[GROUP] = {"run_id": "current-run", "pipelines": {"expression": {"status": "completed"}}}
+    for index in range(30):
+        manager._last_mining_outcomes[f"old-group-{index}"] = {"run_id": f"old-run-{index}"}
+    await manager._settle_mining_result(
+        GROUP, PREVIOUS_MINING_AT, None, run_id="current-run", status="succeeded", reason="",
+    )
+    assert len(manager._last_mining_outcomes) == 20
+    assert manager._last_mining_outcomes[GROUP]["settlement"]["committed"] is None
+    assert manager._last_mining_outcomes[GROUP]["pipelines"]["expression"]["status"] == "completed"
+
+
+@pytest.mark.parametrize("source", ["startup", "worker", "shutdown"])
+@pytest.mark.parametrize("status", ["succeeded", "rejected", "retry_wait"])
+async def test_scheduler_recovers_real_mining_settlement_without_provider_retry(manager, source, status, monkeypatch):
+    from astrmai.proactive.proactive_task import ProactiveTask
+    import astrmai.proactive.proactive_task as module
+
+    finish = manager._task_ledger.finish
+    monkeypatch.setattr(manager._task_ledger, "finish", AsyncMock(side_effect=RuntimeError("storage failed")))
+    if status != "succeeded":
+        result = {} if status == "rejected" else {"expression": {"status": "failed"}}
+        monkeypatch.setattr(manager, "process_logs_and_mine", AsyncMock(return_value=result))
+    await _run(manager, "backlog")
+    assert (await manager._task_ledger.describe_pending_settlements())["pending_total"] == 1
+    provider_calls = manager.expression_miner.mine.await_count
+    monkeypatch.setattr(manager._task_ledger, "finish", finish)
+
+    task = ProactiveTask.__new__(ProactiveTask)
+    task._task_ledger = manager._task_ledger
+    task._is_running = False
+    task._task = None
+    task._settlement_recovery_task = None
+    task._background_tasks = set()
+    task._background_task_stats = {}
+    task._maintenance_tasks = {}
+    task._lease_settlement_tasks = set()
+    task._kernel_signal_tasks = {}
+    task.scheduled_scenario_service = None
+    task.dream_agent = object()
+    task.proactive_dispatcher = SimpleNamespace(shutdown=AsyncMock())
+    task._load_profile_scheduler_state = lambda: None
+    task._persist_profile_scheduler_state = AsyncMock()
+
+    async def idle():
+        await asyncio.Event().wait()
+
+    task._loop = idle
+    sources = []
+    replay = task._replay_pending_lease_settlements
+
+    async def capture_source(*, source):
+        sources.append(source)
+        result = await replay(source=source)
+        if source == "worker":
+            task._is_running = False
+        return result
+
+    task._replay_pending_lease_settlements = capture_source
+    if source == "startup":
+        try:
+            await task.start()
+            assert sources == ["startup"]
+            assert (await _row(manager))["status"] == status
+        finally:
+            await task.stop()
+    elif source == "worker":
+        sleeps = []
+
+        async def tick(delay):
+            sleeps.append(delay)
+
+        # Replace only this module's binding, not the shared asyncio.sleep.
+        monkeypatch.setattr(module, "asyncio", SimpleNamespace(**{**vars(asyncio), "sleep": tick}))
+        task._is_running = True
+        await task._settlement_recovery_loop()
+        assert sleeps == [30.0]
+        assert sources == ["worker"]
+    else:
+        task._is_running = True
+        await task.stop()
+        assert sources == ["shutdown"]
+    assert (await _row(manager))["status"] == status
+    assert (await manager._task_ledger.describe_pending_settlements())["pending_total"] == 0
+    assert manager.expression_miner.mine.await_count == provider_calls
+    assert manager._mining_cooldown_active(GROUP) == (status == "succeeded")

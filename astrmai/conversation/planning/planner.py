@@ -6,7 +6,7 @@ import json
 import random
 import re
 import time
-from typing import List
+from typing import Any, List
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent

@@ -4,6 +4,8 @@ import asyncio
 import time
 from typing import Dict
 
+from astrbot.api import logger
+
 from .instant_memory_gate import InstantMemoryGate
 from .session_memory_summarizer import SessionMemorySummarizer, uuid4_short
 from ...shared.helpers.plugin_helpers import safe_create_task

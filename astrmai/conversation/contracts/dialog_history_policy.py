@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 
 HistoryMode = Literal["none", "current_topic", "explicit_recall", "recent_only", "background"]
@@ -50,7 +50,7 @@ class DialogHistoryPolicy:
         except (TypeError, ValueError):
             topic_age_seconds = 0.0
         return cls(
-            history_mode=mode,
+            history_mode=cast(HistoryMode, mode),
             group_id=str(value.get("group_id", "") or "").strip(),
             thread_key=str(value.get("thread_key", "") or "").strip(),
             topic_epoch=topic_epoch,

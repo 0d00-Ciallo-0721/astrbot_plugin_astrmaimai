@@ -4,7 +4,7 @@ import asyncio
 import time
 from enum import Enum
 from importlib import import_module
-from typing import Any, List, Tuple
+from typing import Any, Iterable, List, Tuple, cast
 
 from astrbot.api import logger as _astrbot_logger
 
@@ -31,7 +31,7 @@ def format_model_pool(models: List[str], default: str = "Unconfigured") -> str:
 def safe_create_task(
     coro,
     name: str = "",
-    track_set: set = None,
+    track_set: set | None = None,
     *,
     event: Any = None,
     task_name: str | None = None,
@@ -83,11 +83,11 @@ def safe_create_task(
         )
     if owns_loop:
         try:
-            loop.run_until_complete(task)
+            cast(asyncio.AbstractEventLoop, loop).run_until_complete(task)
         except Exception:
             pass
         finally:
-            loop.close()
+            cast(asyncio.AbstractEventLoop, loop).close()
     return task
 
 
@@ -106,7 +106,7 @@ def extract_result_text(result: Any) -> str:
     if isinstance(chain, str):
         return chain
     if hasattr(chain, "__iter__"):
-        for comp in chain:
+        for comp in cast(Iterable[Any], chain):
             if hasattr(comp, "text"):
                 reply_text += str(comp.text)
             elif isinstance(comp, str):

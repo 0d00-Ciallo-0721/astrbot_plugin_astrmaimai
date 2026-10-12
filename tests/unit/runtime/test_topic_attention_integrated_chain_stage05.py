@@ -300,8 +300,8 @@ class IntegratedChainStage05Tests(unittest.TestCase):
             300: ("", "same_topic"),
             1210: ("weak_window_evidence", "same_topic"),
             1750: ("weak_window_evidence", "same_topic"),
-            1810: ("topic_stale", "no_source_anchor"),
-            3600: ("topic_stale", "no_source_anchor"),
+            1810: ("idle_history_evidence", "expired"),
+            3600: ("idle_history_evidence", "expired"),
         }
         for gap, (rotation_reason, bridge_reason) in expectations.items():
             with self.subTest(gap=gap):
@@ -318,7 +318,7 @@ class IntegratedChainStage05Tests(unittest.TestCase):
         decision = case["decision"]
         self.assertFalse(case["bridge_branch_taken"])
         self.assertFalse(decision.allowed)
-        self.assertEqual(decision.reason, "no_source_anchor")
+        self.assertEqual(decision.reason, "expired")
 
     def test_stale_topic_boundary_does_not_inject_expired_context(self):
         """The real loader must not inject expired context."""

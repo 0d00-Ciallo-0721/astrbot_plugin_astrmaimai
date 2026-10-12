@@ -493,7 +493,8 @@ class S519IndependentAcceptanceTests(unittest.TestCase):
             rotation_reason="explicit_history_recall",
         )
         self.assertFalse(swept.allowed)
-        self.assertEqual(swept.reason, "no_source_anchor")
+        self.assertEqual(swept.reason, "expired")
+        self.assertEqual(swept.prompt_text(), "")
 
     def test_bot_quote_still_denied_for_cross_chat_guarded_duplicate_and_stale_source(self):
         self._record_previous_topic(outbound_ids=("bot-500",))

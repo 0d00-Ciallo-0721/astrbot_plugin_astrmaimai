@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, List, Optional
+from typing import Any, List, Optional, TYPE_CHECKING
 
 from astrbot.api import logger
 
 from .turn_call_ledger import clamp_timeout_to_turn_budget
 from .runtime_contracts import VisibleReplyArtifact
+
+if TYPE_CHECKING:
+    from .lane_manager import LaneKey, LanePolicy
 
 
 class LaneStorageMixin:

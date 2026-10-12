@@ -2436,4 +2436,4 @@ class PlannerSideInputMixin:
         return None
 
 
-__all__ = ["Planner"]
+__all__ = ["PlannerSideInputMixin"]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import re
@@ -212,6 +213,26 @@ def validate_release_candidate(output_dir: Path) -> list[str]:
                 continue
             if any(pattern.search(content) for pattern in FORBIDDEN_TEXT_PATTERNS):
                 errors.append(f"sensitive or machine-local text: {relative.as_posix()}")
+            # Host installs the runtime below data.plugins.<plugin>.astrmai.
+            # Walk nested imports too; a lazy import can pass module smoke tests.
+            # Root main/config standalone fallbacks are outside this package.
+            if path.suffix.lower() == ".py" and relative.parts[0] == "astrmai":
+                try:
+                    tree = ast.parse(content, filename=relative.as_posix())
+                except SyntaxError as exc:
+                    errors.append(f"invalid runtime Python: {relative.as_posix()}:{exc.lineno}")
+                else:
+                    for node in ast.walk(tree):
+                        modules = []
+                        if isinstance(node, ast.Import):
+                            modules = [alias.name for alias in node.names]
+                        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                            modules = [node.module]
+                        for module in modules:
+                            if module == "astrmai" or module.startswith("astrmai."):
+                                errors.append(
+                                    f"absolute internal import: {relative.as_posix()}:{node.lineno}: {module}"
+                                )
         classification, _ = _classify_included(relative.as_posix())
         if classification not in {"runtime", "page", "resource"}:
             errors.append(f"unknown release classification: {relative.as_posix()}")

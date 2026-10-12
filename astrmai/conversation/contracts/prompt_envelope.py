@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from .focus_context import FreshnessState, ReplyMode
 from .context_package import ContextPackage, escape_untrusted_text

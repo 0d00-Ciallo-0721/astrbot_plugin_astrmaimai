@@ -3,11 +3,14 @@ from __future__ import annotations
 import json
 import time
 from time import monotonic
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, TYPE_CHECKING
 from uuid import uuid4
 
 from .orm_models import ChatState, LastMessageMetadata
 from .sqlite_helpers import connect_aiosqlite, connect_sqlite
+
+if TYPE_CHECKING:
+    from .orm_models import UserProfile
 
 
 class StateProfilePersistenceMixin:

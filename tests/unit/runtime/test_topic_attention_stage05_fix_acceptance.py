@@ -286,8 +286,8 @@ class Stage05FixAcceptanceTests(unittest.TestCase):
             119: (True, "explicit_reply"),
             120: (False, "expired"),
             121: (False, "expired"),
-            1810: (False, "no_source_anchor"),
-            1900: (False, "no_source_anchor"),
+            1810: (False, "expired"),
+            1900: (False, "expired"),
         }
         for gap, (allowed, reason) in expected.items():
             with self.subTest(gap=gap):

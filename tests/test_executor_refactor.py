@@ -9,12 +9,17 @@ from types import SimpleNamespace
 
 from tests.helpers.astrbot_stubs import install_astrbot_stubs
 from tests.helpers.executor_stubs import install_executor_stubs
+from tests.helpers.atwake_stage00_fixtures import executor_fixture
 
 
 class CanonicalToolSetAliasTests(unittest.TestCase):
+    def setUp(self):
+        self.executor_context = executor_fixture()
+        self.executor_mod = self.executor_context.__enter__()
+        self.addCleanup(self.executor_context.__exit__, None, None, None)
+
     def test_aliases_are_deduplicated_from_schema_and_lookup(self):
-        install_astrbot_stubs(tempfile.mkdtemp())
-        mod = importlib.import_module("astrmai.conversation.execution.executor")
+        mod = self.executor_mod
         canonical = SimpleNamespace(name="message_emoji_reaction_action", description="", parameters={})
         legacy = SimpleNamespace(name="message_reaction_action", description="", parameters={})
         tool_set = mod.CanonicalToolSet([])
@@ -26,8 +31,7 @@ class CanonicalToolSetAliasTests(unittest.TestCase):
         self.assertEqual([tool.name for tool in tool_set.tools], ["message_emoji_reaction_action"])
 
     def test_alias_only_input_exposes_canonical_schema_name(self):
-        install_astrbot_stubs(tempfile.mkdtemp())
-        mod = importlib.import_module("astrmai.conversation.execution.executor")
+        mod = self.executor_mod
         legacy = SimpleNamespace(name="message_reaction_action", description="", parameters={})
 
         tool_set = mod.CanonicalToolSet([legacy])
@@ -39,8 +43,7 @@ class CanonicalToolSetAliasTests(unittest.TestCase):
         self.assertIsNot(tool_set.tools[0], legacy)
 
     def test_native_canonical_instance_wins_over_legacy_regardless_of_order(self):
-        install_astrbot_stubs(tempfile.mkdtemp())
-        mod = importlib.import_module("astrmai.conversation.execution.executor")
+        mod = self.executor_mod
         legacy = SimpleNamespace(
             name="message_reaction_action",
             description="legacy description",
@@ -61,8 +64,7 @@ class CanonicalToolSetAliasTests(unittest.TestCase):
         self.assertEqual(tool_set.tools[0].parameters, {"properties": {"emoji": {}}})
 
     def test_add_tool_native_canonical_replaces_legacy_wrapper(self):
-        install_astrbot_stubs(tempfile.mkdtemp())
-        mod = importlib.import_module("astrmai.conversation.execution.executor")
+        mod = self.executor_mod
         legacy = SimpleNamespace(name="message_reaction_action", description="legacy", parameters={})
         canonical = SimpleNamespace(name="message_emoji_reaction_action", description="native", parameters={})
 
@@ -73,8 +75,7 @@ class CanonicalToolSetAliasTests(unittest.TestCase):
         self.assertEqual(tool_set.tools[0].description, "native")
 
     def test_add_tool_legacy_does_not_replace_native_canonical(self):
-        install_astrbot_stubs(tempfile.mkdtemp())
-        mod = importlib.import_module("astrmai.conversation.execution.executor")
+        mod = self.executor_mod
         canonical = SimpleNamespace(name="message_emoji_reaction_action", description="native", parameters={})
         legacy = SimpleNamespace(name="message_reaction_action", description="legacy", parameters={})
 
@@ -84,8 +85,7 @@ class CanonicalToolSetAliasTests(unittest.TestCase):
         self.assertIs(tool_set.tools[0], canonical)
 
     def test_constructor_internal_type_error_is_not_retried(self):
-        install_astrbot_stubs(tempfile.mkdtemp())
-        mod = importlib.import_module("astrmai.conversation.execution.executor")
+        mod = self.executor_mod
         calls = []
         original_init = mod.ToolSet.__init__
 

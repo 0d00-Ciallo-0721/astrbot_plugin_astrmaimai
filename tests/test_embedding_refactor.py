@@ -1,10 +1,5 @@
 import asyncio
-import tempfile
 import unittest
-
-from tests.helpers.astrbot_stubs import install_astrbot_stubs
-
-install_astrbot_stubs(tempfile.mkdtemp(prefix="astrmai-embedding-"))
 
 from astrmai.memory.retrieval.embedding import EmbeddingClient
 

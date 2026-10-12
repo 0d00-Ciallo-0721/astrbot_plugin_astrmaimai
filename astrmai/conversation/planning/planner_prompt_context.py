@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import time
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
@@ -18,6 +18,7 @@ from ..contracts.context_package import ContextBlock, ContextPackage
 from ..contracts.dialog_history_policy import DialogHistoryPolicy, POLICY_EVENT_KEY
 from ..contracts.focus_context import FocusThreadContext, FreshnessState, ReplyMode
 from ..contracts.prompt_envelope import PromptEnvelope
+from ..contracts.turn_target import TargetKind
 from ..reply_shape_policy import resolve_reply_shape_policy, set_reply_shape_policy
 from ..runtime.architecture_rollout import (
     ArchitectureTimer,
@@ -27,8 +28,18 @@ from ..runtime.architecture_rollout import (
 from .group_entity_resolution import event_group_id, resolve_group_references
 from .message_renderer import MessageRenderer
 
+if TYPE_CHECKING:
+    from config import AstrMaiConfig
+    from ...infrastructure.gateway.model_gateway import GlobalModelGateway
+    from .conversation_continuity import ConversationContinuityStore
+
 
 class PlannerPromptContextMixin:
+    if TYPE_CHECKING:
+        gateway: GlobalModelGateway
+        config: AstrMaiConfig
+        conversation_continuity: ConversationContinuityStore
+
     def _resolve_group_history_policy(
         self,
         *,
@@ -248,7 +259,6 @@ class PlannerPromptContextMixin:
         reply_target_name = ""
 
         if turn_target is not None:
-            from astrmai.conversation.contracts.turn_target import TargetKind
             if getattr(turn_target, "target_kind", None) == TargetKind.MESSAGE:
                 reply_target_id = str(getattr(turn_target, "target_actor_id", "") or "").strip()
                 reply_target_name = str(getattr(turn_target, "target_actor_name", "") or "").strip()

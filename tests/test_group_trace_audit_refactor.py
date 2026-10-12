@@ -1,9 +1,39 @@
 import importlib
 import json
 import unittest
+from unittest.mock import patch
 
 
 class GroupTraceAuditRefactorTests(unittest.TestCase):
+    def test_provider_uses_bounded_httpx_client_for_completion_and_model_list(self):
+        import httpx
+
+        audit_mod = importlib.import_module("tests.manual.group_trace_audit")
+        calls = []
+
+        def respond(request):
+            calls.append(request)
+            if request.method == "POST":
+                return httpx.Response(200, json={"choices": [{"message": {"content": "reply"}}]})
+            return httpx.Response(200, json={"data": [{"id": "model-a"}]})
+
+        original_client = httpx.Client
+
+        def client(**kwargs):
+            self.assertEqual(kwargs["timeout"], 2.0)
+            return original_client(transport=httpx.MockTransport(respond), **kwargs)
+
+        provider = audit_mod.OpenAICompatibleReplyProvider(
+            base_url="https://provider.invalid", api_key="test-only", timeout_seconds=2.0
+        )
+        with patch.object(httpx, "Client", side_effect=client):
+            result = provider._generate_reply_sync([{"role": "user", "content": "hello"}], "model-a", {})
+            models = provider._list_models_sync()
+        self.assertEqual(result.text, "reply")
+        self.assertEqual(models, ["model-a"])
+        self.assertEqual([call.method for call in calls], ["POST", "GET"])
+        self.assertEqual([call.url.path for call in calls], ["/v1/chat/completions", "/v1/models"])
+
     def test_group_trace_audit_metrics_and_summary_include_failure_evidence(self):
         audit_mod = importlib.import_module("tests.manual.group_trace_audit")
         records = [

@@ -126,7 +126,7 @@ class ProactiveSpeakerBlockTests(unittest.TestCase):
             is_lightweight_event=False,
         )
 
-        self.assertIn("QQ: 111", block)
+        self.assertIn("实际发言人：真人(QQ:111)", block)
 
 
 class PokeUnknownTargetTests(unittest.TestCase):

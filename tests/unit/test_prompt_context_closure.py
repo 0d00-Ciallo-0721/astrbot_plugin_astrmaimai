@@ -209,22 +209,23 @@ async def test_idle_history_reaches_planner_envelope(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_restart_restores_recent_count_without_time_limit(tmp_path):
-    source = GroupDialogueStore(snapshot_dir=tmp_path, restore_recent_message_limit=5)
-    for index in range(10):
+@pytest.mark.parametrize("count,limit", [(10, 5), (100, 20)])
+async def test_restart_restores_recent_count_without_time_limit(tmp_path, count, limit):
+    source = GroupDialogueStore(snapshot_dir=tmp_path, restore_recent_message_limit=limit)
+    for index in range(count):
         await source.append_segment("group", event_id=str(index), speaker_id="alice", content=f"history-{index}", timestamp=1000 + index)
     assert await source.persist_snapshot()
-    restored = GroupDialogueStore(snapshot_dir=tmp_path, restore_recent_message_limit=5)
+    restored = GroupDialogueStore(snapshot_dir=tmp_path, restore_recent_message_limit=limit)
     assert await restored.restore_snapshot() == 1
     thread = restored._threads["group"]
-    assert [item.event_id for item in thread.segments] == ["5", "6", "7", "8", "9"]
+    assert [item.event_id for item in thread.segments] == [str(index) for index in range(count - limit, count)]
     assert await restored.restore_snapshot() == 1
-    assert len(thread.segments) == 5
+    assert len(thread.segments) == limit
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("restart", [False, True])
-async def test_real_store_history_reaches_final_prompt(tmp_path, monkeypatch, restart):
+async def test_real_store_history_reaches_final_prompt(tmp_path, monkeypatch, restart, record_property):
     from astrmai.conversation.planning.prompt_refiner import PromptRefiner
 
     monkeypatch.setattr(continuity_module.time, "time", lambda: 11860)
@@ -261,6 +262,9 @@ async def test_real_store_history_reaches_final_prompt(tmp_path, monkeypatch, re
     assert "SECRET OTHER GROUP" not in prompt
     assert "HIDDEN SESSION" not in prompt
     assert result["dialog_history_policy"].history_mode == "recent_only"
+    record_property("replay_scenario", "group_restart" if restart else "group_idle_31_minutes")
+    record_property("final_prompt", prompt)
+    record_property("stable_system_prompt", system)
     if restart:
         assert result["dialog_history_policy"].topic_age_seconds == 10859
     planner._get_recent_dialogue_transcript.assert_not_awaited()
@@ -298,10 +302,11 @@ async def test_restore_bootstrap_grace_does_not_reopen_forever(tmp_path, monkeyp
     assert not bundle.quote_text and not bundle.summary_text
 
 
-def test_installed_astrbot_components_through_final_prompt(tmp_path):
+def test_installed_astrbot_components_through_final_prompt(tmp_path, record_property):
     """A clean process loads installed components, not another suite's AstrBot stubs."""
     source = r'''
 import asyncio
+import json
 from types import SimpleNamespace
 from astrbot.api.message_components import At, Plain, Reply
 from astrbot.core.message.components import ComponentType
@@ -358,7 +363,12 @@ async def run():
     assert "实际发言人：Bob" not in prompt
     assert "当前唯一对话对象是 Alice（QQ 111）" in prompt
     assert target.target_actor_id == "222"
+    prompt_samples = {"quote_third_party_and_at_other": prompt}
     for text, chain, expected in [
+        ("", [Reply(id="bot-old", sender_id="999", message_str="quoted answer")], False),
+        (" \u200b\ufeff", [Reply(id="bot-old", sender_id="999"), Plain(" \u200b\ufeff")], False),
+        ("@Carol(333)", [Reply(id="bot-old", sender_id="999"), At(qq="333", name="Carol")], False),
+        ("？", [Reply(id="bot-old", sender_id="999"), Plain("？")], True),
         ("Mai在吗", [At(qq="333", name="Carol"), Plain("Mai在吗")], False),
         ("Mai hello", [Plain("Mai hello")], True),
         ("hello", [At(qq="999"), Plain("hello")], True),
@@ -370,6 +380,18 @@ async def run():
         assert await sensors.should_process_message(sample)
         candidate = build_normalized_events(gate, [sample], "999")[0]
         assert (candidate.is_direct_wakeup or candidate.is_reply_to_bot) == expected
+        if text == "Mai在吗":
+            sample_target, sample_actors = resolve_turn_target(candidate, None, [candidate], bot_id="999")
+            sample.set_extra("astrmai_focus_thread_context", FocusThreadContext(
+                focus_event=sample, focus_message_text=sample.message_str,
+                turn_target=sample_target, actor_set=sample_actors))
+            result = await planner._build_planning_context(sample, [sample], sample.unified_msg_origin)
+            system, final = await PromptRefiner(memory_engine=None).refine_prompt(
+                sample, "stable system", context={"disable_rag_injection": True}, prompt_envelope=result["prompt_envelope"])
+            assert system == "stable system"
+            assert "实际发言人：Alice" in final and "333" in final
+            prompt_samples["at_other_and_bot_nickname"] = final
+    print("prompt_samples=" + json.dumps(prompt_samples, ensure_ascii=False))
     print("installed_components_to_final_prompt_ok")
 asyncio.run(run())
 '''
@@ -379,3 +401,46 @@ asyncio.run(run())
                             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "installed_components_to_final_prompt_ok" in result.stdout
+    samples = next(line.removeprefix("prompt_samples=") for line in result.stdout.splitlines()
+                   if line.startswith("prompt_samples="))
+    record_property("installed_component_prompts", samples)
+
+
+@pytest.mark.asyncio
+async def test_private_followup_reaches_final_prompt_with_existing_ttl(monkeypatch, record_property):
+    from config import AstrMaiConfig
+    from astrmai.infrastructure.runtime.lane_manager import LaneManager
+    from astrmai.conversation.planning.prompt_refiner import PromptRefiner
+
+    now = 10000
+    monkeypatch.setattr(continuity_module.time, "time", lambda: now)
+    event = Event("安装之后呢？")
+    event.unified_msg_origin = "offline:FriendMessage:alice"
+    event.get_group_id = lambda: ""
+    config = AstrMaiConfig()
+    lanes = LaneManager(conversation_manager=None, config=config)
+    history = [
+        {"role": "user", "content": "EXPIRED PRIVATE TEXT", "timestamp": now - 1801},
+        {"role": "user", "content": "Python library install", "sender_name": "Alice", "timestamp": now - 600},
+        {"role": "assistant", "content": "pip install example", "timestamp": now - 599},
+    ]
+
+    async def load_lane(*, lane_key, base_origin):
+        assert base_origin == event.unified_msg_origin
+        assert lane_key.task_family == "dialog"
+        return "private-lane", "offline-conversation", history, False
+
+    monkeypatch.setattr(lanes, "_ensure_lane_with_timeout", load_lane)
+    planner = PlannerPromptContextMixin()
+    planner.config = config
+    planner.gateway = SimpleNamespace(config=config, lane_manager=lanes)
+    planner.conversation_continuity = seeded_store(event.unified_msg_origin)
+    result = await planner._build_planning_context(event, [event], event.unified_msg_origin)
+    system, prompt = await PromptRefiner(memory_engine=None).refine_prompt(
+        event, "stable system", context={"disable_rag_injection": True}, prompt_envelope=result["prompt_envelope"])
+    assert system == "stable system"
+    assert "Python library install" in prompt and "pip install example" in prompt
+    assert "EXPIRED PRIVATE TEXT" not in prompt
+    assert not result["dialog_history_policy"].group_id
+    record_property("replay_scenario", "private_followup")
+    record_property("final_prompt", prompt)

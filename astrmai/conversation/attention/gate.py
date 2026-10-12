@@ -6,9 +6,10 @@ import hashlib
 import inspect
 import re
 import time
+import unicodedata
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
-from typing import Any, Dict, List, Set
+from typing import Any, Callable, Dict, List, Mapping, Set, cast
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
@@ -1209,7 +1210,7 @@ class AttentionGate:
         session: SessionContext | None = None,
     ) -> int:
         tasks = []
-        sessions = []
+        sessions: list[SessionContext] = []
         for task in list(self._session_tasks):
             worker_context = getattr(task, "_worker_context", None)
             worker_chat_id = str(getattr(worker_context, "chat_id", "") or "")
@@ -1325,6 +1326,22 @@ class AttentionGate:
 
     def _is_reply_to_bot_event(self, event: AstrMessageEvent, self_id: str) -> bool:
         message = getattr(getattr(event, "message_obj", None), "message", None) or []
+        component_types = [message_component_type(component) for component in message]
+        followup_text = "".join(
+            str(getattr(component, "text", "") or "")
+            for component, kind in zip(message, component_types)
+            if kind == "plain"
+        )
+        # Some event producers expose text only through message_str. An At-only
+        # chain can render a name there, which is not a new reply body.
+        if "plain" not in component_types and "at" not in component_types:
+            followup_text = str(getattr(event, "message_str", "") or "")
+        has_followup = any(
+            not char.isspace() and unicodedata.category(char) not in {"Cf", "Cc"}
+            for char in followup_text
+        ) or any(kind in {"image", "record", "video", "file"} for kind in component_types)
+        if not has_followup:
+            return False
         bot_names = [
             str(name).strip()
             for name in getattr(
@@ -1519,7 +1536,7 @@ class AttentionGate:
     async def _run_managed_system2_task(self, coro, event, *, deferred_replay: bool = False):
         task = asyncio.current_task()
         if task is not None:
-            task._astrmai_diagnostic_event = event
+            setattr(task, "_astrmai_diagnostic_event", event)
         turn = event.get_extra("astrmai_turn_identity", None) if hasattr(event, "get_extra") else None
         coordinator = self.runtime_coordinator
         registered = True
@@ -1538,7 +1555,7 @@ class AttentionGate:
         if is_system2 and key is not None and self._is_strong_wakeup(event):
             if not event.get_extra("astrmai_atwake_replay_count", 0):
                 tracked = StrongWakeupHandoff(
-                    event, task, turn, time.monotonic() + self.STRONG_WAKEUP_HANDOFF_TTL_SECONDS,
+                    event, cast(asyncio.Task, task), turn, time.monotonic() + self.STRONG_WAKEUP_HANDOFF_TTL_SECONDS,
                 )
                 self._strong_wakeup_running[key] = tracked
                 while len(self._strong_wakeup_running) > self.STRONG_WAKEUP_HANDOFF_MAX:
@@ -1565,8 +1582,10 @@ class AttentionGate:
         finally:
             if coordinator is not None and hasattr(coordinator, "unregister_turn_task"):
                 await coordinator.unregister_turn_task(turn, task)
-            if tracked is not None and self._strong_wakeup_running.get(key) is tracked:
-                self._strong_wakeup_running.pop(key, None)
+            if tracked is not None:
+                tracked_key = cast(tuple[str, str], key)
+                if self._strong_wakeup_running.get(tracked_key) is tracked:
+                    self._strong_wakeup_running.pop(tracked_key, None)
             if is_system2 and (completed or event.get_extra("astrmai_reply_sent", False)
                               or event.get_extra("tool_actions_sent", False)):
                 try:
@@ -2122,18 +2141,18 @@ class AttentionGate:
                 return decision("stale", "session_identity_mismatch", kind="session_identity_mismatch", terminal=True)
             if bool(getattr(session, "closed", False)):
                 return decision("stale", "session_closed", kind="session_closed", terminal=True)
-            expected_generation = item.get("worker_generation")
-            if expected_generation is not None and int(getattr(session, "worker_generation", 0) or 0) != int(expected_generation):
+            expected_worker_generation = item.get("worker_generation")
+            if expected_worker_generation is not None and int(getattr(session, "worker_generation", 0) or 0) != int(expected_worker_generation):
                 return decision("superseded", "worker_generation_mismatch", kind="generation_mismatch", terminal=True)
         return decision()
 
     async def _dispatch_deferred_attention_work(self) -> None:
         while not self._workers_shutdown:
             if not self._deferred_attention_work:
-                event = self._deferred_attention_event or asyncio.Event()
-                self._deferred_attention_event = event
-                event.clear()
-                await event.wait()
+                wake_signal = self._deferred_attention_event or asyncio.Event()
+                self._deferred_attention_event = wake_signal
+                wake_signal.clear()
+                await wake_signal.wait()
                 continue
             now = time.time()
             item_key, item = min(
@@ -2478,6 +2497,7 @@ class AttentionGate:
             nonlocal admission_scope, on_budget_acquired
             if budget is not None:
                 scope_id = str(getattr(event, "unified_msg_origin", "") or "")
+                budget_parameters: Mapping[str, inspect.Parameter]
                 try:
                     budget_parameters = inspect.signature(budget.run).parameters
                 except (TypeError, ValueError):
@@ -2513,7 +2533,7 @@ class AttentionGate:
                     )
 
                 on_budget_acquired = _on_budget_acquired
-                run_kwargs = {"task_name": task_name}
+                run_kwargs: dict[str, str | float | Callable[[], None]] = {"task_name": task_name}
                 # Share the configured admission deadline across the local
                 # slot and global budget, without timing admitted execution.
                 if str(task_name or "").startswith("attention.") and supports_wait_timeout:
@@ -2814,8 +2834,8 @@ class AttentionGate:
                 deferred_metadata=deferred_metadata,
             )
         )
-        task._astrmai_inner_coro = coro
-        task._astrmai_task_name = task_name
+        setattr(task, "_astrmai_inner_coro", coro)
+        setattr(task, "_astrmai_task_name", task_name)
         self._background_tasks.add(task)
         self._register_owner_task(
             task,
@@ -2838,8 +2858,8 @@ class AttentionGate:
     def _fire_priority_task(self, coro, event=None):
         managed_coro = self._run_managed_system2_task(coro, event) if event is not None else coro
         task = asyncio.create_task(managed_coro)
-        task._astrmai_inner_coro = coro
-        task._astrmai_task_name = "attention.priority"
+        setattr(task, "_astrmai_inner_coro", coro)
+        setattr(task, "_astrmai_task_name", "attention.priority")
         self._background_tasks.add(task)
         self._register_owner_task(
             task,
@@ -2860,7 +2880,7 @@ class AttentionGate:
         self._background_tasks.discard(task)
         if task.cancelled():
             inner_coro = getattr(task, "_astrmai_inner_coro", None)
-            if hasattr(inner_coro, "close"):
+            if inner_coro is not None and hasattr(inner_coro, "close"):
                 inner_coro.close()
             return
         try:
@@ -2883,10 +2903,11 @@ class AttentionGate:
         generation: int | None = None,
     ):
         current_session = self.focus_pools.get(str(chat_id))
+        session_is_current = current_session is session
         if (
             self._workers_shutdown
             or session.closed
-            or current_session is not session
+            or not session_is_current
             or (generation is not None and generation != session.worker_generation)
         ):
             return None
@@ -2905,14 +2926,14 @@ class AttentionGate:
                 worker_event=event,
             )
         )
-        task._worker_context = SimpleNamespace(
+        setattr(task, "_worker_context", SimpleNamespace(
             chat_id=chat_id,
             session=session,
             self_id=self_id,
             event=event,
             generation=session.worker_generation,
             token=worker_token,
-        )
+        ))
         session.worker_task = task
         self._session_tasks.add(task)
         self._register_owner_task(
@@ -2933,7 +2954,7 @@ class AttentionGate:
     def _handle_session_worker_result(self, task: asyncio.Task):
         self._session_tasks.discard(task)
         worker_context = getattr(task, "_worker_context", None)
-        session = getattr(worker_context, "session", None)
+        session = cast(SessionContext | None, getattr(worker_context, "session", None))
         raw_generation = getattr(worker_context, "generation", None)
         raw_token = getattr(worker_context, "token", None)
         identity_valid = bool(
@@ -2954,7 +2975,7 @@ class AttentionGate:
         if session is not None and raw_token is not None and not identity_valid:
             self._worker_invariant_violation_count += 1
         if identity_valid:
-            session.worker_task = None
+            cast(SessionContext, session).worker_task = None
         if session is not None and session.closed:
             session.is_evaluating = False
         if task.cancelled():
@@ -3045,7 +3066,7 @@ class AttentionGate:
         self._background_tasks.discard(task)
         if task.cancelled():
             inner_coro = getattr(task, "_astrmai_inner_coro", None)
-            if hasattr(inner_coro, "close"):
+            if inner_coro is not None and hasattr(inner_coro, "close"):
                 inner_coro.close()
             return
         exc = task.exception()
@@ -4229,7 +4250,7 @@ class AttentionGate:
                 False,
             )
             try:
-                callback_kwargs = {
+                callback_kwargs: dict[str, str | bool | None] = {
                     "status": status,
                     "reply_text": reply_text,
                 }

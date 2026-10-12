@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import importlib
 import sys
 import time

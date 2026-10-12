@@ -1,4 +1,4 @@
-﻿from astrmai.conversation.planning.think_level_policy import ThinkLevelPolicy
+from astrmai.conversation.planning.think_level_policy import ThinkLevelPolicy
 from astrmai.conversation.contracts.turn_context import ensure_turn_context
 
 

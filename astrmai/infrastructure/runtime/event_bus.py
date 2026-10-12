@@ -3,6 +3,8 @@ import asyncio
 import uuid
 from typing import Callable, List, Dict, Any
 
+from astrbot.api import logger
+
 from ...shared.helpers.plugin_helpers import safe_create_task
 from .turn_call_ledger import detach_turn_telemetry
 

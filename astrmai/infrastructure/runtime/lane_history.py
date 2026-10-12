@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from typing import Any, List, Optional
+from typing import Any, List, Optional, TYPE_CHECKING
 
 from astrbot.api import logger
 
@@ -16,6 +16,10 @@ from ..gateway.output_guard import (
 
 
 from .lane_transcript import LaneTranscriptMixin
+
+if TYPE_CHECKING:
+    from .lane_manager import LaneKey, LanePolicy
+    from .runtime_contracts import SocialTranscriptTurn
 
 
 class LaneHistoryMixin(LaneTranscriptMixin):

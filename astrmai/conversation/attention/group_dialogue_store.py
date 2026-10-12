@@ -7,7 +7,7 @@ import re
 import time
 from dataclasses import dataclass, field, fields as dataclass_fields
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from astrbot.api import logger
 
@@ -1506,12 +1506,16 @@ class GroupDialogueStore:
             ("social_incidents", self._social_incidents, self._deserialize_social_incident),
         )
         for payload_key, target, deserializer in causal_specs:
+            causal_target = cast(
+                dict[str, list[PendingDirectItem | BotTurnRecord | SocialFeedbackRecord | GroupSocialIncident]],
+                target,
+            )
             for chat_id, items_payload in dict(payload.get(payload_key, {}) or {}).items():
                 try:
                     key = self._resolve_chat_key(chat_id)
                 except ValueError:
                     continue
-                items = []
+                causal_items: list[PendingDirectItem | BotTurnRecord | SocialFeedbackRecord | GroupSocialIncident] = []
                 for item_payload in list(items_payload or []):
                     item = deserializer(item_payload)
                     if item is None:
@@ -1538,29 +1542,29 @@ class GroupDialogueStore:
                         if now - feedback_at > SocialFeedbackAggregate.WINDOW_SECONDS:
                             diagnostics["dropped_expired_count"] += 1
                             continue
-                    items.append(item)
-                items = items[-80:]
-                if not items:
+                    causal_items.append(item)
+                causal_items = causal_items[-80:]
+                if not causal_items:
                     continue
                 async with self._lock:
-                    existing = {
+                    existing_causal = {
                         getattr(item, "pending_id", "")
                         or getattr(item, "turn_id", "")
                         or getattr(item, "feedback_id", "")
                         or getattr(item, "incident_id", ""): item
-                        for item in target.get(key, [])
+                        for item in causal_target.get(key, [])
                     }
-                    for item in items:
+                    for item in causal_items:
                         item_id = (
                             getattr(item, "pending_id", "")
                             or getattr(item, "turn_id", "")
                             or getattr(item, "feedback_id", "")
                             or getattr(item, "incident_id", "")
                         )
-                        existing.setdefault(item_id, item)
-                    target[key] = list(existing.values())[-80:]
+                        existing_causal.setdefault(item_id, item)
+                    causal_target[key] = list(existing_causal.values())[-80:]
                 restored_causal += 1
-                diagnostics["restored_count"] += len(items)
+                diagnostics["restored_count"] += len(causal_items)
                 restored_chat_ids.add(key)
                 if restored_causal % 16 == 0:
                     await asyncio.sleep(0.001)

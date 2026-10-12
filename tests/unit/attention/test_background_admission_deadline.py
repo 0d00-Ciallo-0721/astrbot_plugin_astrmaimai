@@ -28,9 +28,12 @@ async def test_real_group_route_execution_outlives_admission(admission, delay, r
     if route == "BUFFERED":
         event.message_str = "Please provide a detailed answer to this request"
     execute = h.runner._execute_planner
+    observed = {}
 
     async def slow(current, *args):
+        observed["started"] = time.monotonic()
         await asyncio.sleep(delay)
+        observed["elapsed"] = time.monotonic() - observed["started"]
         return await execute(current, *args)
 
     h.runner._execute_planner = slow
@@ -44,7 +47,8 @@ async def test_real_group_route_execution_outlives_admission(admission, delay, r
         assert not h.gate.background_task_budget._active_leases
         if route == "BUFFERED":
             assert event.get_extra("astrmai_background_execution_started") is True
-            assert event.get_extra("astrmai_background_execution_elapsed_sec") >= delay
+            assert event.get_extra("astrmai_background_execution_elapsed_sec") >= observed["elapsed"]
+            assert observed["elapsed"] > admission
     finally:
         await h.close()
 

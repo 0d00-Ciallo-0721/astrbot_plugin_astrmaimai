@@ -477,16 +477,15 @@ class RefactoredSystem2RunnerTests(unittest.TestCase):
         self.assertEqual(runtime.chat_loop_kernel.cooldowns[0][1:], ("followup", "followup_dispatch"))
         self.assertEqual(runtime.group_reply_wait_manager.events, [event])
         stages = event.get_extra("astrmai_stage_ledger", [])
-        self.assertEqual(stages[-4]["stage"], "system2.chat_lock_resolve")
-        self.assertEqual(stages[-4]["status"], "success")
-        self.assertEqual(stages[-3]["stage"], "system2.chat_lock_wait")
-        self.assertEqual(stages[-3]["status"], "success")
-        self.assertEqual(stages[-3]["metadata"]["thread_id"], "thread-a")
-        self.assertEqual(stages[-3]["metadata"]["lock_scope"], "chat")
-        self.assertEqual(stages[-2]["stage"], "system2.energy_prepare")
-        self.assertEqual(stages[-2]["status"], "success")
-        self.assertEqual(stages[-1]["stage"], "system2.lane_prepare")
-        self.assertEqual(stages[-1]["status"], "success")
+        self.assertEqual([stage["stage"] for stage in stages], [
+            "system2.chat_lock_resolve", "system2.chat_lock_wait",
+            "system2.energy_prepare", "system2.lane_prepare", "system2.planner",
+        ])
+        self.assertTrue(all(stage["status"] == "success" for stage in stages))
+        self.assertEqual(stages[1]["metadata"]["thread_id"], "thread-a")
+        self.assertEqual(stages[1]["metadata"]["lock_scope"], "chat")
+        terminal = [row for row in event.get_extra("astrmai_trace_log", []) if row["stage"] == "turn.terminal"]
+        self.assertEqual([row["status"] for row in terminal], ["reply_sent"])
 
     def test_runner_prewarms_same_topic_lane_as_executor(self):
         runner_mod = importlib.import_module("astrmai.conversation.execution.system2_runner")

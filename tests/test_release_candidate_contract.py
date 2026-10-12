@@ -20,6 +20,57 @@ from scripts.build_release_candidate import (
 
 
 class ReleaseCandidateContractTests(unittest.TestCase):
+    def test_candidate_speaker_prompt_uses_host_namespace(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            output = Path(temp_dir) / "data" / "plugins" / "astrmai"
+            build_release_candidate(output)
+            script = Path(__file__).resolve().parents[1] / "scripts/probe_host_import_shape.py"
+            result = subprocess.run(
+                [sys.executable, "-I", "-B", str(script), str(output)],
+                cwd=temp_dir,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+            report_line = next(
+                line for line in result.stdout.splitlines()
+                if line.startswith("ASTRMAI_IMPORT_SHAPE_REPORT=")
+            )
+            report = json.loads(report_line.split("=", 1)[1])
+            self.assertTrue(report["passed"])
+            self.assertEqual(
+                report["module"],
+                "data.plugins.astrmai.astrmai.conversation.planning.planner_prompt_context",
+            )
+            self.assertFalse(report["top_level_astrmai_available"])
+            self.assertFalse(report["live_host_verified"])
+            self.assertFalse(report["message_sent"])
+            self.assertEqual(validate_release_candidate(output), [])
+            self.assertEqual(validate_release_manifest(output, manifest_path_for(output)), [])
+
+    def test_release_validator_rejects_absolute_internal_imports(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            output = Path(temp_dir)
+            module = output / "astrmai" / "nested.py"
+            module.parent.mkdir()
+            for statement in (
+                "from astrmai.conversation.contracts.turn_target import TargetKind",
+                "import astrmai.conversation.contracts.turn_target",
+                "import astrmai",
+            ):
+                with self.subTest(statement=statement):
+                    module.write_text(f"def lazy():\n    {statement}\n", encoding="utf-8")
+                    self.assertTrue(
+                        any("absolute internal import" in error for error in validate_release_candidate(output)),
+                        "nested imports must be checked before packaging",
+                    )
+            module.write_text("from .contracts.turn_target import TargetKind\n", encoding="utf-8")
+            self.assertFalse(
+                any("absolute internal import" in error for error in validate_release_candidate(output))
+            )
+
     def test_release_candidate_contains_only_runtime_files_and_imports(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             output = Path(temp_dir) / "astrmai_release_candidate"

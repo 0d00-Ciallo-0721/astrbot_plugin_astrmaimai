@@ -3,7 +3,7 @@ import inspect
 import random
 import re
 import time
-from typing import List
+from typing import Any, List
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 import astrbot.api.message_components as Comp
@@ -211,7 +211,9 @@ class PreFilters:
             for raw_segment in raw_segments:
                 if not isinstance(raw_segment, dict) or str(raw_segment.get("type", "")).lower() != "image":
                     continue
-                raw_data = raw_segment.get("data") if isinstance(raw_segment.get("data"), dict) else raw_segment
+                raw_data = raw_segment.get("data")
+                if not isinstance(raw_data, dict):
+                    raw_data = raw_segment
                 refs = unique_image_refs(
                     raw_data.get(key)
                     for key in ("local_path", "path", "file", "file_id", "url", "file_unique")
@@ -285,7 +287,7 @@ class PreFilters:
         async def _scan_reply_chain(chain, reply_to_message_id: str = ""):
             """递归扫描引用链中的图片"""
             nonlocal reply_image_component_count
-            urls = []
+            urls: list[str] = []
             if not chain:
                 return urls
             for c in chain:
@@ -696,7 +698,7 @@ class PreFilters:
         [新增] 静默抽取社交互动关系，构建群组社交图谱
         返回格式: [(from_user, to_user, relation_type, strength_delta)]
         """
-        relations = []
+        relations: list[tuple[str, Any, str, float]] = []
         if not event.message_obj or not event.message_obj.message:
             return relations
             
@@ -715,14 +717,14 @@ class PreFilters:
                     # 注意：部分平台的 Reply 组件可能不直接提供 target_user_id，这里作示意
                     # 如果有具体的目标用户ID可以提取，则计入强度更高的回复关系
                     # 假设 AstrBot 的某些适配器在 Reply 中有 sender_id
-                    to_user = getattr(component, 'sender_id', None) 
-                    if to_user and to_user != from_user:
-                        relations.append((from_user, to_user, "reply", 0.3))
+                    reply_user = getattr(component, 'sender_id', None)
+                    if reply_user and reply_user != from_user:
+                        relations.append((from_user, reply_user, "reply", 0.3))
 
                 elif hasattr(Comp, "Poke") and isinstance(component, Comp.Poke):
-                    to_user = getattr(component, 'target_id', getattr(component, 'qq', None))
-                    if to_user and not callable(to_user):
-                        to_user = str(to_user)
+                    poke_target = getattr(component, 'target_id', getattr(component, 'qq', None))
+                    if poke_target and not callable(poke_target):
+                        to_user = str(poke_target)
                         if to_user and to_user != from_user:
                             relations.append((from_user, to_user, "poke", 0.2))
         except Exception as e:

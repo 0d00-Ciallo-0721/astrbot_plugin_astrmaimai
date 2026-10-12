@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
-from ..contracts.dialog_history_policy import DialogHistoryPolicy
+from ..contracts.dialog_history_policy import DialogHistoryPolicy, HistoryMode
 from ..contracts.topic_attention_anchor import (
     ANCHOR_MAX_EVENT_IDS,
     ANCHOR_MAX_ID_CHARS,
@@ -495,7 +495,7 @@ class ConversationContinuityStore:
             evidence.append("known_participant")
 
         next_epoch = max(1, int(state.topic_epoch or 0))
-        mode = "none"
+        mode: HistoryMode = "none"
         rotation_reason = ""
         allow_provider_session = False
         if explicit_recall:

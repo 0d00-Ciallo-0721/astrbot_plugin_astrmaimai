@@ -374,7 +374,7 @@ class OpenAICompatibleReplyProvider(ReplyProvider):
         model: str,
         metadata: dict[str, Any],
     ) -> ReplyResult:
-        import requests
+        import httpx
 
         url = f"{self.base_url}/chat/completions"
         payload = {
@@ -389,8 +389,9 @@ class OpenAICompatibleReplyProvider(ReplyProvider):
             "Accept-Encoding": "identity",
         }
         try:
-            response = requests.post(url, headers=headers, json=payload, timeout=self.timeout_seconds)
-        except requests.RequestException as exc:
+            with httpx.Client(timeout=self.timeout_seconds) as client:
+                response = client.post(url, headers=headers, json=payload)
+        except httpx.RequestError as exc:
             raise RuntimeError(f"relay_unreachable::{exc}") from exc
         raw = response.json()
         if response.status_code >= 400:
@@ -420,7 +421,7 @@ class OpenAICompatibleReplyProvider(ReplyProvider):
         )
 
     def _list_models_sync(self) -> list[str]:
-        import requests
+        import httpx
 
         url = f"{self.base_url}/models"
         headers = {
@@ -428,8 +429,9 @@ class OpenAICompatibleReplyProvider(ReplyProvider):
             "Accept-Encoding": "identity",
         }
         try:
-            response = requests.get(url, headers=headers, timeout=self.timeout_seconds)
-        except requests.RequestException as exc:
+            with httpx.Client(timeout=self.timeout_seconds) as client:
+                response = client.get(url, headers=headers)
+        except httpx.RequestError as exc:
             raise RuntimeError(f"relay_unreachable::{exc}") from exc
         raw = response.json()
         if response.status_code >= 400:
