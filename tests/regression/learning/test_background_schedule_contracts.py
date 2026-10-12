@@ -2207,8 +2207,9 @@ class BackgroundScheduleContractTests(unittest.IsolatedAsyncioTestCase):
         calls = []
 
         async def process_logs(group_id, logs):
+            self.assertGreater(float(store.values[manager._mining_timestamp_key(group_id)]), 0.0)
             calls.append((group_id, logs))
-            return {}
+            return {"expression": {"status": "completed"}}
 
         manager.process_logs_and_mine = process_logs
 

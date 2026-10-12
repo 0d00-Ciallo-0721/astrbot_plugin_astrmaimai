@@ -164,6 +164,47 @@ def _log_learning_contract_failure(diagnostic: Mapping[str, Any]) -> None:
         logger.warning(message, *args, exc_info=True)
 
 
+def _parse_mining_snapshot_result(
+    value: Any, *, group_id: str,
+) -> tuple[dict[str, Mapping[str, Any]], str]:
+    result = _require_mapping(value, stage="mining_result", group_id=group_id)
+    if not result:
+        return {}, "mining_not_attempted"
+    if result.get("status") == "blocked":
+        nested = _require_mapping(
+            result.get("outcomes"), stage="mining_blocked_outcomes", group_id=group_id,
+        )
+        reason = result.get("reason")
+        if (
+            set(result) != {"status", "reason", "outcomes"}
+            or nested or not isinstance(reason, str) or not reason.strip()
+        ):
+            raise _LearningInputContractError(
+                "blocked mining result must contain a reason and no attempted pipelines",
+                stage="mining_blocked_result", group_id=group_id, value=result,
+            )
+        return {}, reason
+    outcomes = {}
+    for pipeline, raw in result.items():
+        if pipeline not in {"expression", "jargon"}:
+            raise _LearningInputContractError(
+                "mining result expected expression/jargon pipeline keys",
+                stage="mining_result", group_id=group_id, value=result,
+            )
+        outcome = _require_mapping(
+            raw, stage="mining_pipeline_result", pipeline=pipeline, group_id=group_id,
+        )
+        status = outcome.get("status")
+        if not isinstance(status, str) or not status.strip():
+            raise _LearningInputContractError(
+                "mining pipeline result expected a nonempty status string",
+                stage="mining_pipeline_status", pipeline=pipeline, group_id=group_id,
+                value=status,
+            )
+        outcomes[pipeline] = outcome
+    return outcomes, ""
+
+
 def _jargon_sense_evidence(evidence: dict[str, Any], sense: dict[str, Any]) -> dict[str, Any]:
     supported_by = list(dict.fromkeys(
         str(item) for item in (sense.get("supported_by") or []) if str(item or "").strip()
@@ -826,6 +867,21 @@ class EvolutionManager:
                 status="retry_wait",
                 error="cancelled",
                 retry_after_seconds=0.0,
+            )
+
+    async def _settle_mining_result(
+        self, group_id: str, previous_mining_at: float, lease,
+        *, run_id: str, status: str, reason: str,
+    ) -> None:
+        if status != "succeeded":
+            self._last_mining_at[str(group_id)] = previous_mining_at
+            await self._persist_mining_timestamp(group_id, previous_mining_at)
+        if self._task_ledger is not None and lease is not None:
+            # A failed write retains this exact intent in durable settlement;
+            # it must not become a retry of the mining work itself.
+            await settle_task_lease(
+                self._task_ledger, lease, run_id=run_id, status=status, error=reason,
+                retry_after_seconds=self._backlog_failure_cooldown() if status == "retry_wait" else 0.0,
             )
 
     def _learning_run_retention_days(self) -> int:
@@ -4228,6 +4284,9 @@ class EvolutionManager:
     get_active_patterns = get_active_patterns_canonical
 
     async def _try_trigger_mining(self, group_id: str):
+        release_gate = runtime_gate_check(self._evolution_config(), ReleaseCheckpoint.DISCOVERY)
+        if not release_gate.allowed:
+            return
         await self._load_mining_timestamp(group_id)
         if self._mining_cooldown_active(group_id):
             return
@@ -4260,38 +4319,43 @@ class EvolutionManager:
                     return
             previous_mining_at = float(self._last_mining_at.get(str(group_id), 0.0) or 0.0)
             self._last_mining_at[str(group_id)] = time.time()
-            await self._persist_mining_timestamp(group_id, self._last_mining_at[str(group_id)])
+            settlement_status = None
+            settlement_reason = ""
+            settlement_finished = False
             try:
-                outcomes = await self._process_mining_snapshot(
-                    group_id, snapshot, run_id=run_id
+                await self._persist_mining_timestamp(group_id, self._last_mining_at[str(group_id)])
+                outcomes, skipped_reason = _parse_mining_snapshot_result(
+                    await self._process_mining_snapshot(group_id, snapshot, run_id=run_id),
+                    group_id=group_id,
                 )
                 all_failed = bool(outcomes) and all(
                     str(item.get("status", "")).lower() in {"failed", "quarantined"}
                     for item in outcomes.values()
                 )
-                if all_failed:
-                    self._last_mining_at[str(group_id)] = previous_mining_at
-                    await self._persist_mining_timestamp(group_id, previous_mining_at)
-                if lease is not None:
-                    await settle_task_lease(
-                        self._task_ledger,
-                        lease,
-                        run_id=run_id,
-                        status="retry_wait" if all_failed else "succeeded",
-                        error="all_pipelines_failed" if all_failed else "",
-                        retry_after_seconds=self._backlog_failure_cooldown() if all_failed else 0.0,
-                    )
+                settlement_status = "rejected" if skipped_reason else "retry_wait" if all_failed else "succeeded"
+                settlement_reason = skipped_reason or ("all_pipelines_failed" if all_failed else "")
+                await self._settle_mining_result(
+                    group_id, previous_mining_at, lease, run_id=run_id,
+                    status=settlement_status, reason=settlement_reason,
+                )
+                settlement_finished = True
             except asyncio.CancelledError:
                 await asyncio.shield(
-                    self._settle_cancelled_mining(
-                        group_id,
-                        previous_mining_at,
-                        lease,
-                        run_id=run_id,
-                    )
+                    self._settle_mining_result(
+                        group_id, previous_mining_at, lease, run_id=run_id,
+                        status=settlement_status, reason=settlement_reason,
+                    ) if settlement_status is not None else
+                    self._settle_cancelled_mining(group_id, previous_mining_at, lease, run_id=run_id)
                 )
                 raise
             except Exception as exc:
+                if settlement_status is not None:
+                    if not settlement_finished:
+                        await self._settle_mining_result(
+                            group_id, previous_mining_at, lease, run_id=run_id,
+                            status=settlement_status, reason=settlement_reason,
+                        )
+                    raise
                 self._last_mining_at[str(group_id)] = previous_mining_at
                 await self._persist_mining_timestamp(group_id, previous_mining_at)
                 if lease is not None:
@@ -4394,6 +4458,10 @@ class EvolutionManager:
                 continue
             if processed_count >= group_limit:
                 break
+            release_gate = runtime_gate_check(self._evolution_config(), ReleaseCheckpoint.DISCOVERY)
+            if not release_gate.allowed:
+                report["skipped_groups"].append({"group_id": group_id, "reason": release_gate.reason})
+                continue
             await self._load_mining_timestamp(group_id)
             if self._mining_tasks.get(group_id) is not None and not self._mining_tasks[group_id].done():
                 report["skipped_groups"].append({"group_id": group_id, "reason": "already_mining"})
@@ -4471,6 +4539,9 @@ class EvolutionManager:
                 continue
             lease = None
             previous_mining_at = None
+            settlement_status = None
+            settlement_reason = ""
+            settlement_finished = False
             run_id = self._mining_run_id(group_id, logs)
             mining_fingerprint = self._mining_batch_id(
                 group_id, logs, prefix="learning"
@@ -4491,25 +4562,24 @@ class EvolutionManager:
                 previous_mining_at = float(self._last_mining_at.get(group_id, 0.0) or 0.0)
                 self._last_mining_at[group_id] = time.time()
                 await self._persist_mining_timestamp(group_id, self._last_mining_at[group_id])
-                outcomes = await self._process_mining_snapshot(
-                    group_id, snapshot, run_id=run_id
+                outcomes, skipped_reason = _parse_mining_snapshot_result(
+                    await self._process_mining_snapshot(group_id, snapshot, run_id=run_id),
+                    group_id=group_id,
                 )
                 all_failed = bool(outcomes) and all(
                     str(item.get("status", "")).lower() in {"failed", "quarantined"}
                     for item in outcomes.values()
                 )
-                if all_failed:
-                    self._last_mining_at[group_id] = previous_mining_at
-                    await self._persist_mining_timestamp(group_id, previous_mining_at)
-                if lease is not None:
-                    await settle_task_lease(
-                        self._task_ledger,
-                        lease,
-                        run_id=run_id,
-                        status="retry_wait" if all_failed else "succeeded",
-                        error="all_pipelines_failed" if all_failed else "",
-                        retry_after_seconds=self._backlog_failure_cooldown() if all_failed else 0.0,
-                    )
+                settlement_status = "rejected" if skipped_reason else "retry_wait" if all_failed else "succeeded"
+                settlement_reason = skipped_reason or ("all_pipelines_failed" if all_failed else "")
+                await self._settle_mining_result(
+                    group_id, previous_mining_at, lease, run_id=run_id,
+                    status=settlement_status, reason=settlement_reason,
+                )
+                settlement_finished = True
+                if skipped_reason:
+                    report["skipped_groups"].append({"group_id": group_id, "reason": skipped_reason})
+                    continue
                 processed_count += 1
                 report["processed_groups"].append(
                     {
@@ -4534,7 +4604,12 @@ class EvolutionManager:
                     f"processed_total={processed_count} outcomes={outcome_summary}"
                 )
             except asyncio.CancelledError:
-                if previous_mining_at is not None:
+                if settlement_status is not None:
+                    await asyncio.shield(self._settle_mining_result(
+                        group_id, previous_mining_at, lease, run_id=run_id,
+                        status=settlement_status, reason=settlement_reason,
+                    ))
+                elif previous_mining_at is not None:
                     await asyncio.shield(
                         self._settle_cancelled_mining(
                             group_id,
@@ -4556,10 +4631,16 @@ class EvolutionManager:
                     )
                 raise
             except Exception as exc:
-                if previous_mining_at is not None:
+                if settlement_status is not None:
+                    if not settlement_finished:
+                        await self._settle_mining_result(
+                            group_id, previous_mining_at, lease, run_id=run_id,
+                            status=settlement_status, reason=settlement_reason,
+                        )
+                elif previous_mining_at is not None:
                     self._last_mining_at[group_id] = previous_mining_at
                     await self._persist_mining_timestamp(group_id, previous_mining_at)
-                if self._task_ledger is not None and lease is not None:
+                if settlement_status is None and self._task_ledger is not None and lease is not None:
                     await settle_task_lease(
                         self._task_ledger,
                         lease,
@@ -4568,10 +4649,11 @@ class EvolutionManager:
                         error=str(exc),
                         retry_after_seconds=self._backlog_failure_cooldown(),
                     )
-                failure_count = int(self._backlog_failure_counts.get(group_id, 0) or 0) + 1
-                self._backlog_failure_counts[group_id] = failure_count
-                self._backlog_failure_until[group_id] = time.time() + self._backlog_failure_cooldown()
-                diagnostic = {
+                if settlement_status is None:
+                    failure_count = int(self._backlog_failure_counts.get(group_id, 0) or 0) + 1
+                    self._backlog_failure_counts[group_id] = failure_count
+                    self._backlog_failure_until[group_id] = time.time() + self._backlog_failure_cooldown()
+                diagnostic = exc.as_report() if isinstance(exc, _LearningInputContractError) else {
                     "stage": "mining_group",
                     "pipeline": ",".join(
                         str(item.get("pipeline") or "")
