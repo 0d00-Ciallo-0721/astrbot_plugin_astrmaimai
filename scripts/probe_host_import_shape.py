@@ -15,6 +15,7 @@ import json
 import os
 import sys
 import tempfile
+from dataclasses import fields
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -86,6 +87,27 @@ def probe(plugin_root: Path) -> dict[str, object]:
     assert Path(prompt.__file__).resolve() == (
         plugin_root / "astrmai/conversation/planning/planner_prompt_context.py"
     ).resolve()
+    bootstrap_module = importlib.import_module(f"{prefix}.astrmai.app.bootstrap")
+    runtime_module = importlib.import_module(f"{prefix}.astrmai.app.runtime_context")
+    runtime = runtime_module.PluginRuntimeContext(
+        host_context=SimpleNamespace(), raw_config={},
+        config=SimpleNamespace(conversation=SimpleNamespace(enable_context_compaction=True)),
+        runtime_coordinator=None, host_bridge=None,
+    )
+    assert "group_lifecycle" in {item.name for item in fields(type(runtime))}
+    runtime.group_lifecycle = bootstrap_module.GroupLifecycleRegistry(None)
+    bootstrap = bootstrap_module.PluginBootstrap(runtime.host_context, runtime.config)
+    # Exercise the real enabled builder and constructor, without opening a DB,
+    # starting workers or calling a provider. An import alone misses this path.
+    dialogue_store = object()
+    db_service, gateway, state_engine = (SimpleNamespace() for _ in range(3))
+    compaction = bootstrap._build_context_compaction_service(
+        runtime, dialogue_store, gateway, db_service, state_engine,
+    )
+    assert isinstance(compaction, bootstrap_module.ContextCompactionEngine)
+    assert compaction.dialogue_store is dialogue_store
+    assert db_service.context_compaction is gateway.context_compaction is state_engine.context_compaction is compaction
+    assert "astrmai" not in sys.modules
     return {
         "measurement_scope": "offline_host_import_shape",
         "passed": True,
@@ -99,6 +121,10 @@ def probe(plugin_root: Path) -> dict[str, object]:
         "speaker_block": block,
         "live_host_verified": False,
         "message_sent": False,
+        "runtime_lifecycle_field_declared": True,
+        "compaction_service_constructed": True,
+        "bootstrap_function_called": "PluginBootstrap._build_context_compaction_service",
+        "database_opened": False,
     }
 
 

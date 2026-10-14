@@ -37,6 +37,7 @@ from ...infrastructure.compat.legacy_compat import emit_legacy_reply_runtime_ext
 from ...infrastructure.gateway.output_guard import is_sendable_segment, sanitize_visible_reply_text
 from ...infrastructure.runtime.trace_runtime import debug_trace
 from ...infrastructure.runtime.outbound_send_guard import outbound_send_allowed
+from .delivery_failure import DeliveryFailure, delivery_failure_from_exception, send_host_message
 from ..concurrency.controls import (
     record_conversation_concurrency_trace,
     resolve_conversation_concurrency_flags,
@@ -757,7 +758,7 @@ class ReplyArtifactMixin:
                         break
                     if artifact.metadata.get("quote_action_instance_id"):
                         artifact.metadata["quote_send_started"] = True
-                    sent_result = await context.send_message(event.unified_msg_origin, chain)
+                    sent_result = await send_host_message(context, event.unified_msg_origin, chain)
                     if external_result_id:
                         debug_trace(
                             event,
@@ -813,10 +814,15 @@ class ReplyArtifactMixin:
                                     artifact.metadata["tts_skip_reason"] = "shutdown_rejected"
                                     tts_payload = None
                                 if tts_payload:
-                                    sent_result = await context.send_message(event.unified_msg_origin, chain)
+                                    sent_result = await send_host_message(
+                                        context, event.unified_msg_origin, chain
+                                    )
                                     if isinstance(sent_result, bool) and sent_result is False:
                                         artifact.metadata["tts_sent"] = False
                                         artifact.metadata["tts_send_failure_reason"] = "host_send_returned_false"
+                                        if not artifact.sent:
+                                            artifact.metadata["send_status"] = "failed"
+                                            artifact.metadata["send_failure_reason"] = "host_send_returned_false"
                                     else:
                                         artifact.metadata["tts_sent"] = True
                                         artifact.sent = True
@@ -827,6 +833,8 @@ class ReplyArtifactMixin:
                                                 emit_legacy_reply_runtime_extras(event, artifact=artifact, reply_sent=True)
                             except Exception as exc:
                                 artifact.metadata["tts_sent"] = False
+                                if not artifact.sent and delivery_failure_from_exception(exc) is not None:
+                                    raise
                                 logger.debug(f"[ReplyService] optional TTS send degraded for {chat_id}: {exc}")
                 else:
                     artifact.metadata["tts_sent"] = False
@@ -845,6 +853,11 @@ class ReplyArtifactMixin:
                     logger.warning("[ReplyService] cancelled quoted send claim release degraded", exc_info=True)
             raise
         except Exception as exc:
+            delivery_failure = delivery_failure_from_exception(exc)
+            if delivery_failure is not None:
+                artifact.metadata["delivery_failure_kind"] = delivery_failure.kind
+                if delivery_failure.kind == "uncertain":
+                    artifact.metadata["delivery_uncertain"] = True
             if artifact.metadata.get("quote_send_started") and not artifact.sent:
                 artifact.metadata["quote_delivery_uncertain"] = True
             if artifact.sent:
@@ -860,6 +873,7 @@ class ReplyArtifactMixin:
             if (
                 not artifact.sent
                 and not artifact.metadata.get("quote_delivery_uncertain")
+                and not artifact.metadata.get("delivery_uncertain")
                 and send_key
                 and runtime_coordinator is not None
                 and hasattr(runtime_coordinator, "mark_send_failed")
@@ -888,6 +902,9 @@ class ReplyArtifactMixin:
                 except Exception:
                     logger.debug("[ReplyService] send claim failure marking degraded", exc_info=True)
             if not artifact.sent:
+                cause = exc.__cause__ if isinstance(exc, DeliveryFailure) else None
+                if isinstance(cause, Exception) and delivery_failure_from_exception(cause) is not None:
+                    raise cause
                 raise
         # OPT-11/ID-05: 满发路径此前从不写 metadata，stage_ledger 恒 0 与 reply_stats
         # 矛盾（67/67 实证），真 partial 与满发在 stage 层无法区分——无条件落计数

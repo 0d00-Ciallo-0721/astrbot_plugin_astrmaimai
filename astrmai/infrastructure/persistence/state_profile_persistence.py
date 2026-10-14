@@ -122,6 +122,13 @@ class StateProfilePersistenceMixin:
                 return state
         return None
 
+    async def delete_chat_state(self, chat_id: str) -> bool:
+        """Delete persisted runtime state; historical message data is retained."""
+        async with connect_aiosqlite(self.db_path) as db:
+            cursor = await db.execute("DELETE FROM chat_states WHERE chat_id = ?", (str(chat_id),))
+            await db.commit()
+            return int(cursor.rowcount or 0) > 0
+
     async def save_chat_state(self, chat_id: str, state: ChatState):
         config_json = json.dumps(state.group_config, ensure_ascii=False)
         last_msg_info = getattr(state, "last_msg_info", None)

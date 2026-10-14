@@ -40,6 +40,7 @@ from ...infrastructure.gateway.output_guard import (
 )
 from ...infrastructure.runtime.outbound_send_guard import outbound_send_allowed
 from ...infrastructure.gateway.gateway_exceptions import LLMCascadeFailureException
+from .delivery_failure import DeliveryFailure, delivery_failure_from_exception
 from ...multimodal.vision_prompt import (
     VISION_SYSTEM_PROMPT,
     VISION_USER_PROMPT,
@@ -1706,6 +1707,8 @@ class ConcurrentExecutor:
         started_at = monotonic()
         policy = self._vision_reply_policy()
         event.set_extra("astrmai_vision_failure_disposition", "")
+        event.set_extra("astrmai_vision_configuration_error", False)
+        event.set_extra("astrmai_vision_failure_class", "")
         event.set_extra("astrmai_vision_independent_text", "")
         event.set_extra("astrmai_vision_required_failed", False)
         original_direct_image_urls = list(vision_bundle.direct_image_urls or [])
@@ -2021,6 +2024,8 @@ class ConcurrentExecutor:
                     failure_reason=failure_reason,
                     failure_kind=failure_kind,
                 )
+                if str(failure_kind or "").strip().lower() == "configuration":
+                    event.set_extra("astrmai_vision_configuration_error", True)
             finally:
                 if created_temp_file_path and os.path.exists(created_temp_file_path):
                     try:
@@ -2129,6 +2134,10 @@ class ConcurrentExecutor:
             fallback_reason = failure_disposition
             event.set_extra("astrmai_vision_failure_text_kind", text_kind)
             event.set_extra("astrmai_vision_failure_disposition", failure_disposition)
+            event.set_extra(
+                "astrmai_vision_failure_class",
+                "configuration" if event.get_extra("astrmai_vision_configuration_error", False) else "transient",
+            )
             event.set_extra(
                 "astrmai_vision_required_failed",
                 bool(policy == "require_analysis" and failure_disposition == "notify_failure"),
@@ -2341,6 +2350,11 @@ class ConcurrentExecutor:
                 event.set_extra("astrmai_execution_status", "stale_drop")
             elif send_status == "duplicate_blocked":
                 event.set_extra("astrmai_execution_status", "duplicate_blocked")
+            elif send_status == "failed" and str(metadata.get("send_failure_reason", "") or "") == "host_send_returned_false":
+                # A host false receipt is a delivery outcome, not a model
+                # failure.  Do not switch models or emit the fatal fallback.
+                event.set_extra("astrmai_execution_status", "delivery_rejected")
+                raise DeliveryFailure("rejected", "host_send_returned_false")
             else:
                 event.set_extra("astrmai_execution_status", "send_failed")
                 raise RuntimeError(blocked_reason or send_status or "visible reply was not sent")
@@ -2435,7 +2449,35 @@ class ConcurrentExecutor:
                     trace_mode="chat",
                     model=provider_id,
                 )
+            except DeliveryFailure as exc:
+                event.set_extra("astrmai_execution_status", f"delivery_{exc.kind}")
+                debug_trace(
+                    event,
+                    "execution.executor.delivery_failure",
+                    mode="chat",
+                    delivery_kind=exc.kind,
+                    detail=preview_text(exc.detail, 160),
+                    model=provider_id,
+                    fallback_triggered=False,
+                )
+                return None
             except Exception as exc:
+                delivery_failure = delivery_failure_from_exception(exc)
+                if delivery_failure is not None:
+                    event.set_extra(
+                        "astrmai_execution_status",
+                        f"delivery_{delivery_failure.kind}",
+                    )
+                    debug_trace(
+                        event,
+                        "execution.executor.delivery_failure",
+                        mode="chat",
+                        delivery_kind=delivery_failure.kind,
+                        detail=preview_text(delivery_failure.detail, 160),
+                        model=provider_id,
+                        fallback_triggered=False,
+                    )
+                    return None
                 last_error = str(exc)
                 last_failure_kind = self._classify_execution_failure_kind(last_error)
                 if str(event.get_extra("astrmai_execution_status", "") or "") == "queue_timeout":
@@ -2715,7 +2757,35 @@ class ConcurrentExecutor:
                     trace_mode="tool",
                     model=provider_id,
                 )
+            except DeliveryFailure as exc:
+                event.set_extra("astrmai_execution_status", f"delivery_{exc.kind}")
+                debug_trace(
+                    event,
+                    "execution.executor.delivery_failure",
+                    mode="tool",
+                    delivery_kind=exc.kind,
+                    detail=preview_text(exc.detail, 160),
+                    model=provider_id,
+                    fallback_triggered=False,
+                )
+                return None
             except Exception as exc:
+                delivery_failure = delivery_failure_from_exception(exc)
+                if delivery_failure is not None:
+                    event.set_extra(
+                        "astrmai_execution_status",
+                        f"delivery_{delivery_failure.kind}",
+                    )
+                    debug_trace(
+                        event,
+                        "execution.executor.delivery_failure",
+                        mode="tool",
+                        delivery_kind=delivery_failure.kind,
+                        detail=preview_text(delivery_failure.detail, 160),
+                        model=provider_id,
+                        fallback_triggered=False,
+                    )
+                    return None
                 last_error = str(exc)
                 last_failure_kind = self._classify_execution_failure_kind(last_error)
                 if str(event.get_extra("astrmai_execution_status", "") or "") == "queue_timeout":

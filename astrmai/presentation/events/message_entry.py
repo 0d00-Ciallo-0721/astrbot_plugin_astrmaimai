@@ -222,6 +222,23 @@ async def handle_global_message(facade: RuntimeFacadeProtocol, event):
         return
 
     scope = MessageScope.from_event(event)
+    if not scope.is_private_chat:
+        bind_group = getattr(facade, "bind_group_lifecycle", None)
+        if callable(bind_group):
+            try:
+                if not await bind_group(event):
+                    debug_trace(event, "ingress.group_retired", chat_id=scope.chat_id)
+                    stop_event = getattr(event, "stop_event", None)
+                    if callable(stop_event):
+                        stop_event()
+                    return
+            except Exception:
+                logger.error("[AstrMai] group lifecycle guard unavailable; blocking group ingress", exc_info=True)
+                debug_trace(event, "ingress.group_lifecycle_unavailable", chat_id=scope.chat_id)
+                stop_event = getattr(event, "stop_event", None)
+                if callable(stop_event):
+                    stop_event()
+                return
     msg = event.message_str.strip() if event.message_str else ""
     try:
         event.set_extra("is_private_chat", bool(scope.is_private_chat))

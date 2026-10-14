@@ -10,6 +10,7 @@ from astrbot.api import logger
 from ..contracts.memory_query import MemoryWriteRequest
 from ...infrastructure.runtime.background_task_budget import BackgroundTaskQueueFull
 from ...infrastructure.persistence.sqlite_helpers import connect_aiosqlite
+from .v2_store import PROJECTION_DEFERRED_REASONS
 
 
 class MemoryIndexProjector:
@@ -23,6 +24,7 @@ class MemoryIndexProjector:
         self._pending_projection_scheduled: dict[str, bool] = {}
         self._retry_task: asyncio.Task | None = None
         self._retry_stop = asyncio.Event()
+        self._retry_batch_lock = asyncio.Lock()
         self._projection_lock = getattr(engine, "_projection_lock", None) or asyncio.Lock()
         self._ack_projection_outbox = bool(getattr(engine, "_ack_projection_outbox", True))
         self._candidate_outbox_candidates: set[str] = {
@@ -381,8 +383,7 @@ class MemoryIndexProjector:
         normalized_reason = str(reason or "unknown")
         self._pending_projection_ids.add(memory_id)
         self._pending_projection_reasons[memory_id] = normalized_reason
-        deferred_reasons = {"retriever_not_ready", "projection_rebuild_in_progress", "shutdown_rejected"}
-        if normalized_reason in deferred_reasons:
+        if normalized_reason in PROJECTION_DEFERRED_REASONS:
             deferred_counts = getattr(self, "_projection_deferred_by_reason", None)
             if deferred_counts is None:
                 deferred_counts = {}
@@ -733,6 +734,17 @@ class MemoryIndexProjector:
         )
         while not self._retry_stop.is_set():
             try:
+                if self._budget_is_draining():
+                    self._retry_rejected_by_shutdown += 1
+                    logger.info("[MemoryIndexProjector] retry worker stopped during shutdown")
+                    return
+                if self._projection_rebuild_active() or getattr(self.engine, "retriever", True) is None:
+                    await asyncio.wait_for(self._retry_stop.wait(), timeout=interval)
+                    continue
+                list_due = getattr(getattr(self.engine, "v2_store", None), "list_due_projection_retries", None)
+                if callable(list_due) and not await list_due(limit=1):
+                    await asyncio.wait_for(self._retry_stop.wait(), timeout=interval)
+                    continue
                 limit = int(self._config_value("projection_retry_batch_size", 20) or 20)
                 background_budget = getattr(self.engine, "background_task_budget", None)
                 if background_budget is not None:
@@ -766,6 +778,10 @@ class MemoryIndexProjector:
                 await asyncio.sleep(min(interval, 30.0))
 
     async def retry_due(self, *, limit: int = 20) -> dict:
+        async with self._retry_batch_lock:
+            return await self._retry_due_batch(limit=limit)
+
+    async def _retry_due_batch(self, *, limit: int = 20) -> dict:
         store = getattr(self.engine, "v2_store", None)
         list_due = getattr(store, "list_due_projection_retries", None)
         if not callable(list_due):
@@ -804,6 +820,9 @@ class MemoryIndexProjector:
             if projected:
                 result["projected"] += 1
                 self._retry_success_count += 1
+            elif item["reason"] in PROJECTION_DEFERRED_REASONS:
+                item["status"] = "deferred"
+                result["deferred"] = result.get("deferred", 0) + 1
             else:
                 result["failed"] += 1
                 self._retry_failure_count += 1
@@ -811,21 +830,39 @@ class MemoryIndexProjector:
         if result["attempted"]:
             logger.info(
                 "[MemoryIndexProjector] retry batch "
-                f"attempted={result['attempted']} projected={result['projected']} failed={result['failed']}"
+                f"attempted={result['attempted']} projected={result['projected']} "
+                f"failed={result['failed']} deferred={result.get('deferred', 0)}"
             )
         return result
 
     async def replay_pending_after_ready(self, *, limit: int = 20) -> dict:
         """Replay deferred rows immediately when the vector retriever becomes ready."""
+        budget = getattr(self.engine, "background_task_budget", None)
+        if budget is not None:
+            return await budget.run(
+                lambda: self._locked_ready_replay(limit=limit),
+                task_name="memory.projection.replay", scope_id="GLOBAL",
+                defer_release_on_timeout=True,
+            )
+        return await self._locked_ready_replay(limit=limit)
+
+    async def _locked_ready_replay(self, *, limit: int) -> dict:
+        async with self._retry_batch_lock:
+            return await self._replay_pending_after_ready_batch(limit=limit)
+
+    async def _replay_pending_after_ready_batch(self, *, limit: int = 20) -> dict:
         store = getattr(self.engine, "v2_store", None)
         snapshot = getattr(store, "projection_retry_snapshot_with_revisions", None)
         if not callable(snapshot):
             return {"attempted": 0, "projected": 0, "failed": 0, "reason": "outbox_unavailable"}
-        rows = await snapshot(limit=max(1, int(limit or 20)))
+        rows = await snapshot(
+            limit=max(1, int(limit or 20)),
+            reasons=tuple(sorted(PROJECTION_DEFERRED_REASONS | {"embedding_timeout", "embedding_queue_timeout"})),
+        )
         eligible = [
             memory_id
             for memory_id, payload in (rows or {}).items()
-            if str((payload or {}).get("reason", "") or "") in {"retriever_not_ready", "embedding_timeout", "embedding_queue_timeout"}
+            if str((payload or {}).get("reason", "") or "") in PROJECTION_DEFERRED_REASONS | {"embedding_timeout", "embedding_queue_timeout"}
         ]
         result = {"attempted": 0, "projected": 0, "failed": 0}
         items: list[dict[str, object]] = []
@@ -849,10 +886,14 @@ class MemoryIndexProjector:
                 status = "projected"
                 reason = "projected"
             else:
-                result["failed"] += 1
-                self._retry_failure_count += 1
-                status = "failed_retryable"
                 reason = failure_reason or self.pending_reason(str(memory_id)) or "projection_failed"
+                if reason in PROJECTION_DEFERRED_REASONS:
+                    result["deferred"] = result.get("deferred", 0) + 1
+                    status = "deferred"
+                else:
+                    result["failed"] += 1
+                    self._retry_failure_count += 1
+                    status = "failed_retryable"
             items.append({"memory_id": str(memory_id), "status": status, "reason": reason})
         self._last_retry_items = items[-100:]
         return result

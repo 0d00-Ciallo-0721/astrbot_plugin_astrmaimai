@@ -214,6 +214,9 @@ class ChatStateService:
         async with self._get_chat_lock(chat_id):
             removed = self.chat_states.pop(chat_id, None) is not None
             self._chat_generations[chat_id] = self._chat_generation(chat_id) + 1
+            delete_persisted = getattr(self.persistence, "delete_chat_state", None)
+            if callable(delete_persisted):
+                removed = bool(await delete_persisted(chat_id)) or removed
             return removed
 
     async def atomic_update_mood(

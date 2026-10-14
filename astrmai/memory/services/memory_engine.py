@@ -6998,12 +6998,13 @@ class MemoryEngine:
             }
         return await pipeline.describe_session_eligibility(chat_id)
 
-    async def apply_daily_decay(self, decay_rate: float, days: int = 1) -> int:
+    async def apply_daily_decay(self, decay_rate: float, days: int = 1, *, min_interval_sec: float = 0.0) -> int:
         return await self.maintenance_service.apply_daily_decay(
             decay_rate=decay_rate,
             days=days,
             min_score=getattr(getattr(self.config, "memory", None), "prune_threshold", 0.2),
             stale_grace_seconds=7 * 86400,
+            min_interval_sec=min_interval_sec,
         )
 
     async def import_legacy_memory_events(self, *, limit: int = 1000) -> int:

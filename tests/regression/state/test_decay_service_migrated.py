@@ -170,7 +170,8 @@ class DecayServiceMigratedTests(unittest.TestCase):
                 self.calls = 0
                 self.rates = []
 
-            async def apply_daily_decay(self, decay_rate):
+            async def apply_daily_decay(self, decay_rate, *, min_interval_sec=0.0):
+                assert min_interval_sec == 86400.0
                 self.calls += 1
                 self.rates.append(decay_rate)
                 if self.calls == 1:

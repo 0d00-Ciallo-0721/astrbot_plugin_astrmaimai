@@ -169,12 +169,14 @@ class ProactiveDispatcher:
         config: Any = None,
         history_db_path: Any = None,
         owner_registry: Any = None,
+        group_lifecycle: Any = None,
     ) -> None:
         self.attention_gate = attention_gate
         self.runtime_coordinator = runtime_coordinator
         self.state_engine = state_engine
         self.config = config
         self.owner_registry = owner_registry
+        self.group_lifecycle = group_lifecycle
         self._history: list[dict[str, Any]] = []
         self._history_store = ProactiveHistoryStore(history_db_path)
         self._history = self._load_persistent_history()
@@ -683,6 +685,18 @@ class ProactiveDispatcher:
         return ""
 
     async def _safety_check(self, intent: ProactiveMessageIntent, *, now: float) -> tuple[bool, str, dict[str, Any]]:
+        lifecycle = self.group_lifecycle
+        if lifecycle is not None and "GroupMessage:" in str(intent.chat_id or ""):
+            try:
+                state = await lifecycle.state(intent.chat_id)
+            except Exception as exc:
+                logger.warning(f"[ProactiveDispatcher] group lifecycle check degraded: {exc}")
+                return False, "group_lifecycle_unavailable", {"group_lifecycle_unavailable": True}
+            if state is not None and str(state.status) == "retired":
+                return False, "group_retired", {
+                    "group_retired": True,
+                    "group_lifecycle_generation": int(state.generation),
+                }
         rhythm = evaluate_proactive_rhythm(self.config, now=now)
         snapshot = await self._activity_snapshot(intent.chat_id)
         try:

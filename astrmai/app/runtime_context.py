@@ -256,6 +256,7 @@ class PluginRuntimeContext:
     chat_loop_kernel: Any = None
     cross_session_handoff_store: Any = None
     conversation_history_service: Any = None
+    group_lifecycle: Any = None
     infrastructure_settings: InfrastructureSettings = field(
         default_factory=InfrastructureSettings
     )

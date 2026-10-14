@@ -1277,6 +1277,10 @@ class BackgroundScheduleContractTests(unittest.IsolatedAsyncioTestCase):
             )
             task.heartflow_manager = object()
             task._run_memory_store_maintenance = lambda: _service("memory")
+            task.config = SimpleNamespace(memory=SimpleNamespace())
+            task.memory_engine = SimpleNamespace(
+                maintenance_service=SimpleNamespace(run_once=task._run_memory_store_maintenance)
+            )
 
             await task._run_maintenance_cycle()
             await asyncio.sleep(0)

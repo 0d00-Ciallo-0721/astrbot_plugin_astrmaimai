@@ -1029,6 +1029,37 @@ class EvolutionManager:
 
     async def _run_backlog_mining_budgeted(self) -> None:
         budget = self.background_task_budget
+        gate = runtime_gate_check(self._evolution_config(), ReleaseCheckpoint.DISCOVERY)
+        if not self._backlog_enabled() or not gate.allowed:
+            now = time.time()
+            run_retention_due = (
+                any(callable(getattr(self.db, name, None)) for name in ("purge_learning_mining_runs_async", "purge_learning_mining_runs"))
+                and now - getattr(self, "_last_learning_run_purge_at", 0.0) >= 86400
+            )
+            log_retention_due = (
+                callable(getattr(self.db, "purge_consumed_message_logs_async", None))
+                and now - float(getattr(self, "_last_message_log_purge", {}).get("purged_at", 0.0)) >= self._message_log_cleanup_interval()
+            )
+
+            async def retain():
+                return {
+                    "run_retention": await self._maybe_purge_learning_runs() if run_retention_due else {},
+                    "message_log_retention": await self._maybe_purge_message_logs() if log_retention_due else {},
+                }
+
+            retention = {}
+            if run_retention_due or log_retention_due:
+                retention = await budget.run(
+                    retain, task_name="learning.retention", scope_id="GLOBAL",
+                    defer_release_on_timeout=True,
+                ) if budget is not None else await retain()
+            self._last_backlog_report = {
+                "enabled": self._backlog_enabled(), "status": "blocked",
+                "reason": gate.reason if not gate.allowed else "backlog_disabled",
+                "checked_at": now, "processed_groups": [], "skipped_groups": [],
+                "errors": [], **retention,
+            }
+            return
         if budget is None:
             await self.run_backlog_mining_once()
             return
@@ -4856,7 +4887,8 @@ class EvolutionManager:
         if self._enrichment_worker_enabled():
             gate_ready, gate_reason = self._enrichment_worker_gate()
             if not gate_ready:
-                logger.error(
+                log_gate = logger.info if gate_reason == "learning_release_kill_switch" or gate_reason.startswith("flag_disabled:") else logger.error
+                log_gate(
                     "[Evolution] enrichment worker blocked: %s",
                     gate_reason,
                 )

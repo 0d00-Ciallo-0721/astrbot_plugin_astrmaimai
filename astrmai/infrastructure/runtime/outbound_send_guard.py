@@ -5,6 +5,8 @@ from __future__ import annotations
 import threading
 from typing import Any
 
+from .group_lifecycle import group_generation_allowed_cached, is_group_retired_cached
+
 
 class OutboundSendGate:
     def __init__(self) -> None:
@@ -40,6 +42,24 @@ class OutboundSendGate:
             return self._provider_enforced
 
     def allowed(self, event: Any = None, generation: int | None = None) -> bool:
+        if event is not None:
+            getter = getattr(event, "get_extra", None)
+            if callable(getter):
+                # A durable group-retirement fence is bound at ingress.  It
+                # must be checked before the process-wide lifecycle gate so
+                # late continuations cannot send after a bot-left notice.
+                try:
+                    if bool(getter("astrmai_group_retired", False)):
+                        return False
+                    chat_id = str(getattr(event, "unified_msg_origin", "") or "")
+                    if is_group_retired_cached(chat_id):
+                        return False
+                    if not group_generation_allowed_cached(
+                        chat_id, getter("astrmai_group_lifecycle_generation", None)
+                    ):
+                        return False
+                except Exception:
+                    return False
         accepting, current_generation = self.snapshot()
         # Before the lifecycle manager has ever opened the gate (generation
         # zero), standalone tool/unit invocations may not carry runtime

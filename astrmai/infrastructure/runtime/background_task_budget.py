@@ -381,6 +381,7 @@ class BackgroundTaskBudget:
         deferred_by_kind: dict[str, int] = {}
         owner_task_names: list[str] = []
         owner_ages: list[float] = []
+        active_owners: list[dict[str, object]] = []
         physical_owner_count = 0
         for waiter in self._waiters:
             if waiter.done():
@@ -399,6 +400,17 @@ class BackgroundTaskBudget:
                 owner_ages.append(max(0.0, now - lease.started_at))
             owner_name = getattr(owner, "get_name", lambda: "unknown")()
             owner_task_names.append(str(owner_name or lease.task_name or "unknown"))
+            active_owners.append(
+                {
+                    "task_name": str(lease.task_name or "unknown"),
+                    "scope": str(lease.scope_key or ""),
+                    "owner_task": str(owner_name or "unknown"),
+                    "age_ms": round(max(0.0, now - lease.started_at) * 1000.0, 3)
+                    if lease.started_at
+                    else 0.0,
+                    "deferred": owner in deferred_tasks,
+                }
+            )
             if owner in deferred_tasks:
                 deferred_by_kind[lease.task_name] = deferred_by_kind.get(lease.task_name, 0) + 1
         return {
@@ -408,6 +420,7 @@ class BackgroundTaskBudget:
             "physical_owner_count": physical_owner_count,
             "oldest_owner_age_ms": round(max(owner_ages, default=0.0) * 1000.0, 3),
             "owner_task_names": sorted(set(owner_task_names)),
+            "active_owners": active_owners[:32],
         }
 
     async def drain(self, timeout_sec: float = 2.0) -> dict[str, object]:
@@ -511,7 +524,8 @@ class BackgroundTaskBudget:
             self._rejected_by_kind[task_name] = self._rejected_by_kind.get(task_name, 0) + 1
             self._increment_scope(self._rejected_by_scope, scope_key)
             raise BackgroundTaskQueueFull(
-                f"background task queue is full: queued={queued} limit={self.max_queue}"
+                f"background task queue is full: queued={queued} limit={self.max_queue} "
+                f"task={task_name[:120]} scope={scope_key[:120]} owners={self._queue_log_diagnostics()}"
             )
         waiter = asyncio.get_running_loop().create_future()
         setattr(waiter, "_astrmai_task_name", task_name)
@@ -533,7 +547,8 @@ class BackgroundTaskBudget:
                 except ValueError:
                     pass
             raise BackgroundTaskQueueTimeout(
-                f"background task queue wait timed out after {queue_timeout:.1f}s"
+                f"background task queue wait timed out after {queue_timeout:.1f}s "
+                f"task={task_name[:120]} scope={scope_key[:120]} owners={self._queue_log_diagnostics()}"
             ) from exc
         except asyncio.CancelledError:
             if waiter.done() and not waiter.cancelled():
@@ -545,6 +560,17 @@ class BackgroundTaskBudget:
                 except ValueError:
                     pass
             raise
+
+    def _queue_log_diagnostics(self) -> dict[str, object]:
+        report = self._owner_diagnostics()
+        for field in ("active_by_kind", "queued_by_kind", "deferred_by_kind"):
+            counts = report[field]
+            report[field] = {str(key)[:120]: value for key, value in list(counts.items())[:8]}
+            report[field + "_total"] = sum(counts.values())
+        names = report["owner_task_names"]
+        report["owner_task_names"] = [name[:120] for name in names[:8]]
+        report["owner_task_name_count"] = len(names)
+        return report
 
     def _release(self, task_name: str = "unknown", scope_key: str = "") -> None:
         self._active = max(0, self._active - 1)

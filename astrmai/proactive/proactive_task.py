@@ -76,6 +76,7 @@ class ProactiveTask:
         attention_gate=None,
         background_task_budget=None,
         owner_registry=None,
+        group_lifecycle=None,
     ):
         self.context = context
         self.state_engine = state_engine
@@ -119,7 +120,7 @@ class ProactiveTask:
         }
         self._last_profile_run = 0.0
         self._last_proactive_scan = 0.0
-        self._background_task_stats: dict[str, dict[str, int | float]] = {}
+        self._background_task_stats: dict[str, dict[str, int | float | str | dict[str, int]]] = {}
         self._last_diary_date = ""
         self._diary_pending_date = ""
         self._last_global_maintenance_run = 0.0
@@ -162,6 +163,7 @@ class ProactiveTask:
             config=self.config,
             history_db_path=getattr(persistence, "db_path", None),
             owner_registry=owner_registry,
+            group_lifecycle=group_lifecycle,
         )
         self.scheduled_scenario_service = ScheduledScenarioService(
             state_engine=state_engine,
@@ -207,7 +209,7 @@ class ProactiveTask:
             dispatcher=self.proactive_dispatcher,
             state_engine=state_engine,
         )
-        self.review_dispatcher = ReviewDispatcher(context, None)
+        self.review_dispatcher = ReviewDispatcher(context, None, group_lifecycle=group_lifecycle)
         self.heartflow_manager = HeartflowManager(
             runtime_coordinator=runtime_coordinator,
             state_engine=state_engine,
@@ -764,31 +766,73 @@ class ProactiveTask:
         llm_call_count: Any = 0,
         cancel_status: str = "retry_wait",
         run_id: str = "",
+        admission_delay_sec: float = 0.0,
     ):
         budget = getattr(self, "background_task_budget", None)
         if budget is None:
             budget = self._build_local_background_budget(getattr(self, "config", None))
             self.background_task_budget = budget
         async def _run_budgeted():
-            return await budget.run(
-                awaitable_factory,
-                task_name=task_name,
-                scope_id=scope_id,
-                defer_release_on_timeout=True,
-            )
+            current = asyncio.current_task()
+            if admission_delay_sec > 0:
+                current._astrmai_stage = "delayed"
+                delayed_at = monotonic()
+                try:
+                    await asyncio.sleep(admission_delay_sec)
+                finally:
+                    current._astrmai_delay_ms = (monotonic() - delayed_at) * 1000.0
+            current._astrmai_stage = "admission"
+            queued_at = monotonic()
+
+            def _acquired():
+                current._astrmai_queue_wait_ms = (monotonic() - queued_at) * 1000.0
+                current._astrmai_stage = "execution"
+
+            async def _work():
+                executing_at = monotonic()
+                try:
+                    return await awaitable_factory()
+                finally:
+                    current._astrmai_execution_ms = (monotonic() - executing_at) * 1000.0
+
+            try:
+                return await budget.run(
+                    _work,
+                    task_name=task_name,
+                    scope_id=scope_id,
+                    defer_release_on_timeout=True,
+                    on_acquired=_acquired,
+                )
+            finally:
+                if current._astrmai_stage == "admission":
+                    current._astrmai_queue_wait_ms = (monotonic() - queued_at) * 1000.0
 
         coro = _run_budgeted()
         base_coro = coro
+        runner_started = False
+        settlement_attempt_returned = False
+        settlement_intent = None
         if task_lease is not None and self._task_ledger is not None:
             async def _finish_lease(**kwargs) -> bool:
-                return await settle_task_lease(
-                    self._task_ledger,
-                    task_lease,
-                    run_id=run_id,
-                    **kwargs,
-                )
+                nonlocal settlement_attempt_returned, settlement_intent
+                settlement_intent = dict(kwargs)
+                current = asyncio.current_task()
+                current._astrmai_terminal_stage = getattr(current, "_astrmai_stage", "admission")
+                current._astrmai_stage = "settlement"
+                settling_at = monotonic()
+                try:
+                    committed = await settle_task_lease(
+                        self._task_ledger, task_lease, run_id=run_id, **kwargs,
+                    )
+                    current._astrmai_settlement_committed = committed
+                    settlement_attempt_returned = True
+                    return committed
+                finally:
+                    current._astrmai_settlement_ms = (monotonic() - settling_at) * 1000.0
 
             async def _run_and_settle_lease():
+                nonlocal runner_started
+                runner_started = True
                 try:
                     result = await base_coro
                 except asyncio.CancelledError:
@@ -821,8 +865,21 @@ class ProactiveTask:
                     if callable(llm_call_count)
                     else llm_call_count
                 )
+                outcome = str(result.get("status", "")) if isinstance(result, dict) else ""
+                status = "succeeded"
+                if outcome in {"no_work", "disabled", "blocked"}:
+                    status = "rejected"
+                elif outcome in {"deferred", "partial", "degraded", "failed"}:
+                    status = "retry_wait"
+                elif isinstance(result, dict) and (result.get("errors") or int(result.get("failed", 0) or 0)):
+                    status = "retry_wait"
+                if isinstance(resolved_checkpoint, dict):
+                    resolved_checkpoint["completed"] = status == "succeeded"
+                    resolved_checkpoint["outcome"] = outcome or status
                 await _finish_lease(
-                    status="succeeded",
+                    status=status,
+                    error=str(result.get("reason") or outcome or "work_incomplete") if status != "succeeded" and isinstance(result, dict) else "",
+                    retry_after_seconds=300.0 if status == "retry_wait" else None,
                     checkpoint_after=resolved_checkpoint,
                     llm_call_count=max(0, int(resolved_llm_calls or 0)),
                 )
@@ -833,6 +890,8 @@ class ProactiveTask:
         task._astrmai_task_name = task_name
         task._astrmai_scope_id = str(scope_id or "")
         task._astrmai_started_at = time.time()
+        task._astrmai_started_monotonic = monotonic()
+        task._astrmai_run_id = run_id
         self._background_tasks.add(task)
         registry = getattr(self, "owner_registry", None)
         register = getattr(registry, "register", None)
@@ -852,20 +911,19 @@ class ProactiveTask:
         task.add_done_callback(self._handle_task_result)
         if task_lease is not None and cancel_status != "retry_wait":
             def _settle_unstarted_cancel(completed: asyncio.Task) -> None:
-                if not completed.cancelled() or self._task_ledger is None:
+                if settlement_attempt_returned or not completed.cancelled() or self._task_ledger is None:
                     return
                 close = getattr(coro, "close", None)
-                if callable(close):
+                if not runner_started and callable(close):
                     close()
                 close_base = getattr(base_coro, "close", None)
-                if callable(close_base):
+                if not runner_started and callable(close_base):
                     close_base()
                 async def _settle() -> None:
                     try:
-                        await _finish_lease(
-                            status=cancel_status,
-                            error="cancelled_before_start",
-                        )
+                        await _finish_lease(**(settlement_intent or {
+                            "status": cancel_status, "error": "cancelled_before_start",
+                        }))
                     except Exception:
                         logger.debug(
                             "[ProactiveTask] pre-start cancellation settlement degraded task=%s",
@@ -906,6 +964,7 @@ class ProactiveTask:
         scope_id: str,
         awaitable_factory,
         lease_seconds: float = 900.0,
+        admission_delay_sec: float = 0.0,
     ) -> dict:
         """Submit a maintenance job through the shared budget and ledger.
 
@@ -1035,6 +1094,7 @@ class ProactiveTask:
                 checkpoint_after=_checkpoint,
                 cancel_status="cancelled",
                 run_id=run_id,
+                admission_delay_sec=admission_delay_sec,
             )
         except Exception as exc:
             if task_lease is not None and task_ledger is not None:
@@ -1066,6 +1126,8 @@ class ProactiveTask:
         def _clear_maintenance_task(completed: asyncio.Task) -> None:
             if tasks.get(key) is completed:
                 tasks.pop(key, None)
+                if family == "diary":
+                    self._diary_pending_date = ""
 
         task.add_done_callback(_clear_maintenance_task)
         return {
@@ -1188,20 +1250,31 @@ class ProactiveTask:
         self._background_tasks.discard(task)
         task_name = str(getattr(task, "_astrmai_task_name", "proactive") or "proactive")
         started_at = float(getattr(task, "_astrmai_started_at", 0.0) or 0.0)
-        duration_ms = max(0.0, (time.time() - started_at) * 1000.0) if started_at else 0.0
+        started_monotonic = float(getattr(task, "_astrmai_started_monotonic", 0.0) or 0.0)
+        duration_ms = max(0.0, (monotonic() - started_monotonic) * 1000.0) if started_monotonic else max(0.0, (time.time() - started_at) * 1000.0) if started_at else 0.0
         stats = self._background_task_stats.setdefault(
             task_name,
             {"completed": 0, "failed": 0, "cancelled": 0, "last_duration_ms": 0.0},
         )
         stats["last_duration_ms"] = duration_ms
+        stats["last_terminal_stage"] = str(getattr(task, "_astrmai_terminal_stage", getattr(task, "_astrmai_stage", "")))
+        stats["last_run_id"] = str(getattr(task, "_astrmai_run_id", ""))
+        stats["last_scope_id"] = str(getattr(task, "_astrmai_scope_id", ""))
+        stats["last_delay_ms"] = float(getattr(task, "_astrmai_delay_ms", 0.0))
+        stats["last_queue_wait_ms"] = float(getattr(task, "_astrmai_queue_wait_ms", 0.0))
+        stats["last_execution_ms"] = float(getattr(task, "_astrmai_execution_ms", 0.0))
+        stats["last_settlement_ms"] = float(getattr(task, "_astrmai_settlement_ms", 0.0))
         try:
             if task.cancelled():
                 stats["cancelled"] = int(stats.get("cancelled", 0) or 0) + 1
+                stats["last_outcome"] = "cancelled"
                 return
             exc = task.exception()
             if exc:
                 stats["failed"] = int(stats.get("failed", 0) or 0) + 1
+                stats["last_outcome"] = "error"
                 if isinstance(exc, (BackgroundTaskQueueFull, BackgroundTaskQueueTimeout)):
+                    stats["last_outcome"] = "queue_timeout" if isinstance(exc, BackgroundTaskQueueTimeout) else "queue_full"
                     if getattr(task, "_astrmai_task_name", "") == "proactive.profile":
                         self._profile_stat_inc("profile_budget_rejected")
                     budget = getattr(self, "background_task_budget", None)
@@ -1215,14 +1288,37 @@ class ProactiveTask:
                             f"[ProactiveTask] background task shutdown_rejected: {exc}"
                         )
                     else:
-                        logger.warning(f"[ProactiveTask] background task skipped: {exc}")
+                        now = monotonic()
+                        if now - float(stats.get("last_queue_warning_at", float("-inf"))) >= 60.0:
+                            stats["last_queue_warning_at"] = now
+                            logger.warning(
+                                f"[ProactiveTask] background task skipped task={task_name} "
+                                f"scope={getattr(task, '_astrmai_scope_id', '')} "
+                                f"run_id={getattr(task, '_astrmai_run_id', '')} "
+                                f"stage={getattr(task, '_astrmai_terminal_stage', getattr(task, '_astrmai_stage', ''))} "
+                                f"failure_count={stats['failed']}: {exc}"
+                            )
+                        else:
+                            stats["queue_warning_suppressed"] = stats.get("queue_warning_suppressed", 0) + 1
                 else:
                     logger.error(f"[Proactive Task Error] {exc}", exc_info=exc)
             else:
                 stats["completed"] = int(stats.get("completed", 0) or 0) + 1
+                result = task.result()
+                outcome = str(result.get("status", "returned_no_report")) if isinstance(result, dict) else "returned_no_report"
+                stats["last_outcome"] = outcome
+                outcomes = stats.setdefault("outcomes", {})
+                outcomes[outcome] = outcomes.get(outcome, 0) + 1
                 logger.info(
-                    f"[ProactiveTask] background job completed task={task_name} "
-                    f"scope={getattr(task, '_astrmai_scope_id', '')} duration_ms={duration_ms:.1f}"
+                    f"[ProactiveTask] background job finished task={task_name} "
+                    f"scope={getattr(task, '_astrmai_scope_id', '')} outcome={outcome} "
+                    f"run_id={getattr(task, '_astrmai_run_id', '')} "
+                    f"delay_ms={stats['last_delay_ms']:.1f} "
+                    f"queue_wait_ms={stats['last_queue_wait_ms']:.1f} "
+                    f"execution_ms={stats['last_execution_ms']:.1f} "
+                    f"settlement_ms={stats['last_settlement_ms']:.1f} "
+                    f"settlement_committed={getattr(task, '_astrmai_settlement_committed', None)} "
+                    f"duration_ms={duration_ms:.1f}"
                 )
         except asyncio.CancelledError:
             stats["cancelled"] = int(stats.get("cancelled", 0) or 0) + 1
@@ -1578,7 +1674,6 @@ class ProactiveTask:
 
     async def _run_daily_diary_task_with_jitter(self, diary_date: str):
         try:
-            await asyncio.sleep(random.randint(1, 300))
             report = await self.diary_service.run_once(
                 self.state_engine.get_active_states(),
                 diary_date=diary_date,
@@ -1589,6 +1684,7 @@ class ProactiveTask:
                 and not list(report.get("deferred_chat_ids", []) or [])
             ):
                 self._last_diary_date = diary_date
+            return report
         finally:
             if self._diary_pending_date == diary_date:
                 self._diary_pending_date = ""
@@ -1946,37 +2042,44 @@ class ProactiveTask:
 
     async def _run_maintenance_cycle(self) -> None:
         try:
-            await self._enqueue_managed_maintenance(
-                task_family="decay",
-                scope_id="global",
-                awaitable_factory=self.decay_service.run_once,
-            )
+            due = getattr(self.decay_service, "has_due_work", None)
+            if due is None or await due():
+                await self._enqueue_managed_maintenance(
+                    task_family="decay",
+                    scope_id="global",
+                    awaitable_factory=self.decay_service.run_once,
+                )
         except Exception as exc:
             logger.error(f"[ProactiveTask] decay maintenance degraded: {exc}")
         try:
-            await self._enqueue_managed_maintenance(
-                task_family="memory_maintenance",
-                scope_id="global",
-                awaitable_factory=self._run_memory_store_maintenance,
-            )
+            if await self._memory_store_maintenance_due():
+                await self._enqueue_managed_maintenance(
+                    task_family="memory_maintenance",
+                    scope_id="global",
+                    awaitable_factory=self._run_memory_store_maintenance,
+                )
         except Exception as exc:
             logger.error(f"[ProactiveTask] memory store maintenance degraded: {exc}")
         try:
-            await self._enqueue_managed_maintenance(
-                task_family="group_signin",
-                scope_id="global",
-                awaitable_factory=self.group_signin_service.run_once,
-            )
+            due = getattr(self.group_signin_service, "has_due_work", None)
+            if due is None or due():
+                await self._enqueue_managed_maintenance(
+                    task_family="group_signin",
+                    scope_id="global",
+                    awaitable_factory=self.group_signin_service.run_once,
+                )
         except Exception as exc:
             logger.error(f"[ProactiveTask] group signin maintenance degraded: {exc}")
         try:
-            await self._enqueue_managed_maintenance(
-                task_family="heartflow_digest",
-                scope_id="global",
-                awaitable_factory=lambda: self.heartflow_topic_digest_service.run_once(
-                    self.heartflow_manager
-                ),
-            )
+            due = getattr(self.heartflow_topic_digest_service, "has_due_work", None)
+            if due is None or due(self.heartflow_manager):
+                await self._enqueue_managed_maintenance(
+                    task_family="heartflow_digest",
+                    scope_id="global",
+                    awaitable_factory=lambda: self.heartflow_topic_digest_service.run_once(
+                        self.heartflow_manager
+                    ),
+                )
         except Exception as exc:
             logger.error(f"[ProactiveTask] heartflow topic digest scheduling degraded: {exc}")
 
@@ -1992,34 +2095,72 @@ class ProactiveTask:
         "rejected_expression_grace_seconds": 1e12,
     }
 
-    async def _run_memory_store_maintenance(self) -> None:
+    async def _memory_store_maintenance_due(self) -> bool:
+        memory_cfg = getattr(self.config, "memory", None)
+        if not bool(getattr(memory_cfg, "maintenance_schedule_enabled", True)):
+            return False
+        engine = getattr(self, "memory_engine", None)
+        maintenance = getattr(engine, "maintenance_service", None) if engine else None
+        if maintenance is None or not hasattr(maintenance, "run_once"):
+            return False
+        last_run = float(getattr(self, "_last_store_maintenance_at", 0.0) or 0.0)
+        store = getattr(maintenance, "store", None)
+        if store is not None:
+            last_run = max(last_run, float(await store.get_meta("scheduled_maintenance_completed_at", "0")))
+            canonical_at = float(await store.get_meta("scheduled_canonical_maintenance_completed_at", "0"))
+            if time.time() - canonical_at < self._MEMORY_STORE_MAINTENANCE_INTERVAL_SEC and (
+                getattr(engine, "_projection_rebuild_active", False) or getattr(engine, "retriever", True) is None
+            ):
+                return False
+        return time.time() - last_run >= self._MEMORY_STORE_MAINTENANCE_INTERVAL_SEC
+
+    async def _run_memory_store_maintenance(self) -> dict:
         # OPT-05/WU-04: MemoryMaintenanceService.run_once（索引一致性修复 + 黑话/
         # 表达积压过期清理 + 墓碑 purge）此前无任何调度方——唯一入口是前端从不
         # 调用的 WebUI 端点，待审积压只增不减、投影缺口重启前不自愈
         memory_cfg = getattr(self.config, "memory", None)
-        if not bool(getattr(memory_cfg, "maintenance_schedule_enabled", True)):
-            return
+        if not await self._memory_store_maintenance_due():
+            return {"status": "no_work", "reason": "maintenance_not_due_or_disabled"}
         engine = getattr(self, "memory_engine", None)
         maintenance = getattr(engine, "maintenance_service", None) if engine else None
         if maintenance is None or not hasattr(maintenance, "run_once"):
             return
-        now = time.time()
-        last_run = float(getattr(self, "_last_store_maintenance_at", 0.0) or 0.0)
-        if now - last_run < self._MEMORY_STORE_MAINTENANCE_INTERVAL_SEC:
-            return
-        self._last_store_maintenance_at = now
         purge_enabled = bool(getattr(memory_cfg, "maintenance_purge_enabled", False))
         policy = {} if purge_enabled else dict(self._MAINTENANCE_NO_PURGE_POLICY)
+        policy["maintenance_interval_sec"] = self._MEMORY_STORE_MAINTENANCE_INTERVAL_SEC
         report = await maintenance.run_once(policy=policy)
+        if not report.get("canonical_completed", not report.get("errors")):
+            raise RuntimeError(f"memory maintenance incomplete: {report.get('errors', [])}")
+        report["status"] = "partial" if report.get("errors") else "succeeded"
+        index_report = dict(report.get("index_repair", {}) or {})
+        pending_reasons = dict(index_report.pop("remaining_pending_reasons", {}) or {})
+        if pending_reasons:
+            counts = {}
+            for reason in pending_reasons.values():
+                counts[reason] = counts.get(reason, 0) + 1
+            index_report["pending_reason_counts"] = {
+                str(reason)[:160]: count for reason, count in sorted(counts.items(), key=lambda item: item[1], reverse=True)[:8]
+            }
+            index_report["pending_reason_kind_count"] = len(counts)
+            index_report["pending_samples"] = [
+                (str(memory_id)[:80], str(reason)[:160]) for memory_id, reason in list(pending_reasons.items())[:5]
+            ]
+            if set(counts).issubset({"projection_rebuild_in_progress", "retriever_not_ready", "shutdown_rejected"}):
+                report["status"] = "deferred" if not report.get("errors") else "partial"
+        if report["status"] == "succeeded" and not index_report.get("remaining_pending", 0):
+            self._last_store_maintenance_at = float(report.get("ran_at") or time.time())
+        elif report["status"] == "succeeded":
+            report["status"] = "deferred"
         logger.info(
             "[ProactiveTask] memory store maintenance completed: "
             f"purge_enabled={purge_enabled} "
             f"physically_deleted={report.get('physically_deleted', 0)} "
             f"projection_deleted={report.get('projection_deleted', 0)} "
             f"marked_stale={report.get('marked_stale', 0)} "
-            f"index_repair={report.get('index_repair', {})} "
+            f"status={report['status']} index_repair={index_report} "
             f"errors={len(report.get('errors', []) or [])}"
         )
+        return report
 
     async def _loop(self):
         while self._is_running:
@@ -2029,10 +2170,11 @@ class ProactiveTask:
                 now = time.time()
                 await self.scheduled_scenario_service.tick(now=now)
                 # ponytail: M1 — only skip maintenance block, not profiling/reflection/diary
-                run_maintenance = (now - self._last_global_maintenance_run) >= self.GLOBAL_MAINTENANCE_INTERVAL_SECONDS
+                maintenance_now = monotonic()
+                run_maintenance = (maintenance_now - self._last_global_maintenance_run) >= self.GLOBAL_MAINTENANCE_INTERVAL_SECONDS
 
                 if run_maintenance:
-                    self._last_global_maintenance_run = now
+                    self._last_global_maintenance_run = maintenance_now
                     await self._run_maintenance_cycle()
 
                 profile_interval = max(
@@ -2081,6 +2223,7 @@ class ProactiveTask:
                             awaitable_factory=lambda: self._run_daily_diary_task_with_jitter(
                                 diary_date
                             ),
+                            admission_delay_sec=float(random.randint(1, 300)),
                         )
                         if diary_dispatch.get("queued"):
                             self._diary_pending_date = diary_date

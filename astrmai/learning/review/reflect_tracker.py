@@ -59,6 +59,17 @@ class ReflectTracker:
             item["processing"] = False
             return True
 
+    async def clear_chat(self, chat_id: str) -> bool:
+        normalized = self._normalize_umo(chat_id)
+        async with self._lock:
+            keys = [
+                key for key, item in self._pending.items()
+                if self._normalize_umo(item.get("umo") or item.get("group_id", "")) == normalized
+            ]
+            for key in keys:
+                self._pending.pop(key, None)
+            return bool(keys)
+
     def _build_question(self, pattern: ExpressionPattern, reason: str = "", replacement: str = "") -> str:
         suffix = f"\nAI 备注：{reason}" if reason else ""
         if replacement:

@@ -38,6 +38,7 @@ from ..infrastructure.runtime.event_bus import EventBus
 from ..infrastructure.runtime.host_bridge import HostBridge
 from ..infrastructure.runtime.background_task_budget import BackgroundTaskBudget
 from ..infrastructure.runtime.lane_manager import LaneManager
+from ..infrastructure.runtime.group_lifecycle import GroupLifecycleRegistry
 from ..infrastructure.runtime.observability import RuntimeObservabilityHub
 from ..infrastructure.runtime.raw_trace_store import RawTraceEventStore
 from ..infrastructure.runtime.turn_trace_store import TurnTraceSampleStore
@@ -120,6 +121,7 @@ class PluginBootstrap:
         runtime.core = self._build_core_services(runtime)
         db_service = getattr(runtime.core, "db_service", None)
         db_path = getattr(db_service, "db_path", None)
+        runtime.group_lifecycle = GroupLifecycleRegistry(db_path)
         runtime.cross_session_handoff_store = CrossSessionHandoffStore(db_path)
         runtime.conversation_history_service = ConversationHistoryService(self.context, runtime.config)
         runtime.set_boot_phase("bootstrap.workmode")
@@ -639,7 +641,11 @@ class PluginBootstrap:
             background_task_budget=getattr(runtime, "background_task_budget", None),
         )
         review_service = ExpressionReviewService(runtime.db_service)
-        review_dispatcher = ReviewDispatcher(self.context, reflect_tracker)
+        review_dispatcher = ReviewDispatcher(
+            self.context,
+            reflect_tracker,
+            group_lifecycle=getattr(runtime, "group_lifecycle", None),
+        )
         return reflector, reflect_tracker, review_service, review_dispatcher
 
     def _build_learning_tasks(

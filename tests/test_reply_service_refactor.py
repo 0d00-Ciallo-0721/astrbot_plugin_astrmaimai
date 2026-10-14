@@ -1124,14 +1124,14 @@ class RefactoredReplyServiceTests(unittest.TestCase):
         self.assertEqual(coordinator.claim_calls, [])
         self.assertEqual(coordinator.commits, [])
 
-    def test_send_exception_marks_claim_failed_before_reraising(self):
+    def test_explicit_delivery_rejection_marks_claim_failed_before_reraising(self):
         from astrmai.conversation.contracts.turn_identity import TurnIdentity
 
         state_engine = FakeStateEngine()
         coordinator = _ClaimingRuntimeCoordinator()
 
         async def _raise_send(*_args, **_kwargs):
-            raise RuntimeError("transport failed")
+            raise RuntimeError("transport failed: 发送失败，你已被移出该群")
 
         state_engine.gateway.context.send_message = _raise_send
         engine = self.reply_mod.ReplyService(
@@ -1154,16 +1154,16 @@ class RefactoredReplyServiceTests(unittest.TestCase):
             asyncio.run(engine.handle_reply(event, "answer", event.unified_msg_origin))
 
         self.assertEqual(len(coordinator.commits), 1)
-        self.assertIn("failed:transport failed", coordinator.commits[0][2])
+        self.assertEqual(coordinator.commits[0][2], ["failed:transport failed: 发送失败，你已被移出该群"])
 
-    def test_send_exception_records_unconfirmed_claim_failure_during_shutdown(self):
+    def test_explicit_delivery_rejection_records_unconfirmed_claim_failure_during_shutdown(self):
         from astrmai.conversation.contracts.turn_identity import TurnIdentity
 
         state_engine = FakeStateEngine()
         coordinator = _ClaimingRuntimeCoordinator()
 
         async def _raise_send(*_args, **_kwargs):
-            raise RuntimeError("transport failed")
+            raise RuntimeError("transport failed: 发送失败，你已被移出该群")
 
         async def _mark_unconfirmed(*_args, **_kwargs):
             return False

@@ -47,6 +47,9 @@ class ReleaseCandidateContractTests(unittest.TestCase):
             self.assertFalse(report["top_level_astrmai_available"])
             self.assertFalse(report["live_host_verified"])
             self.assertFalse(report["message_sent"])
+            self.assertTrue(report["runtime_lifecycle_field_declared"])
+            self.assertTrue(report["compaction_service_constructed"])
+            self.assertFalse(report["database_opened"])
             self.assertEqual(validate_release_candidate(output), [])
             self.assertEqual(validate_release_manifest(output, manifest_path_for(output)), [])
 

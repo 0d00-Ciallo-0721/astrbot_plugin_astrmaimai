@@ -22,28 +22,46 @@ class HeartflowTopicDigestService:
         self._last_digest_by_chat: dict[str, float] = {}
         self._history: list[HeartflowTopicDigest] = []
 
-    async def run_once(self, manager: Any, *, now: float | None = None) -> None:
+    def has_due_work(self, manager: Any, *, now: float | None = None) -> bool:
         if not self.memory_engine or not hasattr(self.memory_engine, "record_cognitive_feedback"):
-            return
+            return False
         if not manager or not hasattr(manager, "list_sessions"):
-            return
+            return False
+        now = monotonic() if now is None else now
+        return any(
+            self._is_digest_window(session, now=now)
+            and now >= self._last_digest_by_chat.get(session.chat_id, 0.0) + self.DIGEST_COOLDOWN_SECONDS
+            and float(getattr(session, "topic_heat", 0.0) or 0.0) >= self.TOPIC_HEAT_THRESHOLD
+            and self._has_meaningful_participation(manager, session)
+            for session in manager.list_sessions(limit=50)
+        )
+
+    async def run_once(self, manager: Any, *, now: float | None = None) -> dict:
+        if not self.memory_engine or not hasattr(self.memory_engine, "record_cognitive_feedback"):
+            return {"status": "no_work", "reason": "memory_unavailable"}
+        if not manager or not hasattr(manager, "list_sessions"):
+            return {"status": "no_work", "reason": "manager_unavailable"}
         if self._semaphore:
             async with self._semaphore:
-                await self._run_once_inner(manager, now=monotonic() if now is None else now)
-            return
-        await self._run_once_inner(manager, now=monotonic() if now is None else now)
+                return await self._run_once_inner(manager, now=monotonic() if now is None else now)
+        return await self._run_once_inner(manager, now=monotonic() if now is None else now)
 
-    async def _run_once_inner(self, manager: Any, *, now: float) -> None:
+    async def _run_once_inner(self, manager: Any, *, now: float) -> dict:
         try:
             sessions = manager.list_sessions(limit=50)
         except Exception as exc:
             logger.debug(f"[HeartflowTopicDigest] session scan degraded: {exc}")
-            return
+            return {"status": "failed", "reason": "session_scan_failed"}
+        processed, failed = 0, 0
         for session in sessions:
             try:
+                previous = self._last_digest_by_chat.get(session.chat_id)
                 await self._maybe_digest_session(manager, session, now=now)
+                processed += int(self._last_digest_by_chat.get(session.chat_id) != previous)
             except Exception as exc:
                 logger.debug(f"[HeartflowTopicDigest] digest degraded for {getattr(session, 'chat_id', '')}: {exc}")
+                failed += 1
+        return {"status": "partial" if failed else "succeeded" if processed else "no_work", "processed": processed, "failed": failed}
 
     async def _maybe_digest_session(self, manager: Any, session: HeartflowSessionState, *, now: float) -> None:
         chat_id = str(getattr(session, "chat_id", "") or "")

@@ -312,6 +312,37 @@ class GatewayVisionRefactorTests(unittest.TestCase):
         self.assertEqual(len(context.calls), 1)
         self.assertEqual(gateway._model_health[("vision", "vision-a")]["status"], "cooldown")
 
+    def test_missing_model_is_configuration_failure_and_model_scoped(self):
+        context = _VisionContext([])
+        gateway = self.gateway_mod.GlobalModelGateway(
+            context,
+            SimpleNamespace(
+                infra=SimpleNamespace(
+                    max_concurrent_llm_calls=1,
+                    llm_retries=0,
+                    backoff_factor=1.5,
+                    api_timeout=10,
+                    quota_model_cooldown_sec=1800,
+                ),
+                provider=SimpleNamespace(
+                    fallback_models=[], task_models=[], agent_models=[], vision_models=[]
+                ),
+            ),
+        )
+        self.assertEqual(
+            gateway._classify_failure_kind("404 model_not_found: Model not exist").value,
+            "configuration",
+        )
+        self.assertEqual(
+            gateway._classify_failure_kind(
+                "Provider doubao/ark-code-latest not found"
+            ).value,
+            "configuration",
+        )
+        gateway._open_model_cooldown("vision", "provider/bad-model", "404 model_not_found")
+        self.assertIn(("vision", "provider/bad-model"), gateway._model_cooldowns)
+        self.assertNotIn(("__provider__", "provider"), gateway._model_cooldowns)
+
     def test_judge_and_mood_tasks_use_task_pool_and_workload_families(self):
         task_mod = importlib.import_module("astrmai.infrastructure.gateway.gateway_tasks")
         context_mod = importlib.import_module("astrmai.infrastructure.context_economy")

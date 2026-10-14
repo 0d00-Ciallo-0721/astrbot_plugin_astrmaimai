@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 
-LATEST_ARCHITECTURE_SCHEMA_VERSION = 175
+LATEST_ARCHITECTURE_SCHEMA_VERSION = 177
 
 MESSAGELOG_REQUIRED_COLUMNS = (
     "event_id",
@@ -78,6 +78,7 @@ REQUIRED_INDEXES = (
     "ix_learning_retrieval_turn",
     "ix_learning_retrieval_generation",
     "ix_learning_human_admission_candidate",
+    "ix_group_lifecycle_status",
 )
 
 REQUIRED_TRIGGERS = (
@@ -232,6 +233,7 @@ def inspect_architecture_migration(
         "learning_admission",
         "learning_human_admission",
         "learning_retrieval_event",
+        "group_lifecycle",
     )
     missing_tables = tuple(name for name in required_tables if name not in tables)
     table_row_counts = {
@@ -352,6 +354,10 @@ def inspect_architecture_migration(
             "prompt_revision", "reason_code", "trimmed_reason", "budget_chars",
             "budget_tokens", "outcome", "reply_id", "diagnostics_json", "created_at",
         ),
+        "group_lifecycle": (
+            "chat_id", "group_id", "status", "generation", "retired_at",
+            "reason", "source_event_id", "updated_at",
+        ),
     }
     missing_columns: dict[str, tuple[str, ...]] = {}
     available_columns: dict[str, set[str]] = {}
@@ -388,6 +394,7 @@ def inspect_architecture_migration(
         "ix_learning_retrieval_turn": "learning_retrieval_event",
         "ix_learning_retrieval_generation": "learning_retrieval_event",
         "ix_learning_human_admission_candidate": "learning_human_admission",
+        "ix_group_lifecycle_status": "group_lifecycle",
     }
     missing_indexes = tuple(
         name

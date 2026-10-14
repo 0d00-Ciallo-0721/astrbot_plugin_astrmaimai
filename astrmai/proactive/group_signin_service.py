@@ -168,13 +168,24 @@ class GroupSigninService:
             logger.error(f"[GroupSigninService] sign failed for group={group_id}: {exc}")
             return False
 
-    async def run_once(self, now_ts: float | None = None) -> None:
+    def has_due_work(self, now_ts: float | None = None) -> bool:
+        now_ts = time.time() if now_ts is None else float(now_ts)
+        if not self._enabled() or not self._within_sign_window(now_ts):
+            return False
+        today = self._today_string(now_ts)
+        return any(
+            self._extract_group_id(str(getattr(state, "chat_id", "") or ""))
+            and not self._already_signed_today(state, today)
+            for state in self.state_engine.get_active_states()
+        )
+
+    async def run_once(self, now_ts: float | None = None) -> dict[str, Any]:
         now_ts = time.time() if now_ts is None else float(now_ts)
         if not self._enabled():
             self._last_run = {"status": "disabled", "signed": 0, "partial": 0, "failed": 0}
-            return
+            return dict(self._last_run)
         if not self._within_sign_window(now_ts):
-            return
+            return {"status": "no_work", "reason": "outside_sign_window"}
 
         today = self._today_string(now_ts)
         stats = {"status": "completed", "signed": 0, "partial": 0, "failed": 0}
@@ -229,6 +240,7 @@ class GroupSigninService:
         elif stats["failed"]:
             stats["status"] = "degraded"
         self._last_run = stats
+        return {**stats, "status": stats["status"] if stats["status"] != "completed" else "succeeded" if stats["signed"] else "no_work"}
 
     def describe_status(self) -> dict[str, Any]:
         return {

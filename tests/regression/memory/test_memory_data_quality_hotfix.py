@@ -831,7 +831,7 @@ class MaintenanceScheduleTests(unittest.TestCase):
 
         asyncio.run(task._run_memory_store_maintenance())
 
-        self.assertEqual(runs, [{}])
+        self.assertEqual(runs, [{"maintenance_interval_sec": 86400.0}])
 
     def test_daily_throttle_skips_second_run(self):
         task, runs = self._task()

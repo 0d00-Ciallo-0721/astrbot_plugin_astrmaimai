@@ -31,6 +31,9 @@ MERGED_STATUS = "merged"
 DEPRECATED_STATUS = "deprecated"
 REVIEW_PENDING_STATUS = "review_pending"
 REJECTED_STATUS = "rejected"
+PROJECTION_DEFERRED_REASONS = frozenset({
+    "retriever_not_ready", "projection_rebuild_in_progress", "shutdown_rejected",
+})
 
 
 class MemoryUpsertResult(dict):
@@ -1788,8 +1791,9 @@ class MemoryV2Store:
                 row = await cursor.fetchone()
                 previous_attempts = int(row[0] or 0) if row else 0
                 previous_status = str(row[3] or "pending") if row and len(row) > 3 else "pending"
-                attempts = previous_attempts + 1
                 reason_text = str(reason or "unknown")
+                deferred = reason_text in PROJECTION_DEFERRED_REASONS
+                attempts = previous_attempts + (0 if deferred else 1)
                 error_type = reason_text.split(":", 1)[0]
                 failed_stage = {
                     "embedding_timeout": "embedding",
@@ -1817,7 +1821,7 @@ class MemoryV2Store:
                     "UPDATE memory_v2_meta SET value = ? WHERE key = 'projection_outbox_revision'",
                     (str(revision),),
                 )
-                if max_attempts is not None and attempts > max(1, int(max_attempts)):
+                if not deferred and max_attempts is not None and attempts > max(1, int(max_attempts)):
                     await db.execute(
                         """
                         INSERT INTO memory_projection_outbox(
@@ -1839,7 +1843,7 @@ class MemoryV2Store:
                     return False
                 delay = min(
                     max(float(max_delay_sec or 900.0), 1.0),
-                    max(float(base_delay_sec or 30.0), 1.0) * (2 ** max(attempts - 1, 0)),
+                    max(float(base_delay_sec or 30.0), 1.0) * (1 if deferred else 2 ** max(attempts - 1, 0)),
                 )
                 await db.execute(
                 """
@@ -1989,17 +1993,23 @@ class MemoryV2Store:
             if row and str(row[0] or "").strip()
         }
 
-    async def projection_retry_snapshot_with_revisions(self, *, limit: int | None = None) -> dict[str, dict[str, object]]:
+    async def projection_retry_snapshot_with_revisions(self, *, limit: int | None = None, reasons: tuple[str, ...] | None = None) -> dict[str, dict[str, object]]:
         await self.initialize()
         async with connect_aiosqlite(self.db_path) as db:
             query = (
                 "SELECT memory_id, last_error, revision FROM memory_projection_outbox "
-                "WHERE status = 'pending' ORDER BY revision ASC"
+                "WHERE status = 'pending'"
             )
-            params: tuple[int, ...] = ()
+            params: tuple[object, ...] = ()
+            if reasons is not None:
+                if not reasons:
+                    return {}
+                query += f" AND last_error IN ({','.join('?' for _ in reasons)})"
+                params = tuple(reasons)
+            query += " ORDER BY revision ASC"
             if limit is not None:
                 query += " LIMIT ?"
-                params = (max(1, int(limit or 1)),)
+                params += (max(1, int(limit or 1)),)
             cursor = await db.execute(query, params)
             rows = await cursor.fetchall()
         return {
@@ -3387,11 +3397,42 @@ class MemoryV2Store:
         protected_kinds: tuple[str, ...] = ("persona_lore", "profile"),
         protected_importance: float = 0.95,
     ) -> int:
+        deleted, _ = await self.apply_decay_if_due(
+            decay_rate=decay_rate, min_score=min_score,
+            stale_grace_seconds=stale_grace_seconds, days=days,
+            allow_protected_physical_delete=allow_protected_physical_delete,
+            protected_kinds=protected_kinds, protected_importance=protected_importance,
+            min_interval_sec=0.0,
+        )
+        return deleted
+
+    async def apply_decay_if_due(
+        self,
+        *,
+        decay_rate: float,
+        min_score: float = 0.05,
+        stale_grace_seconds: float = 7 * 86400,
+        days: int = 1,
+        allow_protected_physical_delete: bool = False,
+        protected_kinds: tuple[str, ...] = ("persona_lore", "profile"),
+        protected_importance: float = 0.95,
+        min_interval_sec: float = 86400.0,
+        checkpoint_key: str = "scheduled_decay_completed_at",
+    ) -> tuple[int, bool]:
+        """Commit scheduled decay and its restart fence in one transaction."""
         await self.initialize()
         self.last_physical_delete_ids = []
         now = self._now()
         decay_factor = max(0.0, min(1.0, (1 - float(decay_rate or 0.0)) ** max(int(days or 1), 1)))
         async with connect_aiosqlite(self.db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            if min_interval_sec > 0:
+                cursor = await db.execute(
+                    "SELECT value FROM memory_v2_meta WHERE key=?", (checkpoint_key,),
+                )
+                row = await cursor.fetchone()
+                if row and now - float(row[0]) < min_interval_sec:
+                    return 0, False
             await db.execute(
                 """
                 UPDATE canonical_memories
@@ -3436,8 +3477,13 @@ class MemoryV2Store:
                 )
             else:
                 cursor = None
+            if min_interval_sec > 0:
+                await db.execute(
+                    "INSERT OR REPLACE INTO memory_v2_meta(key,value) VALUES(?,?)",
+                    (checkpoint_key, str(now)),
+                )
             await db.commit()
-            return int(getattr(cursor, "rowcount", 0) or 0)
+            return int(getattr(cursor, "rowcount", 0) or 0), True
 
     async def purge_jargon_candidates(
         self,

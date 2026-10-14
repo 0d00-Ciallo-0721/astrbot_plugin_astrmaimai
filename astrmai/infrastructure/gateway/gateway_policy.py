@@ -67,6 +67,24 @@ class GatewayPolicyMixin:
         return None
 
     def _classify_cooldown_reason(self, error_message: str, error: Any = None) -> str:
+        lowered = str(error_message or "").lower()
+        if any(
+            marker in lowered
+            for marker in (
+                "model not exist",
+                "model_not_found",
+                "model not found",
+                "invalid model",
+                "provider not found",
+                "providernotfound",
+                "unknown provider",
+                "没有找到 id",
+                "没有找到提供商",
+            )
+        ) or re.search(r"\bprovider\b[^\r\n]{0,160}\bnot found\b", lowered):
+            # A single missing model must not cool down every model offered by
+            # the same provider.  Keep the fence model-scoped.
+            return "configuration"
         status = self._extract_http_status(error)
         text_status_match = re.search(
             r"(?:http\s*(?:status|code)?|status|error\s*code)\s*[:=]?\s*(401|403|404|408|429|500|502|503|504)\b",
@@ -88,7 +106,6 @@ class GatewayPolicyMixin:
                 return "rate_limit"
             if text_status == 401:
                 return "provider_permission_denied"
-        lowered = str(error_message or "").lower()
         if any(keyword in lowered for keyword in ("internal server error", "bad gateway", "service unavailable", "gateway timeout")):
             return "server_error"
         if any(keyword in lowered for keyword in ("429", "rate limit", "ratelimit", "too many requests")):
@@ -171,7 +188,7 @@ class GatewayPolicyMixin:
         cooldowns = getattr(self, "_model_cooldowns", {})
         cooldowns[self._cooldown_key(pool_name, model_id)] = meta
         provider_id = self._provider_id(model_id)
-        if provider_id:
+        if provider_id and reason != "configuration":
             cooldowns[self._cooldown_key("__provider__", provider_id)] = dict(meta)
         return dict(meta)
 
@@ -282,6 +299,21 @@ class GatewayPolicyMixin:
                 return FailureKind.TURN_BUDGET_EXHAUSTED
             return FailureKind.TIMEOUT
         lowered = str(error_message).lower()
+        if any(
+            marker in lowered
+            for marker in (
+                "model not exist",
+                "model_not_found",
+                "model not found",
+                "provider not found",
+                "providernotfound",
+                "unknown provider",
+                "invalid model",
+                "没有找到 id",
+                "没有找到提供商",
+            )
+        ) or re.search(r"\bprovider\b[^\r\n]{0,160}\bnot found\b", lowered):
+            return FailureKind.CONFIGURATION
         if "empty_response" in lowered:
             return FailureKind.EMPTY_RESPONSE
         if "provider_failure_text" in lowered:

@@ -31,6 +31,7 @@ from astrmai.learning.release.preflight import (
     run_preflight,
 )
 from astrmai.infrastructure.persistence.persistence_schema import _run_migrations
+from astrmai.infrastructure.persistence.architecture_migration_audit import LATEST_ARCHITECTURE_SCHEMA_VERSION
 from astrmai.learning.release.rollback import PointerState, RollbackCoordinator
 from astrmai.learning.release.state_machine import (
     ManualApproval,
@@ -409,13 +410,13 @@ def test_p0_migrates_only_temporary_copy_and_preserves_source(tmp_path):
     result = migrate_temporary_sqlite(
         source=source,
         working_copy=working,
-        expected_schema_version=175,
+        expected_schema_version=LATEST_ARCHITECTURE_SCHEMA_VERSION,
         migrate=_run_migrations,
     )
 
     assert result.source_unchanged is True
     assert source.read_bytes() == before
-    assert result.working_copy.schema_version == 175
+    assert result.working_copy.schema_version == LATEST_ARCHITECTURE_SCHEMA_VERSION
     assert result.working_copy.schema_version_ok is True
     assert result.working_copy.integrity_ok is True
     assert result.working_copy.foreign_keys_ok is True

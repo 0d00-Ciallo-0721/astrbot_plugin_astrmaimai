@@ -362,6 +362,10 @@ class ContextRuntimeWiringTests(unittest.TestCase):
             runtime = bootstrap.build()
 
         self.assertEqual(runtime.chat_loop_kernel, "kernel-marker")
+        from dataclasses import fields
+
+        self.assertIn("group_lifecycle", {item.name for item in fields(type(runtime))})
+        self.assertIsInstance(runtime.group_lifecycle, bootstrap_mod.GroupLifecycleRegistry)
 
     def test_lifecycle_stack_allows_proactive_to_be_disabled(self):
         bootstrap_mod = importlib.import_module("astrmai.app.bootstrap")

@@ -20,6 +20,7 @@ from ..presentation.events.result_sniffer import sniff_external_plugin_results
 from ..presentation.events.startup_hooks import on_program_start as run_startup_hook
 from ..infrastructure.runtime.lane_manager import LaneKey
 from ..infrastructure.runtime.outbound_send_guard import bind_event_generation
+from ..infrastructure.persistence.sqlite_helpers import connect_aiosqlite
 from ..shared.helpers.plugin_helpers import format_model_pool
 from .lifecycle import PluginLifecycleManager
 from .runtime_context import PluginRuntimeContext
@@ -106,7 +107,7 @@ class PluginFacade(RuntimeFacadeProtocol):
         if depth > 4:
             return {}
         if isinstance(obj, dict):
-            if obj.get("notice_type") == "group_decrease":
+            if obj.get("notice_type"):
                 return obj
             for value in obj.values():
                 found = self._find_notice_payload(value, depth + 1)
@@ -121,7 +122,7 @@ class PluginFacade(RuntimeFacadeProtocol):
 
     def _group_decrease_notice_for_self(self, event) -> tuple[str, str] | None:
         payload = self._find_notice_payload(event)
-        if not payload:
+        if not payload or str(payload.get("notice_type") or "").strip().lower() != "group_decrease":
             return None
         group_id = str(payload.get("group_id") or "")
         user_id = str(payload.get("user_id") or "")
@@ -138,14 +139,74 @@ class PluginFacade(RuntimeFacadeProtocol):
             chat_id = f"default:GroupMessage:{group_id}"
         return chat_id, group_id
 
+    def _group_increase_notice_for_self(self, event) -> tuple[str, str] | None:
+        payload = self._find_notice_payload(event)
+        if not payload or str(payload.get("notice_type") or "").strip().lower() != "group_increase":
+            return None
+        group_id = str(payload.get("group_id") or "").strip()
+        user_id = str(payload.get("user_id") or "").strip()
+        self_id = str(payload.get("self_id") or "").strip()
+        if not self_id and hasattr(event, "get_self_id"):
+            try:
+                self_id = str(event.get_self_id() or "").strip()
+            except Exception:
+                self_id = ""
+        if not group_id or not user_id or not self_id or user_id != self_id:
+            return None
+        chat_id = str(getattr(event, "unified_msg_origin", "") or "").strip()
+        return (chat_id or f"default:GroupMessage:{group_id}"), group_id
+
     async def handle_group_membership_notice(self, event) -> bool:
         resolved = self._group_decrease_notice_for_self(event)
-        if not resolved:
+        if resolved:
+            chat_id, group_id = resolved
+            lifecycle = getattr(self.runtime, "group_lifecycle", None)
+            if lifecycle is not None:
+                try:
+                    await lifecycle.retire(
+                        chat_id,
+                        group_id=group_id,
+                        reason="bot_left_group",
+                        source_event_id=self._resolve_turn_message_id(event),
+                    )
+                except Exception:
+                    logger.error("[AstrMai] failed to persist retired group fence for %s", chat_id, exc_info=True)
+            await self.clear_group_runtime_state(chat_id, group_id=group_id)
+            logger.info(f"[AstrMai] bot left group {group_id}; cleared runtime state for {chat_id}")
+            return True
+        activated = self._group_increase_notice_for_self(event)
+        if activated:
+            chat_id, group_id = activated
+            lifecycle = getattr(self.runtime, "group_lifecycle", None)
+            if lifecycle is not None:
+                try:
+                    await lifecycle.activate(
+                        chat_id,
+                        group_id=group_id,
+                        source_event_id=self._resolve_turn_message_id(event),
+                    )
+                except Exception:
+                    logger.error("[AstrMai] failed to activate group fence for %s", chat_id, exc_info=True)
+            logger.info(f"[AstrMai] bot joined group {group_id}; activated runtime state for {chat_id}")
+            return True
+        return False
+
+    async def bind_group_lifecycle(self, event) -> bool:
+        lifecycle = getattr(self.runtime, "group_lifecycle", None)
+        if lifecycle is None:
+            return True
+        try:
+            await lifecycle.bind_event(event)
+            return not bool(event.get_extra("astrmai_group_retired", False))
+        except Exception:
+            # A lifecycle read failure must fail closed for group ingress;
+            # otherwise a retired group can receive a late continuation.
+            logger.error("[AstrMai] group lifecycle binding unavailable; blocking group ingress", exc_info=True)
+            try:
+                event.set_extra("astrmai_group_lifecycle_unavailable", True)
+            except Exception:
+                pass
             return False
-        chat_id, group_id = resolved
-        await self.clear_group_runtime_state(chat_id, group_id=group_id)
-        logger.info(f"[AstrMai] bot left group {group_id}; cleared runtime state for {chat_id}")
-        return True
 
     async def handle_message_recall(self, chat_id: str, event_id: str) -> bool:
         """G3/ID-08: 撤回通知 → 对话热区打墓碑，防止 bot 后续原文复述已撤回内容。
@@ -172,6 +233,7 @@ class PluginFacade(RuntimeFacadeProtocol):
             ("dialogue_store", getattr(runtime, "dialogue_store", None), "clear_chat", True),
             ("group_social_feedback_observer", getattr(runtime, "group_social_feedback_observer", None), "clear_chat", True),
             ("group_reread_observer", getattr(runtime, "group_reread_observer", None), "clear_chat", True),
+            ("reflect_tracker", getattr(runtime, "reflect_tracker", None), "clear_chat", True),
             ("chat_loop_kernel", getattr(runtime, "chat_loop_kernel", None), "clear_chat_state", True),
         ]
         proactive_task = getattr(runtime, "proactive_task", None)
@@ -195,7 +257,51 @@ class PluginFacade(RuntimeFacadeProtocol):
             except Exception as exc:
                 result["group_reply_wait"] = False
                 logger.debug(f"[AstrMai] group wait clear degraded for {chat_id}: {exc}", exc_info=True)
+        result.update(await self._purge_group_pending_records(chat_id))
         return result
+
+    async def _purge_group_pending_records(self, chat_id: str) -> dict[str, bool]:
+        """Remove durable work that could emit after a bot-left notice.
+
+        Historical conversation/learning rows are intentionally untouched.
+        Only queues and idempotency leases with an explicit chat/scope key are
+        deleted; the retired lifecycle row remains as the durable fence.
+        """
+        db_service = getattr(getattr(self.runtime, "core", None), "db_service", None)
+        db_path = getattr(db_service, "db_path", None) or getattr(self.runtime, "db_path", None)
+        if not db_path:
+            return {"pending_records": False}
+        tables = (
+            ("attention_deferred_outbox", "chat_id"),
+            ("attention_deferred_outbox_terminal_history", "chat_id"),
+            ("qq_action_ledger", "chat_id"),
+            ("proactive_scenario_delivery", "chat_id"),
+            ("reflection_outbox", "chat_id"),
+            ("background_task_ledger", "scope_id"),
+            ("memory_turn_ledger", "chat_id"),
+        )
+        removed = False
+        try:
+            async with connect_aiosqlite(db_path) as db:
+                for table, column in tables:
+                    try:
+                        cursor = await db.execute(
+                            f"DELETE FROM {table} WHERE {column} = ?", (str(chat_id),)
+                        )
+                        removed = bool(int(cursor.rowcount or 0)) or removed
+                        await cursor.close()
+                    except Exception as exc:
+                        # Older databases may not yet have optional tables.
+                        # Real write failures abort the whole purge so a
+                        # partial cleanup is never reported as complete.
+                        if "no such table" in str(exc).lower():
+                            continue
+                        raise
+                await db.commit()
+        except Exception:
+            logger.warning("[AstrMai] durable group pending purge degraded for %s", chat_id, exc_info=True)
+            return {"pending_records": False}
+        return {"pending_records": removed}
 
     async def sniff_external_plugin_results(self, event) -> None:
         await sniff_external_plugin_results(self.runtime, event)
@@ -1072,6 +1178,9 @@ class PluginFacade(RuntimeFacadeProtocol):
 
         task_query = event.message_str.replace("/work", "").strip()
         bind_event_generation(event)
+        if not await self.bind_group_lifecycle(event):
+            event.stop_event()
+            return
         if not task_query:
             yield event.plain_result(
                 "❌ 请告诉我需要执行什么任务。\n"

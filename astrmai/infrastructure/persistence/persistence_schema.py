@@ -829,6 +829,17 @@ _MIGRATIONS: list[tuple[int, str]] = [
     (175, """CREATE TRIGGER IF NOT EXISTS trg_learning_human_admission_no_delete
         BEFORE DELETE ON learning_human_admission
         BEGIN SELECT RAISE(ABORT, 'learning_human_admission is immutable'); END"""),
+    (176, """CREATE TABLE IF NOT EXISTS group_lifecycle (
+        chat_id TEXT PRIMARY KEY,
+        group_id TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','retired')),
+        generation INTEGER NOT NULL DEFAULT 0,
+        retired_at REAL NOT NULL DEFAULT 0,
+        reason TEXT NOT NULL DEFAULT '',
+        source_event_id TEXT NOT NULL DEFAULT '',
+        updated_at REAL NOT NULL DEFAULT 0
+    )"""),
+    (177, "CREATE INDEX IF NOT EXISTS ix_group_lifecycle_status ON group_lifecycle(status, updated_at)"),
 ]
 
 
